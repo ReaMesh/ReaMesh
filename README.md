@@ -4,24 +4,27 @@ Work on a REAPER project together. ReaMesh shares project files and keeps edits
 in sync between computers on a local network. No account or server needed.
 
 One person hosts a project, the others join and get a local copy. Everyone can
-then add, remove and reorder tracks and change their basic settings.
+then add, remove and reorder tracks and change their basic settings. A panel
+inside REAPER handles hosting and joining.
 
 ## Getting started
 
-ReaMesh runs on macOS. There are no packaged builds yet, so
+ReaMesh runs on macOS. The panel needs ReaImGui, which you can install with
+[ReaPack](https://reapack.com). There are no packaged builds yet, so
 [build the extension from source](#building-from-source) first.
 
 1. Copy `reaper_reamesh.dylib` into
    `~/Library/Application Support/REAPER/UserPlugins/` on each Mac.
-2. Restart REAPER. The REAPER console shows a short message when ReaMesh loads.
-3. Save a project in its own folder, then run the action "ReaMesh: Host
-   session".
-4. On the other computer, run "ReaMesh: Join session" to search for sessions,
-   then run it again to join the first one found. ReaMesh downloads the project
-   and opens it in REAPER.
+2. Restart REAPER. ReaMesh installs its panel script on startup.
+3. Run the action "ReaMesh: Open panel (GUI)". Save a project in its own
+   folder, then click Host current project.
+4. On the other computer, open the panel and join the session from the list.
+   ReaMesh downloads the project and opens it in REAPER.
 
-"ReaMesh: Leave session" stops hosting or leaves. Status and download progress
-appear in the REAPER console.
+The panel shows download progress and how many people are connected, and stops
+hosting or leaves the session. Without ReaImGui, the actions "ReaMesh: Host
+session", "ReaMesh: Join session" and "ReaMesh: Leave session" still work and
+report to the REAPER console.
 
 **Hosting shares the project folder**, including files that aren't used in the
 project. Dotfiles, `.rpp-bak` backups and `.reapeaks` caches are excluded.
@@ -98,5 +101,8 @@ are also [C ABI smoke tests](tools/ffi_smoke.cpp).
   on its main thread.
 - [`rust/`](rust/): networking, file transfers and shared state using libp2p,
   Tokio and yrs. The host coordinates edits.
+- [`scripts/`](scripts/): ReaImGui panel, embedded into the extension at build
+  time.
 
-The extension and Rust core communicate through a C ABI.
+The extension and Rust core communicate through a C ABI. The panel talks to the
+extension through its ReaScript API.
