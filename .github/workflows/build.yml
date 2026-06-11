@@ -1,0 +1,41 @@
+# Builds the REAPER extension for Windows (reaper_reamesh.dll) and macOS
+# (reaper_reamesh.dylib) and uploads them as artifacts. Push this repo to
+# GitHub and grab the dll from the Actions tab, no Windows machine needed
+# to produce it (you still need one, or a collaborator, to run it).
+name: build
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Rust staticlib
+        run: cargo build --release
+        working-directory: rust
+      - name: Build extension DLL
+        run: |
+          cmake -S extension -B extension/build
+          cmake --build extension/build --config Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reaper_reamesh-windows-x64
+          path: extension/build/Release/reaper_reamesh.dll
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Rust staticlib
+        run: cargo build --release
+        working-directory: rust
+      - name: Build extension dylib
+        run: |
+          cmake -S extension -B extension/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build extension/build --config Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reaper_reamesh-macos
+          path: extension/build/reaper_reamesh.dylib

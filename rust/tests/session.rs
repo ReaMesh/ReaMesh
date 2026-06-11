@@ -1,0 +1,311 @@
+//! In-process owner/client session tests: two complete peers (two Tokio
+//! runtimes, two swarms, one authoritative doc + one replica) over loopback.
+//!
+//! Requires real sockets (mDNS may be unavailable; the tests fall back to
+//! dialing the peer's listen addresses directly).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use reamesh::Reamesh;
+use serde_json::Value;
+
+const KICK_SIZE: usize = 2 * 1024 * 1024 + 12345; // >1 chunk, not chunk-aligned
+
+fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+fn temp_dir(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "reamesh-test-{tag}-{}-{nanos:x}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A small but realistic project directory: .rpp, a subdirectory with a
+/// multi-chunk media file, an empty file, and files that must NOT transfer.
+fn make_project(dir: &Path) {
+    fs::write(dir.join("Song.rpp"), b"<REAPER_PROJECT 0.1\n>\n").unwrap();
+    fs::create_dir_all(dir.join("Audio")).unwrap();
+    let kick: Vec<u8> = (0..KICK_SIZE).map(|i| (i % 251) as u8).collect();
+    fs::write(dir.join("Audio/kick.wav"), kick).unwrap();
+    fs::write(dir.join("notes.txt"), b"").unwrap();
+    fs::write(dir.join("Song.rpp-bak"), b"backup").unwrap();
+    fs::write(dir.join(".DS_Store"), b"junk").unwrap();
+}
+
+fn session_id_of(owner: &Reamesh) -> String {
+    let status: Value = serde_json::from_str(&owner.status_json()).unwrap();
+    status["session_id"].as_str().unwrap().to_string()
+}
+
+fn interconnect(a: &Reamesh, b: &Reamesh) {
+    for addr in b.listen_addrs() {
+        a.dial(&addr);
+    }
+    for addr in a.listen_addrs() {
+        b.dial(&addr);
+    }
+}
+
+/// Host a session over `project_dir`, join it from a client, and wait until
+/// the download finished and both sides see each other on the session topic.
+fn establish(session_name: &str, project_dir: &Path, staging: &Path) -> (Box<Reamesh>, Box<Reamesh>) {
+    let owner = Reamesh::host(session_name, project_dir.to_str().unwrap(), "Song.rpp")
+        .expect("host failed");
+    let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
+    let sid = session_id_of(&owner);
+
+    // mDNS with explicit-dial fallback (sandboxed/multicast-less environments).
+    let discovered = wait_until(Duration::from_secs(20), || {
+        interconnect(&owner, &client);
+        client.sessions_json().contains(&sid)
+    });
+    assert!(discovered, "client never saw the session announcement");
+
+    assert!(client.join_session(&sid), "join_session refused");
+    let ready = wait_until(Duration::from_secs(30), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        assert_ne!(s["state"], "failed", "download failed: {}", s["message"]);
+        s["state"] == "ready"
+    });
+    assert!(ready, "download never completed: {}", client.status_json());
+
+    let meshed = wait_until(Duration::from_secs(15), || {
+        owner.connected_peers() >= 1 && client.connected_peers() >= 1
+    });
+    assert!(meshed, "session topic mesh never formed");
+    (owner, client)
+}
+
+/// Read tracks["<guid>"]["<field>"] out of a snapshot_json string.
+fn field(snapshot_json: &str, guid: &str, field: &str) -> Value {
+    let v: Value = serde_json::from_str(snapshot_json).unwrap();
+    v["tracks"][guid][field].clone()
+}
+
+/// Apply every drained changeset to `state` (a tiny stand-in for REAPER) and
+/// return whether anything arrived.
+fn drain_into(peer: &Reamesh, state: &mut serde_json::Map<String, Value>) -> bool {
+    let drained: Value = serde_json::from_str(&peer.drain_remote()).unwrap();
+    let mut any = false;
+    for cs in drained.as_array().unwrap() {
+        for (guid, fields) in cs["tracks"].as_object().unwrap() {
+            any = true;
+            let entry = state
+                .entry(guid.clone())
+                .or_insert_with(|| Value::Object(Default::default()));
+            for (k, v) in fields.as_object().unwrap() {
+                entry[k] = v.clone();
+            }
+        }
+    }
+    any
+}
+
+#[test]
+fn client_join_downloads_project_files() {
+    let project = temp_dir("proj-files");
+    let staging = temp_dir("staging-files");
+    make_project(&project);
+
+    let (owner, client) = establish("files-test", &project, &staging);
+
+    let status: Value = serde_json::from_str(&client.status_json()).unwrap();
+    let path = PathBuf::from(status["project_path"].as_str().unwrap());
+    assert!(path.ends_with("Song.rpp"), "unexpected project path {path:?}");
+    let dest = path.parent().unwrap();
+
+    assert_eq!(
+        fs::read(dest.join("Song.rpp")).unwrap(),
+        fs::read(project.join("Song.rpp")).unwrap()
+    );
+    assert_eq!(
+        fs::read(dest.join("Audio/kick.wav")).unwrap(),
+        fs::read(project.join("Audio/kick.wav")).unwrap(),
+        "media file corrupted in transfer"
+    );
+    assert_eq!(fs::read(dest.join("notes.txt")).unwrap(), b"");
+    assert!(!dest.join("Song.rpp-bak").exists(), "backup file should not transfer");
+    assert!(!dest.join(".DS_Store").exists(), "hidden file should not transfer");
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
+fn owner_edit_propagates_to_client() {
+    let project = temp_dir("proj-owneredit");
+    let staging = temp_dir("staging-owneredit");
+    make_project(&project);
+    let (owner, client) = establish("owneredit-test", &project, &staging);
+
+    owner.push_local(
+        r#"{"tracks":{"{T1}":{"present":true,"index":0,"name":"Drums","vol":0.8,"pan":0.0,"mute":false,"solo":false}}}"#,
+    );
+
+    let mut applied = serde_json::Map::new();
+    let arrived = wait_until(Duration::from_secs(10), || {
+        drain_into(&client, &mut applied);
+        applied.get("{T1}").map(|t| t["name"] == "Drums").unwrap_or(false)
+    });
+    assert!(arrived, "owner edit never reached the client");
+    assert_eq!(field(&client.snapshot_json(), "{T1}", "vol"), 0.8);
+
+    // No echo afterwards.
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(client.drain_remote(), "[]");
+    assert_eq!(owner.drain_remote(), "[]");
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
+fn client_edit_proposes_and_propagates() {
+    let project = temp_dir("proj-clientedit");
+    let staging = temp_dir("staging-clientedit");
+    make_project(&project);
+    let (owner, client) = establish("clientedit-test", &project, &staging);
+
+    // Owner creates the track, client renames it once it sees it.
+    owner.push_local(
+        r#"{"tracks":{"{T2}":{"present":true,"index":0,"name":"Vox","vol":1.0,"pan":0.0,"mute":false,"solo":false}}}"#,
+    );
+    let mut client_state = serde_json::Map::new();
+    assert!(wait_until(Duration::from_secs(10), || {
+        drain_into(&client, &mut client_state);
+        client_state.contains_key("{T2}")
+    }));
+
+    // Track creation locks every field for the owner. Wait for those locks
+    // to expire before proposing the client edit.
+    std::thread::sleep(Duration::from_millis(3200));
+    client.push_local(r#"{"tracks":{"{T2}":{"name":"Lead Vox"}}}"#);
+
+    // The proposal reaches the owner's REAPER via its drain...
+    let mut owner_state = serde_json::Map::new();
+    let on_owner = wait_until(Duration::from_secs(10), || {
+        drain_into(&owner, &mut owner_state);
+        owner_state.get("{T2}").map(|t| t["name"] == "Lead Vox").unwrap_or(false)
+    });
+    assert!(on_owner, "client proposal never surfaced on the owner");
+
+    // ...and is confirmed into the client's replica without echoing a
+    // self-apply back to the client's host.
+    assert!(wait_until(Duration::from_secs(10), || {
+        let _ = drain_into(&client, &mut client_state);
+        field(&client.snapshot_json(), "{T2}", "name") == "Lead Vox"
+    }));
+    assert_eq!(
+        client_state["{T2}"]["name"], "Vox",
+        "confirmed proposal must not echo back to the proposing client"
+    );
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
+fn owner_wins_live_conflict() {
+    let project = temp_dir("proj-conflict");
+    let staging = temp_dir("staging-conflict");
+    make_project(&project);
+    let (owner, client) = establish("conflict-test", &project, &staging);
+
+    // Baseline track on both sides.
+    owner.push_local(
+        r#"{"tracks":{"{T3}":{"present":true,"index":0,"name":"Bass","vol":0.5,"pan":0.0,"mute":false,"solo":false}}}"#,
+    );
+    let mut client_state = serde_json::Map::new();
+    assert!(wait_until(Duration::from_secs(10), || {
+        drain_into(&client, &mut client_state);
+        client_state.contains_key("{T3}")
+    }));
+
+    // Conflict: owner sets vol=0.9, client proposes vol=0.1 right after.
+    owner.push_local(r#"{"tracks":{"{T3}":{"vol":0.9}}}"#);
+    client.push_local(r#"{"tracks":{"{T3}":{"vol":0.1}}}"#);
+
+    // Collect what each host would apply for long enough to cover the
+    // proposal timeout + revert.
+    let mut owner_state = serde_json::Map::new();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        drain_into(&owner, &mut owner_state);
+        drain_into(&client, &mut client_state);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The owner never applies the losing proposal...
+    assert_ne!(
+        owner_state.get("{T3}").map(|t| t["vol"].clone()),
+        Some(serde_json::json!(0.1)),
+        "owner applied a proposal it should have dropped"
+    );
+    // ...the doc converges to the owner's value on both sides...
+    assert_eq!(field(&owner.snapshot_json(), "{T3}", "vol"), 0.9);
+    assert_eq!(field(&client.snapshot_json(), "{T3}", "vol"), 0.9);
+    // ...and the client's host was told to revert to it.
+    assert_eq!(
+        client_state["{T3}"]["vol"],
+        serde_json::json!(0.9),
+        "client host never reverted to the owner's value"
+    );
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
+fn track_delete_propagates_as_tombstone() {
+    let project = temp_dir("proj-delete");
+    let staging = temp_dir("staging-delete");
+    make_project(&project);
+    let (owner, client) = establish("delete-test", &project, &staging);
+
+    owner.push_local(
+        r#"{"tracks":{"{T4}":{"present":true,"index":0,"name":"Gtr","vol":1.0,"pan":0.0,"mute":false,"solo":false}}}"#,
+    );
+    let mut client_state = serde_json::Map::new();
+    assert!(wait_until(Duration::from_secs(10), || {
+        drain_into(&client, &mut client_state);
+        client_state.contains_key("{T4}")
+    }));
+
+    owner.push_local(r#"{"tracks":{"{T4}":{"present":false}}}"#);
+    assert!(wait_until(Duration::from_secs(10), || {
+        drain_into(&client, &mut client_state);
+        client_state["{T4}"]["present"] == false
+    }));
+    // Tombstone, not removal: identity must survive in the doc.
+    assert_eq!(field(&client.snapshot_json(), "{T4}", "present"), false);
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}

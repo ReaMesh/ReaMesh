@@ -7,17 +7,29 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(reaper_reamesh SHARED src/reamesh.cpp)
 set_target_properties(reaper_reamesh PROPERTIES
   PREFIX ""
-  SUFFIX ".dylib"
   # Only export ReaperPluginEntry (marked with REAPER_PLUGIN_DLL_EXPORT);
   # keeps the REAPER API pointer globals from colliding with other extensions.
   CXX_VISIBILITY_PRESET hidden
   VISIBILITY_INLINES_HIDDEN ON
 )
+if(APPLE)
+  set_target_properties(reaper_reamesh PROPERTIES SUFFIX ".dylib")
+endif()
 
 target_include_directories(reaper_reamesh PRIVATE include sdk)
 
-# The Rust staticlib (built by ../build.sh before cmake runs).
-set(REAMESH_RUST_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../rust/target/release/libreamesh.a"
+if(MSVC)
+  # Compile source files and string literals as UTF-8.
+  target_compile_options(reaper_reamesh PRIVATE /utf-8)
+endif()
+
+# Rust static library, built by build.sh or cargo before CMake runs.
+if(WIN32)
+  set(REAMESH_RUST_LIB_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../rust/target/release/reamesh.lib")
+else()
+  set(REAMESH_RUST_LIB_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../rust/target/release/libreamesh.a")
+endif()
+set(REAMESH_RUST_LIB "${REAMESH_RUST_LIB_DEFAULT}"
     CACHE FILEPATH "Path to the Rust staticlib")
 if(NOT EXISTS "${REAMESH_RUST_LIB}")
   message(FATAL_ERROR "Rust library not found at ${REAMESH_RUST_LIB}; run 'cargo build --release' in rust/ first (or use ../build.sh)")
@@ -31,5 +43,9 @@ if(APPLE)
     "-framework Security"
     "-framework SystemConfiguration"
     resolv
+  )
+elseif(WIN32)
+  target_link_libraries(reaper_reamesh PRIVATE
+    ws2_32 bcrypt ntdll userenv iphlpapi crypt32 secur32 ncrypt runtimeobject propsys
   )
 endif()

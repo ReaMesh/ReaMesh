@@ -16,31 +16,64 @@ extern "C" {
 #endif // __cplusplus
 
 /**
- * Start the runtime, open the shared doc for `project_id`, start LAN
- * discovery. Returns null on failure. The handle must be released with
- * `reamesh_shutdown`.
+ * Start hosting a session named `session_name` that shares the project at
+ * `project_dir`/`project_file` (path + file name of the saved .rpp).
+ * Returns null on failure. Release with `reamesh_shutdown`.
  */
-struct ReameshHandle *reamesh_init(const char *project_id);
+struct ReameshHandle *reamesh_host(const char *session_name,
+                                   const char *project_dir,
+                                   const char *project_file);
+
+/**
+ * Start browsing for sessions on the LAN. Downloaded projects are written
+ * into fresh subdirectories of `staging_dir` (created as needed). Returns
+ * null on failure. Release with `reamesh_shutdown`.
+ */
+struct ReameshHandle *reamesh_join(const char *staging_dir);
+
+/**
+ * Sessions currently announced on the LAN, as a JSON array of
+ * `{"session_id","session_name","project_file","owner"}`. Free the result
+ * with `reamesh_free_string`.
+ */
+char *reamesh_sessions(struct ReameshHandle *handle);
+
+/**
+ * Join an announced session by id (client handles only). Returns true if the
+ * join was started; watch `reamesh_status` for progress and the final
+ * project path.
+ */
+bool reamesh_join_session(struct ReameshHandle *handle, const char *session_id);
+
+/**
+ * Current session status as JSON:
+ * `{"state","progress","project_path","session_id","session_name","message"}`
+ * where state is hosting|browsing|connecting|downloading|ready|failed.
+ * Free the result with `reamesh_free_string`.
+ */
+char *reamesh_status(struct ReameshHandle *handle);
 
 /**
  * Feed a locally-observed changeset (JSON, see schema in README) into the
- * shared document. Non-blocking; never calls back into the host.
+ * session. On the owner this is authoritative; on clients it is a proposal
+ * the owner may reject. Non-blocking; never calls back into the host.
  */
 void reamesh_push_local(struct ReameshHandle *handle, const char *changeset_json);
 
 /**
- * Return changesets that arrived from remote peers since the last call, as a
- * JSON array ("[]" when none). Free the result with `reamesh_free_string`.
+ * Return changesets the host must apply, as a JSON array ("[]" when none):
+ * authoritative remote changes, plus (on clients) reverts of rejected
+ * proposals. Free the result with `reamesh_free_string`.
  */
 char *reamesh_drain_remote(struct ReameshHandle *handle);
 
 /**
- * Number of peers currently in this project's session (for status display).
+ * Number of peers currently in this session (for status display).
  */
 uint32_t reamesh_peer_count(struct ReameshHandle *handle);
 
 /**
- * Free a string returned by `reamesh_drain_remote`.
+ * Free a string returned by any reamesh_* function.
  */
 void reamesh_free_string(char *s);
 
