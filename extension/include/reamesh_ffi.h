@@ -18,11 +18,13 @@ extern "C" {
 /**
  * Start hosting a session named `session_name` that shares the project at
  * `project_dir`/`project_file` (path + file name of the saved .rpp).
+ * `passphrase` gates who may download and edit (empty/null = open session).
  * Returns null on failure. Release with `reamesh_shutdown`.
  */
 struct ReameshHandle *reamesh_host(const char *session_name,
                                    const char *project_dir,
-                                   const char *project_file);
+                                   const char *project_file,
+                                   const char *passphrase);
 
 /**
  * Start browsing for sessions on the LAN. Downloaded projects are written
@@ -39,11 +41,14 @@ struct ReameshHandle *reamesh_join(const char *staging_dir);
 char *reamesh_sessions(struct ReameshHandle *handle);
 
 /**
- * Join an announced session by id (client handles only). Returns true if the
- * join was started; watch `reamesh_status` for progress and the final
- * project path.
+ * Join an announced session by id (client handles only). `passphrase` must
+ * match the host's if the session is protected (empty/null otherwise).
+ * Returns true if the join was started; watch `reamesh_status` for progress
+ * and the final project path.
  */
-bool reamesh_join_session(struct ReameshHandle *handle, const char *session_id);
+bool reamesh_join_session(struct ReameshHandle *handle,
+                          const char *session_id,
+                          const char *passphrase);
 
 /**
  * Current session status as JSON:

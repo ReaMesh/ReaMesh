@@ -65,7 +65,7 @@ int main() {
   }
 
   printf("hosting...\n");
-  ReameshHandle* owner = reamesh_host("Smoke", proj.c_str(), "Smoke.rpp");
+  ReameshHandle* owner = reamesh_host("Smoke", proj.c_str(), "Smoke.rpp", "");
   printf("browsing...\n");
   ReameshHandle* client = reamesh_join(staging.c_str());
   if (!owner || !client) {
@@ -87,7 +87,7 @@ int main() {
   }
 
   printf("joining + downloading...\n");
-  if (!reamesh_join_session(client, sid.c_str())) {
+  if (!reamesh_join_session(client, sid.c_str(), "")) {
     fprintf(stderr, "FAIL: join_session refused\n");
     return 1;
   }

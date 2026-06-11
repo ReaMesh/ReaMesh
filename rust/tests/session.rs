@@ -66,7 +66,7 @@ fn interconnect(a: &Reamesh, b: &Reamesh) {
 /// Host a session over `project_dir`, join it from a client, and wait until
 /// the download finished and both sides see each other on the session topic.
 fn establish(session_name: &str, project_dir: &Path, staging: &Path) -> (Box<Reamesh>, Box<Reamesh>) {
-    let owner = Reamesh::host(session_name, project_dir.to_str().unwrap(), "Song.rpp")
+    let owner = Reamesh::host(session_name, project_dir.to_str().unwrap(), "Song.rpp", "")
         .expect("host failed");
     let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
     let sid = session_id_of(&owner);
@@ -78,7 +78,7 @@ fn establish(session_name: &str, project_dir: &Path, staging: &Path) -> (Box<Rea
     });
     assert!(discovered, "client never saw the session announcement");
 
-    assert!(client.join_session(&sid), "join_session refused");
+    assert!(client.join_session(&sid, ""), "join_session refused");
     let ready = wait_until(Duration::from_secs(30), || {
         let s: Value = serde_json::from_str(&client.status_json()).unwrap();
         assert_ne!(s["state"], "failed", "download failed: {}", s["message"]);
@@ -380,6 +380,63 @@ fn mid_session_media_fetch() {
     drop(owner);
     let _ = fs::remove_dir_all(project);
     let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
+fn passphrase_gates_download() {
+    let project = temp_dir("proj-pass");
+    let staging_bad = temp_dir("staging-pass-bad");
+    let staging_ok = temp_dir("staging-pass-ok");
+    make_project(&project);
+
+    let owner = Reamesh::host("pass-test", project.to_str().unwrap(), "Song.rpp", "hunter2")
+        .expect("host failed");
+    let sid = session_id_of(&owner);
+
+    // Wrong passphrase: the owner refuses to serve the manifest, the download
+    // fails rather than handing the project to an unauthorized peer.
+    let wrong = Reamesh::join(staging_bad.to_str().unwrap()).expect("join failed");
+    assert!(wait_until(Duration::from_secs(20), || {
+        interconnect(&owner, &wrong);
+        wrong.sessions_json().contains(&sid)
+    }));
+    // Find this session by id; other hosts may also appear in the LAN lobby.
+    let listing: Value = serde_json::from_str(&wrong.sessions_json()).unwrap();
+    let ours = listing
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session_id"] == sid)
+        .expect("our session in the listing");
+    assert_eq!(ours["auth"], true);
+
+    assert!(wrong.join_session(&sid, "wrong"));
+    let failed = wait_until(Duration::from_secs(15), || {
+        let s: Value = serde_json::from_str(&wrong.status_json()).unwrap();
+        s["state"] == "failed"
+    });
+    assert!(failed, "download with wrong passphrase should fail");
+    drop(wrong);
+
+    // Right passphrase: downloads normally.
+    let good = Reamesh::join(staging_ok.to_str().unwrap()).expect("join failed");
+    assert!(wait_until(Duration::from_secs(20), || {
+        interconnect(&owner, &good);
+        good.sessions_json().contains(&sid)
+    }));
+    assert!(good.join_session(&sid, "hunter2"));
+    let ready = wait_until(Duration::from_secs(30), || {
+        let s: Value = serde_json::from_str(&good.status_json()).unwrap();
+        assert_ne!(s["state"], "failed", "correct passphrase should not fail");
+        s["state"] == "ready"
+    });
+    assert!(ready, "download with correct passphrase never completed");
+
+    drop(good);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging_bad);
+    let _ = fs::remove_dir_all(staging_ok);
 }
 
 #[test]

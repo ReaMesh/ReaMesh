@@ -24,6 +24,10 @@ local ImGui = require 'imgui' '0.9'
 
 local ctx = ImGui.CreateContext('ReaMesh')
 
+-- Passphrase inputs persist across frames: one for hosting, one per session id.
+local host_pass = ''
+local join_pass = {}
+
 local function get_status()
   local st = {}
   for line in reaper.ReaMesh_GetStatus():gmatch('[^\n]+') do
@@ -36,8 +40,10 @@ end
 local function get_sessions()
   local list = {}
   for line in reaper.ReaMesh_GetSessions():gmatch('[^\n]+') do
-    local id, name, file = line:match('^([^\t]*)\t([^\t]*)\t(.*)$')
-    if id and id ~= '' then list[#list + 1] = { id = id, name = name, file = file } end
+    local id, name, file, auth = line:match('^([^\t]*)\t([^\t]*)\t([^\t]*)\t(.*)$')
+    if id and id ~= '' then
+      list[#list + 1] = { id = id, name = name, file = file, auth = auth == '1' }
+    end
   end
   return list
 end
@@ -58,23 +64,35 @@ local function draw_browser(st)
   end
   for _, s in ipairs(list) do
     if ImGui.Button(ctx, 'Join##' .. s.id) then
-      reaper.ReaMesh_JoinSession(s.id)
+      reaper.ReaMesh_JoinSession(s.id, join_pass[s.id] or '')
     end
     ImGui.SameLine(ctx)
-    ImGui.Text(ctx, s.name)
+    ImGui.Text(ctx, (s.auth and '[lock] ' or '') .. s.name)
     ImGui.SameLine(ctx)
     ImGui.TextDisabled(ctx, '(' .. s.file .. ')')
+    -- Protected sessions need the passphrase typed before Join works.
+    if s.auth then
+      ImGui.SetNextItemWidth(ctx, 180)
+      local changed, val = ImGui.InputText(ctx, 'passphrase##' .. s.id,
+        join_pass[s.id] or '', ImGui.InputTextFlags_Password)
+      if changed then join_pass[s.id] = val end
+    end
   end
 
   ImGui.Spacing(ctx)
   ImGui.Spacing(ctx)
   ImGui.Text(ctx, 'Share this project')
   ImGui.Separator(ctx)
+  ImGui.SetNextItemWidth(ctx, 180)
+  local pchanged, pval = ImGui.InputText(ctx, 'Passphrase (optional)', host_pass,
+    ImGui.InputTextFlags_Password)
+  if pchanged then host_pass = pval end
   if ImGui.Button(ctx, 'Host current project') then
-    reaper.ReaMesh_Host()
+    reaper.ReaMesh_Host(host_pass)
   end
   ImGui.TextWrapped(ctx, 'Shares every file in the project folder with people who join. '
-    .. 'Media outside the project folder is copied in automatically.')
+    .. 'Media outside the project folder is copied in automatically. '
+    .. 'Set a passphrase to limit who can download and edit.')
 end
 
 local function draw_downloading(st)

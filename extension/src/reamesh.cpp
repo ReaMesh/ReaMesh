@@ -59,6 +59,16 @@
 #define REAPERAPI_WANT_SetMediaItemTake_Source
 #define REAPERAPI_WANT_PCM_Source_Destroy
 #define REAPERAPI_WANT_UpdateItemInProject
+#define REAPERAPI_WANT_Undo_BeginBlock2
+#define REAPERAPI_WANT_Undo_EndBlock2
+#define REAPERAPI_WANT_CountProjectMarkers
+#define REAPERAPI_WANT_EnumProjectMarkers3
+#define REAPERAPI_WANT_AddProjectMarker2
+#define REAPERAPI_WANT_DeleteProjectMarkerByIndex
+#define REAPERAPI_WANT_CountTempoTimeSigMarkers
+#define REAPERAPI_WANT_GetTempoTimeSigMarker
+#define REAPERAPI_WANT_SetTempoTimeSigMarker
+#define REAPERAPI_WANT_DeleteTempoTimeSigMarker
 
 #include "reaper_plugin.h"
 #include "reaper_plugin_functions.h"
@@ -69,6 +79,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -102,9 +114,19 @@ struct ItemState {
   bool operator==(const ItemState&) const = default;
 };
 
+// Project-wide state that belongs to neither a track nor an item: the tempo /
+// time-signature map and the marker/region list, each serialized to a stable
+// line-based string (see captureTempo / captureMarkers).
+struct ProjectState {
+  std::string tempo;
+  std::string markers;
+  bool operator==(const ProjectState&) const = default;
+};
+
 struct Snapshot {
   std::map<std::string, TrackState> tracks;  // track GUID -> state
   std::map<std::string, ItemState> items;    // item GUID -> state
+  ProjectState project;
 };
 
 // An incoming item whose media files have not arrived yet. Re-checked every
@@ -393,8 +415,111 @@ static fs::path projectDir() {
   return fs::path(g_sessionProjectPath).parent_path();
 }
 
+// ---------- project-wide state: tempo map + markers/regions ----------
+
+// One line per tempo/time-signature marker: "timepos bpm num denom linear".
+// Position is absolute seconds so it reproduces without depending on the rest
+// of the map; points are re-added in order.
+static std::string captureTempo() {
+  std::string out;
+  const int n = CountTempoTimeSigMarkers(nullptr);
+  for (int i = 0; i < n; ++i) {
+    double timepos = 0, beatpos = 0, bpm = 0;
+    int measurepos = 0, num = 0, den = 0;
+    bool linear = false;
+    if (!GetTempoTimeSigMarker(nullptr, i, &timepos, &measurepos, &beatpos, &bpm, &num, &den,
+                               &linear))
+      continue;
+    char line[160];
+    // Full double precision so capture->apply->recapture round-trips exactly
+    // and a re-applied map never re-emits as a phantom edit.
+    snprintf(line, sizeof(line), "%.17g %.17g %d %d %d\n", timepos, bpm, num, den, linear ? 1 : 0);
+    out += line;
+  }
+  return out;
+}
+
+static void applyTempo(const std::string& s) {
+  for (int i = CountTempoTimeSigMarkers(nullptr) - 1; i >= 0; --i)
+    DeleteTempoTimeSigMarker(nullptr, i);
+  size_t pos = 0;
+  while (pos < s.size()) {
+    size_t eol = s.find('\n', pos);
+    if (eol == std::string::npos) eol = s.size();
+    std::string line = s.substr(pos, eol - pos);
+    pos = eol + 1;
+    double timepos = 0, bpm = 0;
+    int num = 0, den = 0, linear = 0;
+    if (sscanf(line.c_str(), "%lf %lf %d %d %d", &timepos, &bpm, &num, &den, &linear) == 5)
+      SetTempoTimeSigMarker(nullptr, -1, timepos, -1, -1, bpm, num, den, linear != 0);
+  }
+}
+
+// One line per marker/region: "M|R \t index \t pos \t rgnend \t color \t name".
+// Name is last so it may contain spaces; tabs/newlines are stripped on capture.
+static std::string sanitizeMarkerName(const char* name) {
+  std::string out = name ? name : "";
+  for (char& c : out)
+    if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+  return out;
+}
+
+static std::string captureMarkers() {
+  std::string out;
+  int idx = 0, next;
+  bool isrgn = false;
+  double pos = 0, rgnend = 0;
+  const char* name = nullptr;
+  int num = 0, color = 0;
+  while ((next = EnumProjectMarkers3(nullptr, idx, &isrgn, &pos, &rgnend, &name, &num, &color)) !=
+         0) {
+    char buf[160];
+    snprintf(buf, sizeof(buf), "%s\t%d\t%.17g\t%.17g\t%d\t", isrgn ? "R" : "M", num, pos, rgnend,
+             color);
+    out += buf;
+    out += sanitizeMarkerName(name);
+    out += '\n';
+    idx = next;
+  }
+  return out;
+}
+
+static void applyMarkers(const std::string& s) {
+  int nm = 0, nr = 0;
+  const int total = CountProjectMarkers(nullptr, &nm, &nr);
+  for (int i = total - 1; i >= 0; --i) DeleteProjectMarkerByIndex(nullptr, i);
+
+  size_t pos = 0;
+  while (pos < s.size()) {
+    size_t eol = s.find('\n', pos);
+    if (eol == std::string::npos) eol = s.size();
+    std::string line = s.substr(pos, eol - pos);
+    pos = eol + 1;
+    if (line.empty()) continue;
+    // Split the five leading tab fields; the name is whatever remains.
+    std::vector<std::string> f;
+    size_t p = 0;
+    for (int k = 0; k < 5; ++k) {
+      size_t tab = line.find('\t', p);
+      if (tab == std::string::npos) { f.clear(); break; }
+      f.push_back(line.substr(p, tab - p));
+      p = tab + 1;
+    }
+    if (f.size() != 5) continue;
+    std::string name = line.substr(p);
+    bool isrgn = f[0] == "R";
+    int num = atoi(f[1].c_str());
+    double mpos = strtod(f[2].c_str(), nullptr);
+    double rgnend = strtod(f[3].c_str(), nullptr);
+    int color = atoi(f[4].c_str());
+    AddProjectMarker2(nullptr, isrgn, mpos, rgnend, name.c_str(), num, color);
+  }
+}
+
 static Snapshot snapshotProject() {
   Snapshot snap;
+  snap.project.tempo = captureTempo();
+  snap.project.markers = captureMarkers();
   const int n = CountTracks(nullptr);
   for (int i = 0; i < n; ++i) {
     MediaTrack* tr = GetTrack(nullptr, i);
@@ -475,9 +600,19 @@ static std::string diffSnapshots(const Snapshot& prev, const Snapshot& now) {
     if (!now.items.count(guid)) items[guid] = json{{"present", false}};
   }
 
+  // Project-wide state lives under section "project", single id "project".
+  json project = json::object();
+  {
+    json delta = json::object();
+    if (prev.project.tempo != now.project.tempo) delta["tempo"] = now.project.tempo;
+    if (prev.project.markers != now.project.markers) delta["markers"] = now.project.markers;
+    if (!delta.empty()) project["project"] = delta;
+  }
+
   json changeset = json::object();
   if (!tracks.empty()) changeset["tracks"] = tracks;
   if (!items.empty()) changeset["items"] = items;
+  if (!project.empty()) changeset["project"] = project;
   if (changeset.empty()) return "";
   return changeset.dump();
 }
@@ -706,6 +841,19 @@ static void applyChangeset(const json& changeset) {
       applyItem(guid, fields);
     }
   }
+
+  // Project-wide state: rebuild the tempo map and/or marker list when they
+  // change (each is whole-field, so a single edit re-emits the whole list).
+  if (changeset.contains("project") && changeset["project"].is_object()) {
+    auto it = changeset["project"].find("project");
+    if (it != changeset["project"].end() && it->is_object()) {
+      const json& f = *it;
+      if (f.contains("tempo") && f["tempo"].is_string())
+        applyTempo(f["tempo"].get<std::string>());
+      if (f.contains("markers") && f["markers"].is_string())
+        applyMarkers(f["markers"].get<std::string>());
+    }
+  }
 }
 
 static void applyRemoteChanges() {
@@ -721,9 +869,14 @@ static void applyRemoteChanges() {
   // the flag set and the re-baseline at the end, the capture loop never sees
   // (and never re-broadcasts) the delta we are about to create.
   g_applyingRemote = true;
+  // Wrap in an undo block so a remote edit is a single Ctrl+Z step. Undoing it
+  // is captured as a normal local change next tick (and, on a client, proposed
+  // back); there is no re-application loop because we re-baseline below.
+  Undo_BeginBlock2(nullptr);
   PreventUIRefresh(1);
   for (const auto& cs : changesets) applyChangeset(cs);
   PreventUIRefresh(-1);
+  Undo_EndBlock2(nullptr, "ReaMesh: apply remote changes", -1);
   TrackList_AdjustWindows(false);
   UpdateArrange();
 
@@ -758,9 +911,11 @@ static void processDeferredItems() {
 
   if (ready.empty()) return;
   g_applyingRemote = true;
+  Undo_BeginBlock2(nullptr);
   PreventUIRefresh(1);
   for (const DeferredItem& d : ready) applyItem(d.guid, d.fields);
   PreventUIRefresh(-1);
+  Undo_EndBlock2(nullptr, "ReaMesh: apply deferred media items", -1);
   UpdateArrange();
   g_snapshot = snapshotProject();
   g_lastChangeCount = GetProjectStateChangeCount(nullptr);
@@ -820,9 +975,10 @@ static bool startBrowse() {
 }
 
 // Join one of the announced sessions (Browsing -> Downloading).
-static bool joinSessionById(const std::string& sid, const std::string& sname) {
+static bool joinSessionById(const std::string& sid, const std::string& sname,
+                            const std::string& passphrase) {
   if (g_mode != Mode::Browsing || !g_handle) return false;
-  if (!reamesh_join_session(g_handle, sid.c_str())) {
+  if (!reamesh_join_session(g_handle, sid.c_str(), passphrase.c_str())) {
     logLine("could not join \"" + sname + "\" (it may have just closed); try again");
     return false;
   }
@@ -832,7 +988,7 @@ static bool joinSessionById(const std::string& sid, const std::string& sname) {
   return true;
 }
 
-static void onHost() {
+static void onHost(const std::string& passphrase) {
   if (g_mode == Mode::Hosting) return;
   if (g_mode != Mode::Idle) leaveSession("left previous session");
 
@@ -851,7 +1007,7 @@ static void onHost() {
   std::string file = (slash != std::string::npos) ? path.substr(slash + 1) : path;
   std::string name = fileStem(file);
 
-  g_handle = reamesh_host(name.c_str(), dir.c_str(), file.c_str());
+  g_handle = reamesh_host(name.c_str(), dir.c_str(), file.c_str(), passphrase.c_str());
   if (!g_handle) {
     g_lastError = "could not start hosting";
     logLine(g_lastError);
@@ -864,7 +1020,9 @@ static void onHost() {
   g_lastChangeCount = -1;  // force a full capture; this seeds the shared doc
   g_lastCapture = {};
   g_lastPeerCount = 0;
-  logLine("hosting \"" + name + "\", sharing all files under " + dir);
+  logLine(passphrase.empty()
+              ? "hosting \"" + name + "\", sharing all files under " + dir
+              : "hosting \"" + name + "\" (passphrase-protected), sharing " + dir);
 }
 
 static void onLeave() {
@@ -929,9 +1087,11 @@ static const char* ReaMesh_GetSessions() {
     json sessions = json::parse(raw ? raw : "[]", nullptr, false);
     reamesh_free_string(raw);
     if (sessions.is_array()) {
-      for (const auto& s : sessions)
+      for (const auto& s : sessions) {
+        bool auth = s.contains("auth") && s["auth"].is_boolean() && s["auth"].get<bool>();
         buf += jsonStr(s, "session_id") + "\t" + jsonStr(s, "session_name") + "\t" +
-               jsonStr(s, "project_file") + "\n";
+               jsonStr(s, "project_file") + "\t" + (auth ? "1" : "0") + "\n";
+      }
     }
   }
   return buf.c_str();
@@ -950,14 +1110,14 @@ static const char* ReaMesh_GetLog() {
 
 static bool ReaMesh_StartBrowse() { return startBrowse(); }
 
-static bool ReaMesh_Host() {
-  onHost();
+static bool ReaMesh_Host(const char* passphrase) {
+  onHost(passphrase ? passphrase : "");
   return g_mode == Mode::Hosting;
 }
 
-static bool ReaMesh_JoinSession(const char* session_id) {
+static bool ReaMesh_JoinSession(const char* session_id, const char* passphrase) {
   if (!session_id || !*session_id) return false;
-  return joinSessionById(session_id, "session");
+  return joinSessionById(session_id, "session", passphrase ? passphrase : "");
 }
 
 static void ReaMesh_Leave() {
@@ -972,10 +1132,14 @@ static void* vararg_GetStatus(void**, int) { return (void*)ReaMesh_GetStatus(); 
 static void* vararg_GetSessions(void**, int) { return (void*)ReaMesh_GetSessions(); }
 static void* vararg_GetLog(void**, int) { return (void*)ReaMesh_GetLog(); }
 static void* vararg_StartBrowse(void**, int) { return (void*)(INT_PTR)ReaMesh_StartBrowse(); }
-static void* vararg_Host(void**, int) { return (void*)(INT_PTR)ReaMesh_Host(); }
+static void* vararg_Host(void** arglist, int numparms) {
+  const char* pass = numparms > 0 ? (const char*)arglist[0] : nullptr;
+  return (void*)(INT_PTR)ReaMesh_Host(pass);
+}
 static void* vararg_JoinSession(void** arglist, int numparms) {
   const char* sid = numparms > 0 ? (const char*)arglist[0] : nullptr;
-  return (void*)(INT_PTR)ReaMesh_JoinSession(sid);
+  const char* pass = numparms > 1 ? (const char*)arglist[1] : nullptr;
+  return (void*)(INT_PTR)ReaMesh_JoinSession(sid, pass);
 }
 static void* vararg_Leave(void**, int) { ReaMesh_Leave(); return nullptr; }
 
@@ -989,15 +1153,15 @@ static const ApiExport g_api[] = {
     {"ReaMesh_GetStatus", (void*)ReaMesh_GetStatus, (void*)vararg_GetStatus,
      "const char*\0\0\0Current ReaMesh state as key=value lines: mode (idle|browsing|downloading|hosting|client), state, session, progress (0..1), peers, path, error."},
     {"ReaMesh_GetSessions", (void*)ReaMesh_GetSessions, (void*)vararg_GetSessions,
-     "const char*\0\0\0Sessions announced on the LAN, one per line: session_id TAB session_name TAB project_file. Requires browsing (see ReaMesh_StartBrowse)."},
+     "const char*\0\0\0Sessions announced on the LAN, one per line: session_id TAB session_name TAB project_file TAB auth (1 if passphrase-protected, else 0). Requires browsing (see ReaMesh_StartBrowse)."},
     {"ReaMesh_GetLog", (void*)ReaMesh_GetLog, (void*)vararg_GetLog,
      "const char*\0\0\0Recent ReaMesh activity log, one event per line, newest last."},
     {"ReaMesh_StartBrowse", (void*)ReaMesh_StartBrowse, (void*)vararg_StartBrowse,
      "bool\0\0\0Start discovering ReaMesh sessions on the LAN. Idempotent while browsing."},
     {"ReaMesh_Host", (void*)ReaMesh_Host, (void*)vararg_Host,
-     "bool\0\0\0Host a ReaMesh session sharing the current project's folder. Prompts to save first if the project is unsaved."},
+     "bool\0const char*\0passphrase\0Host a ReaMesh session sharing the current project's folder. Pass a non-empty passphrase to require it of joiners (empty = open). Prompts to save first if the project is unsaved."},
     {"ReaMesh_JoinSession", (void*)ReaMesh_JoinSession, (void*)vararg_JoinSession,
-     "bool\0const char*\0session_id\0Join an announced ReaMesh session by id (see ReaMesh_GetSessions). Downloads the project, then opens it."},
+     "bool\0const char*,const char*\0session_id,passphrase\0Join an announced ReaMesh session by id (see ReaMesh_GetSessions). Supply the passphrase if the session is protected (empty otherwise). Downloads the project, then opens it."},
     {"ReaMesh_Leave", (void*)ReaMesh_Leave, (void*)vararg_Leave,
      "void\0\0\0Leave the current ReaMesh session / stop hosting or browsing."},
 };
@@ -1112,7 +1276,7 @@ static void timerTick() {
 
 static bool dispatchCommand(int command) {
   if (command == 0) return false;
-  if (command == g_cmdHost) { onHost(); return true; }
+  if (command == g_cmdHost) { onHost(""); return true; }
   if (command == g_cmdJoin) { openPanel(); return true; }
   if (command == g_cmdLeave) { onLeave(); return true; }
   if (command == g_cmdPanel) { openPanel(); return true; }

@@ -17,7 +17,7 @@ ReaMesh runs on macOS. The panel needs ReaImGui, which you can install with
    `~/Library/Application Support/REAPER/UserPlugins/` on each Mac.
 2. Restart REAPER. ReaMesh installs its panel script on startup.
 3. Run the action "ReaMesh: Open panel (GUI)". Save a project in its own
-   folder, then click Host current project.
+   folder, then click Host current project. You can set a passphrase first.
 4. On the other computer, open the panel and join the session from the list.
    ReaMesh downloads the project and opens it in REAPER.
 
@@ -40,10 +40,11 @@ traversal, so everyone needs to be on the same local network.
 | Tracks | Add, remove, reorder, names, volume, pan, mute and solo |
 | Audio and MIDI items | Move, split, trim, fades, takes, take FX and MIDI content |
 | Effects and automation | Track FX, plugin state and track envelopes |
+| Project settings | Tempo, time signatures, markers and regions |
 | Media files | New recordings and imported files transfer in the background |
 
-Selection, open FX windows and window layout stay local. The tempo map,
-markers, regions and master-track state aren't synced.
+Selection, open FX windows and window layout stay local. Master-track state
+isn't synced.
 
 ## Working together
 
@@ -53,16 +54,16 @@ back. A guest's change that the host doesn't confirm in that time also snaps
 back. Whole items, FX chains and sets of track envelopes each count as one
 field, so working on different tracks or items avoids conflicts.
 
-Remote edits don't create undo points. Undoing an earlier local action can still
-roll back received changes because REAPER uses snapshots for undo. That rollback
-syncs too.
+Each remote edit arrives as one undo point, so Ctrl+Z steps back through
+received changes one at a time. Undoing one syncs like any other edit.
 
 When the host stops the session, everyone keeps their local project copy.
 
 To use the project's effects, you'll need the plugins installed locally.
 
 Only join people you trust: shared projects can load plugins on your computer.
-Sessions have no passphrase yet, so anyone on the network can join.
+Passphrase-protected sessions restrict downloading. Session names remain public
+for discovery, and session messages aren't encrypted with the passphrase.
 
 ## Building from source
 

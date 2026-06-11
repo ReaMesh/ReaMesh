@@ -25,7 +25,7 @@
 //! Deleted entities are tombstoned with `present: false`, never removed.
 //! Authority, proposals and reconciliation are per (section, id, field).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -49,13 +49,19 @@ use yrs::{Any, Doc, Map, MapRef, Out, ReadTxn, StateVector, Transact, Update};
 
 const TRACKS_ROOT: &str = "tracks";
 const ITEMS_ROOT: &str = "items";
+/// Project-wide state that is neither a track nor an item: tempo map and
+/// markers/regions, synced as a single entity under a well-known id.
+const PROJECT_ROOT: &str = "project";
 /// Root maps of the shared doc; every changeset is shaped
 /// `{ "<section>": { "<id>": { fields... } } }` with any subset of sections.
-const SECTIONS: [&str; 2] = [TRACKS_ROOT, ITEMS_ROOT];
+const SECTIONS: [&str; 3] = [TRACKS_ROOT, ITEMS_ROOT, PROJECT_ROOT];
 const LOBBY_TOPIC: &str = "reamesh/v2/lobby";
 const XFER_PROTOCOL: &str = "/reamesh/xfer/1";
 /// Max payload per file chunk over the transfer protocol.
 const CHUNK_SIZE: u64 = 1024 * 1024;
+/// How many chunk requests a downloader keeps in flight at once. Pipelining:
+/// the link stays full instead of idling one round-trip per chunk.
+const DOWNLOAD_WINDOW: usize = 12;
 /// Fields the owner edited this recently beat any client proposal.
 const OWNER_PRIORITY_TTL: Duration = Duration::from_secs(3);
 /// How long a client keeps its optimistic value before reverting to the
@@ -88,15 +94,22 @@ struct FileMeta {
     /// Path relative to the project directory, '/'-separated.
     path: String,
     size: u64,
+    /// blake3 of the file's (uncompressed) contents, hex. Lets a downloader
+    /// skip files it already has byte-for-byte (resume/dedup) and verify each
+    /// completed file.
+    #[serde(default)]
+    hash: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 enum XferRequest {
-    Manifest,
-    Chunk { file: u32, offset: u64 },
-    /// Mid-session fetch of a single project-relative file. Served by every
-    /// session peer (not just the owner) from its project copy.
-    File { path: String, offset: u64 },
+    /// Initial project manifest. `auth` is the session token (empty for open
+    /// sessions); the owner refuses to serve without the right one.
+    Manifest { auth: String },
+    /// Fetch of a single project-relative file at `offset`. Served by every
+    /// session peer (not just the owner) from its project copy: this is what
+    /// both the windowed initial download and mid-session media fetch ride.
+    File { path: String, offset: u64, auth: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -107,13 +120,12 @@ enum XferResponse {
         project_file: String,
         files: Vec<FileMeta>,
     },
-    Chunk {
-        #[serde(with = "serde_bytes")]
-        data: Vec<u8>,
-    },
-    /// Response to `File`: total size lets the requester know when it is done.
+    /// Response to `File`: `size` is the file's full *uncompressed* length so
+    /// the requester knows when it is done; `data` is one chunk, zstd-deflated
+    /// when `compressed` (project text files only: audio is left raw).
     FileChunk {
         size: u64,
+        compressed: bool,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
@@ -130,6 +142,10 @@ struct SessionInfo {
     session_name: String,
     project_file: String,
     owner: String, // peer id string
+    /// Whether the session is passphrase-protected, and the per-session salt a
+    /// client mixes with the passphrase to reproduce the access token.
+    auth: bool,
+    salt: String,
     last_seen: Instant,
 }
 
@@ -190,12 +206,29 @@ struct Shared {
     serve_dir: Mutex<Option<PathBuf>>,
     /// Peer ids currently subscribed to the session topic (fetch candidates).
     session_peers: Mutex<Vec<PeerId>>,
+    /// Access token every peer in this session shares (empty = open session).
+    /// Requests carry it; serving peers refuse mismatches. Set on the owner at
+    /// host time and on a client when it joins (derived from the salt in the
+    /// announcement + the passphrase the user supplied).
+    auth_token: Mutex<String>,
+}
+
+/// Token a peer must present to download from / propose to a session.
+/// Derived from the public per-session salt and the secret passphrase, so only
+/// holders of the passphrase can produce it. Empty passphrase = open session.
+fn auth_token(salt: &str, passphrase: &str) -> String {
+    if passphrase.is_empty() {
+        return String::new();
+    }
+    blake3::hash(format!("reamesh/v3/auth\0{salt}\0{passphrase}").as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 enum Command {
     PublishAuthoritative(Vec<u8>),
     PublishProposal(Vec<u8>),
-    JoinSession(String),
+    JoinSession { session_id: String, passphrase: String },
     FetchFile(String),
     Dial(Multiaddr),
     Shutdown,
@@ -205,9 +238,12 @@ enum Command {
 struct Hosting {
     session_id: String,
     session_name: String,
-    project_dir: PathBuf,
     project_file: String,
     files: Vec<FileMeta>,
+    /// Public per-session salt announced to clients, and whether a passphrase
+    /// is required at all. The secret token itself lives in `Shared::auth_token`.
+    salt: String,
+    auth: bool,
 }
 
 struct NetConfig {
@@ -232,6 +268,7 @@ impl Reamesh {
         session_name: &str,
         project_dir: &str,
         project_file: &str,
+        passphrase: &str,
     ) -> anyhow::Result<Box<Self>> {
         let dir = PathBuf::from(project_dir);
         if !dir.is_dir() {
@@ -239,12 +276,15 @@ impl Reamesh {
         }
         let files = build_manifest(&dir)?;
         let session_id = new_session_id();
+        let salt = new_session_id(); // fresh public salt, distinct from the id
+        let token = auth_token(&salt, passphrase);
         let hosting = Hosting {
             session_id: session_id.clone(),
             session_name: session_name.to_string(),
-            project_dir: dir.clone(),
             project_file: project_file.to_string(),
             files,
+            salt,
+            auth: !passphrase.is_empty(),
         };
         let status = StatusState {
             state: "hosting".into(),
@@ -264,6 +304,7 @@ impl Reamesh {
             status,
         )?;
         *r.shared.serve_dir.lock().unwrap() = Some(dir);
+        *r.shared.auth_token.lock().unwrap() = token;
         Ok(r)
     }
 
@@ -319,6 +360,7 @@ impl Reamesh {
             status: Mutex::new(status),
             serve_dir: Mutex::new(None),
             session_peers: Mutex::new(Vec::new()),
+            auth_token: Mutex::new(String::new()),
         });
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (init_tx, init_rx) = std_mpsc::channel();
@@ -534,6 +576,7 @@ impl Reamesh {
                     "session_name": s.session_name,
                     "project_file": s.project_file,
                     "owner": s.owner,
+                    "auth": s.auth,
                 })
             })
             .collect();
@@ -542,7 +585,7 @@ impl Reamesh {
 
     /// Join an announced session (client only): subscribe to its topic and
     /// download the project files. Progress is reported via `status_json`.
-    pub fn join_session(&self, session_id: &str) -> bool {
+    pub fn join_session(&self, session_id: &str, passphrase: &str) -> bool {
         if self.role != Role::Client {
             return false;
         }
@@ -556,7 +599,10 @@ impl Reamesh {
             return false;
         }
         self.cmd_tx
-            .send(Command::JoinSession(session_id.to_string()))
+            .send(Command::JoinSession {
+                session_id: session_id.to_string(),
+                passphrase: passphrase.to_string(),
+            })
             .is_ok()
     }
 
@@ -701,12 +747,39 @@ fn build_manifest(dir: &Path) -> anyhow::Result<Vec<FileMeta>> {
                     .map(|c| c.as_os_str().to_string_lossy())
                     .collect::<Vec<_>>()
                     .join("/");
-                out.push(FileMeta { path, size: meta.len() });
+                let hash = blake3_file(&dir.join(&rel_child)).unwrap_or_default();
+                out.push(FileMeta { path, size: meta.len(), hash });
             }
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// blake3 of a file's contents as a hex string, streamed so large media never
+/// loads fully into memory.
+fn blake3_file(path: &Path) -> std::io::Result<String> {
+    let mut f = fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Whether a project-relative file is worth compressing: text-shaped project
+/// data (.rpp and friends) shrinks ~10x; audio is already dense, so it is left
+/// raw to avoid burning CPU for nothing.
+fn is_compressible(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [".rpp", ".rtracktemplate", ".rfxchain", ".txt", ".reapeaks", ".xml", ".csv"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
 }
 
 fn sanitize_dir_name(name: &str) -> String {
@@ -759,6 +832,11 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
             yamux::Config::default,
         )
         .map_err(|e| anyhow::anyhow!("tcp transport: {e}"))?
+        // QUIC (UDP) connects in fewer round-trips than TCP and avoids
+        // head-of-line blocking between concurrent file chunks; libp2p picks
+        // whichever transport a peer's advertised address uses, falling back
+        // to TCP. Same identity keypair as the TCP transport.
+        .with_quic()
         .with_behaviour(|key| {
             // Item/FX-chain state chunks ride gossipsub; plugin state blobs
             // (samplers etc.) can be tens of MB.
@@ -799,67 +877,67 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
         .gossipsub
         .subscribe(&gossipsub::IdentTopic::new(LOBBY_TOPIC))?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
     Ok(swarm)
 }
 
-/// Client-side state of an in-progress project download.
+/// One file in an in-progress download. Written to a hidden temp at chunk
+/// offsets (out of order is fine) and renamed to `dest` when whole.
+struct FileDl {
+    meta: FileMeta,
+    tmp: PathBuf, // equals `dest` for files already present (never requested)
+    dest: PathBuf,
+    file: Option<fs::File>,
+    remaining: u64, // chunks not yet written
+    tries: u32,     // hash-mismatch re-downloads
+}
+
+/// One outstanding chunk: which file index, at what byte offset.
+#[derive(Clone, Copy, Debug)]
+struct Piece {
+    file: usize,
+    offset: u64,
+}
+
+/// Client-side state of an in-progress project download. Pieces are pulled
+/// from `queue` into a sliding window of in-flight requests (pipelining), each
+/// sent to a peer chosen round-robin from `peers` (swarming: other clients
+/// that already have the project serve too); files already present
+/// byte-for-byte are skipped (dedup/resume). Each file lands atomically.
 struct Download {
     owner: PeerId,
     dir: PathBuf,
-    files: Vec<FileMeta>,
     project_file: String,
+    auth: String,
     got_manifest: bool,
-    cur: usize,
-    out: Option<fs::File>,
-    written: u64,
+    manifest_req: Option<request_response::OutboundRequestId>,
+    files: Vec<FileDl>,
+    queue: VecDeque<Piece>,
+    inflight: HashMap<request_response::OutboundRequestId, Piece>,
+    peers: Vec<PeerId>,
+    next_peer: usize,
     total: u64,
     done: u64,
     last_activity: Instant,
-    attempts: u32,
+}
+
+/// Chunk offsets for a file of `size` bytes.
+fn file_pieces(file: usize, size: u64) -> Vec<Piece> {
+    let mut v = Vec::new();
+    let mut off = 0;
+    while off < size {
+        v.push(Piece { file, offset: off });
+        off += CHUNK_SIZE;
+    }
+    v
 }
 
 impl Download {
-    /// The request that should currently be in flight (for retries).
-    fn current_request(&self) -> XferRequest {
-        if !self.got_manifest {
-            XferRequest::Manifest
-        } else {
-            XferRequest::Chunk {
-                file: self.cur as u32,
-                offset: self.written,
-            }
-        }
-    }
-
-    /// Ensure the current output file is open, skipping completed and
-    /// zero-byte files. Returns true when every file is finished.
-    fn advance(&mut self) -> std::io::Result<bool> {
-        loop {
-            if self.cur >= self.files.len() {
-                self.out = None;
-                return Ok(true);
-            }
-            let meta = &self.files[self.cur];
-            if self.out.is_none() {
-                let Some(rel) = safe_relative_path(&meta.path) else {
-                    return Err(std::io::Error::other(format!(
-                        "unsafe path in manifest: {}",
-                        meta.path
-                    )));
-                };
-                let dest = self.dir.join(rel);
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                self.out = Some(fs::File::create(dest)?);
-                self.written = 0;
-            }
-            if self.written >= self.files[self.cur].size {
-                self.out = None;
-                self.cur += 1;
-                continue;
-            }
-            return Ok(false);
+    fn request(&self, p: Piece) -> XferRequest {
+        XferRequest::File {
+            path: self.files[p.file].meta.path.clone(),
+            offset: p.offset,
+            auth: self.auth.clone(),
         }
     }
 }
@@ -877,6 +955,7 @@ struct Fetch {
     written: u64,
     last_activity: Instant,
     attempts: u32,
+    auth: String,
 }
 
 impl Fetch {
@@ -884,6 +963,7 @@ impl Fetch {
         XferRequest::File {
             path: self.rel.clone(),
             offset: self.written,
+            auth: self.auth.clone(),
         }
     }
 
@@ -941,6 +1021,7 @@ fn start_fetch(
         written: 0,
         last_activity: Instant::now(),
         attempts: 0,
+        auth: shared.auth_token.lock().unwrap().clone(),
     };
     if fetch_send(swarm, fetch_reqs, &mut fetch) {
         fetches.insert(fetch.rel.clone(), fetch);
@@ -958,10 +1039,18 @@ fn handle_fetch_response(
     let Some(fetch) = fetches.get_mut(rel) else { return };
 
     match response {
-        Some(XferResponse::FileChunk { size, data }) => {
+        Some(XferResponse::FileChunk { size, compressed, data }) => {
             fetch.attempts = 0;
+            let chunk = if compressed {
+                match zstd::decode_all(&data[..]) {
+                    Ok(d) => d,
+                    Err(_) => return, // corrupt; in-order request stays in flight
+                }
+            } else {
+                data
+            };
             let expected = CHUNK_SIZE.min(size.saturating_sub(fetch.written)) as usize;
-            if data.len() != expected {
+            if chunk.len() != expected {
                 return; // stale retry; the in-order request stays in flight
             }
             let mut write = || -> std::io::Result<bool> {
@@ -972,8 +1061,8 @@ fn handle_fetch_response(
                     fetch.out = Some(fs::File::create(&fetch.tmp)?);
                     fetch.written = 0;
                 }
-                fetch.out.as_mut().unwrap().write_all(&data)?;
-                fetch.written += data.len() as u64;
+                fetch.out.as_mut().unwrap().write_all(&chunk)?;
+                fetch.written += chunk.len() as u64;
                 if fetch.written >= size {
                     fetch.out = None; // close before rename
                     fs::rename(&fetch.tmp, &fetch.dest)?;
@@ -1025,76 +1114,71 @@ fn set_status(shared: &Shared, f: impl FnOnce(&mut StatusState)) {
     f(&mut shared.status.lock().unwrap());
 }
 
-/// Handler for transfer requests. `Manifest`/`Chunk` (the initial project
-/// download) are served by the owner only; `File` (mid-session media fetch)
-/// is served by every peer that has a project copy.
+/// Handler for transfer requests. Every request carries the session access
+/// token, checked against `auth_token` (empty = open session) before anything
+/// is served. `Manifest` is owner-only; `File` is served by every peer that
+/// has a project copy (which powers both the windowed initial download and
+/// mid-session media fetch). Project text chunks are returned zstd-compressed.
 fn serve_xfer(
     hosting: Option<&Hosting>,
     serve_dir: Option<&Path>,
+    auth_token: &str,
     req: &XferRequest,
 ) -> XferResponse {
-    if let XferRequest::File { path, offset } = req {
-        let Some(dir) = serve_dir else {
-            return XferResponse::Error {
-                message: "no project copy to serve from".into(),
-            };
-        };
-        let Some(rel) = safe_relative_path(path) else {
-            return XferResponse::Error {
-                message: format!("unsafe path: {path}"),
-            };
-        };
-        let full = dir.join(rel);
-        let read = || -> std::io::Result<(u64, Vec<u8>)> {
-            let mut f = fs::File::open(&full)?;
-            let size = f.metadata()?.len();
-            f.seek(SeekFrom::Start(*offset))?;
-            let want = CHUNK_SIZE.min(size.saturating_sub(*offset)) as usize;
-            let mut buf = vec![0u8; want];
-            f.read_exact(&mut buf)?;
-            Ok((size, buf))
-        };
-        return match read() {
-            Ok((size, data)) => XferResponse::FileChunk { size, data },
-            Err(e) => XferResponse::Error {
-                message: format!("read {path}: {e}"),
-            },
+    let presented = match req {
+        XferRequest::Manifest { auth } | XferRequest::File { auth, .. } => auth.as_str(),
+    };
+    if presented != auth_token {
+        return XferResponse::Error {
+            message: "wrong or missing session passphrase".into(),
         };
     }
-    let Some(h) = hosting else {
-        return XferResponse::Error {
-            message: "not hosting".into(),
-        };
-    };
     match req {
-        XferRequest::File { .. } => unreachable!("handled above"),
-        XferRequest::Manifest => XferResponse::Manifest {
-            session_id: h.session_id.clone(),
-            session_name: h.session_name.clone(),
-            project_file: h.project_file.clone(),
-            files: h.files.clone(),
-        },
-        XferRequest::Chunk { file, offset } => {
-            let Some(meta) = h.files.get(*file as usize) else {
+        XferRequest::File { path, offset, .. } => {
+            let Some(dir) = serve_dir else {
                 return XferResponse::Error {
-                    message: format!("no such file index {file}"),
+                    message: "no project copy to serve from".into(),
                 };
             };
-            let read = || -> std::io::Result<Vec<u8>> {
-                let mut f = fs::File::open(h.project_dir.join(&meta.path))?;
+            let Some(rel) = safe_relative_path(path) else {
+                return XferResponse::Error {
+                    message: format!("unsafe path: {path}"),
+                };
+            };
+            let full = dir.join(rel);
+            let compress = is_compressible(path);
+            let read = || -> std::io::Result<(u64, bool, Vec<u8>)> {
+                let mut f = fs::File::open(&full)?;
+                let size = f.metadata()?.len();
                 f.seek(SeekFrom::Start(*offset))?;
-                let want = CHUNK_SIZE.min(meta.size.saturating_sub(*offset)) as usize;
+                let want = CHUNK_SIZE.min(size.saturating_sub(*offset)) as usize;
                 let mut buf = vec![0u8; want];
                 f.read_exact(&mut buf)?;
-                Ok(buf)
+                if compress {
+                    if let Ok(z) = zstd::encode_all(&buf[..], 3) {
+                        return Ok((size, true, z));
+                    }
+                }
+                Ok((size, false, buf))
             };
             match read() {
-                Ok(data) => XferResponse::Chunk { data },
+                Ok((size, compressed, data)) => XferResponse::FileChunk { size, compressed, data },
                 Err(e) => XferResponse::Error {
-                    message: format!("read {}: {e}", meta.path),
+                    message: format!("read {path}: {e}"),
                 },
             }
         }
+        XferRequest::Manifest { .. } => match hosting {
+            Some(h) => XferResponse::Manifest {
+                session_id: h.session_id.clone(),
+                session_name: h.session_name.clone(),
+                project_file: h.project_file.clone(),
+                files: h.files.clone(),
+            },
+            None => XferResponse::Error {
+                message: "not hosting".into(),
+            },
+        },
     }
 }
 
@@ -1174,6 +1258,8 @@ async fn run_network(
             "session_name": h.session_name,
             "project_file": h.project_file,
             "owner": swarm.local_peer_id().to_string(),
+            "auth": h.auth,
+            "salt": h.salt,
         })
         .to_string()
         .into_bytes()
@@ -1224,7 +1310,7 @@ async fn run_network(
                         None => eprintln!("[reamesh] dropped proposal: not in a session"),
                     }
                 }
-                Some(Command::JoinSession(session_id)) => {
+                Some(Command::JoinSession { session_id, passphrase }) => {
                     let info = shared.sessions.lock().unwrap().get(&session_id).cloned();
                     let Some(info) = info else {
                         set_status(&shared, |s| {
@@ -1240,6 +1326,10 @@ async fn run_network(
                         });
                         continue;
                     };
+                    // Derive (and remember) this session's access token so we
+                    // both present it and can serve other peers later.
+                    let token = auth_token(&info.salt, &passphrase);
+                    *shared.auth_token.lock().unwrap() = token.clone();
                     let t = session_topic(&session_id);
                     if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&t) {
                         eprintln!("[reamesh] subscribe to session topic failed: {e}");
@@ -1258,20 +1348,25 @@ async fn run_network(
                         s.session_name = Some(info.session_name.clone());
                         s.message = None;
                     });
-                    swarm.behaviour_mut().xfer.send_request(&owner, XferRequest::Manifest);
+                    let req = swarm
+                        .behaviour_mut()
+                        .xfer
+                        .send_request(&owner, XferRequest::Manifest { auth: token.clone() });
                     download = Some(Download {
                         owner,
-                        project_file: info.project_file.clone(),
                         dir,
-                        files: Vec::new(),
+                        project_file: info.project_file.clone(),
+                        auth: token,
                         got_manifest: false,
-                        cur: 0,
-                        out: None,
-                        written: 0,
+                        manifest_req: Some(req),
+                        files: Vec::new(),
+                        queue: VecDeque::new(),
+                        inflight: HashMap::new(),
+                        peers: vec![owner],
+                        next_peer: 0,
                         total: 0,
                         done: 0,
                         last_activity: Instant::now(),
-                        attempts: 0,
                     });
                 }
                 Some(Command::FetchFile(rel)) => {
@@ -1355,25 +1450,9 @@ async fn run_network(
                 if fetch_reqs.len() > 1024 {
                     fetch_reqs.retain(|_, rel| fetches.contains_key(rel));
                 }
-                // Client: nudge a stalled download (lost request, dropped
-                // connection mid-transfer, ...).
-                if let Some(dl) = &mut download {
-                    if dl.last_activity.elapsed() > Duration::from_secs(3) {
-                        dl.attempts += 1;
-                        if dl.attempts > 20 {
-                            eprintln!("[reamesh] download from {} failed (timeout)", dl.owner);
-                            set_status(&shared, |s| {
-                                s.state = "failed".into();
-                                s.message = Some("project download timed out".into());
-                            });
-                            download = None;
-                        } else {
-                            let req = dl.current_request();
-                            dl.last_activity = Instant::now();
-                            swarm.behaviour_mut().xfer.send_request(&dl.owner, req);
-                        }
-                    }
-                }
+                // Client: keep the download's request window full, fold in any
+                // newly-arrived peers (swarming), and recover from stalls.
+                download_tick(&mut swarm, &shared, &mut download);
             },
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { address, .. } => {
@@ -1456,6 +1535,8 @@ async fn run_network(
                                 session_name: get("session_name"),
                                 project_file: get("project_file"),
                                 owner: get("owner"),
+                                auth: v.get("auth").and_then(|x| x.as_bool()).unwrap_or(false),
+                                salt: get("salt"),
                                 last_seen: Instant::now(),
                             };
                             if !info.session_id.is_empty() && !info.owner.is_empty() {
@@ -1482,31 +1563,37 @@ async fn run_network(
                         }
                     }
                 }
-                SwarmEvent::Behaviour(BehaviourEvent::Xfer(request_response::Event::Message { peer, message, .. })) => {
+                SwarmEvent::Behaviour(BehaviourEvent::Xfer(request_response::Event::Message { message, .. })) => {
                     match message {
                         request_response::Message::Request { request, channel, .. } => {
                             let serve_dir = shared.serve_dir.lock().unwrap().clone();
-                            let resp = serve_xfer(hosting.as_ref(), serve_dir.as_deref(), &request);
+                            let token = shared.auth_token.lock().unwrap().clone();
+                            let resp = serve_xfer(hosting.as_ref(), serve_dir.as_deref(), &token, &request);
                             let _ = swarm.behaviour_mut().xfer.send_response(channel, resp);
                         }
                         request_response::Message::Response { request_id, response } => {
-                            if let Some(rel) = fetch_reqs.remove(&request_id) {
+                            if download.as_ref().is_some_and(|dl| dl.manifest_req == Some(request_id)) {
+                                handle_download_manifest(&mut swarm, &shared, &mut download, response);
+                            } else if download.as_ref().is_some_and(|dl| dl.inflight.contains_key(&request_id)) {
+                                handle_download_piece(&mut swarm, &shared, &mut download, request_id, Some(response));
+                            } else if let Some(rel) = fetch_reqs.remove(&request_id) {
                                 handle_fetch_response(&mut swarm, &mut fetches, &mut fetch_reqs, &rel, Some(response));
-                            } else {
-                                handle_xfer_response(&mut swarm, &shared, &mut download, peer, response);
                             }
                         }
                     }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Xfer(request_response::Event::OutboundFailure { peer, error, request_id, .. })) => {
                     eprintln!("[reamesh] transfer request to {peer} failed: {error}");
-                    if let Some(rel) = fetch_reqs.remove(&request_id) {
+                    if download.as_ref().is_some_and(|dl| dl.manifest_req == Some(request_id)) {
+                        // Manifest never arrived; re-request on the next tick.
+                        if let Some(dl) = &mut download {
+                            dl.manifest_req = None;
+                            dl.last_activity = Instant::now() - Duration::from_secs(10);
+                        }
+                    } else if download.as_ref().is_some_and(|dl| dl.inflight.contains_key(&request_id)) {
+                        handle_download_piece(&mut swarm, &shared, &mut download, request_id, None);
+                    } else if let Some(rel) = fetch_reqs.remove(&request_id) {
                         handle_fetch_response(&mut swarm, &mut fetches, &mut fetch_reqs, &rel, None);
-                    } else if let Some(dl) = &mut download
-                        && dl.owner == peer {
-                        // The tick-driven stall handler retries; just age the
-                        // activity timestamp so it kicks in soon.
-                        dl.last_activity = Instant::now() - Duration::from_secs(10);
                     }
                 }
                 _ => {}
@@ -1515,118 +1602,350 @@ async fn run_network(
     }
 }
 
-/// Client-side: feed a transfer response into the download state machine.
-fn handle_xfer_response(
-    swarm: &mut Swarm<Behaviour>,
-    shared: &Shared,
-    download: &mut Option<Download>,
-    peer: PeerId,
-    response: XferResponse,
-) {
-    let Some(dl) = download.as_mut() else { return };
-    if dl.owner != peer {
-        return;
-    }
-    dl.last_activity = Instant::now();
-    dl.attempts = 0;
-
-    let fail = |download: &mut Option<Download>, shared: &Shared, msg: String| {
-        eprintln!("[reamesh] download failed: {msg}");
-        set_status(shared, |s| {
-            s.state = "failed".into();
-            s.message = Some(msg);
-        });
-        *download = None;
-    };
-
-    match response {
-        XferResponse::Manifest { files, project_file, .. } => {
-            if dl.got_manifest {
-                return; // duplicate (retry raced the response)
-            }
-            if let Err(e) = fs::create_dir_all(&dl.dir) {
-                return fail(download, shared, format!("create staging dir: {e}"));
-            }
-            dl.got_manifest = true;
-            dl.total = files.iter().map(|f| f.size).sum();
-            dl.files = files;
-            dl.project_file = project_file;
-            eprintln!(
-                "[reamesh] downloading {} files ({} bytes) into {}",
-                dl.files.len(),
-                dl.total,
-                dl.dir.display()
-            );
-            set_status(shared, |s| {
-                s.state = "downloading".into();
-                s.progress = 0.0;
-            });
-            step_download(swarm, shared, download);
+impl Download {
+    /// Next serving peer in the round-robin (owner + other session peers).
+    fn next_peer(&mut self) -> Option<PeerId> {
+        if self.peers.is_empty() {
+            return None;
         }
-        XferResponse::Chunk { data } => {
-            if !dl.got_manifest {
-                return;
-            }
-            // A stale retry can deliver a chunk we already have; only accept
-            // the bytes we are waiting for.
-            let expected = CHUNK_SIZE.min(dl.files[dl.cur].size - dl.written) as usize;
-            if data.len() != expected {
-                eprintln!(
-                    "[reamesh] ignoring unexpected chunk ({} bytes, wanted {expected})",
-                    data.len()
-                );
-                return;
-            }
-            if let Some(out) = &mut dl.out {
-                if let Err(e) = out.write_all(&data) {
-                    return fail(download, shared, format!("write chunk: {e}"));
-                }
-            } else {
-                return; // advance() opens the file before any chunk is requested
-            }
-            dl.written += data.len() as u64;
-            dl.done += data.len() as u64;
-            let progress = if dl.total == 0 { 1.0 } else { dl.done as f64 / dl.total as f64 };
-            set_status(shared, |s| s.progress = progress);
-            step_download(swarm, shared, download);
-        }
-        XferResponse::Error { message } => {
-            fail(download, shared, format!("owner reported: {message}"));
-        }
-        // Fetch responses are routed by request id before reaching here.
-        XferResponse::FileChunk { .. } => {}
+        let p = self.peers[self.next_peer % self.peers.len()];
+        self.next_peer = self.next_peer.wrapping_add(1);
+        Some(p)
     }
 }
 
-/// Open the next pending file and request its next chunk, or finish.
-fn step_download(swarm: &mut Swarm<Behaviour>, shared: &Shared, download: &mut Option<Download>) {
-    let Some(dl) = download.as_mut() else { return };
-    match dl.advance() {
-        Err(e) => {
-            eprintln!("[reamesh] download failed: {e}");
-            set_status(shared, |s| {
-                s.state = "failed".into();
-                s.message = Some(e.to_string());
-            });
-            *download = None;
-        }
-        Ok(true) => {
-            let path = dl.dir.join(&dl.project_file);
-            eprintln!("[reamesh] download complete: {}", path.display());
-            // This copy is now what we serve to (and fetch from) other peers.
-            *shared.serve_dir.lock().unwrap() = Some(dl.dir.clone());
-            set_status(shared, |s| {
-                s.state = "ready".into();
-                s.progress = 1.0;
-                s.project_path = Some(path.to_string_lossy().into_owned());
-            });
-            *download = None;
-        }
-        Ok(false) => {
-            let req = dl.current_request();
-            swarm.behaviour_mut().xfer.send_request(&dl.owner, req);
+/// Existing files under the staging root, indexed by size (cheap: no
+/// hashing). Same-size candidates are hashed lazily when a manifest entry
+/// might match one, so a re-download reuses bytes already on disk.
+fn build_reuse_index(root: &Path) -> HashMap<u64, Vec<PathBuf>> {
+    let mut idx: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut budget = 50_000u32; // bound the scan on huge staging roots
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            if budget == 0 {
+                return idx;
+            }
+            budget -= 1;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() && !name.starts_with(".reamesh-part-") {
+                idx.entry(meta.len()).or_default().push(entry.path());
+            }
         }
     }
+    idx
+}
+
+/// Whether `path` already holds exactly the file `meta` describes.
+fn file_matches(path: &Path, meta: &FileMeta) -> bool {
+    match fs::metadata(path) {
+        Ok(m) if m.is_file() && m.len() == meta.size => {
+            meta.hash.is_empty() || blake3_file(path).ok().as_deref() == Some(meta.hash.as_str())
+        }
+        _ => false,
+    }
+}
+
+/// Turn a manifest into the per-file download plan: skip files already present
+/// byte-for-byte (resume), copy in identical files found elsewhere under the
+/// staging root (dedup), and queue chunk requests for the rest.
+fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()> {
+    let reuse = build_reuse_index(dl.dir.parent().unwrap_or(&dl.dir));
+    for (idx, meta) in files.into_iter().enumerate() {
+        let Some(rel) = safe_relative_path(&meta.path) else {
+            return Err(std::io::Error::other(format!(
+                "unsafe path in manifest: {}",
+                meta.path
+            )));
+        };
+        let dest = dl.dir.join(&rel);
+        dl.total += meta.size;
+
+        // Already on disk (a prior attempt, or another session's copy)?
+        let reused = file_matches(&dest, &meta)
+            || (!meta.hash.is_empty()
+                && reuse
+                    .get(&meta.size)
+                    .and_then(|cands| {
+                        cands.iter().find(|p| {
+                            p.as_path() != dest
+                                && blake3_file(p).ok().as_deref() == Some(meta.hash.as_str())
+                        })
+                    })
+                    .map(|src| {
+                        dest.parent().map(fs::create_dir_all).transpose().is_ok()
+                            && fs::copy(src, &dest).is_ok()
+                    })
+                    .unwrap_or(false));
+        if reused {
+            dl.done += meta.size;
+            dl.files.push(FileDl { meta, tmp: dest.clone(), dest, file: None, remaining: 0, tries: 0 });
+            continue;
+        }
+
+        // Need it: write chunks (possibly out of order) into a sparse temp.
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = dest.with_file_name(format!(
+            ".reamesh-part-{}",
+            dest.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.set_len(meta.size)?;
+        let pieces = file_pieces(idx, meta.size);
+        let remaining = pieces.len() as u64;
+        if remaining == 0 {
+            drop(f); // empty file: complete immediately
+            fs::rename(&tmp, &dest)?;
+            dl.files.push(FileDl { meta, tmp, dest, file: None, remaining: 0, tries: 0 });
+            continue;
+        }
+        for p in pieces {
+            dl.queue.push_back(p);
+        }
+        dl.files.push(FileDl { meta, tmp, dest, file: Some(f), remaining, tries: 0 });
+    }
+    Ok(())
+}
+
+/// Fill the in-flight window: pull pending pieces and dispatch each to the
+/// next serving peer in the rotation.
+fn download_pump(swarm: &mut Swarm<Behaviour>, dl: &mut Download) {
+    while dl.inflight.len() < DOWNLOAD_WINDOW {
+        let Some(piece) = dl.queue.pop_front() else { break };
+        let Some(peer) = dl.next_peer() else {
+            dl.queue.push_front(piece);
+            break;
+        };
+        let req = dl.request(piece);
+        let id = swarm.behaviour_mut().xfer.send_request(&peer, req);
+        dl.inflight.insert(id, piece);
+    }
+}
+
+fn download_fail(download: &mut Option<Download>, shared: &Shared, msg: String) {
+    eprintln!("[reamesh] download failed: {msg}");
+    if let Some(dl) = download {
+        for f in &dl.files {
+            if f.tmp != f.dest {
+                let _ = fs::remove_file(&f.tmp);
+            }
+        }
+    }
+    set_status(shared, |s| {
+        s.state = "failed".into();
+        s.message = Some(msg);
+    });
+    *download = None;
+}
+
+fn download_finalize(shared: &Shared, download: &mut Option<Download>) {
+    let Some(dl) = download.as_ref() else { return };
+    let path = dl.dir.join(&dl.project_file);
+    eprintln!("[reamesh] download complete: {}", path.display());
+    // This copy is now what we serve to (and fetch from) other peers.
+    *shared.serve_dir.lock().unwrap() = Some(dl.dir.clone());
+    set_status(shared, |s| {
+        s.state = "ready".into();
+        s.progress = 1.0;
+        s.project_path = Some(path.to_string_lossy().into_owned());
+    });
+    *download = None;
+}
+
+/// Per-tick download upkeep: refresh the serving-peer set (swarming), recover
+/// from stalls by requeueing lost in-flight pieces, and keep the window full.
+fn download_tick(swarm: &mut Swarm<Behaviour>, shared: &Shared, download: &mut Option<Download>) {
+    let Some(dl) = download.as_mut() else { return };
+    let mut peers = vec![dl.owner];
+    for p in shared.session_peers.lock().unwrap().iter() {
+        if !peers.contains(p) {
+            peers.push(*p);
+        }
+    }
+    dl.peers = peers;
+
+    if !dl.got_manifest {
+        if dl.manifest_req.is_none() {
+            let id = swarm
+                .behaviour_mut()
+                .xfer
+                .send_request(&dl.owner, XferRequest::Manifest { auth: dl.auth.clone() });
+            dl.manifest_req = Some(id);
+            dl.last_activity = Instant::now();
+        }
+        return;
+    }
+    if dl.last_activity.elapsed() > Duration::from_secs(5) && !dl.inflight.is_empty() {
+        let lost: Vec<Piece> = dl.inflight.drain().map(|(_, p)| p).collect();
+        for p in lost {
+            dl.queue.push_back(p);
+        }
+        dl.last_activity = Instant::now();
+    }
+    download_pump(swarm, dl);
+}
+
+/// Client-side: the manifest arrived. Plan the download and start pumping.
+fn handle_download_manifest(
+    swarm: &mut Swarm<Behaviour>,
+    shared: &Shared,
+    download: &mut Option<Download>,
+    response: XferResponse,
+) {
+    {
+        let Some(dl) = download.as_mut() else { return };
+        dl.manifest_req = None;
+        dl.last_activity = Instant::now();
+        match response {
+            XferResponse::Manifest { files, project_file, .. } => {
+                if dl.got_manifest {
+                    return; // duplicate (a retry raced the response)
+                }
+                if let Err(e) = fs::create_dir_all(&dl.dir) {
+                    return download_fail(download, shared, format!("create staging dir: {e}"));
+                }
+                dl.got_manifest = true;
+                dl.project_file = project_file;
+                if let Err(e) = download_build(dl, files) {
+                    return download_fail(download, shared, e.to_string());
+                }
+                eprintln!(
+                    "[reamesh] downloading into {} ({} of {} bytes already present)",
+                    dl.dir.display(),
+                    dl.done,
+                    dl.total
+                );
+                let progress = if dl.total == 0 { 1.0 } else { dl.done as f64 / dl.total as f64 };
+                set_status(shared, |s| {
+                    s.state = "downloading".into();
+                    s.progress = progress;
+                });
+                download_pump(swarm, dl);
+            }
+            XferResponse::Error { message } => {
+                return download_fail(download, shared, format!("owner refused: {message}"));
+            }
+            _ => {}
+        }
+    }
+    // Everything may already have been present locally.
+    if let Some(dl) = download.as_ref() {
+        if dl.got_manifest && dl.queue.is_empty() && dl.inflight.is_empty() {
+            download_finalize(shared, download);
+        }
+    }
+}
+
+/// Client-side: a chunk arrived (or a piece request failed: `response` None).
+fn handle_download_piece(
+    swarm: &mut Swarm<Behaviour>,
+    shared: &Shared,
+    download: &mut Option<Download>,
+    request_id: request_response::OutboundRequestId,
+    response: Option<XferResponse>,
+) {
+    let Some(dl) = download.as_mut() else { return };
+    let Some(piece) = dl.inflight.remove(&request_id) else { return };
+    dl.last_activity = Instant::now();
+
+    // Decode/validate. On anything wrong (peer can't serve it, corrupt,
+    // stale), requeue the piece and keep the window full.
+    let chunk: Option<Vec<u8>> = match response {
+        Some(XferResponse::FileChunk { compressed, data, .. }) => {
+            let bytes = if compressed {
+                zstd::decode_all(&data[..]).ok()
+            } else {
+                Some(data)
+            };
+            bytes.filter(|b| {
+                let expected =
+                    CHUNK_SIZE.min(dl.files[piece.file].meta.size.saturating_sub(piece.offset))
+                        as usize;
+                b.len() == expected
+            })
+        }
+        _ => None,
+    };
+    let Some(chunk) = chunk else {
+        dl.queue.push_back(piece);
+        download_pump(swarm, dl);
+        return;
+    };
+
+    let fd = &mut dl.files[piece.file];
+    let wrote = fd.file.as_mut().map(|f| {
+        f.seek(SeekFrom::Start(piece.offset))
+            .and_then(|_| f.write_all(&chunk))
+    });
+    match wrote {
+        Some(Ok(())) => {}
+        Some(Err(e)) => {
+            let dest = fd.dest.display().to_string();
+            return download_fail(download, shared, format!("write {dest}: {e}"));
+        }
+        None => {
+            // File already finished (a duplicate/late chunk); ignore.
+            download_pump(swarm, dl);
+            return;
+        }
+    }
+    fd.remaining -= 1;
+    dl.done += chunk.len() as u64;
+    let progress = if dl.total == 0 { 1.0 } else { dl.done as f64 / dl.total as f64 };
+    set_status(shared, |s| s.progress = progress);
+
+    if dl.files[piece.file].remaining == 0 {
+        let fd = &mut dl.files[piece.file];
+        fd.file = None; // close before verifying/renaming
+        let ok = fd.meta.hash.is_empty()
+            || blake3_file(&fd.tmp).ok().as_deref() == Some(fd.meta.hash.as_str());
+        if ok {
+            if let Err(e) = fs::rename(&fd.tmp, &fd.dest) {
+                let dest = fd.dest.display().to_string();
+                return download_fail(download, shared, format!("finalize {dest}: {e}"));
+            }
+        } else {
+            fd.tries += 1;
+            if fd.tries > 3 {
+                let p = fd.meta.path.clone();
+                return download_fail(download, shared, format!("checksum mismatch for {p}"));
+            }
+            eprintln!("[reamesh] checksum mismatch for {}, re-downloading", fd.meta.path);
+            match fs::OpenOptions::new().read(true).write(true).truncate(true).open(&fd.tmp) {
+                Ok(f) => {
+                    let _ = f.set_len(fd.meta.size);
+                    fd.file = Some(f);
+                }
+                Err(e) => {
+                    let tmp = fd.tmp.display().to_string();
+                    return download_fail(download, shared, format!("reopen {tmp}: {e}"));
+                }
+            }
+            let size = fd.meta.size;
+            let pieces = file_pieces(piece.file, size);
+            fd.remaining = pieces.len() as u64;
+            dl.done = dl.done.saturating_sub(size);
+            for p in pieces {
+                dl.queue.push_back(p);
+            }
+        }
+    }
+
+    if dl.queue.is_empty() && dl.inflight.is_empty() {
+        return download_finalize(shared, download);
+    }
+    download_pump(swarm, dl);
 }
 
 /// If `addr` points at one of this host's own non-loopback IPs (i.e. the peer
@@ -1762,12 +2081,14 @@ fn into_c_string(s: String) -> *mut c_char {
 
 /// Start hosting a session named `session_name` that shares the project at
 /// `project_dir`/`project_file` (path + file name of the saved .rpp).
+/// `passphrase` gates who may download and edit (empty/null = open session).
 /// Returns null on failure. Release with `reamesh_shutdown`.
 #[unsafe(no_mangle)]
 pub extern "C" fn reamesh_host(
     session_name: *const c_char,
     project_dir: *const c_char,
     project_file: *const c_char,
+    passphrase: *const c_char,
 ) -> *mut Reamesh {
     let (Some(name), Some(dir), Some(file)) = (
         cstr_arg(session_name),
@@ -1776,7 +2097,9 @@ pub extern "C" fn reamesh_host(
     ) else {
         return std::ptr::null_mut();
     };
-    std::panic::catch_unwind(|| match Reamesh::host(&name, &dir, &file) {
+    // Null/absent passphrase = open session.
+    let pass = cstr_arg(passphrase).unwrap_or_default();
+    std::panic::catch_unwind(|| match Reamesh::host(&name, &dir, &file, &pass) {
         Ok(r) => Box::into_raw(r),
         Err(e) => {
             eprintln!("[reamesh] host failed: {e}");
@@ -1819,16 +2142,22 @@ pub extern "C" fn reamesh_sessions(handle: *mut Reamesh) -> *mut c_char {
     into_c_string(out)
 }
 
-/// Join an announced session by id (client handles only). Returns true if the
-/// join was started; watch `reamesh_status` for progress and the final
-/// project path.
+/// Join an announced session by id (client handles only). `passphrase` must
+/// match the host's if the session is protected (empty/null otherwise).
+/// Returns true if the join was started; watch `reamesh_status` for progress
+/// and the final project path.
 #[unsafe(no_mangle)]
-pub extern "C" fn reamesh_join_session(handle: *mut Reamesh, session_id: *const c_char) -> bool {
+pub extern "C" fn reamesh_join_session(
+    handle: *mut Reamesh,
+    session_id: *const c_char,
+    passphrase: *const c_char,
+) -> bool {
     let (false, Some(sid)) = (handle.is_null(), cstr_arg(session_id)) else {
         return false;
     };
+    let pass = cstr_arg(passphrase).unwrap_or_default();
     let r = unsafe { &*handle };
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.join_session(&sid)))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.join_session(&sid, &pass)))
         .unwrap_or(false)
 }
 
