@@ -1,0 +1,77 @@
+{
+  "features" : [
+    "refractivity"
+  ],
+  "fill" : {
+    "solid" : "srgb:0.10980,0.10980,0.12941,1.00000"
+  },
+  "groups" : [
+    {
+      "blur-material" : null,
+      "layers" : [
+        {
+          "blend-mode" : "normal",
+          "fill" : {
+            "automatic-gradient" : "srgb:0.90588,0.82745,0.36078,1.00000"
+          },
+          "glass-specializations" : [
+            {
+              "value" : true
+            },
+            {
+              "appearance" : "light",
+              "value" : true
+            },
+            {
+              "idiom" : "square",
+              "value" : true
+            }
+          ],
+          "image-name" : "2-bar-yellow.svg",
+          "name" : "2-bar-yellow"
+        },
+        {
+          "fill" : {
+            "automatic-gradient" : "srgb:0.35686,0.55294,0.93725,1.00000"
+          },
+          "image-name" : "4-bar-blue.svg",
+          "name" : "4-bar-blue"
+        },
+        {
+          "fill" : {
+            "automatic-gradient" : "srgb:0.47843,0.84706,0.56078,1.00000"
+          },
+          "image-name" : "3-bar-green.svg",
+          "name" : "3-bar-green"
+        },
+        {
+          "fill" : {
+            "automatic-gradient" : "srgb:0.94118,0.51373,0.41961,1.00000"
+          },
+          "image-name" : "1-bar-coral.svg",
+          "name" : "1-bar-coral"
+        }
+      ],
+      "refractivity" : {
+        "depth" : 0,
+        "enabled" : true,
+        "strength" : 0.5
+      },
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "specular" : true,
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.33
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}
