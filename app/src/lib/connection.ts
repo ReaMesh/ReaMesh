@@ -1,0 +1,131 @@
+// Connection manager: keeps a WebSocket to every running REAPER instance's
+// ReaMesh control server (ports 47415-47418, one per instance) and exposes
+// them as a tiny external store for React.
+//
+// Session state stays in the extension; this module only transports it.
+// Commands go out as JSON ({cmd:"host"|"join"|"leave"|"browse"|"set_profile"});
+// the extension streams back one `state` message whenever anything changes.
+
+import { useSyncExternalStore } from "react";
+import type { ExtState, Instance } from "./types";
+import { getProfile } from "./profile";
+
+const PORTS = [47415, 47416, 47417, 47418];
+const RETRY_MS = 2000;
+
+interface StoreState {
+  instances: Instance[];
+  activePort: number | null;
+}
+
+const sockets = new Map<number, WebSocket>();
+const live = new Map<number, Instance>();
+let activePort: number | null = null;
+let snapshot: StoreState = { instances: [], activePort: null };
+const listeners = new Set<() => void>();
+let started = false;
+
+function emit() {
+  // Stable instance order (by port) so the UI never reshuffles.
+  snapshot = {
+    instances: [...live.values()].sort((a, b) => a.port - b.port),
+    activePort,
+  };
+  listeners.forEach((l) => l());
+}
+
+function ensureActive() {
+  if (activePort !== null && live.has(activePort)) return;
+  const first = [...live.keys()].sort((a, b) => a - b)[0];
+  activePort = first ?? null;
+}
+
+function connect(port: number) {
+  if (sockets.has(port)) return;
+  let ws: WebSocket;
+  try {
+    ws = new WebSocket(`ws://127.0.0.1:${port}`);
+  } catch {
+    return;
+  }
+  sockets.set(port, ws);
+
+  ws.onopen = () => {
+    live.set(port, { port });
+    ensureActive();
+    sendProfile(port);
+    emit();
+  };
+  ws.onmessage = (ev) => {
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(String(ev.data));
+    } catch {
+      return;
+    }
+    const inst = live.get(port) ?? { port };
+    if (msg.type === "hello") {
+      inst.pid = Number(msg.pid) || undefined;
+    } else if (msg.type === "state") {
+      inst.state = msg as unknown as ExtState;
+    }
+    live.set(port, inst);
+    ensureActive();
+    emit();
+  };
+  ws.onclose = () => {
+    sockets.delete(port);
+    if (live.delete(port)) {
+      ensureActive();
+      emit();
+    }
+  };
+  ws.onerror = () => ws.close();
+}
+
+export function startScanning() {
+  if (started) return;
+  started = true;
+  const scan = () => PORTS.forEach(connect);
+  scan();
+  setInterval(scan, RETRY_MS);
+}
+
+export function send(cmd: Record<string, unknown>, port?: number) {
+  const target = port ?? activePort;
+  if (target === null) return;
+  const ws = sockets.get(target);
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(cmd));
+}
+
+export function sendProfile(port?: number) {
+  const { name, color } = getProfile();
+  const cmd = { cmd: "set_profile", name, color };
+  if (port !== undefined) {
+    send(cmd, port);
+  } else {
+    for (const p of sockets.keys()) send(cmd, p);
+  }
+}
+
+export function setActivePort(port: number) {
+  if (live.has(port)) {
+    activePort = port;
+    emit();
+  }
+}
+
+export function useConnections(): StoreState {
+  return useSyncExternalStore(
+    (cb) => {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    () => snapshot,
+  );
+}
+
+export function useActiveInstance(): Instance | null {
+  const { instances, activePort: active } = useConnections();
+  return instances.find((i) => i.port === active) ?? null;
+}

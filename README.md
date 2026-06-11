@@ -5,26 +5,28 @@ in sync between computers on a local network. No account or server needed.
 
 One person hosts a project, the others join and get a local copy. Everyone can
 then edit tracks, arrange audio and MIDI, and work on effects. A panel inside
-REAPER handles hosting and joining.
+REAPER or a desktop app handles hosting and joining.
 
 ## Getting started
 
-ReaMesh runs on macOS. The panel needs ReaImGui, which you can install with
-[ReaPack](https://reapack.com). There are no packaged builds yet, so
-[build the extension from source](#building-from-source) first.
+ReaMesh runs on macOS. There are no packaged builds yet, so
+[build the extension and app from source](#building-from-source) first.
 
 1. Copy `reaper_reamesh.dylib` into
    `~/Library/Application Support/REAPER/UserPlugins/` on each Mac.
 2. Restart REAPER. ReaMesh installs its panel script on startup.
-3. Run the action "ReaMesh: Open panel (GUI)". Save a project in its own
-   folder, then click Host current project. You can set a passphrase first.
-4. On the other computer, open the panel and join the session from the list.
-   ReaMesh downloads the project and opens it in REAPER.
+3. Open the ReaMesh app, which connects to REAPER automatically. You can also
+   run the action "ReaMesh: Open panel (GUI)" instead. The panel needs
+   ReaImGui, which you can install with [ReaPack](https://reapack.com).
+4. Save a project in its own folder, then host it. You can set a passphrase
+   first.
+5. On the other computer, join the session from the list. ReaMesh downloads the
+   project and opens it in REAPER.
 
-The panel shows download progress, how many people are connected and an
-activity log, and stops hosting or leaves the session. ReaMesh doesn't write to
+The app and the panel both show download progress, who's connected and an
+activity log, and stop hosting or leave the session. ReaMesh doesn't write to
 the REAPER console. The actions "ReaMesh: Host session" and "ReaMesh: Leave
-session" also work without the panel, which is handy for keyboard shortcuts.
+session" also work on their own, which is handy for keyboard shortcuts.
 
 **Hosting shares the project folder**, including files that aren't used in the
 project. Dotfiles, `.rpp-bak` backups and `.reapeaks` caches are excluded.
@@ -45,6 +47,9 @@ traversal, so everyone needs to be on the same local network.
 
 Selection, open FX windows and window layout stay local. Master-track state
 isn't synced.
+
+The app shows everyone in the session by the name and color they picked, and
+tells you when people join or leave.
 
 ## Working together
 
@@ -67,7 +72,9 @@ for discovery, and session messages aren't encrypted with the passphrase.
 
 ## Building from source
 
-Install Rust, CMake 3.20 or newer and the Xcode command-line tools.
+Install Rust, Bun, CMake 3.20 or newer, the Xcode command-line tools and the
+[Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) for
+macOS.
 
 From the repository root:
 
@@ -87,16 +94,33 @@ A [CI workflow](.github/workflows/build.yml) also builds
 Windows with Rust, CMake and MSVC, run `cargo build --release` in `rust/`, then
 CMake on `extension/`.
 
+After building the extension, build the companion app:
+
+```sh
+cd app
+bun install
+bun run tauri build
+```
+
+This produces `app/src-tauri/target/release/bundle/macos/ReaMesh.app`. Use
+`bun run tauri dev` instead to run it in development mode. REAPER must be
+running with the extension installed for live session data. The app uses Bun
+for package management.
+
 ### Checks
 
-Run this from the repository root:
+Run these from the repository root:
 
 ```sh
 cargo test --manifest-path rust/Cargo.toml
+cd app
+bun install
+bun run build
 ```
 
-The Rust tests run a host and a guest in one process over real sockets. There
-are also [C ABI smoke tests](tools/ffi_smoke.cpp) and
+The Rust tests run a host and a guest in one process over real sockets, plus a
+round trip through the app's control connection. There are also
+[C ABI smoke tests](tools/ffi_smoke.cpp) and
 [state-chunk tests](tools/chunk_test.cpp).
 
 ## Code layout
@@ -105,8 +129,10 @@ are also [C ABI smoke tests](tools/ffi_smoke.cpp) and
   on its main thread.
 - [`rust/`](rust/): networking, file transfers and shared state using libp2p,
   Tokio and yrs. The host coordinates edits.
+- [`app/`](app/): desktop companion built with Tauri 2, React and shadcn/ui.
 - [`scripts/`](scripts/): ReaImGui panel, embedded into the extension at build
   time.
 
-The extension and Rust core communicate through a C ABI. The panel talks to the
-extension through its ReaScript API.
+The extension and Rust core communicate through a C ABI. The companion app
+talks to the extension over a localhost WebSocket, and the panel through the
+extension's ReaScript API.
