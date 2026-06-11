@@ -468,3 +468,41 @@ fn track_delete_propagates_as_tombstone() {
     let _ = fs::remove_dir_all(project);
     let _ = fs::remove_dir_all(staging);
 }
+
+#[test]
+fn presence_names_propagate() {
+    let project = temp_dir("proj-presence");
+    let staging = temp_dir("staging-presence");
+    make_project(&project);
+    // The profile is process-global, so both in-process peers beacon the same
+    // name; what this verifies is the wire round trip: each side must learn
+    // the *other's* name from its presence messages, not from local state.
+    reamesh::set_profile("Tester", "#a1b2c3");
+    let (owner, client) = establish("presence-test", &project, &staging);
+
+    let seen = wait_until(Duration::from_secs(10), || {
+        let o: Value = serde_json::from_str(&owner.peers_json()).unwrap();
+        let c: Value = serde_json::from_str(&client.peers_json()).unwrap();
+        let named = |v: &Value| {
+            v.as_array().unwrap().iter().any(|p| {
+                p["is_self"] == false && p["name"] == "Tester" && p["color"] == "#a1b2c3"
+            })
+        };
+        named(&o) && named(&c)
+    });
+    assert!(seen, "presence beacons never arrived: {}", owner.peers_json());
+
+    // Shape checks: self first, exactly one owner on each side.
+    let o: Value = serde_json::from_str(&owner.peers_json()).unwrap();
+    assert_eq!(o[0]["is_self"], true);
+    assert_eq!(o[0]["is_owner"], true);
+    let c: Value = serde_json::from_str(&client.peers_json()).unwrap();
+    assert_eq!(c[0]["is_self"], true);
+    assert_eq!(c[0]["is_owner"], false);
+    assert!(c.as_array().unwrap().iter().any(|p| p["is_owner"] == true));
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}

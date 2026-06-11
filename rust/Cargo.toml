@@ -12,7 +12,8 @@ libp2p = { version = "0.56.0", features = ["tokio", "tcp", "quic", "noise", "yam
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1.0.150"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
+tokio-tungstenite = "0.27"
 yrs = "0.26"
 blake3 = "1.5"
 zstd = "0.13"

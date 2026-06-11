@@ -11,6 +11,11 @@
 
 typedef struct ReameshHandle ReameshHandle;
 
+/**
+ * Ports tried in order; one per running REAPER instance.
+ */
+#define CTL_PORTS { 47415, 47416, 47417, 47418, }
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -84,6 +89,42 @@ bool reamesh_fetch_file(struct ReameshHandle *handle, const char *rel_path);
  * Number of peers currently in this session (for status display).
  */
 uint32_t reamesh_peer_count(struct ReameshHandle *handle);
+
+/**
+ * Everyone visibly in the session, self first, as a JSON array of
+ * `{"id","name","color","is_self","is_owner"}`. Names and colors come from
+ * the presence beacons peers broadcast; a peer without a profile has an
+ * empty name and a color derived from its peer id. Free the result with
+ * `reamesh_free_string`.
+ */
+char *reamesh_peers(struct ReameshHandle *handle);
+
+/**
+ * Set the process-wide display profile (name + color hex) included in this
+ * peer's presence beacons. Survives host/join/leave; usually set by the
+ * companion app through the control server rather than called directly.
+ */
+void reamesh_set_profile(const char *name, const char *color);
+
+/**
+ * Start the localhost control server the companion app connects to
+ * (idempotent). Returns the bound port, 0 if no port was available.
+ */
+uint16_t reamesh_ctl_start(void);
+
+/**
+ * Next command sent by a connected companion app, as a JSON string, or null
+ * when none is queued. The extension drains this on its timer tick and
+ * dispatches the commands itself (the server never acts on the session).
+ * Free non-null results with `reamesh_free_string`.
+ */
+char *reamesh_ctl_poll(void);
+
+/**
+ * Broadcast the extension's composed state JSON to every connected companion
+ * app (and replay it to apps that connect later).
+ */
+void reamesh_ctl_publish(const char *state_json);
 
 /**
  * Free a string returned by any reamesh_* function.

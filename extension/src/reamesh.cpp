@@ -1183,6 +1183,83 @@ static void registerApi(reaper_plugin_info_t* rec, bool add) {
   }
 }
 
+// ---------- companion app control server ----------
+//
+// The Rust lib runs a localhost WebSocket server (reamesh_ctl_*) that the
+// ReaMesh companion app connects to. The app's commands are queued there and
+// drained here, on the main thread, where it is safe to drive the same
+// host/join/leave paths the panel uses; in return we push one composed state
+// JSON (mode, session, peers with names/colors, announced sessions, activity
+// log) whenever it changes. The server itself never touches the session.
+
+static const char* modeName() {
+  switch (g_mode) {
+    case Mode::Hosting: return "hosting";
+    case Mode::Browsing: return "browsing";
+    case Mode::Downloading: return "downloading";
+    case Mode::ClientActive: return "client";
+    case Mode::Idle: break;
+  }
+  return "idle";
+}
+
+static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback) {
+  if (!g_handle) return fallback;
+  char* raw = fn(g_handle);
+  json parsed = json::parse(raw ? raw : "", nullptr, false);
+  reamesh_free_string(raw);
+  return parsed.is_discarded() ? fallback : parsed;
+}
+
+static void ctlDispatch(const json& cmd) {
+  const std::string c = jsonStr(cmd, "cmd");
+  if (c == "browse") {
+    startBrowse();
+  } else if (c == "host") {
+    onHost(jsonStr(cmd, "passphrase"));
+  } else if (c == "join") {
+    if (g_mode == Mode::Idle) startBrowse();
+    std::string name = jsonStr(cmd, "session_name");
+    joinSessionById(jsonStr(cmd, "session_id"), name.empty() ? "session" : name,
+                    jsonStr(cmd, "passphrase"));
+  } else if (c == "leave") {
+    onLeave();
+  }
+}
+
+static void ctlTick() {
+  for (;;) {
+    char* raw = reamesh_ctl_poll();
+    if (!raw) break;
+    json cmd = json::parse(raw, nullptr, false);
+    reamesh_free_string(raw);
+    if (cmd.is_object()) ctlDispatch(cmd);
+  }
+
+  json state;
+  state["type"] = "state";
+  state["mode"] = modeName();
+  state["project"] = fileStem(currentProjectPath());
+  state["error"] = g_lastError;
+  state["log"] = g_log;
+  json st = handleJson(reamesh_status, json::object());
+  state["state"] = jsonStr(st, "state");
+  state["progress"] =
+      (st.contains("progress") && st["progress"].is_number()) ? st["progress"].get<double>() : 0.0;
+  std::string session = jsonStr(st, "session_name");
+  if (session.empty() && !g_sessionProjectPath.empty()) session = fileStem(g_sessionProjectPath);
+  state["session"] = session;
+  state["sessions"] = handleJson(reamesh_sessions, json::array());
+  state["peers"] = handleJson(reamesh_peers, json::array());
+
+  static std::string lastPublished;
+  std::string out = state.dump();
+  if (out != lastPublished) {
+    lastPublished = out;
+    reamesh_ctl_publish(out.c_str());
+  }
+}
+
 // ---------- GUI script install ----------
 
 // Write the embedded ReaImGui panel script into the resource path and
@@ -1238,7 +1315,11 @@ static void pollDownload() {
 }
 
 static void timerTick() {
-  if (g_applyingRemote || !g_handle) return;
+  if (g_applyingRemote) return;
+  // Companion-app commands and state mirroring run in every mode, including
+  // Idle (the app may connect before any session exists).
+  ctlTick();
+  if (!g_handle) return;
 
   switch (g_mode) {
     case Mode::Idle:
@@ -1326,5 +1407,6 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
   rec->Register("timer", (void*)timerTick);
   registerApi(rec, true);
   g_guiScriptCmd = installGuiScript();
+  reamesh_ctl_start();
   return 1;
 }

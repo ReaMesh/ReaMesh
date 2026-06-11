@@ -25,6 +25,8 @@
 //! Deleted entities are tombstoned with `present: false`, never removed.
 //! Authority, proposals and reconciliation are per (section, id, field).
 
+mod ctl;
+
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::fs;
@@ -73,6 +75,11 @@ const SESSION_STALE: Duration = Duration::from_secs(10);
 // Session-topic message tags.
 const TAG_AUTHORITATIVE: u8 = b'A';
 const TAG_PROPOSAL: u8 = b'P';
+/// Presence beacon: `'N'` + JSON `{"name","color"}`, published by every
+/// session participant every ~1s so peers can show who is in the session.
+const TAG_PRESENCE: u8 = b'N';
+/// Presence entries not refreshed within this window are dropped.
+const PRESENCE_STALE: Duration = Duration::from_secs(8);
 
 type Fields = JsonMap<String, JsonValue>;
 type SectionState = HashMap<String, Fields>;
@@ -211,6 +218,58 @@ struct Shared {
     /// host time and on a client when it joins (derived from the salt in the
     /// announcement + the passphrase the user supplied).
     auth_token: Mutex<String>,
+    /// Latest presence beacon per peer id string (display name + color).
+    peers_info: Mutex<HashMap<String, PeerPresence>>,
+    /// Peer id string of the session owner (self when hosting).
+    owner_peer: Mutex<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PeerPresence {
+    name: String,
+    color: String,
+    last_seen: Instant,
+}
+
+/// Process-wide display profile (name, color hex), set by the companion app
+/// through the control server (or `reamesh_set_profile`). Global rather than
+/// per-session: it describes the user, not the session, and must survive
+/// host/join/leave cycles.
+static PROFILE: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+
+pub fn set_profile(name: &str, color: &str) {
+    let mut p = PROFILE.lock().unwrap();
+    p.0 = name.chars().take(64).collect();
+    p.1 = color.chars().take(16).collect();
+}
+
+/// Stable fallback identity color for a peer that never told us one: a
+/// saturated hue picked from the peer id, so every UI derives the same color
+/// for the same person without coordination.
+fn default_color(peer_id: &str) -> String {
+    let h = blake3::hash(peer_id.as_bytes());
+    let hue = (u16::from_le_bytes([h.as_bytes()[0], h.as_bytes()[1]]) % 360) as f64;
+    hsl_to_hex(hue, 0.62, 0.58)
+}
+
+fn hsl_to_hex(h: f64, s: f64, l: f64) -> String {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match h as u32 {
+        0..=59 => (c, x, 0.0),
+        60..=119 => (x, c, 0.0),
+        120..=179 => (0.0, c, x),
+        180..=239 => (0.0, x, c),
+        240..=299 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8
+    )
 }
 
 /// Token a peer must present to download from / propose to a session.
@@ -305,6 +364,7 @@ impl Reamesh {
         )?;
         *r.shared.serve_dir.lock().unwrap() = Some(dir);
         *r.shared.auth_token.lock().unwrap() = token;
+        *r.shared.owner_peer.lock().unwrap() = r.local_peer_id.clone();
         Ok(r)
     }
 
@@ -361,6 +421,8 @@ impl Reamesh {
             serve_dir: Mutex::new(None),
             session_peers: Mutex::new(Vec::new()),
             auth_token: Mutex::new(String::new()),
+            peers_info: Mutex::new(HashMap::new()),
+            owner_peer: Mutex::new(String::new()),
         });
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (init_tx, init_rx) = std_mpsc::channel();
@@ -641,6 +703,37 @@ impl Reamesh {
 
     pub fn local_peer_id(&self) -> &str {
         &self.local_peer_id
+    }
+
+    /// Everyone visibly in the session: self first, then the connected
+    /// session-topic peers, as a JSON array of
+    /// `{"id","name","color","is_self","is_owner"}`. Names/colors come from
+    /// presence beacons; a peer that never sent one gets an empty name (UIs
+    /// derive a placeholder from the id) and a color derived from its peer id.
+    pub fn peers_json(&self) -> String {
+        let owner = self.shared.owner_peer.lock().unwrap().clone();
+        let (my_name, my_color) = PROFILE.lock().unwrap().clone();
+        let entry = |id: &str, name: &str, color: &str, is_self: bool| {
+            json!({
+                "id": id,
+                "name": name,
+                "color": if color.is_empty() { default_color(id) } else { color.to_string() },
+                "is_self": is_self,
+                "is_owner": id == owner,
+            })
+        };
+        let mut arr = vec![entry(&self.local_peer_id, &my_name, &my_color, true)];
+        let mut infos = self.shared.peers_info.lock().unwrap();
+        let now = Instant::now();
+        infos.retain(|_, p| now.duration_since(p.last_seen) < PRESENCE_STALE);
+        for p in self.shared.session_peers.lock().unwrap().iter() {
+            let id = p.to_string();
+            match infos.get(&id) {
+                Some(info) => arr.push(entry(&id, &info.name, &info.color, false)),
+                None => arr.push(entry(&id, "", "", false)),
+            }
+        }
+        json!(arr).to_string()
     }
 
     /// Number of peers currently subscribed to this session's topic.
@@ -1330,6 +1423,7 @@ async fn run_network(
                     // both present it and can serve other peers later.
                     let token = auth_token(&info.salt, &passphrase);
                     *shared.auth_token.lock().unwrap() = token.clone();
+                    *shared.owner_peer.lock().unwrap() = info.owner.clone();
                     let t = session_topic(&session_id);
                     if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&t) {
                         eprintln!("[reamesh] subscribe to session topic failed: {e}");
@@ -1396,6 +1490,14 @@ async fn run_network(
                 // Owner: announce the session on the lobby every ~1s.
                 if let (Some(bytes), true) = (&announce, tick_count % 2 == 0) {
                     let _ = swarm.behaviour_mut().gossipsub.publish(lobby.clone(), bytes.clone());
+                }
+                // Everyone: presence beacon on the session topic every ~1s so
+                // peers can show who is here, by name and color.
+                if tick_count % 2 == 0 && let Some(t) = &sess_topic {
+                    let (name, color) = PROFILE.lock().unwrap().clone();
+                    let mut data = vec![TAG_PRESENCE];
+                    data.extend_from_slice(json!({"name": name, "color": color}).to_string().as_bytes());
+                    let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), data);
                 }
                 // Owner: full-state anti-entropy.
                 if need_full_sync && shared.topic_peers.load(Ordering::Relaxed) > 0 {
@@ -1545,6 +1647,24 @@ async fn run_network(
                         }
                     } else if sess_topic.as_ref().is_some_and(|st| message.topic == st.hash()) {
                         match (message.data.first(), cfg.role) {
+                            (Some(&TAG_PRESENCE), _) => {
+                                // Signed gossipsub messages carry the author.
+                                if let Some(src) = message.source
+                                    && let Ok(v) = serde_json::from_slice::<JsonValue>(&message.data[1..])
+                                {
+                                    let get = |k: &str| {
+                                        v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+                                    };
+                                    shared.peers_info.lock().unwrap().insert(
+                                        src.to_string(),
+                                        PeerPresence {
+                                            name: get("name"),
+                                            color: get("color"),
+                                            last_seen: Instant::now(),
+                                        },
+                                    );
+                                }
+                            }
                             (Some(&TAG_AUTHORITATIVE), Role::Client) => {
                                 shared.inbound.lock().unwrap().push(message.data[1..].to_vec());
                                 shared.dirty.store(true, Ordering::SeqCst);
@@ -2226,6 +2346,61 @@ pub extern "C" fn reamesh_peer_count(handle: *mut Reamesh) -> u32 {
     }
     let r = unsafe { &*handle };
     r.connected_peers() as u32
+}
+
+/// Everyone visibly in the session, self first, as a JSON array of
+/// `{"id","name","color","is_self","is_owner"}`. Names and colors come from
+/// the presence beacons peers broadcast; a peer without a profile has an
+/// empty name and a color derived from its peer id. Free the result with
+/// `reamesh_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_peers(handle: *mut Reamesh) -> *mut c_char {
+    let out = if handle.is_null() {
+        "[]".to_string()
+    } else {
+        let r = unsafe { &*handle };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.peers_json()))
+            .unwrap_or_else(|_| "[]".to_string())
+    };
+    into_c_string(out)
+}
+
+/// Set the process-wide display profile (name + color hex) included in this
+/// peer's presence beacons. Survives host/join/leave; usually set by the
+/// companion app through the control server rather than called directly.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_set_profile(name: *const c_char, color: *const c_char) {
+    set_profile(
+        &cstr_arg(name).unwrap_or_default(),
+        &cstr_arg(color).unwrap_or_default(),
+    );
+}
+
+/// Start the localhost control server the companion app connects to
+/// (idempotent). Returns the bound port, 0 if no port was available.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_ctl_start() -> u16 {
+    std::panic::catch_unwind(ctl::start).unwrap_or(0)
+}
+
+/// Next command sent by a connected companion app, as a JSON string, or null
+/// when none is queued. The extension drains this on its timer tick and
+/// dispatches the commands itself (the server never acts on the session).
+/// Free non-null results with `reamesh_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_ctl_poll() -> *mut c_char {
+    match std::panic::catch_unwind(ctl::poll).unwrap_or(None) {
+        Some(s) => into_c_string(s),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Broadcast the extension's composed state JSON to every connected companion
+/// app (and replay it to apps that connect later).
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_ctl_publish(state_json: *const c_char) {
+    let Some(s) = cstr_arg(state_json) else { return };
+    let _ = std::panic::catch_unwind(|| ctl::publish(&s));
 }
 
 /// Free a string returned by any reamesh_* function.
