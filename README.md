@@ -4,8 +4,8 @@ Work on a REAPER project together. ReaMesh shares project files and keeps edits
 in sync between computers on a local network. No account or server needed.
 
 One person hosts a project, the others join and get a local copy. Everyone can
-then edit tracks, arrange audio and MIDI, and work on effects. A panel inside
-REAPER or a desktop app handles hosting and joining.
+then edit tracks, arrange audio and MIDI, and work on effects. A desktop app
+handles sessions alongside REAPER.
 
 ## Getting started
 
@@ -14,19 +14,12 @@ ReaMesh runs on macOS. There are no packaged builds yet, so
 
 1. Copy `reaper_reamesh.dylib` into
    `~/Library/Application Support/REAPER/UserPlugins/` on each Mac.
-2. Restart REAPER. ReaMesh installs its panel script on startup.
-3. Open the ReaMesh app, which connects to REAPER automatically. You can also
-   run the action "ReaMesh: Open panel (GUI)" instead. The panel needs
-   ReaImGui, which you can install with [ReaPack](https://reapack.com).
-4. Save a project in its own folder, then host it. You can set a passphrase
-   first.
-5. On the other computer, join the session from the list. ReaMesh downloads the
-   project and opens it in REAPER.
-
-The app and the panel both show download progress, who's connected and an
-activity log, and stop hosting or leave the session. ReaMesh doesn't write to
-the REAPER console. The actions "ReaMesh: Host session" and "ReaMesh: Leave
-session" also work on their own, which is handy for keyboard shortcuts.
+2. Restart REAPER so it loads the extension.
+3. Open the ReaMesh app. It connects to REAPER automatically.
+4. Save a project in its own folder, then host it from the app. You can set a
+   passphrase when creating the session.
+5. On the other computer, join from the lobby. ReaMesh downloads the project and
+   opens it in REAPER.
 
 **Hosting shares the project folder**, including files that aren't used in the
 project. Dotfiles, `.rpp-bak` backups and `.reapeaks` caches are excluded.
@@ -130,9 +123,6 @@ round trip through the app's control connection. There are also
 - [`rust/`](rust/): networking, file transfers and shared state using libp2p,
   Tokio and yrs. The host coordinates edits.
 - [`app/`](app/): desktop companion built with Tauri 2, React and shadcn/ui.
-- [`scripts/`](scripts/): ReaImGui panel, embedded into the extension at build
-  time.
 
 The extension and Rust core communicate through a C ABI. The companion app
-talks to the extension over a localhost WebSocket, and the panel through the
-extension's ReaScript API.
+talks to the extension over a localhost WebSocket.

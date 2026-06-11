@@ -17,8 +17,9 @@
 // fetched from the session peers in the background; the item is applied as
 // soon as its files exist (deferred apply).
 //
-// The extension never writes to the REAPER console: status, errors and an
-// activity log are exposed to the ReaImGui panel through the ReaMesh_* API.
+// Send status, errors, and activity to the companion app through the local
+// control server instead of writing to the REAPER console. The app is the UI,
+// so the extension does not depend on ReaImGui or ReaPack.
 
 #define REAPERAPI_IMPLEMENT
 #define REAPERAPI_MINIMAL
@@ -41,8 +42,6 @@
 #define REAPERAPI_WANT_Main_SaveProject
 #define REAPERAPI_WANT_Main_openProject
 #define REAPERAPI_WANT_GetResourcePath
-#define REAPERAPI_WANT_AddRemoveReaScript
-#define REAPERAPI_WANT_Main_OnCommand
 #define REAPERAPI_WANT_GetSetObjectState
 #define REAPERAPI_WANT_FreeHeapPtr
 #define REAPERAPI_WANT_CountMediaItems
@@ -74,7 +73,6 @@
 #include "reaper_plugin_functions.h"
 
 #include "reamesh_ffi.h"
-#include "reamesh_gui_script.h"
 #include "json.hpp"
 
 #include <algorithm>
@@ -148,22 +146,19 @@ static Snapshot g_snapshot;               // last known state, by GUID
 static int g_lastChangeCount = -1;
 static bool g_applyingRemote = false;  // echo-suppression / reentrancy guard
 static unsigned g_lastPeerCount = 0;
-static std::string g_lastError;  // last session-ending message, shown by the GUI
-static int g_guiScriptCmd = 0;   // command id of the installed GUI ReaScript
+static std::string g_lastError;  // last session-ending message, shown by the app
 static std::vector<DeferredItem> g_deferredItems;
 static std::chrono::steady_clock::time_point g_lastCapture{};
 
-static int g_cmdHost = 0, g_cmdJoin = 0, g_cmdLeave = 0, g_cmdPanel = 0;
+// Two parameter-free convenience actions; the companion app is the real UI
+// and drives everything (browse/join/leave) over the control server instead.
+static int g_cmdHost = 0, g_cmdLeave = 0;
 static custom_action_register_t g_caHost = {
     0, "REAMESH_HOST", "ReaMesh: Host session (share current project on LAN)", nullptr};
-static custom_action_register_t g_caJoin = {
-    0, "REAMESH_JOIN", "ReaMesh: Join session (opens the panel)", nullptr};
 static custom_action_register_t g_caLeave = {
     0, "REAMESH_LEAVE", "ReaMesh: Leave session / stop hosting", nullptr};
-static custom_action_register_t g_caPanel = {
-    0, "REAMESH_PANEL", "ReaMesh: Open panel (GUI)", nullptr};
 
-// Activity log shown by the GUI panel (never the REAPER console).
+// Activity log streamed to the companion app (never the REAPER console).
 static std::deque<std::string> g_log;
 
 static void logLine(const std::string& s) {
@@ -1028,168 +1023,23 @@ static void onHost(const std::string& passphrase) {
 static void onLeave() {
   if (g_mode == Mode::Idle) return;
   leaveSession("left the session");
-  g_lastError.clear();  // user-initiated, nothing to flag in the GUI
+  g_lastError.clear();  // user-initiated, nothing to flag in the app
 }
 
-static void openPanel() {
-  if (g_guiScriptCmd) Main_OnCommand(g_guiScriptCmd, 0);
-}
-
-// ---------- ReaScript API (drives the ReaImGui panel) ----------
+// ---------- JSON helper ----------
 
 static std::string jsonStr(const json& j, const char* key) {
   auto it = j.find(key);
   return (it != j.end() && it->is_string()) ? it->get<std::string>() : "";
 }
 
-// Current state as key=value lines (trivial to parse from Lua, no JSON
-// library needed there).
-static const char* ReaMesh_GetStatus() {
-  static std::string buf;
-  const char* mode = "idle";
-  switch (g_mode) {
-    case Mode::Hosting: mode = "hosting"; break;
-    case Mode::Browsing: mode = "browsing"; break;
-    case Mode::Downloading: mode = "downloading"; break;
-    case Mode::ClientActive: mode = "client"; break;
-    case Mode::Idle: break;
-  }
-  std::string state, session, path;
-  double progress = 0.0;
-  unsigned peers = 0;
-  if (g_handle) {
-    char* raw = reamesh_status(g_handle);
-    json st = json::parse(raw ? raw : "{}", nullptr, false);
-    reamesh_free_string(raw);
-    if (st.is_object()) {
-      state = jsonStr(st, "state");
-      session = jsonStr(st, "session_name");
-      path = jsonStr(st, "project_path");
-      if (st.contains("progress") && st["progress"].is_number())
-        progress = st["progress"].get<double>();
-    }
-    peers = reamesh_peer_count(g_handle);
-  }
-  if (session.empty() && !g_sessionProjectPath.empty())
-    session = fileStem(g_sessionProjectPath);
-  buf = "mode=" + std::string(mode) + "\nstate=" + state + "\nsession=" + session +
-        "\nprogress=" + std::to_string(progress) + "\npeers=" + std::to_string(peers) +
-        "\npath=" + path + "\nerror=" + g_lastError;
-  return buf.c_str();
-}
-
-// Announced sessions, one per line: session_id \t session_name \t project_file
-static const char* ReaMesh_GetSessions() {
-  static std::string buf;
-  buf.clear();
-  if (g_handle) {
-    char* raw = reamesh_sessions(g_handle);
-    json sessions = json::parse(raw ? raw : "[]", nullptr, false);
-    reamesh_free_string(raw);
-    if (sessions.is_array()) {
-      for (const auto& s : sessions) {
-        bool auth = s.contains("auth") && s["auth"].is_boolean() && s["auth"].get<bool>();
-        buf += jsonStr(s, "session_id") + "\t" + jsonStr(s, "session_name") + "\t" +
-               jsonStr(s, "project_file") + "\t" + (auth ? "1" : "0") + "\n";
-      }
-    }
-  }
-  return buf.c_str();
-}
-
-// Recent activity, newest line last.
-static const char* ReaMesh_GetLog() {
-  static std::string buf;
-  buf.clear();
-  for (const std::string& line : g_log) {
-    buf += line;
-    buf += '\n';
-  }
-  return buf.c_str();
-}
-
-static bool ReaMesh_StartBrowse() { return startBrowse(); }
-
-static bool ReaMesh_Host(const char* passphrase) {
-  onHost(passphrase ? passphrase : "");
-  return g_mode == Mode::Hosting;
-}
-
-static bool ReaMesh_JoinSession(const char* session_id, const char* passphrase) {
-  if (!session_id || !*session_id) return false;
-  return joinSessionById(session_id, "session", passphrase ? passphrase : "");
-}
-
-static void ReaMesh_Leave() {
-  if (g_mode != Mode::Idle) {
-    leaveSession("left the session");
-    g_lastError.clear();
-  }
-}
-
-// ReaScript vararg shims (see "APIvararg_*" in reaper_plugin.h).
-static void* vararg_GetStatus(void**, int) { return (void*)ReaMesh_GetStatus(); }
-static void* vararg_GetSessions(void**, int) { return (void*)ReaMesh_GetSessions(); }
-static void* vararg_GetLog(void**, int) { return (void*)ReaMesh_GetLog(); }
-static void* vararg_StartBrowse(void**, int) { return (void*)(INT_PTR)ReaMesh_StartBrowse(); }
-static void* vararg_Host(void** arglist, int numparms) {
-  const char* pass = numparms > 0 ? (const char*)arglist[0] : nullptr;
-  return (void*)(INT_PTR)ReaMesh_Host(pass);
-}
-static void* vararg_JoinSession(void** arglist, int numparms) {
-  const char* sid = numparms > 0 ? (const char*)arglist[0] : nullptr;
-  const char* pass = numparms > 1 ? (const char*)arglist[1] : nullptr;
-  return (void*)(INT_PTR)ReaMesh_JoinSession(sid, pass);
-}
-static void* vararg_Leave(void**, int) { ReaMesh_Leave(); return nullptr; }
-
-struct ApiExport {
-  const char* name;
-  void* func;
-  void* vararg;
-  const char* def;  // four NUL-separated fields: ret \0 argtypes \0 argnames \0 help
-};
-static const ApiExport g_api[] = {
-    {"ReaMesh_GetStatus", (void*)ReaMesh_GetStatus, (void*)vararg_GetStatus,
-     "const char*\0\0\0Current ReaMesh state as key=value lines: mode (idle|browsing|downloading|hosting|client), state, session, progress (0..1), peers, path, error."},
-    {"ReaMesh_GetSessions", (void*)ReaMesh_GetSessions, (void*)vararg_GetSessions,
-     "const char*\0\0\0Sessions announced on the LAN, one per line: session_id TAB session_name TAB project_file TAB auth (1 if passphrase-protected, else 0). Requires browsing (see ReaMesh_StartBrowse)."},
-    {"ReaMesh_GetLog", (void*)ReaMesh_GetLog, (void*)vararg_GetLog,
-     "const char*\0\0\0Recent ReaMesh activity log, one event per line, newest last."},
-    {"ReaMesh_StartBrowse", (void*)ReaMesh_StartBrowse, (void*)vararg_StartBrowse,
-     "bool\0\0\0Start discovering ReaMesh sessions on the LAN. Idempotent while browsing."},
-    {"ReaMesh_Host", (void*)ReaMesh_Host, (void*)vararg_Host,
-     "bool\0const char*\0passphrase\0Host a ReaMesh session sharing the current project's folder. Pass a non-empty passphrase to require it of joiners (empty = open). Prompts to save first if the project is unsaved."},
-    {"ReaMesh_JoinSession", (void*)ReaMesh_JoinSession, (void*)vararg_JoinSession,
-     "bool\0const char*,const char*\0session_id,passphrase\0Join an announced ReaMesh session by id (see ReaMesh_GetSessions). Supply the passphrase if the session is protected (empty otherwise). Downloads the project, then opens it."},
-    {"ReaMesh_Leave", (void*)ReaMesh_Leave, (void*)vararg_Leave,
-     "void\0\0\0Leave the current ReaMesh session / stop hosting or browsing."},
-};
-
-static void registerApi(reaper_plugin_info_t* rec, bool add) {
-  // REAPER may keep the registration key pointer; the constructed names must
-  // outlive the call (deque: growth never relocates existing elements, which
-  // would invalidate c_str() of SSO strings).
-  static std::deque<std::string> keys;
-  const char* prefix = add ? "" : "-";
-  for (const ApiExport& a : g_api) {
-    for (const char* kind : {"API_", "APIvararg_", "APIdef_"}) {
-      keys.push_back(std::string(prefix) + kind + a.name);
-      void* value = !strcmp(kind, "API_")        ? a.func
-                    : !strcmp(kind, "APIvararg_") ? a.vararg
-                                                  : (void*)a.def;
-      rec->Register(keys.back().c_str(), value);
-    }
-  }
-}
-
 // ---------- companion app control server ----------
 //
 // The Rust lib runs a localhost WebSocket server (reamesh_ctl_*) that the
 // ReaMesh companion app connects to. The app's commands are queued there and
-// drained here, on the main thread, where it is safe to drive the same
-// host/join/leave paths the panel uses; in return we push one composed state
-// JSON (mode, session, peers with names/colors, announced sessions, activity
+// drained here, on the main thread, where it is safe to drive the
+// browse/host/join/leave paths; in return we push one composed state JSON
+// (mode, session, people with names/colors, announced sessions, activity
 // log) whenever it changes. The server itself never touches the session.
 
 static const char* modeName() {
@@ -1258,32 +1108,6 @@ static void ctlTick() {
     lastPublished = out;
     reamesh_ctl_publish(out.c_str());
   }
-}
-
-// ---------- GUI script install ----------
-
-// Write the embedded ReaImGui panel script into the resource path and
-// register it as an action. Returns the script's command id (0 on failure).
-static int installGuiScript() {
-  const fs::path dir = fs::path(GetResourcePath()) / "Scripts" / "ReaMesh";
-  const fs::path path = dir / "ReaMesh GUI.lua";
-
-  std::error_code ec;
-  fs::create_directories(dir, ec);
-  std::string existing;
-  {
-    std::ifstream in(path, std::ios::binary);
-    existing.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-  }
-  if (existing != kReameshGuiScript) {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    out << kReameshGuiScript;
-    if (!out) {
-      logLine("could not write " + path.string() + ": GUI unavailable");
-      return 0;
-    }
-  }
-  return AddRemoveReaScript(true, 0, path.string().c_str(), true);
 }
 
 // ---------- timer ----------
@@ -1358,9 +1182,7 @@ static void timerTick() {
 static bool dispatchCommand(int command) {
   if (command == 0) return false;
   if (command == g_cmdHost) { onHost(""); return true; }
-  if (command == g_cmdJoin) { openPanel(); return true; }
   if (command == g_cmdLeave) { onLeave(); return true; }
-  if (command == g_cmdPanel) { openPanel(); return true; }
   return false;
 }
 
@@ -1385,10 +1207,7 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
       g_rec->Register("-hookcommand", (void*)hookCommand);
       g_rec->Register("-hookcommand2", (void*)hookCommand2);
       g_rec->Register("-custom_action", &g_caHost);
-      g_rec->Register("-custom_action", &g_caJoin);
       g_rec->Register("-custom_action", &g_caLeave);
-      g_rec->Register("-custom_action", &g_caPanel);
-      registerApi(g_rec, false);
     }
     leaveSession("");
     g_rec = nullptr;
@@ -1399,14 +1218,10 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
 
   g_rec = rec;
   g_cmdHost = rec->Register("custom_action", &g_caHost);
-  g_cmdJoin = rec->Register("custom_action", &g_caJoin);
   g_cmdLeave = rec->Register("custom_action", &g_caLeave);
-  g_cmdPanel = rec->Register("custom_action", &g_caPanel);
   rec->Register("hookcommand", (void*)hookCommand);
   rec->Register("hookcommand2", (void*)hookCommand2);
   rec->Register("timer", (void*)timerTick);
-  registerApi(rec, true);
-  g_guiScriptCmd = installGuiScript();
   reamesh_ctl_start();
   return 1;
 }

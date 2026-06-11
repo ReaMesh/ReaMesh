@@ -18,15 +18,6 @@ endif()
 
 target_include_directories(reaper_reamesh PRIVATE include sdk)
 
-# Embed the ReaImGui GUI script so the extension can (re)install it into
-# <resource>/Scripts/ReaMesh/ when REAPER loads it.
-set(REAMESH_GUI_LUA_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/ReaMesh GUI.lua")
-file(READ "${REAMESH_GUI_LUA_FILE}" REAMESH_GUI_LUA)
-configure_file(src/reamesh_gui_script.h.in
-               "${CMAKE_CURRENT_BINARY_DIR}/generated/reamesh_gui_script.h" @ONLY)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${REAMESH_GUI_LUA_FILE}")
-target_include_directories(reaper_reamesh PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
-
 if(MSVC)
   # Compile source files and string literals as UTF-8.
   target_compile_options(reaper_reamesh PRIVATE /utf-8)
