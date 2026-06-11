@@ -20,9 +20,10 @@
 //! private Tokio runtime owned by `Reamesh`. The two sides meet only at
 //! thread-safe queues/flags and a mutex around the yrs document.
 //!
-//! Document model (unchanged from v1): one root `Map` named "tracks", keyed
-//! by REAPER track GUID; each value is a nested `Map` of scalar fields.
-//! Deleted tracks are tombstoned with `present: false`, never removed.
+//! Document model: root `Map`s named "tracks" and "items" (the *sections*),
+//! keyed by REAPER GUID; each value is a nested `Map` of scalar fields.
+//! Deleted entities are tombstoned with `present: false`, never removed.
+//! Authority, proposals and reconciliation are per (section, id, field).
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
@@ -47,6 +48,10 @@ use yrs::updates::decoder::Decode;
 use yrs::{Any, Doc, Map, MapRef, Out, ReadTxn, StateVector, Transact, Update};
 
 const TRACKS_ROOT: &str = "tracks";
+const ITEMS_ROOT: &str = "items";
+/// Root maps of the shared doc; every changeset is shaped
+/// `{ "<section>": { "<id>": { fields... } } }` with any subset of sections.
+const SECTIONS: [&str; 2] = [TRACKS_ROOT, ITEMS_ROOT];
 const LOBBY_TOPIC: &str = "reamesh/v2/lobby";
 const XFER_PROTOCOL: &str = "/reamesh/xfer/1";
 /// Max payload per file chunk over the transfer protocol.
@@ -63,8 +68,12 @@ const SESSION_STALE: Duration = Duration::from_secs(10);
 const TAG_AUTHORITATIVE: u8 = b'A';
 const TAG_PROPOSAL: u8 = b'P';
 
-type TrackFields = JsonMap<String, JsonValue>;
-type StateMap = HashMap<String, TrackFields>;
+type Fields = JsonMap<String, JsonValue>;
+type SectionState = HashMap<String, Fields>;
+/// section -> id -> fields
+type StateMap = HashMap<String, SectionState>;
+/// (section, id, field)
+type FieldKey = (String, String, String);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -85,6 +94,9 @@ struct FileMeta {
 enum XferRequest {
     Manifest,
     Chunk { file: u32, offset: u64 },
+    /// Mid-session fetch of a single project-relative file. Served by every
+    /// session peer (not just the owner) from its project copy.
+    File { path: String, offset: u64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,6 +108,12 @@ enum XferResponse {
         files: Vec<FileMeta>,
     },
     Chunk {
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    /// Response to `File`: total size lets the requester know when it is done.
+    FileChunk {
+        size: u64,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
@@ -147,10 +165,10 @@ struct DocState {
     /// previous drain_remote on a client). drain_remote diffs the doc against
     /// this, which is what keeps already-seen changes from echoing back out.
     last_state: StateMap,
-    /// Owner only: (guid, field) -> when the owner last edited it locally.
-    recent_edits: HashMap<(String, String), Instant>,
-    /// Client only: (guid, field) -> (proposed value, when proposed).
-    pending: HashMap<(String, String), (JsonValue, Instant)>,
+    /// Owner only: (section, id, field) -> when the owner last edited it.
+    recent_edits: HashMap<FieldKey, Instant>,
+    /// Client only: (section, id, field) -> (proposed value, when proposed).
+    pending: HashMap<FieldKey, (JsonValue, Instant)>,
 }
 
 struct Shared {
@@ -166,12 +184,19 @@ struct Shared {
     /// Sessions currently announced on the lobby (client side).
     sessions: Mutex<HashMap<String, SessionInfo>>,
     status: Mutex<StatusState>,
+    /// Directory this peer serves (and fetches) session files from: the
+    /// project dir on the owner, the downloaded copy on clients (set once the
+    /// initial transfer completes).
+    serve_dir: Mutex<Option<PathBuf>>,
+    /// Peer ids currently subscribed to the session topic (fetch candidates).
+    session_peers: Mutex<Vec<PeerId>>,
 }
 
 enum Command {
     PublishAuthoritative(Vec<u8>),
     PublishProposal(Vec<u8>),
     JoinSession(String),
+    FetchFile(String),
     Dial(Multiaddr),
     Shutdown,
 }
@@ -217,7 +242,7 @@ impl Reamesh {
         let hosting = Hosting {
             session_id: session_id.clone(),
             session_name: session_name.to_string(),
-            project_dir: dir,
+            project_dir: dir.clone(),
             project_file: project_file.to_string(),
             files,
         };
@@ -229,7 +254,7 @@ impl Reamesh {
             session_name: Some(session_name.to_string()),
             message: None,
         };
-        Self::start(
+        let r = Self::start(
             Role::Owner,
             NetConfig {
                 role: Role::Owner,
@@ -237,7 +262,9 @@ impl Reamesh {
                 staging_dir: None,
             },
             status,
-        )
+        )?;
+        *r.shared.serve_dir.lock().unwrap() = Some(dir);
+        Ok(r)
     }
 
     /// Start in browsing mode: listen for session announcements on the lobby.
@@ -273,7 +300,9 @@ impl Reamesh {
         let doc = Doc::new();
         // Root types must be registered before remote updates referencing
         // them are applied.
-        doc.get_or_insert_map(TRACKS_ROOT);
+        for section in SECTIONS {
+            doc.get_or_insert_map(section);
+        }
 
         let shared = Arc::new(Shared {
             doc: Mutex::new(DocState {
@@ -288,6 +317,8 @@ impl Reamesh {
             topic_peers: AtomicUsize::new(0),
             sessions: Mutex::new(HashMap::new()),
             status: Mutex::new(status),
+            serve_dir: Mutex::new(None),
+            session_peers: Mutex::new(Vec::new()),
         });
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (init_tx, init_rx) = std_mpsc::channel();
@@ -334,24 +365,33 @@ impl Reamesh {
                 return;
             }
         };
-        let Some(tracks) = parsed.get(TRACKS_ROOT).and_then(|t| t.as_object()) else {
+        if !SECTIONS
+            .iter()
+            .any(|s| parsed.get(s).and_then(|v| v.as_object()).is_some())
+        {
             return;
-        };
+        }
 
         match self.role {
             Role::Owner => {
                 let mut ds = self.shared.doc.lock().unwrap();
                 let now = Instant::now();
-                for (guid, fields) in tracks {
-                    if let Some(fields) = fields.as_object() {
-                        for key in fields.keys() {
-                            ds.recent_edits.insert((guid.clone(), key.clone()), now);
+                for section in SECTIONS {
+                    let Some(entities) = parsed.get(section).and_then(|t| t.as_object()) else {
+                        continue;
+                    };
+                    for (id, fields) in entities {
+                        if let Some(fields) = fields.as_object() {
+                            for key in fields.keys() {
+                                ds.recent_edits
+                                    .insert((section.into(), id.clone(), key.clone()), now);
+                            }
                         }
                     }
                 }
                 ds.recent_edits
                     .retain(|_, t| now.duration_since(*t) < OWNER_PRIORITY_TTL * 4);
-                let Some(update) = apply_changeset_to_doc(&mut ds, tracks) else {
+                let Some(update) = apply_changeset_to_doc(&mut ds, &parsed) else {
                     return;
                 };
                 // Re-baseline so this local change never re-surfaces from
@@ -363,13 +403,21 @@ impl Reamesh {
             Role::Client => {
                 let mut ds = self.shared.doc.lock().unwrap();
                 let now = Instant::now();
-                for (guid, fields) in tracks {
-                    if let Some(fields) = fields.as_object() {
-                        for (key, value) in fields {
-                            // Normalize through the same Any round-trip the
-                            // doc snapshot uses so confirmation compares hold.
-                            let norm = any_to_json(&json_to_any(value));
-                            ds.pending.insert((guid.clone(), key.clone()), (norm, now));
+                for section in SECTIONS {
+                    let Some(entities) = parsed.get(section).and_then(|t| t.as_object()) else {
+                        continue;
+                    };
+                    for (id, fields) in entities {
+                        if let Some(fields) = fields.as_object() {
+                            for (key, value) in fields {
+                                // Normalize through the same Any round-trip the
+                                // doc snapshot uses so confirmation compares hold.
+                                let norm = any_to_json(&json_to_any(value));
+                                ds.pending.insert(
+                                    (section.into(), id.clone(), key.clone()),
+                                    (norm, now),
+                                );
+                            }
                         }
                     }
                 }
@@ -413,11 +461,18 @@ impl Reamesh {
         // owner, so this is a no-op there).
         let now = Instant::now();
         let pending = &mut ds.pending;
-        pending.retain(|(guid, field), (proposed, when)| {
-            let doc_val = new_state.get(guid).and_then(|f| f.get(field));
+        pending.retain(|(section, id, field), (proposed, when)| {
+            let doc_val = new_state
+                .get(section)
+                .and_then(|s| s.get(id))
+                .and_then(|f| f.get(field));
             if doc_val == Some(proposed) {
                 // Confirmed by the owner; suppress the no-op echo.
-                if let Some(JsonValue::Object(m)) = diff.get_mut(guid) {
+                if let Some(m) = diff
+                    .get_mut(section.as_str())
+                    .and_then(|s| s.get_mut(id.as_str()))
+                    .and_then(|v| v.as_object_mut())
+                {
                     m.remove(field);
                 }
                 false
@@ -425,7 +480,11 @@ impl Reamesh {
                 // Never confirmed: the owner dropped it (or overrode it).
                 // Revert the host to the authoritative value.
                 if let Some(dv) = doc_val {
-                    diff.entry(guid.clone())
+                    diff.entry(section.clone())
+                        .or_insert_with(|| JsonValue::Object(JsonMap::new()))
+                        .as_object_mut()
+                        .unwrap()
+                        .entry(id.clone())
                         .or_insert_with(|| JsonValue::Object(JsonMap::new()))
                         .as_object_mut()
                         .unwrap()
@@ -434,19 +493,29 @@ impl Reamesh {
                 false
             } else {
                 // Still in flight: keep the optimistic local value for now.
-                if let Some(JsonValue::Object(m)) = diff.get_mut(guid) {
+                if let Some(m) = diff
+                    .get_mut(section.as_str())
+                    .and_then(|s| s.get_mut(id.as_str()))
+                    .and_then(|v| v.as_object_mut())
+                {
                     m.remove(field);
                 }
                 true
             }
         });
-        diff.retain(|_, v| v.as_object().is_none_or(|m| !m.is_empty()));
+        // Drop empty entities, then empty sections.
+        for (_, section) in diff.iter_mut() {
+            if let Some(s) = section.as_object_mut() {
+                s.retain(|_, v| v.as_object().is_none_or(|m| !m.is_empty()));
+            }
+        }
+        diff.retain(|_, s| s.as_object().is_none_or(|m| !m.is_empty()));
 
         ds.last_state = new_state;
         if diff.is_empty() {
             "[]".to_string()
         } else {
-            json!([{ TRACKS_ROOT: diff }]).to_string()
+            json!([diff]).to_string()
         }
     }
 
@@ -501,8 +570,27 @@ impl Reamesh {
     pub fn snapshot_json(&self) -> String {
         let ds = self.shared.doc.lock().unwrap();
         let state = snapshot(&ds.doc);
-        let ordered: std::collections::BTreeMap<&String, &TrackFields> = state.iter().collect();
-        json!({ TRACKS_ROOT: ordered }).to_string()
+        let mut out = JsonMap::new();
+        for section in SECTIONS {
+            let ordered: std::collections::BTreeMap<&String, &Fields> = state
+                .get(section)
+                .map(|s| s.iter().collect())
+                .unwrap_or_default();
+            out.insert(section.to_string(), json!(ordered));
+        }
+        JsonValue::Object(out).to_string()
+    }
+
+    /// Fetch a project-relative file from the session peers into this peer's
+    /// project copy (no-op if already present or already being fetched). The
+    /// file appears atomically: it exists on disk only once it is complete.
+    pub fn fetch_file(&self, rel_path: &str) -> bool {
+        if safe_relative_path(rel_path).is_none() {
+            return false;
+        }
+        self.cmd_tx
+            .send(Command::FetchFile(rel_path.to_string()))
+            .is_ok()
     }
 
     pub fn local_peer_id(&self) -> &str {
@@ -543,22 +631,28 @@ impl Drop for Reamesh {
     }
 }
 
-/// Apply a parsed changeset into the doc. Returns the encoded yrs update when
-/// something actually changed. Does NOT touch `last_state`; callers decide
-/// whether the change should surface from drain_remote.
-fn apply_changeset_to_doc(
-    ds: &mut DocState,
-    tracks: &JsonMap<String, JsonValue>,
-) -> Option<Vec<u8>> {
-    let tracks_root = ds.doc.get_or_insert_map(TRACKS_ROOT);
+/// Apply a parsed changeset (any subset of sections) into the doc. Returns
+/// the encoded yrs update when something actually changed. Does NOT touch
+/// `last_state`: callers decide whether the change should surface from
+/// drain_remote.
+fn apply_changeset_to_doc(ds: &mut DocState, changeset: &JsonValue) -> Option<Vec<u8>> {
+    let roots: Vec<(&str, MapRef)> = SECTIONS
+        .iter()
+        .map(|s| (*s, ds.doc.get_or_insert_map(*s)))
+        .collect();
     let mut txn = ds.doc.transact_mut();
     let mut changed = false;
-    for (guid, fields) in tracks {
-        let Some(fields) = fields.as_object() else { continue };
-        let track: MapRef = tracks_root.get_or_init(&mut txn, guid.as_str());
-        for (key, value) in fields {
-            if track.try_update(&mut txn, key.as_str(), json_to_any(value)) {
-                changed = true;
+    for (section, root) in roots {
+        let Some(entities) = changeset.get(section).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (id, fields) in entities {
+            let Some(fields) = fields.as_object() else { continue };
+            let entity: MapRef = root.get_or_init(&mut txn, id.as_str());
+            for (key, value) in fields {
+                if entity.try_update(&mut txn, key.as_str(), json_to_any(value)) {
+                    changed = true;
+                }
             }
         }
     }
@@ -579,6 +673,7 @@ fn new_session_id() -> String {
 }
 
 fn skip_in_manifest(name: &str) -> bool {
+    // Dotfiles also cover in-progress ".reamesh-part-*" fetch temp files.
     name.starts_with('.')
         || name.ends_with(".rpp-bak")
         || name.ends_with(".RPP-bak")
@@ -665,8 +760,10 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
         )
         .map_err(|e| anyhow::anyhow!("tcp transport: {e}"))?
         .with_behaviour(|key| {
+            // Item/FX-chain state chunks ride gossipsub; plugin state blobs
+            // (samplers etc.) can be tens of MB.
             let gs_config = gossipsub::ConfigBuilder::default()
-                .max_transmit_size(8 * 1024 * 1024)
+                .max_transmit_size(64 * 1024 * 1024)
                 .build()
                 .map_err(std::io::Error::other)?;
             let gossipsub = gossipsub::Behaviour::new(
@@ -767,18 +864,210 @@ impl Download {
     }
 }
 
+/// Mid-session fetch of one project-relative file from the session peers.
+/// Written to a hidden ".part" temp name and renamed when complete, so the
+/// destination path existing means the file is whole.
+struct Fetch {
+    rel: String,
+    candidates: Vec<PeerId>,
+    idx: usize,
+    tmp: PathBuf,
+    dest: PathBuf,
+    out: Option<fs::File>,
+    written: u64,
+    last_activity: Instant,
+    attempts: u32,
+}
+
+impl Fetch {
+    fn request(&self) -> XferRequest {
+        XferRequest::File {
+            path: self.rel.clone(),
+            offset: self.written,
+        }
+    }
+
+    fn peer(&self) -> Option<PeerId> {
+        self.candidates.get(self.idx).copied()
+    }
+}
+
+type FetchMap = HashMap<String, Fetch>;
+type FetchReqs = HashMap<request_response::OutboundRequestId, String>;
+
+fn fetch_send(
+    swarm: &mut Swarm<Behaviour>,
+    fetch_reqs: &mut FetchReqs,
+    fetch: &mut Fetch,
+) -> bool {
+    let Some(peer) = fetch.peer() else { return false };
+    fetch.last_activity = Instant::now();
+    let id = swarm.behaviour_mut().xfer.send_request(&peer, fetch.request());
+    fetch_reqs.insert(id, fetch.rel.clone());
+    true
+}
+
+fn start_fetch(
+    swarm: &mut Swarm<Behaviour>,
+    shared: &Shared,
+    fetches: &mut FetchMap,
+    fetch_reqs: &mut FetchReqs,
+    rel: String,
+) {
+    if fetches.contains_key(&rel) {
+        return;
+    }
+    let Some(dir) = shared.serve_dir.lock().unwrap().clone() else { return };
+    let Some(rel_path) = safe_relative_path(&rel) else { return };
+    let dest = dir.join(&rel_path);
+    if dest.exists() {
+        return;
+    }
+    let candidates = shared.session_peers.lock().unwrap().clone();
+    if candidates.is_empty() {
+        return; // the host re-requests on its tick once peers are around
+    }
+    let tmp = dest.with_file_name(format!(
+        ".reamesh-part-{}",
+        dest.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let mut fetch = Fetch {
+        rel,
+        candidates,
+        idx: 0,
+        tmp,
+        dest,
+        out: None,
+        written: 0,
+        last_activity: Instant::now(),
+        attempts: 0,
+    };
+    if fetch_send(swarm, fetch_reqs, &mut fetch) {
+        fetches.insert(fetch.rel.clone(), fetch);
+    }
+}
+
+/// Feed a response (or failure: `response = None`) for a fetch request id.
+fn handle_fetch_response(
+    swarm: &mut Swarm<Behaviour>,
+    fetches: &mut FetchMap,
+    fetch_reqs: &mut FetchReqs,
+    rel: &str,
+    response: Option<XferResponse>,
+) {
+    let Some(fetch) = fetches.get_mut(rel) else { return };
+
+    match response {
+        Some(XferResponse::FileChunk { size, data }) => {
+            fetch.attempts = 0;
+            let expected = CHUNK_SIZE.min(size.saturating_sub(fetch.written)) as usize;
+            if data.len() != expected {
+                return; // stale retry; the in-order request stays in flight
+            }
+            let mut write = || -> std::io::Result<bool> {
+                if fetch.out.is_none() {
+                    if let Some(parent) = fetch.tmp.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fetch.out = Some(fs::File::create(&fetch.tmp)?);
+                    fetch.written = 0;
+                }
+                fetch.out.as_mut().unwrap().write_all(&data)?;
+                fetch.written += data.len() as u64;
+                if fetch.written >= size {
+                    fetch.out = None; // close before rename
+                    fs::rename(&fetch.tmp, &fetch.dest)?;
+                    return Ok(true);
+                }
+                Ok(false)
+            };
+            match write() {
+                Ok(true) => {
+                    eprintln!("[reamesh] fetched {} ({size} bytes)", fetch.rel);
+                    fetches.remove(rel);
+                }
+                Ok(false) => {
+                    let mut fetch = fetches.remove(rel).unwrap();
+                    fetch_send(swarm, fetch_reqs, &mut fetch);
+                    fetches.insert(rel.to_string(), fetch);
+                }
+                Err(e) => {
+                    eprintln!("[reamesh] fetch {} failed: {e}", fetch.rel);
+                    let f = fetches.remove(rel);
+                    if let Some(f) = f {
+                        let _ = fs::remove_file(&f.tmp);
+                    }
+                }
+            }
+        }
+        _ => {
+            // Any other response (peer cannot serve the file) or an outright
+            // request failure (None): start over with the next candidate; out
+            // of candidates, give up: the host re-requests while the file is
+            // missing.
+            fetch.idx += 1;
+            fetch.out = None;
+            fetch.written = 0;
+            fetch.attempts = 0;
+            let _ = fs::remove_file(&fetch.tmp);
+            if fetch.peer().is_some() {
+                let mut fetch = fetches.remove(rel).unwrap();
+                fetch_send(swarm, fetch_reqs, &mut fetch);
+                fetches.insert(rel.to_string(), fetch);
+            } else {
+                fetches.remove(rel);
+            }
+        }
+    }
+}
+
 fn set_status(shared: &Shared, f: impl FnOnce(&mut StatusState)) {
     f(&mut shared.status.lock().unwrap());
 }
 
-/// Owner-side handler for transfer requests.
-fn serve_xfer(hosting: Option<&Hosting>, req: &XferRequest) -> XferResponse {
+/// Handler for transfer requests. `Manifest`/`Chunk` (the initial project
+/// download) are served by the owner only; `File` (mid-session media fetch)
+/// is served by every peer that has a project copy.
+fn serve_xfer(
+    hosting: Option<&Hosting>,
+    serve_dir: Option<&Path>,
+    req: &XferRequest,
+) -> XferResponse {
+    if let XferRequest::File { path, offset } = req {
+        let Some(dir) = serve_dir else {
+            return XferResponse::Error {
+                message: "no project copy to serve from".into(),
+            };
+        };
+        let Some(rel) = safe_relative_path(path) else {
+            return XferResponse::Error {
+                message: format!("unsafe path: {path}"),
+            };
+        };
+        let full = dir.join(rel);
+        let read = || -> std::io::Result<(u64, Vec<u8>)> {
+            let mut f = fs::File::open(&full)?;
+            let size = f.metadata()?.len();
+            f.seek(SeekFrom::Start(*offset))?;
+            let want = CHUNK_SIZE.min(size.saturating_sub(*offset)) as usize;
+            let mut buf = vec![0u8; want];
+            f.read_exact(&mut buf)?;
+            Ok((size, buf))
+        };
+        return match read() {
+            Ok((size, data)) => XferResponse::FileChunk { size, data },
+            Err(e) => XferResponse::Error {
+                message: format!("read {path}: {e}"),
+            },
+        };
+    }
     let Some(h) = hosting else {
         return XferResponse::Error {
             message: "not hosting".into(),
         };
     };
     match req {
+        XferRequest::File { .. } => unreachable!("handled above"),
         XferRequest::Manifest => XferResponse::Manifest {
             session_id: h.session_id.clone(),
             session_name: h.session_name.clone(),
@@ -814,33 +1103,41 @@ fn serve_xfer(hosting: Option<&Hosting>, req: &XferRequest) -> XferResponse {
 /// to re-broadcast.
 fn admit_proposal(shared: &Shared, payload: &[u8]) -> Option<Vec<u8>> {
     let parsed: JsonValue = serde_json::from_slice(payload).ok()?;
-    let tracks = parsed.get(TRACKS_ROOT)?.as_object()?;
 
     let mut ds = shared.doc.lock().unwrap();
     let now = Instant::now();
     let mut admitted = JsonMap::new();
-    for (guid, fields) in tracks {
-        let Some(fields) = fields.as_object() else { continue };
-        let mut keep = TrackFields::new();
-        for (key, value) in fields {
-            let owner_recent = ds
-                .recent_edits
-                .get(&(guid.clone(), key.clone()))
-                .is_some_and(|t| now.duration_since(*t) < OWNER_PRIORITY_TTL);
-            if owner_recent {
-                eprintln!("[reamesh] proposal for {guid}.{key} dropped (owner priority)");
-            } else {
-                keep.insert(key.clone(), value.clone());
+    for section in SECTIONS {
+        let Some(entities) = parsed.get(section).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        let mut sec_out = JsonMap::new();
+        for (id, fields) in entities {
+            let Some(fields) = fields.as_object() else { continue };
+            let mut keep = Fields::new();
+            for (key, value) in fields {
+                let owner_recent = ds
+                    .recent_edits
+                    .get(&(section.into(), id.clone(), key.clone()))
+                    .is_some_and(|t| now.duration_since(*t) < OWNER_PRIORITY_TTL);
+                if owner_recent {
+                    eprintln!("[reamesh] proposal for {section}/{id}.{key} dropped (owner priority)");
+                } else {
+                    keep.insert(key.clone(), value.clone());
+                }
+            }
+            if !keep.is_empty() {
+                sec_out.insert(id.clone(), JsonValue::Object(keep));
             }
         }
-        if !keep.is_empty() {
-            admitted.insert(guid.clone(), JsonValue::Object(keep));
+        if !sec_out.is_empty() {
+            admitted.insert(section.to_string(), JsonValue::Object(sec_out));
         }
     }
     if admitted.is_empty() {
         return None;
     }
-    let update = apply_changeset_to_doc(&mut ds, &admitted)?;
+    let update = apply_changeset_to_doc(&mut ds, &JsonValue::Object(admitted))?;
     // Deliberately no last_state re-baseline: the admitted change must
     // surface from the owner's next drain_remote so its REAPER applies it.
     shared.dirty.store(true, Ordering::SeqCst);
@@ -883,6 +1180,12 @@ async fn run_network(
     });
 
     let mut download: Option<Download> = None;
+    // Mid-session file fetches, keyed by project-relative path, plus the
+    // outstanding request ids that belong to them (request-response gives us
+    // back the id, which is how fetch responses are told apart from the
+    // initial project download).
+    let mut fetches: FetchMap = HashMap::new();
+    let mut fetch_reqs: FetchReqs = HashMap::new();
 
     // Anti-entropy (owner): whenever a peer (re)appears on the session topic,
     // or a publish fails because nobody was listening, we owe the network a
@@ -971,6 +1274,9 @@ async fn run_network(
                         attempts: 0,
                     });
                 }
+                Some(Command::FetchFile(rel)) => {
+                    start_fetch(&mut swarm, &shared, &mut fetches, &mut fetch_reqs, rel);
+                }
                 Some(Command::Dial(addr)) => {
                     if let Err(e) = swarm.dial(addr) {
                         eprintln!("[reamesh] dial failed: {e}");
@@ -985,10 +1291,12 @@ async fn run_network(
                 // topic ourselves.)
                 if let Some(t) = &sess_topic {
                     let hash = t.hash();
-                    let count = swarm.behaviour().gossipsub.all_peers()
+                    let peers: Vec<PeerId> = swarm.behaviour().gossipsub.all_peers()
                         .filter(|(_, topics)| topics.iter().any(|th| **th == hash))
-                        .count();
-                    shared.topic_peers.store(count, Ordering::Relaxed);
+                        .map(|(p, _)| *p)
+                        .collect();
+                    shared.topic_peers.store(peers.len(), Ordering::Relaxed);
+                    *shared.session_peers.lock().unwrap() = peers;
                 }
                 // Owner: announce the session on the lobby every ~1s.
                 if let (Some(bytes), true) = (&announce, tick_count % 2 == 0) {
@@ -1020,6 +1328,32 @@ async fn run_network(
                             }
                         }
                     }
+                }
+                // Nudge stalled mid-session file fetches.
+                let stalled: Vec<String> = fetches
+                    .values()
+                    .filter(|f| f.last_activity.elapsed() > Duration::from_secs(3))
+                    .map(|f| f.rel.clone())
+                    .collect();
+                for rel in stalled {
+                    let mut fetch = fetches.remove(&rel).unwrap();
+                    fetch.attempts += 1;
+                    if fetch.attempts > 5 {
+                        // Restart on the next candidate from scratch.
+                        fetch.idx += 1;
+                        fetch.out = None;
+                        fetch.written = 0;
+                        fetch.attempts = 0;
+                        let _ = fs::remove_file(&fetch.tmp);
+                    }
+                    if fetch.peer().is_some() && fetch_send(&mut swarm, &mut fetch_reqs, &mut fetch) {
+                        fetches.insert(rel, fetch);
+                    } else {
+                        let _ = fs::remove_file(&fetch.tmp);
+                    }
+                }
+                if fetch_reqs.len() > 1024 {
+                    fetch_reqs.retain(|_, rel| fetches.contains_key(rel));
                 }
                 // Client: nudge a stalled download (lost request, dropped
                 // connection mid-transfer, ...).
@@ -1151,20 +1485,27 @@ async fn run_network(
                 SwarmEvent::Behaviour(BehaviourEvent::Xfer(request_response::Event::Message { peer, message, .. })) => {
                     match message {
                         request_response::Message::Request { request, channel, .. } => {
-                            let resp = serve_xfer(hosting.as_ref(), &request);
+                            let serve_dir = shared.serve_dir.lock().unwrap().clone();
+                            let resp = serve_xfer(hosting.as_ref(), serve_dir.as_deref(), &request);
                             let _ = swarm.behaviour_mut().xfer.send_response(channel, resp);
                         }
-                        request_response::Message::Response { response, .. } => {
-                            handle_xfer_response(&mut swarm, &shared, &mut download, peer, response);
+                        request_response::Message::Response { request_id, response } => {
+                            if let Some(rel) = fetch_reqs.remove(&request_id) {
+                                handle_fetch_response(&mut swarm, &mut fetches, &mut fetch_reqs, &rel, Some(response));
+                            } else {
+                                handle_xfer_response(&mut swarm, &shared, &mut download, peer, response);
+                            }
                         }
                     }
                 }
-                SwarmEvent::Behaviour(BehaviourEvent::Xfer(request_response::Event::OutboundFailure { peer, error, .. })) => {
+                SwarmEvent::Behaviour(BehaviourEvent::Xfer(request_response::Event::OutboundFailure { peer, error, request_id, .. })) => {
                     eprintln!("[reamesh] transfer request to {peer} failed: {error}");
-                    // The tick-driven stall handler retries; just age the
-                    // activity timestamp so it kicks in soon.
-                    if let Some(dl) = &mut download
+                    if let Some(rel) = fetch_reqs.remove(&request_id) {
+                        handle_fetch_response(&mut swarm, &mut fetches, &mut fetch_reqs, &rel, None);
+                    } else if let Some(dl) = &mut download
                         && dl.owner == peer {
+                        // The tick-driven stall handler retries; just age the
+                        // activity timestamp so it kicks in soon.
                         dl.last_activity = Instant::now() - Duration::from_secs(10);
                     }
                 }
@@ -1252,6 +1593,8 @@ fn handle_xfer_response(
         XferResponse::Error { message } => {
             fail(download, shared, format!("owner reported: {message}"));
         }
+        // Fetch responses are routed by request id before reaching here.
+        XferResponse::FileChunk { .. } => {}
     }
 }
 
@@ -1270,6 +1613,8 @@ fn step_download(swarm: &mut Swarm<Behaviour>, shared: &Shared, download: &mut O
         Ok(true) => {
             let path = dl.dir.join(&dl.project_file);
             eprintln!("[reamesh] download complete: {}", path.display());
+            // This copy is now what we serve to (and fetch from) other peers.
+            *shared.serve_dir.lock().unwrap() = Some(dl.dir.clone());
             set_status(shared, |s| {
                 s.state = "ready".into();
                 s.progress = 1.0;
@@ -1314,48 +1659,65 @@ fn loopback_variant(
 /// Read the full doc into plain JSON, normalizing all numbers to f64 so that
 /// snapshot comparisons never flap on int-vs-float representation.
 fn snapshot(doc: &Doc) -> StateMap {
-    let tracks = doc.get_or_insert_map(TRACKS_ROOT);
+    let roots: Vec<(&str, MapRef)> = SECTIONS
+        .iter()
+        .map(|s| (*s, doc.get_or_insert_map(*s)))
+        .collect();
     let txn = doc.transact();
     let mut out = StateMap::new();
-    for (guid, value) in tracks.iter(&txn) {
-        if let Out::YMap(track) = value {
-            let mut fields = TrackFields::new();
-            for (key, v) in track.iter(&txn) {
-                if let Out::Any(any) = v {
-                    fields.insert(key.to_string(), any_to_json(&any));
+    for (section, root) in roots {
+        let entities = out.entry(section.to_string()).or_default();
+        for (id, value) in root.iter(&txn) {
+            if let Out::YMap(entity) = value {
+                let mut fields = Fields::new();
+                for (key, v) in entity.iter(&txn) {
+                    if let Out::Any(any) = v {
+                        fields.insert(key.to_string(), any_to_json(&any));
+                    }
                 }
+                entities.insert(id.to_string(), fields);
             }
-            out.insert(guid.to_string(), fields);
         }
     }
     out
 }
 
+/// Diff two doc snapshots into changeset shape: `{section: {id: {changed
+/// fields}}}`, omitting empty sections.
 fn diff_states(old: &StateMap, new: &StateMap) -> JsonMap<String, JsonValue> {
+    let empty = SectionState::new();
     let mut out = JsonMap::new();
-    for (guid, new_fields) in new {
-        match old.get(guid) {
-            None => {
-                out.insert(guid.clone(), JsonValue::Object(new_fields.clone()));
-            }
-            Some(old_fields) => {
-                let mut changed = TrackFields::new();
-                for (key, value) in new_fields {
-                    if old_fields.get(key) != Some(value) {
-                        changed.insert(key.clone(), value.clone());
-                    }
+    for section in SECTIONS {
+        let old_s = old.get(section).unwrap_or(&empty);
+        let new_s = new.get(section).unwrap_or(&empty);
+        let mut sec_out = JsonMap::new();
+        for (id, new_fields) in new_s {
+            match old_s.get(id) {
+                None => {
+                    sec_out.insert(id.clone(), JsonValue::Object(new_fields.clone()));
                 }
-                if !changed.is_empty() {
-                    out.insert(guid.clone(), JsonValue::Object(changed));
+                Some(old_fields) => {
+                    let mut changed = Fields::new();
+                    for (key, value) in new_fields {
+                        if old_fields.get(key) != Some(value) {
+                            changed.insert(key.clone(), value.clone());
+                        }
+                    }
+                    if !changed.is_empty() {
+                        sec_out.insert(id.clone(), JsonValue::Object(changed));
+                    }
                 }
             }
         }
-    }
-    // Tracks are tombstoned (present:false), not removed, so this branch is
-    // defensive only.
-    for guid in old.keys() {
-        if !new.contains_key(guid) {
-            out.insert(guid.clone(), json!({ "present": false }));
+        // Entities are tombstoned (present:false), not removed, so this
+        // branch is defensive only.
+        for id in old_s.keys() {
+            if !new_s.contains_key(id) {
+                sec_out.insert(id.clone(), json!({ "present": false }));
+            }
+        }
+        if !sec_out.is_empty() {
+            out.insert(section.to_string(), JsonValue::Object(sec_out));
         }
     }
     out
@@ -1512,6 +1874,19 @@ pub extern "C" fn reamesh_drain_remote(handle: *mut Reamesh) -> *mut c_char {
             .unwrap_or_else(|_| "[]".to_string())
     };
     into_c_string(out)
+}
+
+/// Request a project-relative file ('/'-separated) from the session peers.
+/// Non-blocking and idempotent: safe to call every tick while the file is
+/// missing. The file appears at its final path only once fully transferred,
+/// so "the path exists" is the completion signal.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_fetch_file(handle: *mut Reamesh, rel_path: *const c_char) -> bool {
+    let (false, Some(rel)) = (handle.is_null(), cstr_arg(rel_path)) else {
+        return false;
+    };
+    let r = unsafe { &*handle };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.fetch_file(&rel))).unwrap_or(false)
 }
 
 /// Number of peers currently in this session (for status display).

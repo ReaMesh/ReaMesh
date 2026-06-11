@@ -74,7 +74,7 @@ local function draw_browser(st)
     reaper.ReaMesh_Host()
   end
   ImGui.TextWrapped(ctx, 'Shares every file in the project folder with people who join. '
-    .. 'Save with "Copy all media into project directory" so media travels too.')
+    .. 'Media outside the project folder is copied in automatically.')
 end
 
 local function draw_downloading(st)
@@ -110,6 +110,26 @@ local function draw_session(st)
   end
 end
 
+local function draw_log()
+  ImGui.Spacing(ctx)
+  if not ImGui.CollapsingHeader(ctx, 'Activity') then return end
+  local log = reaper.ReaMesh_GetLog()
+  if log == '' then
+    ImGui.TextDisabled(ctx, 'nothing yet')
+    return
+  end
+  if ImGui.BeginChild(ctx, 'activity_log', 0, 120) then
+    for line in log:gmatch('[^\n]+') do
+      ImGui.TextWrapped(ctx, line)
+    end
+    -- Keep the newest entry in view.
+    if ImGui.GetScrollY(ctx) >= ImGui.GetScrollMaxY(ctx) - 1 then
+      ImGui.SetScrollHereY(ctx, 1.0)
+    end
+    ImGui.EndChild(ctx)
+  end
+end
+
 local function draw()
   local st = get_status()
   if st.error and st.error ~= '' then
@@ -124,6 +144,7 @@ local function draw()
   elseif st.mode == 'hosting' or st.mode == 'client' then
     draw_session(st)
   end
+  draw_log()
 end
 
 local function loop()

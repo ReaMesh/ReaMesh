@@ -68,6 +68,14 @@ void reamesh_push_local(struct ReameshHandle *handle, const char *changeset_json
 char *reamesh_drain_remote(struct ReameshHandle *handle);
 
 /**
+ * Request a project-relative file ('/'-separated) from the session peers.
+ * Non-blocking and idempotent: safe to call every tick while the file is
+ * missing. The file appears at its final path only once fully transferred,
+ * so "the path exists" is the completion signal.
+ */
+bool reamesh_fetch_file(struct ReameshHandle *handle, const char *rel_path);
+
+/**
  * Number of peers currently in this session (for status display).
  */
 uint32_t reamesh_peer_count(struct ReameshHandle *handle);

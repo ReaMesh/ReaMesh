@@ -281,6 +281,108 @@ fn owner_wins_live_conflict() {
 }
 
 #[test]
+fn items_section_propagates_and_client_items_propose() {
+    let project = temp_dir("proj-items");
+    let staging = temp_dir("staging-items");
+    make_project(&project);
+    let (owner, client) = establish("items-test", &project, &staging);
+
+    // Owner creates an item (chunk-shaped payload, as the extension sends).
+    owner.push_local(
+        r#"{"items":{"{I1}":{"present":true,"track":"{T1}","chunk":"<ITEM\nPOSITION 1.0\n>"}}}"#,
+    );
+    let drained_has = |state: &serde_json::Map<String, Value>, id: &str| {
+        state.contains_key(id)
+    };
+    let mut client_items = serde_json::Map::new();
+    let arrived = wait_until(Duration::from_secs(10), || {
+        let drained: Value = serde_json::from_str(&client.drain_remote()).unwrap();
+        for cs in drained.as_array().unwrap() {
+            if let Some(items) = cs.get("items").and_then(|v| v.as_object()) {
+                for (id, fields) in items {
+                    client_items.insert(id.clone(), fields.clone());
+                }
+            }
+        }
+        drained_has(&client_items, "{I1}")
+    });
+    assert!(arrived, "owner item never reached the client");
+    assert_eq!(client_items["{I1}"]["track"], "{T1}");
+
+    // Client proposes an item move after the creation lock expires.
+    std::thread::sleep(Duration::from_millis(3200));
+    client.push_local(r#"{"items":{"{I1}":{"chunk":"<ITEM\nPOSITION 2.0\n>"}}}"#);
+    let on_owner = wait_until(Duration::from_secs(10), || {
+        let v: Value = serde_json::from_str(&owner.snapshot_json()).unwrap();
+        v["items"]["{I1}"]["chunk"]
+            .as_str()
+            .is_some_and(|c| c.contains("POSITION 2.0"))
+    });
+    assert!(on_owner, "client item proposal never admitted by the owner");
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
+fn mid_session_media_fetch() {
+    let project = temp_dir("proj-fetch");
+    let staging = temp_dir("staging-fetch");
+    make_project(&project);
+    let (owner, client) = establish("fetch-test", &project, &staging);
+
+    let client_dir = {
+        let status: Value = serde_json::from_str(&client.status_json()).unwrap();
+        PathBuf::from(status["project_path"].as_str().unwrap())
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    };
+
+    // New media appears on the owner *after* the initial transfer (recorded /
+    // imported mid-session). Multi-chunk to exercise chunked fetch.
+    let snare: Vec<u8> = (0..KICK_SIZE).map(|i| (i % 241) as u8).collect();
+    fs::write(project.join("Audio/snare.wav"), &snare).unwrap();
+
+    // The client notices an item referencing it and fetches; idempotent calls
+    // while missing must be safe.
+    assert!(client.fetch_file("Audio/snare.wav"));
+    let fetched = wait_until(Duration::from_secs(20), || {
+        client.fetch_file("Audio/snare.wav");
+        client_dir.join("Audio/snare.wav").exists()
+    });
+    assert!(fetched, "mid-session fetch never completed");
+    assert_eq!(
+        fs::read(client_dir.join("Audio/snare.wav")).unwrap(),
+        snare,
+        "fetched file corrupted"
+    );
+
+    // And the reverse direction: the client "records" a file, the owner
+    // fetches it from the client.
+    let vox: Vec<u8> = (0..123_456).map(|i| (i % 13) as u8).collect();
+    fs::create_dir_all(client_dir.join("Audio")).unwrap();
+    fs::write(client_dir.join("Audio/vox.wav"), &vox).unwrap();
+    let fetched_back = wait_until(Duration::from_secs(20), || {
+        owner.fetch_file("Audio/vox.wav");
+        project.join("Audio/vox.wav").exists()
+    });
+    assert!(fetched_back, "owner never fetched the client's file");
+    assert_eq!(fs::read(project.join("Audio/vox.wav")).unwrap(), vox);
+
+    // Path traversal is refused outright.
+    assert!(!client.fetch_file("../escape.wav"));
+    assert!(!client.fetch_file("/abs/path.wav"));
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
 fn track_delete_propagates_as_tombstone() {
     let project = temp_dir("proj-delete");
     let staging = temp_dir("staging-delete");

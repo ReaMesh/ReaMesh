@@ -153,9 +153,34 @@ int main() {
     return 1;
   }
 
+  printf("owner pushes a media item...\n");
+  reamesh_push_local(owner,
+      "{\"items\":{\"{SMOKE-I1}\":{\"present\":true,\"track\":\"{SMOKE-1}\","
+      "\"chunk\":\"<ITEM\\nPOSITION 2.5\\n>\"}}}");
+  if (!drainUntil(client, "POSITION 2.5", 10)) {
+    fprintf(stderr, "FAIL: client never drained the owner's item\n");
+    return 1;
+  }
+
+  printf("client fetches media that appeared mid-session...\n");
+  {
+    std::ofstream wav(proj / "Audio" / "snare.wav", std::ios::binary);
+    for (int i = 0; i < 300000; ++i) wav.put((char)(i % 241));
+  }
+  const fs::path clientSnare = fs::path(projectPath).parent_path() / "Audio" / "snare.wav";
+  deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (std::chrono::steady_clock::now() < deadline && !fs::exists(clientSnare)) {
+    reamesh_fetch_file(client, "Audio/snare.wav");
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+  if (!fs::exists(clientSnare) || fs::file_size(clientSnare) != 300000) {
+    fprintf(stderr, "FAIL: mid-session media fetch never completed\n");
+    return 1;
+  }
+
   reamesh_shutdown(client);
   reamesh_shutdown(owner);
   fs::remove_all(base);
-  printf("OK: discovery, file transfer, authoritative + proposal round trips, no echo\n");
+  printf("OK: discovery, file transfer, track + item round trips, media fetch, no echo\n");
   return 0;
 }

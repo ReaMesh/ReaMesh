@@ -4,8 +4,8 @@ Work on a REAPER project together. ReaMesh shares project files and keeps edits
 in sync between computers on a local network. No account or server needed.
 
 One person hosts a project, the others join and get a local copy. Everyone can
-then add, remove and reorder tracks and change their basic settings. A panel
-inside REAPER handles hosting and joining.
+then edit tracks, arrange audio and MIDI, and work on effects. A panel inside
+REAPER handles hosting and joining.
 
 ## Getting started
 
@@ -21,15 +21,14 @@ ReaMesh runs on macOS. The panel needs ReaImGui, which you can install with
 4. On the other computer, open the panel and join the session from the list.
    ReaMesh downloads the project and opens it in REAPER.
 
-The panel shows download progress and how many people are connected, and stops
-hosting or leaves the session. Without ReaImGui, the actions "ReaMesh: Host
-session", "ReaMesh: Join session" and "ReaMesh: Leave session" still work and
-report to the REAPER console.
+The panel shows download progress, how many people are connected and an
+activity log, and stops hosting or leaves the session. ReaMesh doesn't write to
+the REAPER console. The actions "ReaMesh: Host session" and "ReaMesh: Leave
+session" also work without the panel, which is handy for keyboard shortcuts.
 
 **Hosting shares the project folder**, including files that aren't used in the
 project. Dotfiles, `.rpp-bak` backups and `.reapeaks` caches are excluded.
-Media outside the folder isn't shared, so save with "Copy all media into project
-directory" before hosting.
+Referenced media outside the folder is copied into it for sharing.
 
 Sessions are discovered automatically on the LAN. ReaMesh has no relay or NAT
 traversal, so everyone needs to be on the same local network.
@@ -39,17 +38,20 @@ traversal, so everyone needs to be on the same local network.
 | Part of the project | Shared edits |
 | --- | --- |
 | Tracks | Add, remove, reorder, names, volume, pan, mute and solo |
+| Audio and MIDI items | Move, split, trim, fades, takes, take FX and MIDI content |
+| Effects and automation | Track FX, plugin state and track envelopes |
+| Media files | New recordings and imported files transfer in the background |
 
-Everything else arrives with the initial download but isn't synced afterwards.
-That includes media items, effects, automation, tempo and markers. Media added
-during a session doesn't transfer, and master-track state isn't synced.
+Selection, open FX windows and window layout stay local. The tempo map,
+markers, regions and master-track state aren't synced.
 
 ## Working together
 
 The host has priority. If the host and a guest change the same field within
 about three seconds of each other, the host's change wins and the guest's snaps
 back. A guest's change that the host doesn't confirm in that time also snaps
-back.
+back. Whole items, FX chains and sets of track envelopes each count as one
+field, so working on different tracks or items avoids conflicts.
 
 Remote edits don't create undo points. Undoing an earlier local action can still
 roll back received changes because REAPER uses snapshots for undo. That rollback
@@ -93,7 +95,8 @@ cargo test --manifest-path rust/Cargo.toml
 ```
 
 The Rust tests run a host and a guest in one process over real sockets. There
-are also [C ABI smoke tests](tools/ffi_smoke.cpp).
+are also [C ABI smoke tests](tools/ffi_smoke.cpp) and
+[state-chunk tests](tools/chunk_test.cpp).
 
 ## Code layout
 

@@ -2,20 +2,23 @@
 //
 // Everything in this file runs on REAPER's main thread, driven by the
 // registered timer and action hooks. The Rust library (reamesh_ffi.h) owns
-// all networking, the CRDT doc and the project-file transfer on its own
+// all networking, the CRDT doc and project-file transfers on its own
 // background threads; we only exchange JSON strings with it and never block
 // on the network.
 //
-// v2 session model (owner-authoritative):
-//   "ReaMesh: Host session":   share the saved project (files included) on
-//                              the LAN; this peer's edits win conflicts.
-//   "ReaMesh: Join session":   discover sessions, download the project into
-//                              <resource>/ReaMesh/, open it, collaborate.
-//   "ReaMesh: Leave session":  stop hosting / leave.
-//   "ReaMesh: Open panel (GUI)": ReaImGui panel (scripts/ReaMesh GUI.lua,
-//                              embedded at build time, auto-installed into
-//                              <resource>/Scripts/ReaMesh/ and driven through
-//                              the ReaMesh_* ReaScript API below).
+// v3 sync model (owner-authoritative):
+//   tracks:  index/name/vol/pan/mute/solo as scalar fields, plus the track's
+//            FX chain (<FXCHAIN> block) and automation envelopes (top-level
+//            *ENV* blocks) as normalized state-chunk strings.
+//   items:   each media item as its full normalized state chunk (covers
+//            position, length, splits, fades, takes, take FX, MIDI content)
+//            plus the GUID of the track it sits on.
+// Media files referenced by an incoming item that are missing locally are
+// fetched from the session peers in the background; the item is applied as
+// soon as its files exist (deferred apply).
+//
+// The extension never writes to the REAPER console: status, errors and an
+// activity log are exposed to the ReaImGui panel through the ReaMesh_* API.
 
 #define REAPERAPI_IMPLEMENT
 #define REAPERAPI_MINIMAL
@@ -34,13 +37,28 @@
 #define REAPERAPI_WANT_ReorderSelectedTracks
 #define REAPERAPI_WANT_TrackList_AdjustWindows
 #define REAPERAPI_WANT_UpdateArrange
-#define REAPERAPI_WANT_ShowConsoleMsg
 #define REAPERAPI_WANT_EnumProjects
 #define REAPERAPI_WANT_Main_SaveProject
 #define REAPERAPI_WANT_Main_openProject
 #define REAPERAPI_WANT_GetResourcePath
 #define REAPERAPI_WANT_AddRemoveReaScript
 #define REAPERAPI_WANT_Main_OnCommand
+#define REAPERAPI_WANT_GetSetObjectState
+#define REAPERAPI_WANT_FreeHeapPtr
+#define REAPERAPI_WANT_CountMediaItems
+#define REAPERAPI_WANT_GetMediaItem
+#define REAPERAPI_WANT_GetMediaItem_Track
+#define REAPERAPI_WANT_GetSetMediaItemInfo_String
+#define REAPERAPI_WANT_AddMediaItemToTrack
+#define REAPERAPI_WANT_DeleteTrackMediaItem
+#define REAPERAPI_WANT_MoveMediaItemToTrack
+#define REAPERAPI_WANT_GetActiveTake
+#define REAPERAPI_WANT_GetMediaItemTake_Source
+#define REAPERAPI_WANT_GetMediaSourceFileName
+#define REAPERAPI_WANT_PCM_Source_CreateFromFile
+#define REAPERAPI_WANT_SetMediaItemTake_Source
+#define REAPERAPI_WANT_PCM_Source_Destroy
+#define REAPERAPI_WANT_UpdateItemInProject
 
 #include "reaper_plugin.h"
 #include "reaper_plugin_functions.h"
@@ -50,6 +68,7 @@
 #include "json.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -57,9 +76,11 @@
 #include <iterator>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using nlohmann::json;
+namespace fs = std::filesystem;
 
 // ---------- state ----------
 
@@ -70,7 +91,29 @@ struct TrackState {
   double pan = 0.0;
   bool mute = false;
   bool solo = false;
+  std::string fxchain;  // normalized <FXCHAIN> block, "" when no FX
+  std::string env;      // concatenated normalized top-level *ENV* blocks
   bool operator==(const TrackState&) const = default;
+};
+
+struct ItemState {
+  std::string track;  // GUID of the owning track
+  std::string chunk;  // normalized item state chunk
+  bool operator==(const ItemState&) const = default;
+};
+
+struct Snapshot {
+  std::map<std::string, TrackState> tracks;  // track GUID -> state
+  std::map<std::string, ItemState> items;    // item GUID -> state
+};
+
+// An incoming item whose media files have not arrived yet. Re-checked every
+// tick; the fields are applied once every file exists.
+struct DeferredItem {
+  std::string guid;
+  json fields;
+  std::vector<std::string> missing;  // project-relative '/'-separated paths
+  std::chrono::steady_clock::time_point since;
 };
 
 enum class Mode { Idle, Hosting, Browsing, Downloading, ClientActive };
@@ -79,26 +122,239 @@ static reaper_plugin_info_t* g_rec = nullptr;
 static ReameshHandle* g_handle = nullptr;
 static Mode g_mode = Mode::Idle;
 static std::string g_sessionProjectPath;  // path the session is bound to
-static std::map<std::string, TrackState> g_snapshot;  // GUID -> last known state
+static Snapshot g_snapshot;               // last known state, by GUID
 static int g_lastChangeCount = -1;
 static bool g_applyingRemote = false;  // echo-suppression / reentrancy guard
 static unsigned g_lastPeerCount = 0;
-static int g_lastProgressPct = -1;
 static std::string g_lastError;  // last session-ending message, shown by the GUI
 static int g_guiScriptCmd = 0;   // command id of the installed GUI ReaScript
+static std::vector<DeferredItem> g_deferredItems;
+static std::chrono::steady_clock::time_point g_lastCapture{};
 
 static int g_cmdHost = 0, g_cmdJoin = 0, g_cmdLeave = 0, g_cmdPanel = 0;
 static custom_action_register_t g_caHost = {
     0, "REAMESH_HOST", "ReaMesh: Host session (share current project on LAN)", nullptr};
 static custom_action_register_t g_caJoin = {
-    0, "REAMESH_JOIN", "ReaMesh: Join session (download project from LAN)", nullptr};
+    0, "REAMESH_JOIN", "ReaMesh: Join session (opens the panel)", nullptr};
 static custom_action_register_t g_caLeave = {
     0, "REAMESH_LEAVE", "ReaMesh: Leave session / stop hosting", nullptr};
 static custom_action_register_t g_caPanel = {
     0, "REAMESH_PANEL", "ReaMesh: Open panel (GUI)", nullptr};
 
-static void msg(const std::string& s) {
-  if (ShowConsoleMsg) ShowConsoleMsg(("[ReaMesh] " + s + "\n").c_str());
+// Activity log shown by the GUI panel (never the REAPER console).
+static std::deque<std::string> g_log;
+
+static void logLine(const std::string& s) {
+  g_log.push_back(s);
+  while (g_log.size() > 80) g_log.pop_front();
+}
+
+// ---------- state-chunk utilities ----------
+
+// Full state chunk of a track or media item (RPP-syntax text).
+static std::string objectStateChunk(void* obj) {
+  char* raw = GetSetObjectState(obj, "");
+  if (!raw) return "";
+  std::string out(raw);
+  FreeHeapPtr(raw);
+  return out;
+}
+
+static void setObjectStateChunk(void* obj, const std::string& chunk) {
+  char* ret = GetSetObjectState(obj, chunk.c_str());
+  if (ret) FreeHeapPtr(ret);  // non-null only for the getter path, but be safe
+}
+
+static std::string_view ltrim(std::string_view s) {
+  while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
+  return s;
+}
+
+// Volatile per-user UI state inside chunks: selection, which FX window is
+// open, dock state, floating window rects. Synced verbatim they would make
+// peers fight over selection and pop each other's plugin windows open, and
+// they bump the diff on every click.
+static bool isVolatileChunkLine(std::string_view trimmed) {
+  return trimmed.rfind("SEL ", 0) == 0 || trimmed.rfind("SHOW ", 0) == 0 ||
+         trimmed.rfind("LASTSEL ", 0) == 0 || trimmed.rfind("DOCKED ", 0) == 0 ||
+         trimmed.rfind("FLOAT", 0) == 0 || trimmed.rfind("WNDRECT ", 0) == 0;
+}
+
+static std::string normalizeChunk(const std::string& chunk) {
+  std::string out;
+  out.reserve(chunk.size());
+  size_t pos = 0;
+  while (pos < chunk.size()) {
+    size_t eol = chunk.find('\n', pos);
+    if (eol == std::string::npos) eol = chunk.size();
+    std::string_view line(chunk.data() + pos, eol - pos);
+    if (!isVolatileChunkLine(ltrim(line))) {
+      out.append(line);
+      out.push_back('\n');
+    }
+    pos = eol + 1;
+  }
+  return out;
+}
+
+// The synced top-level child blocks of a track chunk: the FX chain and the
+// automation envelopes. Items (<ITEM>) deliberately stay out; they are
+// synced per-item through the "items" section.
+static bool isEnvTag(std::string_view tag) {
+  return tag.find("ENV") != std::string_view::npos;
+}
+
+struct TrackBlocks {
+  std::string fxchain;
+  std::string env;
+};
+
+// Extract the FXCHAIN and envelope blocks from a (normalized) track chunk.
+static TrackBlocks extractTrackBlocks(const std::string& chunk) {
+  TrackBlocks out;
+  int depth = 0;
+  bool collecting = false;
+  std::string cur, curTag;
+  size_t pos = 0;
+  while (pos < chunk.size()) {
+    size_t eol = chunk.find('\n', pos);
+    if (eol == std::string::npos) eol = chunk.size();
+    std::string_view line(chunk.data() + pos, eol - pos);
+    std::string_view t = ltrim(line);
+    if (!collecting && depth == 1 && !t.empty() && t.front() == '<') {
+      std::string_view tag = t.substr(1);
+      tag = tag.substr(0, tag.find_first_of(" \t"));
+      if (tag == "FXCHAIN" || isEnvTag(tag)) {
+        collecting = true;
+        curTag = std::string(tag);
+        cur.clear();
+      }
+    }
+    if (collecting) {
+      cur.append(line);
+      cur.push_back('\n');
+    }
+    if (!t.empty() && t.front() == '<') {
+      ++depth;
+    } else if (t == ">") {
+      --depth;
+      if (collecting && depth == 1) {
+        if (curTag == "FXCHAIN") {
+          out.fxchain = cur;
+        } else {
+          out.env += cur;
+        }
+        collecting = false;
+      }
+    }
+    pos = eol + 1;
+  }
+  return out;
+}
+
+// Rebuild a track chunk with its FXCHAIN block replaced by `fxchain` and/or
+// its envelope blocks replaced by `env` (nullptr = leave that kind alone,
+// empty string = remove). Replacements land where the old blocks were, else
+// before the first item, else before the closing ">".
+static std::string replaceTrackBlocks(const std::string& chunk, const std::string* fxchain,
+                                      const std::string* env) {
+  std::vector<std::string> lines;
+  {
+    size_t pos = 0;
+    while (pos < chunk.size()) {
+      size_t eol = chunk.find('\n', pos);
+      if (eol == std::string::npos) eol = chunk.size();
+      lines.emplace_back(chunk.substr(pos, eol - pos));
+      pos = eol + 1;
+    }
+  }
+
+  std::vector<std::string> out;
+  out.reserve(lines.size());
+  int depth = 0;
+  int skipUntilDepth = -1;  // inside a block being removed
+  size_t insertAt = std::string::npos;
+  size_t firstItemAt = std::string::npos;
+
+  for (const std::string& line : lines) {
+    std::string_view t = ltrim(line);
+    bool opens = !t.empty() && t.front() == '<';
+    bool closes = (t == ">");
+
+    if (skipUntilDepth < 0 && depth == 1 && opens) {
+      std::string_view tag = t.substr(1);
+      tag = tag.substr(0, tag.find_first_of(" \t"));
+      bool removeFx = fxchain && tag == "FXCHAIN";
+      bool removeEnv = env && isEnvTag(tag);
+      if (removeFx || removeEnv) {
+        if (insertAt == std::string::npos) insertAt = out.size();
+        skipUntilDepth = depth;  // skip until we return to this depth
+        ++depth;
+        continue;
+      }
+      if (tag == "ITEM" && firstItemAt == std::string::npos) firstItemAt = out.size();
+    }
+
+    if (opens) {
+      ++depth;
+    } else if (closes) {
+      --depth;
+      if (skipUntilDepth >= 0 && depth == skipUntilDepth) {
+        skipUntilDepth = -1;
+        continue;
+      }
+    }
+    if (skipUntilDepth >= 0) continue;
+    out.push_back(line);
+  }
+
+  if (insertAt == std::string::npos)
+    insertAt = (firstItemAt != std::string::npos) ? firstItemAt
+                                                  : (out.empty() ? 0 : out.size() - 1);
+
+  std::string result;
+  result.reserve(chunk.size() + (fxchain ? fxchain->size() : 0) + (env ? env->size() : 0));
+  auto emit = [&](const std::string& l) {
+    result += l;
+    result += '\n';
+  };
+  for (size_t i = 0; i < out.size(); ++i) {
+    if (i == insertAt) {
+      if (fxchain && !fxchain->empty()) result += *fxchain;  // blocks end in '\n'
+      if (env && !env->empty()) result += *env;
+    }
+    emit(out[i]);
+  }
+  if (insertAt >= out.size()) {
+    if (fxchain && !fxchain->empty()) result += *fxchain;
+    if (env && !env->empty()) result += *env;
+  }
+  return result;
+}
+
+// All quoted FILE references in an item chunk (media sources).
+static std::vector<std::string> chunkFilePaths(const std::string& chunk) {
+  std::vector<std::string> out;
+  size_t pos = 0;
+  while (pos < chunk.size()) {
+    size_t eol = chunk.find('\n', pos);
+    if (eol == std::string::npos) eol = chunk.size();
+    std::string_view t = ltrim(std::string_view(chunk.data() + pos, eol - pos));
+    if (t.rfind("FILE ", 0) == 0) {
+      size_t q1 = t.find('"');
+      size_t q2 = (q1 == std::string_view::npos) ? std::string_view::npos : t.find('"', q1 + 1);
+      if (q2 != std::string_view::npos)
+        out.emplace_back(t.substr(q1 + 1, q2 - q1 - 1));
+    }
+    pos = eol + 1;
+  }
+  return out;
+}
+
+static bool isRelativePath(const std::string& p) {
+  if (p.empty() || p.front() == '/' || p.front() == '\\') return false;
+  if (p.size() >= 2 && isalpha((unsigned char)p[0]) && p[1] == ':') return false;
+  return true;
 }
 
 // ---------- snapshot & diff (capture side) ----------
@@ -118,8 +374,27 @@ static MediaTrack* findTrackByGuid(const std::string& guid) {
   return nullptr;
 }
 
-static std::map<std::string, TrackState> snapshotProject() {
-  std::map<std::string, TrackState> snap;
+static std::string itemGuid(MediaItem* item) {
+  char buf[64] = "";
+  GetSetMediaItemInfo_String(item, "GUID", buf, false);
+  return buf;
+}
+
+static MediaItem* findItemByGuid(const std::string& guid) {
+  const int n = CountMediaItems(nullptr);
+  for (int i = 0; i < n; ++i) {
+    MediaItem* item = GetMediaItem(nullptr, i);
+    if (itemGuid(item) == guid) return item;
+  }
+  return nullptr;
+}
+
+static fs::path projectDir() {
+  return fs::path(g_sessionProjectPath).parent_path();
+}
+
+static Snapshot snapshotProject() {
+  Snapshot snap;
   const int n = CountTracks(nullptr);
   for (int i = 0; i < n; ++i) {
     MediaTrack* tr = GetTrack(nullptr, i);
@@ -132,26 +407,36 @@ static std::map<std::string, TrackState> snapshotProject() {
     ts.pan = GetMediaTrackInfo_Value(tr, "D_PAN");
     ts.mute = GetMediaTrackInfo_Value(tr, "B_MUTE") != 0.0;
     ts.solo = GetMediaTrackInfo_Value(tr, "I_SOLO") != 0.0;
-    snap[trackGuid(tr)] = ts;
+    TrackBlocks blocks = extractTrackBlocks(normalizeChunk(objectStateChunk(tr)));
+    ts.fxchain = std::move(blocks.fxchain);
+    ts.env = std::move(blocks.env);
+    snap.tracks[trackGuid(tr)] = std::move(ts);
+  }
+  const int ni = CountMediaItems(nullptr);
+  for (int i = 0; i < ni; ++i) {
+    MediaItem* item = GetMediaItem(nullptr, i);
+    ItemState is;
+    is.track = trackGuid(GetMediaItem_Track(item));
+    is.chunk = normalizeChunk(objectStateChunk(item));
+    snap.items[itemGuid(item)] = std::move(is);
   }
   return snap;
 }
 
 static json trackToJson(const TrackState& ts) {
-  return json{{"present", true}, {"index", ts.index}, {"name", ts.name},
-              {"vol", ts.vol},   {"pan", ts.pan},     {"mute", ts.mute},
-              {"solo", ts.solo}};
+  return json{{"present", true}, {"index", ts.index},     {"name", ts.name},
+              {"vol", ts.vol},   {"pan", ts.pan},         {"mute", ts.mute},
+              {"solo", ts.solo}, {"fxchain", ts.fxchain}, {"env", ts.env}};
 }
 
-// Minimal changeset: full field set for new tracks, changed fields only for
-// known tracks, a present:false tombstone for removed ones. Empty string when
+// Minimal changeset: full field set for new entities, changed fields only for
+// known ones, a present:false tombstone for removed ones. Empty string when
 // nothing relevant changed.
-static std::string diffSnapshots(const std::map<std::string, TrackState>& prev,
-                                 const std::map<std::string, TrackState>& now) {
+static std::string diffSnapshots(const Snapshot& prev, const Snapshot& now) {
   json tracks = json::object();
-  for (const auto& [guid, ts] : now) {
-    auto it = prev.find(guid);
-    if (it == prev.end()) {
+  for (const auto& [guid, ts] : now.tracks) {
+    auto it = prev.tracks.find(guid);
+    if (it == prev.tracks.end()) {
       tracks[guid] = trackToJson(ts);
       continue;
     }
@@ -164,27 +449,99 @@ static std::string diffSnapshots(const std::map<std::string, TrackState>& prev,
     if (old.pan != ts.pan) delta["pan"] = ts.pan;
     if (old.mute != ts.mute) delta["mute"] = ts.mute;
     if (old.solo != ts.solo) delta["solo"] = ts.solo;
+    if (old.fxchain != ts.fxchain) delta["fxchain"] = ts.fxchain;
+    if (old.env != ts.env) delta["env"] = ts.env;
     if (!delta.empty()) tracks[guid] = delta;
   }
-  for (const auto& [guid, ts] : prev) {
-    if (!now.count(guid)) tracks[guid] = json{{"present", false}};
+  for (const auto& [guid, ts] : prev.tracks) {
+    if (!now.tracks.count(guid)) tracks[guid] = json{{"present", false}};
   }
-  if (tracks.empty()) return "";
-  return json{{"tracks", tracks}}.dump();
+
+  json items = json::object();
+  for (const auto& [guid, is] : now.items) {
+    auto it = prev.items.find(guid);
+    if (it == prev.items.end()) {
+      items[guid] = json{{"present", true}, {"track", is.track}, {"chunk", is.chunk}};
+      continue;
+    }
+    const ItemState& old = it->second;
+    if (old == is) continue;
+    json delta = json::object();
+    if (old.track != is.track) delta["track"] = is.track;
+    if (old.chunk != is.chunk) delta["chunk"] = is.chunk;
+    items[guid] = delta;
+  }
+  for (const auto& [guid, is] : prev.items) {
+    if (!now.items.count(guid)) items[guid] = json{{"present", false}};
+  }
+
+  json changeset = json::object();
+  if (!tracks.empty()) changeset["tracks"] = tracks;
+  if (!items.empty()) changeset["items"] = items;
+  if (changeset.empty()) return "";
+  return changeset.dump();
+}
+
+// Media imported from outside the project folder cannot be served to peers
+// (only project-relative paths cross the wire). Copy such sources into the
+// project folder and repoint the take, like REAPER's own "copy media into
+// project" option. Runs during capture, so the path change is published.
+static void internalizeExternalMedia() {
+  const fs::path projDir = projectDir();
+  if (projDir.empty()) return;
+  const int n = CountMediaItems(nullptr);
+  for (int i = 0; i < n; ++i) {
+    MediaItem* item = GetMediaItem(nullptr, i);
+    MediaItem_Take* take = GetActiveTake(item);
+    if (!take) continue;
+    PCM_source* src = GetMediaItemTake_Source(take);
+    if (!src) continue;
+    char fn[4096] = "";
+    GetMediaSourceFileName(src, fn, sizeof(fn));
+    if (!fn[0]) continue;  // in-project MIDI etc.
+    std::error_code ec;
+    fs::path source = fs::path(fn);
+    fs::path rel = fs::relative(source, projDir, ec);
+    if (!ec && !rel.empty() && rel.native().rfind("..", 0) != 0) continue;  // already inside
+
+    fs::path dest = projDir / source.filename();
+    for (int k = 2; fs::exists(dest, ec) && fs::file_size(dest, ec) != fs::file_size(source, ec);
+         ++k)
+      dest = projDir / (source.stem().string() + " (" + std::to_string(k) + ")" +
+                        source.extension().string());
+    if (!fs::exists(dest, ec)) {
+      fs::copy_file(source, dest, ec);
+      if (ec) {
+        logLine("could not copy " + source.filename().string() + " into the project: " +
+                ec.message());
+        continue;
+      }
+    }
+    PCM_source* ns = PCM_Source_CreateFromFile(dest.string().c_str());
+    if (!ns) continue;
+    SetMediaItemTake_Source(take, ns);
+    PCM_Source_Destroy(src);
+    UpdateItemInProject(item);
+    logLine("copied " + source.filename().string() + " into the project folder so peers get it");
+  }
 }
 
 static void captureLocalChanges() {
   const int cc = GetProjectStateChangeCount(nullptr);
   if (cc == g_lastChangeCount) return;
+  // Chunk serialization isn't free; cap capture rate (sync target is ~1s).
+  const auto now = std::chrono::steady_clock::now();
+  if (now - g_lastCapture < std::chrono::milliseconds(250)) return;
+  g_lastCapture = now;
   g_lastChangeCount = cc;
 
-  auto now = snapshotProject();
-  std::string changeset = diffSnapshots(g_snapshot, now);
-  g_snapshot = std::move(now);
+  internalizeExternalMedia();
+  Snapshot snap = snapshotProject();
+  std::string changeset = diffSnapshots(g_snapshot, snap);
+  g_snapshot = std::move(snap);
   if (changeset.empty()) return;  // change count moved for something we don't sync
 
   reamesh_push_local(g_handle, changeset.c_str());
-  msg("push " + (changeset.size() > 400 ? changeset.substr(0, 400) + "..." : changeset));
 }
 
 // ---------- apply (remote side) ----------
@@ -204,6 +561,22 @@ static void applyTrackFields(MediaTrack* tr, const json& fields) {
     SetMediaTrackInfo_Value(tr, "B_MUTE", fields["mute"].get<bool>() ? 1.0 : 0.0);
   if (fields.contains("solo") && fields["solo"].is_boolean())
     SetMediaTrackInfo_Value(tr, "I_SOLO", fields["solo"].get<bool>() ? 1.0 : 0.0);
+
+  // FX chain / envelopes arrive as normalized chunk blocks; splice them into
+  // the track's current chunk (after the scalar setters above, so their
+  // values survive the chunk round-trip).
+  const bool hasFx = fields.contains("fxchain") && fields["fxchain"].is_string();
+  const bool hasEnv = fields.contains("env") && fields["env"].is_string();
+  if (hasFx || hasEnv) {
+    std::string fx = hasFx ? fields["fxchain"].get<std::string>() : "";
+    std::string env = hasEnv ? fields["env"].get<std::string>() : "";
+    std::string cur = objectStateChunk(tr);
+    if (!cur.empty()) {
+      std::string next =
+          replaceTrackBlocks(cur, hasFx ? &fx : nullptr, hasEnv ? &env : nullptr);
+      if (next != cur) setObjectStateChunk(tr, next);
+    }
+  }
 }
 
 // Reorder current tracks toward the index hints in the changeset: current
@@ -234,42 +607,105 @@ static void applyReorder(const std::map<std::string, double>& desiredIndex) {
   }
 }
 
+// Media files this item needs that are missing from the project folder.
+static std::vector<std::string> missingMediaIn(const json& fields) {
+  std::vector<std::string> missing;
+  if (!fields.contains("chunk") || !fields["chunk"].is_string()) return missing;
+  const fs::path projDir = projectDir();
+  for (std::string p : chunkFilePaths(fields["chunk"].get<std::string>())) {
+    if (!isRelativePath(p)) continue;  // absolute: nothing we can fetch
+    std::replace(p.begin(), p.end(), '\\', '/');
+    std::error_code ec;
+    if (!fs::exists(projDir / fs::path(p), ec)) missing.push_back(p);
+  }
+  return missing;
+}
+
+// Apply one item's fields (creation, move across tracks, content update,
+// deletion). Caller has verified the referenced media exists.
+static void applyItem(const std::string& guid, const json& fields) {
+  MediaItem* item = findItemByGuid(guid);
+  if (fields.value("present", true) == false) {
+    if (item) DeleteTrackMediaItem(GetMediaItem_Track(item), item);
+    return;
+  }
+  MediaTrack* tr = nullptr;
+  if (fields.contains("track") && fields["track"].is_string())
+    tr = findTrackByGuid(fields["track"].get<std::string>());
+  if (!item) {
+    if (!tr) return;  // no destination track (yet); the full-sync will retry
+    item = AddMediaItemToTrack(tr);
+    if (!item) return;
+  } else if (tr && GetMediaItem_Track(item) != tr) {
+    MoveMediaItemToTrack(item, tr);
+  }
+  if (fields.contains("chunk") && fields["chunk"].is_string()) {
+    // The chunk carries the originator's item GUID, so identity is stamped
+    // onto newly created items as a side effect.
+    setObjectStateChunk(item, fields["chunk"].get<std::string>());
+  }
+  UpdateItemInProject(item);
+}
+
 static void applyChangeset(const json& changeset) {
-  if (!changeset.contains("tracks") || !changeset["tracks"].is_object()) return;
-  const json& tracks = changeset["tracks"];
+  if (changeset.contains("tracks") && changeset["tracks"].is_object()) {
+    const json& tracks = changeset["tracks"];
 
-  // Deletions first so insertion indices below land in a settled track list.
-  for (auto it = tracks.begin(); it != tracks.end(); ++it) {
-    const json& fields = it.value();
-    if (fields.is_object() && fields.value("present", true) == false) {
-      if (MediaTrack* tr = findTrackByGuid(it.key())) DeleteTrack(tr);
+    // Deletions first so insertion indices below land in a settled list.
+    for (auto it = tracks.begin(); it != tracks.end(); ++it) {
+      const json& fields = it.value();
+      if (fields.is_object() && fields.value("present", true) == false) {
+        if (MediaTrack* tr = findTrackByGuid(it.key())) DeleteTrack(tr);
+      }
     }
+
+    std::map<std::string, double> desiredIndex;
+    for (auto it = tracks.begin(); it != tracks.end(); ++it) {
+      const std::string& guid = it.key();
+      const json& fields = it.value();
+      if (!fields.is_object() || fields.value("present", true) == false) continue;
+
+      MediaTrack* tr = findTrackByGuid(guid);
+      if (!tr) {
+        int idx = (int)fields.value("index", (double)CountTracks(nullptr));
+        idx = std::clamp(idx, 0, CountTracks(nullptr));
+        InsertTrackAtIndex(idx, false);
+        tr = GetTrack(nullptr, idx);
+        if (!tr) continue;
+        // Stamp the originator's GUID onto the new track so identity is
+        // shared across all peers (indices are never used as identity).
+        std::vector<char> gbuf(guid.begin(), guid.end());
+        gbuf.push_back('\0');
+        GetSetMediaTrackInfo_String(tr, "GUID", gbuf.data(), true);
+      }
+      applyTrackFields(tr, fields);
+      if (fields.contains("index") && fields["index"].is_number())
+        desiredIndex[guid] = fields["index"].get<double>();
+    }
+    if (!desiredIndex.empty()) applyReorder(desiredIndex);
   }
 
-  std::map<std::string, double> desiredIndex;
-  for (auto it = tracks.begin(); it != tracks.end(); ++it) {
-    const std::string& guid = it.key();
-    const json& fields = it.value();
-    if (!fields.is_object() || fields.value("present", true) == false) continue;
+  if (changeset.contains("items") && changeset["items"].is_object()) {
+    const json& items = changeset["items"];
+    for (auto it = items.begin(); it != items.end(); ++it) {
+      const std::string& guid = it.key();
+      const json& fields = it.value();
+      if (!fields.is_object()) continue;
 
-    MediaTrack* tr = findTrackByGuid(guid);
-    if (!tr) {
-      int idx = (int)fields.value("index", (double)CountTracks(nullptr));
-      idx = std::clamp(idx, 0, CountTracks(nullptr));
-      InsertTrackAtIndex(idx, false);
-      tr = GetTrack(nullptr, idx);
-      if (!tr) continue;
-      // Stamp the originator's GUID onto the new track so identity is shared
-      // across all peers (indices are never used as identity).
-      std::vector<char> gbuf(guid.begin(), guid.end());
-      gbuf.push_back('\0');
-      GetSetMediaTrackInfo_String(tr, "GUID", gbuf.data(), true);
+      std::vector<std::string> missing = missingMediaIn(fields);
+      if (!missing.empty()) {
+        // Media hasn't arrived yet: fetch it from the peers and apply the
+        // item once it exists. Latest fields win for the same item.
+        for (const std::string& rel : missing) reamesh_fetch_file(g_handle, rel.c_str());
+        std::erase_if(g_deferredItems, [&](const DeferredItem& d) { return d.guid == guid; });
+        g_deferredItems.push_back(
+            {guid, fields, std::move(missing), std::chrono::steady_clock::now()});
+        logLine("waiting for media of an incoming item...");
+        continue;
+      }
+      applyItem(guid, fields);
     }
-    applyTrackFields(tr, fields);
-    if (fields.contains("index") && fields["index"].is_number())
-      desiredIndex[guid] = fields["index"].get<double>();
   }
-  if (!desiredIndex.empty()) applyReorder(desiredIndex);
 }
 
 static void applyRemoteChanges() {
@@ -294,8 +730,42 @@ static void applyRemoteChanges() {
   g_snapshot = snapshotProject();
   g_lastChangeCount = GetProjectStateChangeCount(nullptr);
   g_applyingRemote = false;
+}
 
-  msg("applied " + (payload.size() > 400 ? payload.substr(0, 400) + "..." : payload));
+// Retry items that were waiting for media files to arrive from the peers.
+static void processDeferredItems() {
+  if (g_deferredItems.empty()) return;
+  const fs::path projDir = projectDir();
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<DeferredItem> ready;
+
+  std::erase_if(g_deferredItems, [&](DeferredItem& d) {
+    std::error_code ec;
+    std::erase_if(d.missing,
+                  [&](const std::string& rel) { return fs::exists(projDir / fs::path(rel), ec); });
+    if (d.missing.empty()) {
+      ready.push_back(std::move(d));
+      return true;
+    }
+    if (now - d.since > std::chrono::seconds(90)) {
+      logLine("gave up waiting for media: " + d.missing.front());
+      return true;
+    }
+    // Keep nudging the fetch; it is idempotent while the file is missing.
+    for (const std::string& rel : d.missing) reamesh_fetch_file(g_handle, rel.c_str());
+    return false;
+  });
+
+  if (ready.empty()) return;
+  g_applyingRemote = true;
+  PreventUIRefresh(1);
+  for (const DeferredItem& d : ready) applyItem(d.guid, d.fields);
+  PreventUIRefresh(-1);
+  UpdateArrange();
+  g_snapshot = snapshotProject();
+  g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+  g_applyingRemote = false;
+  logLine("applied " + std::to_string(ready.size()) + " item(s) after media arrived");
 }
 
 // ---------- session lifecycle ----------
@@ -322,12 +792,12 @@ static void leaveSession(const std::string& why) {
   }
   g_mode = Mode::Idle;
   g_sessionProjectPath.clear();
-  g_snapshot.clear();
+  g_snapshot = Snapshot{};
+  g_deferredItems.clear();
   g_lastChangeCount = -1;
   g_lastPeerCount = 0;
-  g_lastProgressPct = -1;
   if (!why.empty()) {
-    msg(why);
+    logLine(why);
     g_lastError = why;
   }
 }
@@ -339,12 +809,13 @@ static bool startBrowse() {
   std::string staging = std::string(GetResourcePath()) + "/ReaMesh";
   g_handle = reamesh_join(staging.c_str());
   if (!g_handle) {
-    msg("FAILED to start session discovery (see stderr).");
-    g_lastError = "could not start session discovery (see stderr)";
+    g_lastError = "could not start session discovery";
+    logLine(g_lastError);
     return false;
   }
   g_mode = Mode::Browsing;
   g_lastError.clear();
+  logLine("searching for sessions on the network");
   return true;
 }
 
@@ -352,27 +823,24 @@ static bool startBrowse() {
 static bool joinSessionById(const std::string& sid, const std::string& sname) {
   if (g_mode != Mode::Browsing || !g_handle) return false;
   if (!reamesh_join_session(g_handle, sid.c_str())) {
-    msg("could not join \"" + sname + "\" (it may have just closed); try again.");
+    logLine("could not join \"" + sname + "\" (it may have just closed); try again");
     return false;
   }
   g_mode = Mode::Downloading;
-  g_lastProgressPct = -1;
   g_lastError.clear();
-  msg("joining \"" + sname + "\", downloading project files...");
+  logLine("joining \"" + sname + "\", downloading the project");
   return true;
 }
 
 static void onHost() {
-  if (g_mode == Mode::Hosting) {
-    msg("already hosting; use \"ReaMesh: Leave session\" first.");
-    return;
-  }
-  if (g_mode != Mode::Idle) leaveSession("left previous session.");
+  if (g_mode == Mode::Hosting) return;
+  if (g_mode != Mode::Idle) leaveSession("left previous session");
 
   std::string path = currentProjectPath();
   if (path.empty()) {
     // Unsaved project: trigger Save As so there is a project file to share.
-    msg("project is unsaved; choose where to save it, then run Host again.");
+    g_lastError = "save the project first, then host again";
+    logLine(g_lastError);
     Main_SaveProject(nullptr, true);
     return;
   }
@@ -385,61 +853,28 @@ static void onHost() {
 
   g_handle = reamesh_host(name.c_str(), dir.c_str(), file.c_str());
   if (!g_handle) {
-    msg("FAILED to start hosting (see stderr).");
-    g_lastError = "could not start hosting (see stderr)";
+    g_lastError = "could not start hosting";
+    logLine(g_lastError);
     return;
   }
   g_mode = Mode::Hosting;
   g_lastError.clear();
   g_sessionProjectPath = path;
-  g_snapshot.clear();
+  g_snapshot = Snapshot{};
   g_lastChangeCount = -1;  // force a full capture; this seeds the shared doc
+  g_lastCapture = {};
   g_lastPeerCount = 0;
-  msg("hosting session \"" + name + "\", sharing all files under " + dir);
-  msg("(make sure media is in the project folder: File > Save project, \"Copy all media\")");
-}
-
-static void onJoin() {
-  if (g_mode == Mode::Hosting || g_mode == Mode::ClientActive) {
-    msg("already in a session; use \"ReaMesh: Leave session\" first.");
-    return;
-  }
-  if (g_mode == Mode::Idle) {
-    if (startBrowse())
-      msg("searching for sessions on the LAN... run \"Join session\" again in a few seconds.");
-    return;
-  }
-  if (g_mode == Mode::Downloading) {
-    msg("already joining a session, hang on...");
-    return;
-  }
-
-  // Browsing: list what we found and join the first session.
-  char* raw = reamesh_sessions(g_handle);
-  std::string payload = raw ? raw : "[]";
-  reamesh_free_string(raw);
-  json sessions = json::parse(payload, nullptr, false);
-  if (!sessions.is_array() || sessions.empty()) {
-    msg("no sessions found yet. Is someone hosting on this network? Try again shortly.");
-    return;
-  }
-  for (const auto& s : sessions)
-    msg("found session \"" + s.value("session_name", "?") + "\" (" +
-        s.value("project_file", "?") + ")");
-  std::string sid = sessions[0].value("session_id", "");
-  std::string sname = sessions[0].value("session_name", "?");
-  if (sessions.size() > 1)
-    msg("multiple sessions found; joining the first: \"" + sname + "\"");
-  joinSessionById(sid, sname);
+  logLine("hosting \"" + name + "\", sharing all files under " + dir);
 }
 
 static void onLeave() {
-  if (g_mode == Mode::Idle) {
-    msg("not in a session.");
-    return;
-  }
-  leaveSession("left the session.");
+  if (g_mode == Mode::Idle) return;
+  leaveSession("left the session");
   g_lastError.clear();  // user-initiated, nothing to flag in the GUI
+}
+
+static void openPanel() {
+  if (g_guiScriptCmd) Main_OnCommand(g_guiScriptCmd, 0);
 }
 
 // ---------- ReaScript API (drives the ReaImGui panel) ----------
@@ -502,6 +937,17 @@ static const char* ReaMesh_GetSessions() {
   return buf.c_str();
 }
 
+// Recent activity, newest line last.
+static const char* ReaMesh_GetLog() {
+  static std::string buf;
+  buf.clear();
+  for (const std::string& line : g_log) {
+    buf += line;
+    buf += '\n';
+  }
+  return buf.c_str();
+}
+
 static bool ReaMesh_StartBrowse() { return startBrowse(); }
 
 static bool ReaMesh_Host() {
@@ -516,7 +962,7 @@ static bool ReaMesh_JoinSession(const char* session_id) {
 
 static void ReaMesh_Leave() {
   if (g_mode != Mode::Idle) {
-    leaveSession("left the session.");
+    leaveSession("left the session");
     g_lastError.clear();
   }
 }
@@ -524,6 +970,7 @@ static void ReaMesh_Leave() {
 // ReaScript vararg shims (see "APIvararg_*" in reaper_plugin.h).
 static void* vararg_GetStatus(void**, int) { return (void*)ReaMesh_GetStatus(); }
 static void* vararg_GetSessions(void**, int) { return (void*)ReaMesh_GetSessions(); }
+static void* vararg_GetLog(void**, int) { return (void*)ReaMesh_GetLog(); }
 static void* vararg_StartBrowse(void**, int) { return (void*)(INT_PTR)ReaMesh_StartBrowse(); }
 static void* vararg_Host(void**, int) { return (void*)(INT_PTR)ReaMesh_Host(); }
 static void* vararg_JoinSession(void** arglist, int numparms) {
@@ -543,6 +990,8 @@ static const ApiExport g_api[] = {
      "const char*\0\0\0Current ReaMesh state as key=value lines: mode (idle|browsing|downloading|hosting|client), state, session, progress (0..1), peers, path, error."},
     {"ReaMesh_GetSessions", (void*)ReaMesh_GetSessions, (void*)vararg_GetSessions,
      "const char*\0\0\0Sessions announced on the LAN, one per line: session_id TAB session_name TAB project_file. Requires browsing (see ReaMesh_StartBrowse)."},
+    {"ReaMesh_GetLog", (void*)ReaMesh_GetLog, (void*)vararg_GetLog,
+     "const char*\0\0\0Recent ReaMesh activity log, one event per line, newest last."},
     {"ReaMesh_StartBrowse", (void*)ReaMesh_StartBrowse, (void*)vararg_StartBrowse,
      "bool\0\0\0Start discovering ReaMesh sessions on the LAN. Idempotent while browsing."},
     {"ReaMesh_Host", (void*)ReaMesh_Host, (void*)vararg_Host,
@@ -575,7 +1024,6 @@ static void registerApi(reaper_plugin_info_t* rec, bool add) {
 // Write the embedded ReaImGui panel script into the resource path and
 // register it as an action. Returns the script's command id (0 on failure).
 static int installGuiScript() {
-  namespace fs = std::filesystem;
   const fs::path dir = fs::path(GetResourcePath()) / "Scripts" / "ReaMesh";
   const fs::path path = dir / "ReaMesh GUI.lua";
 
@@ -590,7 +1038,7 @@ static int installGuiScript() {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out << kReameshGuiScript;
     if (!out) {
-      msg("could not write " + path.string() + ": GUI unavailable");
+      logLine("could not write " + path.string() + ": GUI unavailable");
       return 0;
     }
   }
@@ -607,15 +1055,9 @@ static void pollDownload() {
   if (!st.is_object()) return;
   std::string state = st.value("state", "");
 
-  if (state == "downloading") {
-    int pct = (int)(st.value("progress", 0.0) * 100.0);
-    if (pct / 10 > g_lastProgressPct / 10) {
-      msg("downloading... " + std::to_string(pct) + "%");
-      g_lastProgressPct = pct;
-    }
-  } else if (state == "ready") {
+  if (state == "ready") {
     std::string path = st.value("project_path", "");
-    msg("download complete, opening " + path);
+    logLine("download complete, opening " + path);
     g_applyingRemote = true;
     Main_openProject(path.c_str());
     // The loaded project IS the owner's state; baseline it so the load is
@@ -625,7 +1067,7 @@ static void pollDownload() {
     g_applyingRemote = false;
     g_mode = Mode::ClientActive;
     g_sessionProjectPath = currentProjectPath();
-    msg("connected: your edits are proposals; the session owner wins conflicts.");
+    logLine("connected: your edits are proposals; the session owner wins conflicts");
   } else if (state == "failed") {
     leaveSession("join failed: " + st.value("message", std::string("unknown error")));
   }
@@ -646,12 +1088,13 @@ static void timerTick() {
       // Switching projects ends the session: its doc is bound to the shared
       // project file.
       if (currentProjectPath() != g_sessionProjectPath) {
-        leaveSession("project changed; session ended.");
+        leaveSession("project changed; session ended");
         return;
       }
       unsigned peers = reamesh_peer_count(g_handle);
       if (peers != g_lastPeerCount) {
-        msg("peers in session: " + std::to_string(peers));
+        logLine(peers > g_lastPeerCount ? "a peer joined the session"
+                                        : "a peer left the session");
         g_lastPeerCount = peers;
       }
       // Capture before apply, so an edit made by the user in this tick
@@ -659,6 +1102,7 @@ static void timerTick() {
       // application re-baselines.
       captureLocalChanges();
       applyRemoteChanges();
+      processDeferredItems();
       return;
     }
   }
@@ -669,15 +1113,9 @@ static void timerTick() {
 static bool dispatchCommand(int command) {
   if (command == 0) return false;
   if (command == g_cmdHost) { onHost(); return true; }
-  if (command == g_cmdJoin) { onJoin(); return true; }
+  if (command == g_cmdJoin) { openPanel(); return true; }
   if (command == g_cmdLeave) { onLeave(); return true; }
-  if (command == g_cmdPanel) {
-    if (g_guiScriptCmd)
-      Main_OnCommand(g_guiScriptCmd, 0);
-    else
-      msg("GUI script unavailable (could not be installed at startup).");
-    return true;
-  }
+  if (command == g_cmdPanel) { openPanel(); return true; }
   return false;
 }
 
@@ -724,7 +1162,5 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
   rec->Register("timer", (void*)timerTick);
   registerApi(rec, true);
   g_guiScriptCmd = installGuiScript();
-  msg("loaded; run the action \"ReaMesh: Open panel (GUI)\" to host or join a session"
-      " (needs the ReaImGui extension, installable via ReaPack).");
   return 1;
 }
