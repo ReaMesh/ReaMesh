@@ -94,6 +94,15 @@ const TAG_SESSION_END: u8 = b'E';
 /// Client fallback: if the owner has been gone from the session topic this
 /// long (crash, network drop: no farewell seen), treat the session as ended.
 const OWNER_GONE_TIMEOUT: Duration = Duration::from_secs(12);
+/// How long a joining client waits for the owner to answer the manifest
+/// request before the join fails (covers an owner that died between the
+/// announcement and the join: the lobby entry stays cached for a while).
+const MANIFEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Post-manifest safety net: a download that has not written a single new
+/// byte for this long is declared dead instead of requeueing pieces forever.
+/// The owner-gone fallback usually fires first; this covers an owner that is
+/// still on the topic but no longer serving.
+const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 type Fields = JsonMap<String, JsonValue>;
 type SectionState = HashMap<String, Fields>;
@@ -180,10 +189,13 @@ struct StatusState {
     session_id: Option<String>,
     session_name: Option<String>,
     message: Option<String>,
+    /// Why state is "ended": "host_ended" (deliberate farewell) or
+    /// "host_lost" (owner vanished: a reconnect attempt is worthwhile).
+    end_reason: Option<String>,
 }
 
 impl StatusState {
-    fn to_json(&self) -> String {
+    fn to_json(&self, reverts: usize) -> String {
         json!({
             "state": self.state,
             "progress": self.progress,
@@ -191,6 +203,8 @@ impl StatusState {
             "session_id": self.session_id,
             "session_name": self.session_name,
             "message": self.message,
+            "end_reason": self.end_reason,
+            "reverts": reverts,
         })
         .to_string()
     }
@@ -233,10 +247,15 @@ struct Shared {
     /// host time and on a client when it joins (derived from the salt in the
     /// announcement + the passphrase the user supplied).
     auth_token: Mutex<String>,
-    /// Latest presence beacon per peer id string (display name + color).
+    /// Latest *authenticated* presence beacon per peer id string (display
+    /// name + color). Beacons whose MAC doesn't verify never land here.
     peers_info: Mutex<HashMap<String, PeerPresence>>,
     /// Peer id string of the session owner (self when hosting).
     owner_peer: Mutex<String>,
+    /// Client only: how many of this peer's proposals were reverted to the
+    /// owner's value (cumulative). Surfaced via status so the UI can tell the
+    /// user their edit was overridden instead of letting it silently snap back.
+    reverts: AtomicUsize,
 }
 
 #[derive(Clone, Debug)]
@@ -325,6 +344,19 @@ fn auth_token(salt: &str, passphrase: &str) -> String {
             String::new()
         }
     }
+}
+
+/// MAC carried by every presence beacon, binding it to the session token and
+/// the sending peer id. Peers only list roster entries with a verifying MAC,
+/// so a LAN peer that merely subscribes to the (publicly-announced) session
+/// topic can neither appear in anyone's roster nor spoof another member's
+/// name/color: producing a valid MAC requires the token, and using someone
+/// else's MAC would require publishing as their (transport-authenticated)
+/// peer id. Open sessions have an empty token: every participant derives the
+/// same key, so the check degrades to "knows the ReaMesh presence protocol".
+fn presence_mac(auth_token: &str, peer_id: &str) -> String {
+    let key = blake3::derive_key("reamesh/v3/presence", auth_token.as_bytes());
+    blake3::keyed_hash(&key, peer_id.as_bytes()).to_hex().to_string()
 }
 
 /// Lower-case hex of a byte slice (no external dep for this one use).
@@ -437,6 +469,7 @@ impl Reamesh {
             session_id: Some(session_id),
             session_name: Some(session_name.to_string()),
             message: None,
+            end_reason: None,
         };
         let r = Self::start(
             Role::Owner,
@@ -464,6 +497,7 @@ impl Reamesh {
             session_id: None,
             session_name: None,
             message: None,
+            end_reason: None,
         };
         Self::start(
             Role::Client,
@@ -508,6 +542,7 @@ impl Reamesh {
             auth_token: Mutex::new(String::new()),
             peers_info: Mutex::new(HashMap::new()),
             owner_peer: Mutex::new(String::new()),
+            reverts: AtomicUsize::new(0),
         });
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (init_tx, init_rx) = std_mpsc::channel();
@@ -677,8 +712,11 @@ impl Reamesh {
                 false
             } else if now.duration_since(*when) > PROPOSAL_TIMEOUT {
                 // Never confirmed: the owner dropped it (or overrode it).
-                // Revert the host to the authoritative value.
+                // Revert the host to the authoritative value, and count it so
+                // the UI can tell the user (the snap-back looks like a glitch
+                // otherwise).
                 if let Some(dv) = doc_val {
+                    self.shared.reverts.fetch_add(1, Ordering::Relaxed);
                     diff.entry(section.clone())
                         .or_insert_with(|| JsonValue::Object(JsonMap::new()))
                         .as_object_mut()
@@ -764,9 +802,11 @@ impl Reamesh {
     }
 
     /// Current session status as JSON:
-    /// `{"state","progress","project_path","session_id","session_name","message"}`.
+    /// `{"state","progress","project_path","session_id","session_name",
+    ///   "message","end_reason","reverts"}`.
     pub fn status_json(&self) -> String {
-        self.shared.status.lock().unwrap().to_json()
+        let reverts = self.shared.reverts.load(Ordering::Relaxed);
+        self.shared.status.lock().unwrap().to_json(reverts)
     }
 
     /// Full current doc state in changeset shape. For tests and debugging.
@@ -800,11 +840,12 @@ impl Reamesh {
         &self.local_peer_id
     }
 
-    /// Everyone visibly in the session: self first, then the connected
-    /// session-topic peers, as a JSON array of
-    /// `{"id","name","color","is_self","is_owner"}`. Names/colors come from
-    /// presence beacons; a peer that never sent one gets an empty name (UIs
-    /// derive a placeholder from the id) and a color derived from its peer id.
+    /// Everyone visibly in the session: self first, then the session-topic
+    /// peers with an *authenticated* presence beacon, as a JSON array of
+    /// `{"id","name","color","is_self","is_owner"}`. A topic subscriber that
+    /// never produced a verifying beacon (no session token) is not listed:
+    /// topic membership is public knowledge, roster membership is not. A
+    /// legitimate joiner appears within one beacon interval (~1s).
     pub fn peers_json(&self) -> String {
         let owner = self.shared.owner_peer.lock().unwrap().clone();
         let (my_name, my_color) = PROFILE.lock().unwrap().clone();
@@ -825,9 +866,8 @@ impl Reamesh {
         infos.retain(|_, p| now.duration_since(p.last_seen) < PRESENCE_STALE);
         for p in self.shared.session_peers.lock().unwrap().iter() {
             let id = p.to_string();
-            match infos.get(&id) {
-                Some(info) => arr.push(entry(&id, &info.name, &info.color, &info.focus, false)),
-                None => arr.push(entry(&id, "", "", "", false)),
+            if let Some(info) = infos.get(&id) {
+                arr.push(entry(&id, &info.name, &info.color, &info.focus, false));
             }
         }
         json!(arr).to_string()
@@ -1133,6 +1173,12 @@ struct Download {
     total: u64,
     done: u64,
     last_activity: Instant,
+    /// When the join started: bounds how long we keep re-requesting a
+    /// manifest from an owner that never answers.
+    started: Instant,
+    /// Last time a new byte actually landed (or the manifest arrived):
+    /// bounds how long pieces are requeued without any forward progress.
+    last_progress: Instant,
 }
 
 /// Chunk offsets for a file of `size` bytes.
@@ -1577,7 +1623,9 @@ async fn run_network(
                         s.session_id = Some(session_id.clone());
                         s.session_name = Some(info.session_name.clone());
                         s.message = None;
+                        s.end_reason = None;
                     });
+                    shared.reverts.store(0, Ordering::Relaxed);
                     let req = swarm
                         .behaviour_mut()
                         .xfer
@@ -1598,6 +1646,8 @@ async fn run_network(
                         total: 0,
                         done: 0,
                         last_activity: Instant::now(),
+                        started: Instant::now(),
+                        last_progress: Instant::now(),
                     });
                 }
                 Some(Command::FetchFile(rel)) => {
@@ -1609,13 +1659,19 @@ async fn run_network(
                     }
                 }
                 Some(Command::Shutdown) | None => {
-                    // Owner farewell: tell the session it is over, then keep
-                    // driving the swarm briefly so the message actually leaves
-                    // the socket before the runtime is torn down. Clients that
-                    // miss it (or an owner crash) are covered by the
-                    // OWNER_GONE_TIMEOUT fallback on their side.
-                    if hosting.is_some() && let Some(t) = &sess_topic {
-                        let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), vec![TAG_SESSION_END]);
+                    // Farewell, then keep driving the swarm briefly so it
+                    // actually leaves the socket before the runtime is torn
+                    // down. Owner: a session-end broadcast (clients that miss
+                    // it are covered by their OWNER_GONE_TIMEOUT fallback).
+                    // Client: a topic unsubscribe, so the other peers drop it
+                    // from their rosters immediately instead of waiting out
+                    // the presence staleness window.
+                    if let Some(t) = &sess_topic {
+                        if hosting.is_some() {
+                            let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), vec![TAG_SESSION_END]);
+                        } else {
+                            swarm.behaviour_mut().gossipsub.unsubscribe(t);
+                        }
                         let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
                         loop {
                             tokio::select! {
@@ -1644,6 +1700,9 @@ async fn run_network(
                 // Client fallback: the owner vanished from the session topic
                 // (crash, quit without the farewell reaching us): end the
                 // session instead of leaving the user stranded in a dead one.
+                // Covers an in-progress download too (the topic is subscribed
+                // from the manifest on), so a host that dies mid-transfer
+                // doesn't leave the client requeueing pieces forever.
                 if cfg.role == Role::Client && sess_topic.is_some() {
                     let owner = shared.owner_peer.lock().unwrap().clone();
                     let owner_present = !owner.is_empty()
@@ -1655,14 +1714,17 @@ async fn run_network(
                             .any(|p| p.to_string() == owner);
                     if owner_present {
                         last_owner_seen = Instant::now();
-                    } else if last_owner_seen.elapsed() > OWNER_GONE_TIMEOUT
-                        && shared.status.lock().unwrap().state == "ready"
-                    {
-                        eprintln!("[reamesh] the owner disappeared; ending the session");
-                        set_status(&shared, |s| {
-                            s.state = "ended".into();
-                            s.message = Some("the host ended the session".into());
-                        });
+                    } else if last_owner_seen.elapsed() > OWNER_GONE_TIMEOUT {
+                        let st = shared.status.lock().unwrap().state.clone();
+                        if st == "ready" || st == "downloading" {
+                            eprintln!("[reamesh] the owner disappeared; ending the session");
+                            download_cleanup(&mut download);
+                            set_status(&shared, |s| {
+                                s.state = "ended".into();
+                                s.message = Some("lost the connection to the host".into());
+                                s.end_reason = Some("host_lost".into());
+                            });
+                        }
                     }
                 }
                 // Owner: announce the session on the lobby every ~1s.
@@ -1674,9 +1736,17 @@ async fn run_network(
                 if tick_count % 2 == 0 && let Some(t) = &sess_topic {
                     let (name, color) = PROFILE.lock().unwrap().clone();
                     let focus = FOCUS.lock().unwrap().clone();
+                    // The MAC proves token possession; peers only roster
+                    // beacons that verify (see presence_mac).
+                    let mac = presence_mac(
+                        &shared.auth_token.lock().unwrap().clone(),
+                        &swarm.local_peer_id().to_string(),
+                    );
                     let mut data = vec![TAG_PRESENCE];
                     data.extend_from_slice(
-                        json!({"name": name, "color": color, "focus": focus}).to_string().as_bytes(),
+                        json!({"name": name, "color": color, "focus": focus, "mac": mac})
+                            .to_string()
+                            .as_bytes(),
                     );
                     let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), data);
                 }
@@ -1846,6 +1916,19 @@ async fn run_network(
                                     let get = |k: &str| {
                                         v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
                                     };
+                                    // Only token holders may appear in the
+                                    // roster: verify the beacon's MAC against
+                                    // the sender's authenticated peer id.
+                                    let expected = presence_mac(
+                                        &shared.auth_token.lock().unwrap().clone(),
+                                        &src.to_string(),
+                                    );
+                                    if !ct_eq(get("mac").as_bytes(), expected.as_bytes()) {
+                                        eprintln!(
+                                            "[reamesh] dropped unauthenticated presence beacon from {src}"
+                                        );
+                                        continue;
+                                    }
                                     shared.peers_info.lock().unwrap().insert(
                                         src.to_string(),
                                         PeerPresence {
@@ -1901,9 +1984,14 @@ async fn run_network(
                                 });
                                 if from_owner {
                                     eprintln!("[reamesh] the owner ended the session");
+                                    // A farewell can also land mid-download;
+                                    // abort it rather than pumping requests at
+                                    // a host that is gone.
+                                    download_cleanup(&mut download);
                                     set_status(&shared, |s| {
                                         s.state = "ended".into();
                                         s.message = Some("the host ended the session".into());
+                                        s.end_reason = Some("host_ended".into());
                                     });
                                 }
                             }
@@ -2108,8 +2196,10 @@ fn download_pump(swarm: &mut Swarm<Behaviour>, dl: &mut Download) {
     }
 }
 
-fn download_fail(download: &mut Option<Download>, shared: &Shared, msg: String) {
-    eprintln!("[reamesh] download failed: {msg}");
+/// Drop an in-progress download (if any), removing its partial temp files.
+/// Status is the caller's business: this is shared by the failure path and
+/// the session-ended paths.
+fn download_cleanup(download: &mut Option<Download>) {
     if let Some(dl) = download {
         for f in &dl.files {
             if f.tmp != f.dest {
@@ -2117,11 +2207,16 @@ fn download_fail(download: &mut Option<Download>, shared: &Shared, msg: String) 
             }
         }
     }
+    *download = None;
+}
+
+fn download_fail(download: &mut Option<Download>, shared: &Shared, msg: String) {
+    eprintln!("[reamesh] download failed: {msg}");
+    download_cleanup(download);
     set_status(shared, |s| {
         s.state = "failed".into();
         s.message = Some(msg);
     });
-    *download = None;
 }
 
 fn download_finalize(shared: &Shared, download: &mut Option<Download>) {
@@ -2151,6 +2246,12 @@ fn download_tick(swarm: &mut Swarm<Behaviour>, shared: &Shared, download: &mut O
     dl.peers = peers;
 
     if !dl.got_manifest {
+        // The lobby announcement outlives its host by SESSION_STALE, so a
+        // join can be aimed at an owner that just died: give up instead of
+        // re-requesting the manifest forever.
+        if dl.started.elapsed() > MANIFEST_TIMEOUT {
+            return download_fail(download, shared, "the host did not respond".into());
+        }
         if dl.manifest_req.is_none() {
             let id = swarm
                 .behaviour_mut()
@@ -2160,6 +2261,11 @@ fn download_tick(swarm: &mut Swarm<Behaviour>, shared: &Shared, download: &mut O
             dl.last_activity = Instant::now();
         }
         return;
+    }
+    // Forward-progress watchdog: requeue-and-retry must not loop forever
+    // against peers that accept requests but never deliver.
+    if dl.last_progress.elapsed() > DOWNLOAD_STALL_TIMEOUT {
+        return download_fail(download, shared, "the download stalled".into());
     }
     if dl.last_activity.elapsed() > Duration::from_secs(5) && !dl.inflight.is_empty() {
         let lost: Vec<Piece> = dl.inflight.drain().map(|(_, p)| p).collect();
@@ -2202,6 +2308,7 @@ fn handle_download_manifest(
                     return download_fail(download, shared, format!("create staging dir: {e}"));
                 }
                 dl.got_manifest = true;
+                dl.last_progress = Instant::now();
                 dl.project_file = project_file;
                 if let Err(e) = download_build(dl, files) {
                     return download_fail(download, shared, e.to_string());
@@ -2288,6 +2395,7 @@ fn handle_download_piece(
     }
     fd.remaining -= 1;
     dl.done += chunk.len() as u64;
+    dl.last_progress = Instant::now();
     let progress = if dl.total == 0 { 1.0 } else { dl.done as f64 / dl.total as f64 };
     set_status(shared, |s| s.progress = progress);
 
@@ -2717,6 +2825,21 @@ mod tests {
         // A different passphrase or salt yields a different token.
         assert_ne!(a, auth_token("salt-abc", "hunter3"));
         assert_ne!(a, auth_token("salt-xyz", "hunter2"));
+    }
+
+    #[test]
+    fn presence_mac_binds_token_and_peer() {
+        let a = presence_mac("token-a", "12D3KooPeerOne");
+        // Deterministic: both ends derive the same value.
+        assert_eq!(a, presence_mac("token-a", "12D3KooPeerOne"));
+        assert_eq!(a.len(), 64);
+        // A different token or a different sender yields a different MAC: a
+        // captured beacon can't be replayed under another identity, and a
+        // peer without the token can't produce a verifying one.
+        assert_ne!(a, presence_mac("token-b", "12D3KooPeerOne"));
+        assert_ne!(a, presence_mac("token-a", "12D3KooPeerTwo"));
+        // Open sessions (empty token) still MAC: deterministic too.
+        assert_eq!(presence_mac("", "p"), presence_mac("", "p"));
     }
 
     #[test]

@@ -99,6 +99,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -194,10 +195,28 @@ static Snapshot g_snapshot;               // last known state, by GUID
 static int g_lastChangeCount = -1;
 static bool g_applyingRemote = false;  // echo-suppression / reentrancy guard
 static unsigned g_lastPeerCount = 0;
-static std::string g_lastError;  // last session-ending message, shown by the app
+// Last session-ending event, shown by the app as an error toast. Structured
+// like a log entry ({code, params, text}); JSON null when there is none.
+static json g_lastError;
 static std::vector<DeferredItem> g_deferredItems;
 static std::chrono::steady_clock::time_point g_lastCapture{};
 static std::chrono::steady_clock::time_point g_lastFullScan{};
+// Client only: cumulative count of own proposals the owner overrode, as
+// reported by reamesh_status ("reverts"); deltas become activity-log events.
+static long g_lastReverts = 0;
+
+// In-flight automatic rejoin after the host vanished without a farewell
+// (network blip / crash). While set, the Browsing tick watches the lobby for
+// the same session id and rejoins with the remembered passphrase.
+struct Reconnect {
+  std::string sessionId;
+  std::string sessionName;
+  std::string passphrase;
+  std::chrono::steady_clock::time_point deadline;
+};
+static std::optional<Reconnect> g_reconnect;
+// Passphrase the current session was joined with, kept for auto-rejoin.
+static std::string g_joinPassphrase;
 
 // Two parameter-free convenience actions; the companion app is the real UI
 // and drives everything (browse/join/leave) over the control server instead.
@@ -208,11 +227,16 @@ static custom_action_register_t g_caLeave = {
     0, "REAMESH_LEAVE", "ReaMesh: Leave session / stop hosting", nullptr};
 
 // Activity log streamed to the companion app (never the REAPER console).
-static std::deque<std::string> g_log;
+// Entries are structured ({"code", "params", "text"}) so the app can render
+// them in the user's language; `text` is the English fallback for codes the
+// app doesn't know (or a raw message when `code` is empty).
+static std::deque<json> g_log;
 
-static void logLine(const std::string& s) {
-  g_log.push_back(s);
+static json logEvent(const char* code, json params, const std::string& text) {
+  json e = {{"code", code}, {"params", std::move(params)}, {"text", text}};
+  g_log.push_back(e);
   while (g_log.size() > 80) g_log.pop_front();
+  return e;
 }
 
 // ---------- state-chunk utilities ----------
@@ -991,8 +1015,9 @@ static void internalizeExternalMedia() {
     if (!fs::exists(dest, ec)) {
       fs::copy_file(source, dest, ec);
       if (ec) {
-        logLine("could not copy " + source.filename().string() + " into the project: " +
-                ec.message());
+        logEvent("media_copy_failed", {{"file", source.filename().string()}},
+                 "could not copy " + source.filename().string() + " into the project: " +
+                     ec.message());
         continue;
       }
     }
@@ -1001,7 +1026,8 @@ static void internalizeExternalMedia() {
     SetMediaItemTake_Source(take, ns);
     PCM_Source_Destroy(src);
     UpdateItemInProject(item);
-    logLine("copied " + source.filename().string() + " into the project folder so peers get it");
+    logEvent("media_copied", {{"file", source.filename().string()}},
+             "copied " + source.filename().string() + " into the project folder so peers get it");
   }
 }
 
@@ -1283,7 +1309,7 @@ static void applyChangeset(const json& changeset) {
         std::erase_if(g_deferredItems, [&](const DeferredItem& d) { return d.guid == guid; });
         g_deferredItems.push_back(
             {guid, fields, std::move(missing), std::chrono::steady_clock::now()});
-        logLine("waiting for media of an incoming item...");
+        logEvent("waiting_media", json::object(), "waiting for media of an incoming item...");
         continue;
       }
       applyItem(guid, fields);
@@ -1360,7 +1386,8 @@ static void processDeferredItems() {
       return true;
     }
     if (now - d.since > std::chrono::seconds(90)) {
-      logLine("gave up waiting for media: " + d.missing.front());
+      logEvent("media_timeout", {{"file", d.missing.front()}},
+               "gave up waiting for media: " + d.missing.front());
       return true;
     }
     // Keep nudging the fetch; it is idempotent while the file is missing.
@@ -1377,7 +1404,8 @@ static void processDeferredItems() {
   g_snapshot = snapshotProject();
   g_lastChangeCount = GetProjectStateChangeCount(nullptr);
   g_applyingRemote = false;
-  logLine("applied " + std::to_string(ready.size()) + " item(s) after media arrived");
+  logEvent("media_applied", {{"count", ready.size()}},
+           "applied " + std::to_string(ready.size()) + " item(s) after media arrived");
 }
 
 // ---------- session lifecycle ----------
@@ -1397,7 +1425,13 @@ static std::string fileStem(const std::string& path) {
   return p;
 }
 
-static void leaveSession(const std::string& why) {
+// Defined in the control-server section below; needed by the reconnect logic.
+static std::string jsonStr(const json& j, const char* key);
+static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback);
+
+// Tear the session down. `code`/`params`/`text` describe why as a structured
+// log event (also flagged to the app as the error); empty text = silent.
+static void leaveSession(const char* code, json params, const std::string& text) {
   if (g_handle) {
     reamesh_shutdown(g_handle);
     g_handle = nullptr;
@@ -1408,10 +1442,8 @@ static void leaveSession(const std::string& why) {
   g_deferredItems.clear();
   g_lastChangeCount = -1;
   g_lastPeerCount = 0;
-  if (!why.empty()) {
-    logLine(why);
-    g_lastError = why;
-  }
+  g_lastReverts = 0;
+  if (!text.empty()) g_lastError = logEvent(code, std::move(params), text);
 }
 
 // Start LAN session discovery (Idle -> Browsing). Idempotent while browsing.
@@ -1421,13 +1453,12 @@ static bool startBrowse() {
   std::string staging = std::string(GetResourcePath()) + "/ReaMesh";
   g_handle = reamesh_join(staging.c_str());
   if (!g_handle) {
-    g_lastError = "could not start session discovery";
-    logLine(g_lastError);
+    g_lastError = logEvent("browse_failed", json::object(), "could not start session discovery");
     return false;
   }
   g_mode = Mode::Browsing;
-  g_lastError.clear();
-  logLine("searching for sessions on the network");
+  g_lastError = json();
+  logEvent("browsing", json::object(), "searching for sessions on the network");
   return true;
 }
 
@@ -1436,24 +1467,69 @@ static bool joinSessionById(const std::string& sid, const std::string& sname,
                             const std::string& passphrase) {
   if (g_mode != Mode::Browsing || !g_handle) return false;
   if (!reamesh_join_session(g_handle, sid.c_str(), passphrase.c_str())) {
-    logLine("could not join \"" + sname + "\" (it may have just closed); try again");
+    logEvent("join_unavailable", {{"name", sname}},
+             "could not join \"" + sname + "\" (it may have just closed); try again");
     return false;
   }
   g_mode = Mode::Downloading;
-  g_lastError.clear();
-  logLine("joining \"" + sname + "\", downloading the project");
+  g_lastError = json();
+  g_joinPassphrase = passphrase;
+  logEvent("joining", {{"name", sname}}, "joining \"" + sname + "\", downloading the project");
   return true;
+}
+
+// Recover from a host crash or network interruption. If the host returns, the
+// session id remains valid and the staged download avoids duplicate transfers.
+// Keep watching the lobby and reuse the passphrase for a bounded retry window.
+static void beginReconnect(const json& st) {
+  Reconnect rc;
+  rc.sessionId = jsonStr(st, "session_id");
+  rc.sessionName = jsonStr(st, "session_name");
+  if (rc.sessionName.empty()) rc.sessionName = "session";
+  rc.passphrase = g_joinPassphrase;
+  rc.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+  leaveSession("", json::object(), "");  // silent: this is not (yet) an error
+  if (rc.sessionId.empty() || !startBrowse()) {
+    g_lastError =
+        logEvent("host_lost", json::object(), "lost the connection to the host");
+    return;
+  }
+  logEvent("reconnecting", {{"name", rc.sessionName}},
+           "lost the host, trying to reconnect to \"" + rc.sessionName + "\"");
+  g_reconnect = std::move(rc);
+}
+
+// Browsing-mode tick while an auto-rejoin is pending: rejoin as soon as the
+// session is announced again, give up (back to the plain lobby) on deadline.
+static void reconnectTick() {
+  if (!g_reconnect) return;
+  if (std::chrono::steady_clock::now() > g_reconnect->deadline) {
+    g_lastError = logEvent("reconnect_failed", {{"name", g_reconnect->sessionName}},
+                           "could not reconnect to \"" + g_reconnect->sessionName + "\"");
+    g_reconnect.reset();
+    return;
+  }
+  json sessions = handleJson(reamesh_sessions, json::array());
+  if (!sessions.is_array()) return;
+  for (const auto& s : sessions) {
+    if (s.is_object() && jsonStr(s, "session_id") == g_reconnect->sessionId) {
+      Reconnect rc = *g_reconnect;
+      g_reconnect.reset();
+      joinSessionById(rc.sessionId, rc.sessionName, rc.passphrase);
+      return;
+    }
+  }
 }
 
 static void onHost(const std::string& passphrase) {
   if (g_mode == Mode::Hosting) return;
-  if (g_mode != Mode::Idle) leaveSession("left previous session");
+  if (g_mode != Mode::Idle) leaveSession("left", json::object(), "left previous session");
 
   std::string path = currentProjectPath();
   if (path.empty()) {
     // Unsaved project: trigger Save As so there is a project file to share.
-    g_lastError = "save the project first, then host again";
-    logLine(g_lastError);
+    g_lastError =
+        logEvent("save_first", json::object(), "save the project first, then host again");
     Main_SaveProject(nullptr, true);
     return;
   }
@@ -1466,27 +1542,28 @@ static void onHost(const std::string& passphrase) {
 
   g_handle = reamesh_host(name.c_str(), dir.c_str(), file.c_str(), passphrase.c_str());
   if (!g_handle) {
-    g_lastError = "could not start hosting";
-    logLine(g_lastError);
+    g_lastError = logEvent("host_failed", json::object(), "could not start hosting");
     return;
   }
   g_mode = Mode::Hosting;
-  g_lastError.clear();
+  g_lastError = json();
   g_sessionProjectPath = path;
   g_snapshot = Snapshot{};
   g_lastChangeCount = -1;  // force a full capture; this seeds the shared doc
   g_lastCapture = {};
   g_lastFullScan = {};
   g_lastPeerCount = 0;
-  logLine(passphrase.empty()
-              ? "hosting \"" + name + "\", sharing all files under " + dir
-              : "hosting \"" + name + "\" (passphrase-protected), sharing " + dir);
+  logEvent("hosting", {{"name", name}},
+           passphrase.empty()
+               ? "hosting \"" + name + "\", sharing all files under " + dir
+               : "hosting \"" + name + "\" (passphrase-protected), sharing " + dir);
 }
 
 static void onLeave() {
+  g_reconnect.reset();  // a manual leave also cancels a pending auto-rejoin
   if (g_mode == Mode::Idle) return;
-  leaveSession("left the session");
-  g_lastError.clear();  // user-initiated, nothing to flag in the app
+  leaveSession("left", json::object(), "left the session");
+  g_lastError = json();  // user-initiated, nothing to flag in the app
 }
 
 // ---------- JSON helper ----------
@@ -1526,6 +1603,8 @@ static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback) {
 
 static void ctlDispatch(const json& cmd) {
   const std::string c = jsonStr(cmd, "cmd");
+  // Any explicit user action supersedes a pending auto-rejoin.
+  if (c == "host" || c == "join" || c == "leave") g_reconnect.reset();
   if (c == "browse") {
     startBrowse();
   } else if (c == "host") {
@@ -1568,12 +1647,29 @@ static void ctlTick() {
       }
     }
   }
+  json st = handleJson(reamesh_status, json::object());
+  // Client: the owner overrode some of this peer's proposals since the last
+  // tick: log it (before the log is mirrored below) and surface a cumulative
+  // counter so the app can toast on the increase.
+  long reverts = (st.contains("reverts") && st["reverts"].is_number_integer())
+                     ? st["reverts"].get<long>()
+                     : 0;
+  if (g_mode == Mode::ClientActive) {
+    if (reverts > g_lastReverts) {
+      logEvent("edit_overridden", {{"count", reverts - g_lastReverts}},
+               "the host overrode your change");
+      g_lastReverts = reverts;
+    }
+  } else {
+    reverts = 0;
+  }
   state["type"] = "state";
   state["mode"] = modeName();
   state["project"] = fileStem(currentProjectPath());
   state["error"] = g_lastError;
   state["log"] = g_log;
-  json st = handleJson(reamesh_status, json::object());
+  state["overridden"] = reverts;
+  state["reconnecting"] = static_cast<bool>(g_reconnect);
   state["state"] = jsonStr(st, "state");
   state["progress"] =
       (st.contains("progress") && st["progress"].is_number()) ? st["progress"].get<double>() : 0.0;
@@ -1617,7 +1713,7 @@ static void pollDownload() {
 
   if (state == "ready") {
     std::string path = st.value("project_path", "");
-    logLine("download complete, opening " + path);
+    logEvent("download_complete", json::object(), "download complete, opening " + path);
     g_applyingRemote = true;
     Main_openProject(path.c_str());
     // The loaded project IS the owner's state; baseline it so the load is
@@ -1627,9 +1723,22 @@ static void pollDownload() {
     g_applyingRemote = false;
     g_mode = Mode::ClientActive;
     g_sessionProjectPath = currentProjectPath();
-    logLine("connected: your edits are proposals; the session owner wins conflicts");
+    logEvent("connected", json::object(),
+             "connected: your edits are proposals; the session owner wins conflicts");
   } else if (state == "failed") {
-    leaveSession("join failed: " + st.value("message", std::string("unknown error")));
+    std::string msg = st.value("message", std::string("unknown error"));
+    // The wrong-passphrase refusal is the one failure a user routinely hits;
+    // give it a stable code so the app can translate it.
+    if (msg.find("passphrase") != std::string::npos)
+      leaveSession("wrong_password", json::object(), "join failed: " + msg);
+    else
+      leaveSession("join_failed", {{"reason", msg}}, "join failed: " + msg);
+  } else if (state == "ended") {
+    // The host went away while we were still downloading. Deliberate stop →
+    // leave; vanished without a farewell → try to rejoin automatically (the
+    // partial download dedups, so the retry is cheap).
+    if (jsonStr(st, "end_reason") == "host_lost") beginReconnect(st);
+    else leaveSession("host_ended", json::object(), "the host ended the session");
   }
 }
 
@@ -1642,7 +1751,9 @@ static void timerTick() {
 
   switch (g_mode) {
     case Mode::Idle:
+      return;
     case Mode::Browsing:
+      reconnectTick();
       return;
     case Mode::Downloading:
       pollDownload();
@@ -1652,23 +1763,28 @@ static void timerTick() {
       // Switching projects ends the session: its doc is bound to the shared
       // project file.
       if (currentProjectPath() != g_sessionProjectPath) {
-        leaveSession("project changed; session ended");
+        leaveSession("project_changed", json::object(), "project changed; session ended");
         return;
       }
       // The owner stopping the session (farewell broadcast, or the
-      // owner-vanished fallback) surfaces as status "ended"; drop out
-      // cleanly instead of editing into a dead doc.
+      // owner-vanished fallback) surfaces as status "ended": drop out
+      // cleanly instead of editing into a dead doc. A deliberate stop sends
+      // the user back to the lobby; a vanished host triggers an automatic
+      // rejoin attempt first.
       if (g_mode == Mode::ClientActive) {
         json st = handleJson(reamesh_status, json::object());
         if (jsonStr(st, "state") == "ended") {
-          leaveSession("the host ended the session");
+          if (jsonStr(st, "end_reason") == "host_lost") beginReconnect(st);
+          else leaveSession("host_ended", json::object(), "the host ended the session");
           return;
         }
       }
       unsigned peers = reamesh_peer_count(g_handle);
       if (peers != g_lastPeerCount) {
-        logLine(peers > g_lastPeerCount ? "a peer joined the session"
-                                        : "a peer left the session");
+        if (peers > g_lastPeerCount)
+          logEvent("peer_joined", json::object(), "a peer joined the session");
+        else
+          logEvent("peer_left", json::object(), "a peer left the session");
         g_lastPeerCount = peers;
       }
       pushLocalFocus();
@@ -1715,7 +1831,7 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
       g_rec->Register("-custom_action", &g_caHost);
       g_rec->Register("-custom_action", &g_caLeave);
     }
-    leaveSession("");
+    leaveSession("", json::object(), "");
     g_rec = nullptr;
     return 0;
   }

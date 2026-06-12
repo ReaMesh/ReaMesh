@@ -312,6 +312,12 @@ fn owner_wins_live_conflict() {
         Some(serde_json::json!(0.1)),
         "owner applied a proposal it should have dropped"
     );
+    // ...the override is counted so the UI can tell the user...
+    let st: Value = serde_json::from_str(&client.status_json()).unwrap();
+    assert!(
+        st["reverts"].as_u64().unwrap_or(0) >= 1,
+        "overridden proposal was not counted: {st}"
+    );
     // ...the doc converges to the owner's value on both sides...
     assert_eq!(field(&owner.snapshot_json(), "{T3}", "vol"), 0.9);
     assert_eq!(field(&client.snapshot_json(), "{T3}", "vol"), 0.9);
@@ -548,6 +554,66 @@ fn owner_shutdown_ends_session_for_clients() {
     assert!(
         ended,
         "client never learned the session ended: {}",
+        client.status_json()
+    );
+
+    drop(client);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
+fn client_leave_clears_owner_roster_quickly() {
+    let project = temp_dir("proj-leave");
+    let staging = temp_dir("staging-leave");
+    make_project(&project);
+    let (owner, client) = establish("leave-test", &project, &staging);
+
+    // A leaving client unsubscribes before shutdown, so the owner removes it
+    // within a few ticks instead of waiting for the presence timeout.
+    drop(client);
+    let gone = wait_until(Duration::from_secs(4), || {
+        let roster: Value = serde_json::from_str(&owner.peers_json()).unwrap();
+        owner.connected_peers() == 0 && roster.as_array().unwrap().len() == 1
+    });
+    assert!(
+        gone,
+        "client departure not noticed promptly: {}",
+        owner.peers_json()
+    );
+
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
+fn join_against_dead_owner_fails_instead_of_hanging() {
+    let project = temp_dir("proj-deadowner");
+    let staging = temp_dir("staging-deadowner");
+    make_project(&project);
+
+    let owner = Reamesh::host("deadowner-test", project.to_str().unwrap(), "Song.rpp", "")
+        .expect("host failed");
+    let sid = session_id_of(&owner);
+    let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
+    assert!(wait_until(Duration::from_secs(20), || {
+        interconnect(&owner, &client);
+        client.sessions_json().contains(&sid)
+    }));
+
+    // The owner dies right before the join: the cached announcement still
+    // names it, so the manifest request goes nowhere. The join must fail
+    // (MANIFEST_TIMEOUT) rather than re-request forever on a dead screen.
+    drop(owner);
+    assert!(client.join_session(&sid, ""));
+    let resolved = wait_until(Duration::from_secs(30), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        s["state"] == "failed" || s["state"] == "ended"
+    });
+    assert!(
+        resolved,
+        "join against a dead owner never resolved: {}",
         client.status_json()
     );
 
