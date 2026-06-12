@@ -43,6 +43,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "../../extension/build/reaper_reamesh.dylib": "reaper_reamesh.dylib"
+    },
     "macOS": {
       "files": {
         "Resources/Assets.car": "resources/Assets.car"
