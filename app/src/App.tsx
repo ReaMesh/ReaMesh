@@ -11,7 +11,7 @@ import { Onboarding } from "@/screens/Onboarding";
 import { Session } from "@/screens/Session";
 import { Settings } from "@/screens/Settings";
 import { startScanning, send, useActiveInstance } from "@/lib/connection";
-import { openOverlay, closeOverlay } from "@/lib/overlay";
+import { openOverlay, closeOverlay, setSessionState } from "@/lib/overlay";
 import { loadReaperPath, refreshStatus, useReaperStatus } from "@/lib/install";
 import { displayName, type ExtState, type Mode } from "@/lib/types";
 
@@ -124,6 +124,12 @@ export default function App() {
     if (inSession && port != null) openOverlay(port);
     else closeOverlay();
   }, [inSession, port]);
+
+  // Keep the backend's quit handler informed of whether we're hosting and on
+  // which control port, so it can stop the session before the app exits.
+  useEffect(() => {
+    setSessionState(mode === "hosting", port ?? null);
+  }, [mode, port]);
 
   // Run onboarding until the bundled extension is installed. Skip the gate
   // while the check is pending and in plain-browser development.

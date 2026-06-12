@@ -198,20 +198,20 @@ fn open_overlay(app: AppHandle, port: u16) -> Result<(), String> {
     .build()
     .map_err(|e| e.to_string())?;
 
-    // Park it in the top-right corner of the primary display, just below the
-    // menu bar. The webview persists nothing yet; each session re-anchors here
-    // and the user can drag it from there.
-    if let Ok(Some(mon)) = win.primary_monitor() {
-        let size = mon.size();
-        let scale = mon.scale_factor();
-        let inset = (20.0 * scale) as i32;
-        let w_px = (OVERLAY_WIDTH * scale) as i32;
-        let x = (size.width as i32 - w_px - inset).max(0);
-        let y = inset + (28.0 * scale) as i32;
-        let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
-    }
-    // Ride across Spaces so it stays with the user when they switch desktops.
     let _ = win.set_visible_on_all_workspaces(true);
+
+    // Hand the window to the native panel layer: it becomes a non-activating
+    // panel that follows REAPER's window and shows only when REAPER is
+    // frontmost. AppKit mutation must run on the main thread; positioning is
+    // now owned natively (no manual parking here).
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.run_on_main_thread(move || native_overlay::attach(&win));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = &win;
+    }
     Ok(())
 }
 
@@ -219,9 +219,57 @@ fn open_overlay(app: AppHandle, port: u16) -> Result<(), String> {
 #[tauri::command]
 fn close_overlay(app: AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("overlay") {
-        let _ = win.close();
+        // Stop the follow timer / observers before the window goes away, in the
+        // same main-thread hop so detach always precedes close.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = app.run_on_main_thread(move || {
+                native_overlay::detach();
+                let _ = win.close();
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = win.close();
+        }
     }
     Ok(())
+}
+
+/// Whether this app is hosting (vs merely a client) and the control port it's
+/// in a session on: pushed by the webview whenever the session mode changes.
+/// Read by the quit handler to leave the session (and confirm, if hosting)
+/// before the app exits.
+static SESSION: std::sync::Mutex<(bool, Option<u16>)> = std::sync::Mutex::new((false, None));
+
+#[tauri::command]
+fn set_session_state(hosting: bool, port: Option<u16>) {
+    *SESSION.lock().unwrap() = (hosting, port);
+}
+
+/// Tell the extension to leave/stop the session over its control server. A
+/// no-Origin local WebSocket client is accepted by ctl.rs (it already runs as
+/// the user). Best-effort, fire-and-forget.
+fn send_leave(port: u16) {
+    use tungstenite::Message;
+    if let Ok((mut socket, _)) = tungstenite::connect(format!("ws://127.0.0.1:{port}")) {
+        let _ = socket.send(Message::Text("{\"cmd\":\"leave\"}".to_string().into()));
+        let _ = socket.flush();
+    }
+}
+
+/// Native confirm shown when quitting while hosting. Returns true to proceed.
+fn confirm_quit_while_hosting(app: &AppHandle) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    app.dialog()
+        .message("Quitting will stop your session and disconnect everyone connected to you.")
+        .title("Stop hosting and quit?")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Stop hosting".into(),
+            "Cancel".into(),
+        ))
+        .blocking_show()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -235,7 +283,8 @@ pub fn run() {
             open_overlay,
             close_overlay,
             get_reaper_path,
-            set_reaper_path
+            set_reaper_path,
+            set_session_state
         ])
         .setup(|app| {
             // macOS menu bar with a Settings… item (Cmd+,) that the webview
@@ -246,6 +295,12 @@ pub fn run() {
                 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
                 let settings = MenuItemBuilder::with_id("settings", "Settings…")
                     .accelerator("Cmd+,")
+                    .build(app)?;
+                // Custom Quit (instead of the predefined item) so it routes
+                // through on_menu_event → app.exit(0) → our ExitRequested handler,
+                // which stops hosting before the app dies.
+                let quit = MenuItemBuilder::with_id("quit", "Quit ReaMesh")
+                    .accelerator("Cmd+Q")
                     .build(app)?;
                 let app_menu = SubmenuBuilder::new(app, "ReaMesh")
                     .about(None)
@@ -258,7 +313,7 @@ pub fn run() {
                     .hide_others()
                     .show_all()
                     .separator()
-                    .quit()
+                    .item(&quit)
                     .build()?;
                 let edit = SubmenuBuilder::new(app, "Edit")
                     .undo()
@@ -297,10 +352,53 @@ pub fn run() {
                     use tauri::Emitter;
                     let _ = app.emit("menu:settings", ());
                 }
+            } else if event.id() == "quit" {
+                // Funnel into the ExitRequested handler (stops hosting first).
+                app.exit(0);
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .on_window_event(|window, event| {
+            // Closing the main window quits the app (which closes the overlay);
+            // the overlay window closing must not quit. Route through exit() so
+            // the session is left/stopped first.
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    window.app_handle().exit(0);
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                // Set once the leave has been sent, so the second exit() pass
+                // (after we stop hosting) isn't intercepted again.
+                static CONFIRMED: AtomicBool = AtomicBool::new(false);
+                if CONFIRMED.load(Ordering::SeqCst) {
+                    return;
+                }
+                let (hosting, port) = *SESSION.lock().unwrap();
+                // Not in a session: quit immediately (the OS tears the overlay
+                // down with the process).
+                let Some(port) = port else { return };
+                api.prevent_exit();
+                // Hosts confirm; clients leave silently.
+                if hosting && !confirm_quit_while_hosting(app) {
+                    return; // user cancelled; stay running
+                }
+                let app = app.clone();
+                std::thread::spawn(move || {
+                    send_leave(port);
+                    // Give the extension a tick to drain the leave so peers see
+                    // us go before the process exits.
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    CONFIRMED.store(true, Ordering::SeqCst);
+                    app.exit(0);
+                });
+            }
+        });
 }
 
 /// Bridge to the native AppKit settings window (src/settings_window.m). The
@@ -402,5 +500,30 @@ mod native_settings {
             set_path,
         };
         unsafe { reamesh_settings_open(cb) };
+    }
+}
+
+/// Bridge to the native overlay panel (src/overlay_panel.m). It turns the Tauri
+/// overlay window into a non-activating panel that follows REAPER's window and
+/// shows only while REAPER is frontmost; all of that state lives on the ObjC
+/// side. Must be called on the main thread.
+#[cfg(target_os = "macos")]
+mod native_overlay {
+    use std::ffi::c_void;
+    use tauri::WebviewWindow;
+
+    extern "C" {
+        fn reamesh_overlay_attach(ns_window: *mut c_void, width: f64);
+        fn reamesh_overlay_detach();
+    }
+
+    pub fn attach(win: &WebviewWindow) {
+        if let Ok(ns) = win.ns_window() {
+            unsafe { reamesh_overlay_attach(ns, super::OVERLAY_WIDTH) };
+        }
+    }
+
+    pub fn detach() {
+        unsafe { reamesh_overlay_detach() };
     }
 }

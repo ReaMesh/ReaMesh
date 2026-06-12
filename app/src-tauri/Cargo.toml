@@ -24,4 +24,6 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Local WebSocket client for leaving the session before exit (ws://127.0.0.1).
+tungstenite = "0.24"
 
