@@ -27,6 +27,7 @@
 #define REAPERAPI_WANT_CountTracks
 #define REAPERAPI_WANT_GetTrack
 #define REAPERAPI_WANT_GetTrackGUID
+#define REAPERAPI_WANT_GetSelectedTrack
 #define REAPERAPI_WANT_GetMediaTrackInfo_Value
 #define REAPERAPI_WANT_SetMediaTrackInfo_Value
 #define REAPERAPI_WANT_GetSetMediaTrackInfo_String
@@ -1087,6 +1088,24 @@ static void ctlTick() {
   }
 
   json state;
+  // Each peer's beacon carries the GUID of the track they're focused on;
+  // resolve it against THIS instance's tracks so the roster shows a
+  // locally-correct 1-based track number. The GUID is the shared identity;
+  // the index is per-project, so the resolution must happen here, never on the
+  // wire. The raw GUID is dropped from what the app sees.
+  json peers = handleJson(reamesh_peers, json::array());
+  if (peers.is_array()) {
+    for (auto& p : peers) {
+      if (!p.is_object()) continue;
+      std::string guid = jsonStr(p, "focus");
+      p.erase("focus");
+      if (guid.empty()) continue;
+      if (MediaTrack* tr = findTrackByGuid(guid)) {
+        int n = static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"));
+        if (n > 0) p["track"] = n;
+      }
+    }
+  }
   state["type"] = "state";
   state["mode"] = modeName();
   state["project"] = fileStem(currentProjectPath());
@@ -1100,7 +1119,7 @@ static void ctlTick() {
   if (session.empty() && !g_sessionProjectPath.empty()) session = fileStem(g_sessionProjectPath);
   state["session"] = session;
   state["sessions"] = handleJson(reamesh_sessions, json::array());
-  state["peers"] = handleJson(reamesh_peers, json::array());
+  state["peers"] = std::move(peers);
 
   static std::string lastPublished;
   std::string out = state.dump();
@@ -1111,6 +1130,20 @@ static void ctlTick() {
 }
 
 // ---------- timer ----------
+
+// Report which track the user is on so peers can show it in their presence
+// roster. We broadcast the GUID (shared identity); each peer resolves it to
+// their own local track number. Only pushed when it changes: cheap value
+// reads, safe on the main-thread tick.
+static void pushLocalFocus() {
+  MediaTrack* sel = GetSelectedTrack(nullptr, 0);
+  std::string guid = sel ? trackGuid(sel) : std::string();
+  static std::string last;
+  if (guid != last) {
+    last = guid;
+    reamesh_set_focus(guid.c_str());
+  }
+}
 
 static void pollDownload() {
   char* raw = reamesh_status(g_handle);
@@ -1166,6 +1199,7 @@ static void timerTick() {
                                         : "a peer left the session");
         g_lastPeerCount = peers;
       }
+      pushLocalFocus();
       // Capture before apply, so an edit made by the user in this tick
       // interval is diffed against the old baseline before remote
       // application re-baselines.

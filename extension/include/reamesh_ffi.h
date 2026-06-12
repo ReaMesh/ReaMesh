@@ -107,6 +107,13 @@ char *reamesh_peers(struct ReameshHandle *handle);
 void reamesh_set_profile(const char *name, const char *color);
 
 /**
+ * Set the local user's currently-focused track GUID, gossiped on the presence
+ * beacon so session peers can show which track this user is on. Pass an empty
+ * string to clear it. Called by the extension each tick.
+ */
+void reamesh_set_focus(const char *guid);
+
+/**
  * Start the localhost control server the companion app connects to
  * (idempotent). Returns the bound port, 0 if no port was available.
  */

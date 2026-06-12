@@ -236,6 +236,8 @@ struct Shared {
 struct PeerPresence {
     name: String,
     color: String,
+    /// GUID of the track this peer is currently focused on ("" if none).
+    focus: String,
     last_seen: Instant,
 }
 
@@ -249,6 +251,17 @@ pub fn set_profile(name: &str, color: &str) {
     let mut p = PROFILE.lock().unwrap();
     p.0 = name.chars().take(64).collect();
     p.1 = color.chars().take(16).collect();
+}
+
+/// The local user's currently-focused track GUID (empty when none), set by the
+/// extension each tick. Like PROFILE it's process-global: it describes where
+/// the user is, not the session, and rides the presence beacon so peers can
+/// show which track each person is on. Peers resolve the GUID to their own
+/// local track number (identity is the GUID, never the index).
+static FOCUS: Mutex<String> = Mutex::new(String::new());
+
+pub fn set_focus(guid: &str) {
+    *FOCUS.lock().unwrap() = guid.chars().take(64).collect();
 }
 
 /// Stable fallback identity color for a peer that never told us one: a
@@ -781,24 +794,26 @@ impl Reamesh {
     pub fn peers_json(&self) -> String {
         let owner = self.shared.owner_peer.lock().unwrap().clone();
         let (my_name, my_color) = PROFILE.lock().unwrap().clone();
-        let entry = |id: &str, name: &str, color: &str, is_self: bool| {
+        let my_focus = FOCUS.lock().unwrap().clone();
+        let entry = |id: &str, name: &str, color: &str, focus: &str, is_self: bool| {
             json!({
                 "id": id,
                 "name": name,
                 "color": if color.is_empty() { default_color(id) } else { color.to_string() },
+                "focus": focus,
                 "is_self": is_self,
                 "is_owner": id == owner,
             })
         };
-        let mut arr = vec![entry(&self.local_peer_id, &my_name, &my_color, true)];
+        let mut arr = vec![entry(&self.local_peer_id, &my_name, &my_color, &my_focus, true)];
         let mut infos = self.shared.peers_info.lock().unwrap();
         let now = Instant::now();
         infos.retain(|_, p| now.duration_since(p.last_seen) < PRESENCE_STALE);
         for p in self.shared.session_peers.lock().unwrap().iter() {
             let id = p.to_string();
             match infos.get(&id) {
-                Some(info) => arr.push(entry(&id, &info.name, &info.color, false)),
-                None => arr.push(entry(&id, "", "", false)),
+                Some(info) => arr.push(entry(&id, &info.name, &info.color, &info.focus, false)),
+                None => arr.push(entry(&id, "", "", "", false)),
             }
         }
         json!(arr).to_string()
@@ -1589,8 +1604,11 @@ async fn run_network(
                 // peers can show who is here, by name and color.
                 if tick_count % 2 == 0 && let Some(t) = &sess_topic {
                     let (name, color) = PROFILE.lock().unwrap().clone();
+                    let focus = FOCUS.lock().unwrap().clone();
                     let mut data = vec![TAG_PRESENCE];
-                    data.extend_from_slice(json!({"name": name, "color": color}).to_string().as_bytes());
+                    data.extend_from_slice(
+                        json!({"name": name, "color": color, "focus": focus}).to_string().as_bytes(),
+                    );
                     let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), data);
                 }
                 // Owner: full-state anti-entropy.
@@ -1764,6 +1782,7 @@ async fn run_network(
                                         PeerPresence {
                                             name: get("name"),
                                             color: get("color"),
+                                            focus: get("focus"),
                                             last_seen: Instant::now(),
                                         },
                                     );
@@ -2520,6 +2539,14 @@ pub extern "C" fn reamesh_set_profile(name: *const c_char, color: *const c_char)
         &cstr_arg(name).unwrap_or_default(),
         &cstr_arg(color).unwrap_or_default(),
     );
+}
+
+/// Set the local user's currently-focused track GUID, gossiped on the presence
+/// beacon so session peers can show which track this user is on. Pass an empty
+/// string to clear it. Called by the extension each tick.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_set_focus(guid: *const c_char) {
+    set_focus(&cstr_arg(guid).unwrap_or_default());
 }
 
 /// Start the localhost control server the companion app connects to
