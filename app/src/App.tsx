@@ -1,14 +1,15 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
+import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { TitleBar } from "@/components/TitleBar";
-import { SettingsDialog } from "@/components/SettingsDialog";
 import { Disconnected } from "@/screens/Disconnected";
 import { Lobby } from "@/screens/Lobby";
 import { Downloading } from "@/screens/Downloading";
 import { Onboarding } from "@/screens/Onboarding";
 import { Session } from "@/screens/Session";
+import { Settings } from "@/screens/Settings";
 import { startScanning, send, useActiveInstance } from "@/lib/connection";
 import { refreshStatus, useReaperStatus } from "@/lib/install";
 import { displayName, type ExtState, type Mode } from "@/lib/types";
@@ -85,8 +86,20 @@ export default function App() {
   const instance = useActiveInstance();
   const state = instance?.state;
   const reaper = useReaperStatus();
+  const [settingsOpen, setSettingsOpen] = useState(false);
   usePresenceToasts(state);
   useErrorToasts(state);
+
+  // Settings is opened from the native menu (ReaMesh → Settings…, Cmd+,).
+  useEffect(() => {
+    const un = listen("menu:settings", () => {
+      refreshStatus();
+      setSettingsOpen(true);
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
 
   // The lobby needs discovery running; the extension's browse is idempotent.
   const mode = state?.mode;
@@ -100,7 +113,12 @@ export default function App() {
   // backend check hasn't answered yet (it's local fs, near-instant), and
   // `null` means no Tauri backend (plain-browser dev); both skip the gate.
   let screen: { key: string; node: React.ReactNode };
-  if (reaper === undefined) {
+  if (settingsOpen) {
+    screen = {
+      key: "settings",
+      node: <Settings onBack={() => setSettingsOpen(false)} />,
+    };
+  } else if (reaper === undefined) {
     screen = { key: "checking", node: null };
   } else if (reaper && !reaper.installed && !state) {
     screen = { key: "onboarding", node: <Onboarding status={reaper} /> };
@@ -129,7 +147,6 @@ export default function App() {
           {screen.node}
         </motion.main>
       </AnimatePresence>
-      <SettingsDialog />
       <Toaster />
     </div>
   );

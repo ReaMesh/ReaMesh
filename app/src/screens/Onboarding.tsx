@@ -1,7 +1,14 @@
 import { useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { CheckCircle2, FolderSearch, Puzzle, TriangleAlert } from "lucide-react";
+import {
+  CheckCircle2,
+  ExternalLink,
+  FolderSearch,
+  Puzzle,
+  TriangleAlert,
+} from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
@@ -72,18 +79,32 @@ function LocateStep({ status }: { status: ReaperStatus }) {
         <div className="min-w-0 space-y-1">
           <h2 className="text-[14px] font-semibold">REAPER not found</h2>
           <p className="text-[13px] leading-relaxed text-muted-foreground">
-            There's no REAPER folder at{" "}
-            <span className="break-all text-foreground/80">
-              {status.resourcePath}
-            </span>
-            . REAPER may not be installed, or it keeps its data somewhere
-            else (portable install).
+            REAPER may not be installed, or it keeps its data somewhere else
+            (portable install).
           </p>
         </div>
       </div>
+      <div className="flex items-center gap-2">
+        <p className="min-w-0 flex-1 break-all rounded-md bg-secondary/60 px-2.5 py-1.5 text-[12px] leading-relaxed text-foreground/80">
+          {status.resourcePath}
+        </p>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 shrink-0 text-[12px]"
+          onClick={pick}
+        >
+          Change…
+        </Button>
+      </div>
       <div className="flex gap-2">
-        <Button size="sm" className="h-8 flex-1 text-[12px]" onClick={pick}>
-          Locate REAPER folder…
+        <Button
+          size="sm"
+          className="h-8 flex-1 gap-1.5 text-[12px]"
+          onClick={() => openUrl("https://www.reaper.fm/download.php")}
+        >
+          Download REAPER
+          <ExternalLink className="size-3" />
         </Button>
         <Button
           variant="outline"

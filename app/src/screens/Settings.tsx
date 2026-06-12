@@ -1,16 +1,10 @@
-import { useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { useState } from "react";
+import { ArrowLeft, ExternalLink } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import {
   getReaperPath,
   installExtension,
@@ -19,24 +13,13 @@ import {
   useReaperStatus,
 } from "@/lib/install";
 
-// App settings, opened from the native menu (ReaMesh → Settings…, Cmd+,).
-// Holds the REAPER folder override (portable installs) and the extension
-// install/update controls.
-export function SettingsDialog() {
-  const [open_, setOpen] = useState(false);
+// Full-screen app settings, opened from the native menu (ReaMesh →
+// Settings…, Cmd+,). Holds the REAPER folder override (portable installs)
+// and the extension install/update controls.
+export function Settings({ onBack }: { onBack: () => void }) {
   const [busy, setBusy] = useState(false);
   const status = useReaperStatus();
   const hasCustom = !!getReaperPath();
-
-  useEffect(() => {
-    const un = listen("menu:settings", () => {
-      refreshStatus();
-      setOpen(true);
-    });
-    return () => {
-      un.then((f) => f());
-    };
-  }, []);
 
   const pickFolder = async () => {
     const dir = await open({
@@ -87,22 +70,28 @@ export function SettingsDialog() {
   );
 
   return (
-    <Dialog open={open_} onOpenChange={setOpen}>
-      <DialogContent className="max-w-[360px] gap-5 rounded-2xl">
-        <DialogHeader>
-          <DialogTitle className="text-[15px]">Settings</DialogTitle>
-          <DialogDescription className="sr-only">
-            ReaMesh settings
-          </DialogDescription>
-        </DialogHeader>
+    <div className="flex flex-1 flex-col overflow-y-auto">
+      <div className="mx-auto w-full max-w-md space-y-6 px-6 py-5">
+        <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="-ml-2 h-8 gap-1.5 px-2 text-[13px] text-muted-foreground hover:text-foreground"
+            onClick={onBack}
+          >
+            <ArrowLeft className="size-4" />
+            Back
+          </Button>
+          <h1 className="text-[15px] font-semibold">Settings</h1>
+        </div>
 
         <section className="space-y-2">
           <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
             REAPER folder
           </h3>
-          <div className="space-y-3 rounded-xl bg-card p-3">
+          <div className="space-y-3 rounded-xl bg-card p-3.5">
             <div className="flex items-center justify-between gap-2">
-              <p className="break-all text-[12px] leading-relaxed text-foreground/80">
+              <p className="break-all rounded-md bg-secondary/60 px-2.5 py-1.5 text-[12px] leading-relaxed text-foreground/80">
                 {status?.resourcePath ?? "Unknown"}
               </p>
               {status && !status.reaperFound && (
@@ -134,6 +123,17 @@ export function SettingsDialog() {
                 </Button>
               )}
             </div>
+            {status && !status.reaperFound && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-full gap-1.5 text-[12px] text-muted-foreground hover:text-foreground"
+                onClick={() => openUrl("https://www.reaper.fm/download.php")}
+              >
+                Don't have REAPER? Download it
+                <ExternalLink className="size-3" />
+              </Button>
+            )}
           </div>
         </section>
 
@@ -141,7 +141,7 @@ export function SettingsDialog() {
           <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
             REAPER extension
           </h3>
-          <div className="space-y-3 rounded-xl bg-card p-3">
+          <div className="space-y-3 rounded-xl bg-card p-3.5">
             <div className="flex items-center justify-between gap-2">
               <span className="text-[13px]">reaper_reamesh</span>
               {extBadge}
@@ -166,7 +166,7 @@ export function SettingsDialog() {
             </p>
           </div>
         </section>
-      </DialogContent>
-    </Dialog>
+      </div>
+    </div>
   );
 }
