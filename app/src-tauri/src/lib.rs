@@ -258,7 +258,14 @@ fn send_leave(port: u16) {
     }
 }
 
+/// Allow the second exit pass after sending leave without another confirmation.
+static QUIT_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Native confirm shown when quitting while hosting. Returns true to proceed.
+/// MUST be called off the main thread: the dialog plugin then marshals the
+/// NSAlert onto the main run loop and blocks *this* thread for the answer.
+/// (Presenting it on the main thread, directly or via the run-loop ExitRequested
+/// observer, throws an ObjC exception that aborts the process.)
 fn confirm_quit_while_hosting(app: &AppHandle) -> bool {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     app.dialog()
@@ -270,6 +277,22 @@ fn confirm_quit_while_hosting(app: &AppHandle) -> bool {
             "Cancel".into(),
         ))
         .blocking_show()
+}
+
+/// Confirm (hosts only), leave the session, give the extension a tick to drain
+/// it so peers see us go, then actually quit. Runs entirely on a background
+/// thread: never touches AppKit on the main thread / run-loop observer.
+fn confirm_leave_then_exit(app: AppHandle, hosting: bool, port: u16) {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        if hosting && !confirm_quit_while_hosting(&app) {
+            return; // user cancelled; stay running (exit already prevented)
+        }
+        send_leave(port);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        QUIT_CONFIRMED.store(true, Ordering::SeqCst);
+        app.exit(0);
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -372,31 +395,19 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                // Set once the leave has been sent, so the second exit() pass
-                // (after we stop hosting) isn't intercepted again.
-                static CONFIRMED: AtomicBool = AtomicBool::new(false);
-                if CONFIRMED.load(Ordering::SeqCst) {
-                    return;
+                use std::sync::atomic::Ordering;
+                if QUIT_CONFIRMED.load(Ordering::SeqCst) {
+                    return; // The leave was sent; allow the confirmed exit.
                 }
                 let (hosting, port) = *SESSION.lock().unwrap();
                 // Not in a session: quit immediately (the OS tears the overlay
                 // down with the process).
                 let Some(port) = port else { return };
                 api.prevent_exit();
-                // Hosts confirm; clients leave silently.
-                if hosting && !confirm_quit_while_hosting(app) {
-                    return; // user cancelled; stay running
-                }
-                let app = app.clone();
-                std::thread::spawn(move || {
-                    send_leave(port);
-                    // Give the extension a tick to drain the leave so peers see
-                    // us go before the process exits.
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    CONFIRMED.store(true, Ordering::SeqCst);
-                    app.exit(0);
-                });
+                // Confirm and leave on a background thread, then request exit again.
+                // The dialog plugin dispatches to the main run loop; presenting
+                // directly from this observer would throw an Objective-C exception.
+                confirm_leave_then_exit(app.clone(), hosting, port);
             }
         });
 }

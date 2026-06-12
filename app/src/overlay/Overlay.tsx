@@ -128,16 +128,24 @@ export function Overlay({ port }: { port: number | null }) {
         data-tauri-drag-region
         className="flex h-9 items-center gap-2 px-2.5"
       >
-        {collapsed && peers.length > 0 ? (
-          <>
-            <AvatarStack peers={peers} />
-            <span className="flex-1 text-[11px] tabular-nums text-muted-foreground">
-              {peers.length}
-            </span>
-          </>
-        ) : (
-          <span data-tauri-drag-region className="flex-1" />
-        )}
+        <div
+          data-tauri-drag-region
+          className="flex min-w-0 flex-1 items-center"
+        >
+          <AnimatePresence initial={false}>
+            {collapsed && peers.length > 0 && (
+              <motion.div
+                key="stack"
+                initial={{ opacity: 0, scale: 0.85, x: -4 }}
+                animate={{ opacity: 1, scale: 1, x: 0 }}
+                exit={{ opacity: 0, scale: 0.85, x: -4 }}
+                transition={{ type: "spring", stiffness: 420, damping: 30 }}
+              >
+                <AvatarStack peers={peers} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}
