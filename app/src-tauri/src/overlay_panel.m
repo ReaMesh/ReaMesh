@@ -40,6 +40,7 @@ static const NSTimeInterval kDragPause = 0.25; // suspend follow during a drag
 @property (strong) NSPanel *panel;
 @property (strong) NSTimer *followTimer;
 @property (weak) id<NSWindowDelegate> prevDelegate;
+@property (assign) Class originalClass; // tao's NSWindow subclass, restored on detach
 @property (assign) NSPoint userOffset; // overlayTopRight - reaperTopRight, CG space
 @property (assign) BOOL isProgrammaticMove;
 @property (assign) BOOL visible;
@@ -226,7 +227,12 @@ static ReaMeshOverlayController *gOverlay = nil;
 #pragma mark - Attach / detach
 
 - (void)attachToWindow:(NSWindow *)window {
-    // Turn it into a non-activating floating panel.
+    // Turn it into a non-activating floating panel. Remember tao's original
+    // window class so detach can restore it: closing a window whose isa we've
+    // swapped away from tao's objc2 subclass dispatches into the wrong class and
+    // throws an ObjC exception (which aborts the process, since it can't unwind
+    // through tao's Rust run-loop observer).
+    self.originalClass = object_getClass(window);
     object_setClass(window, [ReaMeshOverlayPanel class]);
     NSPanel *panel = (NSPanel *)window;
     panel.styleMask |= NSWindowStyleMaskNonactivatingPanel;
@@ -268,8 +274,18 @@ static ReaMeshOverlayController *gOverlay = nil;
     self.followTimer = nil;
     [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
     if (self.panel) {
-        self.panel.delegate = self.prevDelegate;
+        NSPanel *panel = self.panel;
+        panel.delegate = self.prevDelegate;
         self.prevDelegate = nil;
+        // Undo the panel-ization before Tauri/tao closes its own window. The
+        // non-activating style bit is only valid on an NSPanel, so clear it
+        // while the class is still our panel subclass, then restore tao's
+        // original class so close/dealloc dispatch hits tao's implementations.
+        panel.styleMask &= ~NSWindowStyleMaskNonactivatingPanel;
+        if (self.originalClass) {
+            object_setClass(panel, self.originalClass);
+            self.originalClass = nil;
+        }
         self.panel = nil;
     }
 }
