@@ -7,12 +7,19 @@
 // on the network.
 //
 // v3 sync model (owner-authoritative):
-//   tracks:  index/name/vol/pan/mute/solo as scalar fields, plus the track's
-//            FX chain (<FXCHAIN> block) and automation envelopes (top-level
-//            *ENV* blocks) as normalized state-chunk strings.
+//   tracks:  index plus the shared scalar fields (name/vol/pan/mute, FX-chain
+//            enable, width/pan mode/dual pan/pan law, phase, solo defeat,
+//            channel count, color, folder depth, parent send, track timebase,
+//            play offset, fixed-lane config), and the track's chunk-level
+//            parts (FX chain, input FX chain, automation envelopes, receives
+//            with their send envelopes, group/VCA flags, control lock) as
+//            normalized state-chunk strings. Solo is deliberately NOT synced:
+//            soloing is per-user monitoring, not document state.
 //   items:   each media item as its full normalized state chunk (covers
 //            position, length, splits, fades, takes, take FX, MIDI content)
 //            plus the GUID of the track it sits on.
+//   project: tempo map, markers/regions, project notes/title/author, track
+//            group names and the project timebase as whole fields.
 // Media files referenced by an incoming item that are missing locally are
 // fetched from the session peers in the background; the item is applied as
 // soon as its files exist (deferred apply).
@@ -59,8 +66,12 @@
 #define REAPERAPI_WANT_SetMediaItemTake_Source
 #define REAPERAPI_WANT_PCM_Source_Destroy
 #define REAPERAPI_WANT_UpdateItemInProject
-#define REAPERAPI_WANT_Undo_BeginBlock2
-#define REAPERAPI_WANT_Undo_EndBlock2
+#define REAPERAPI_WANT_ColorToNative
+#define REAPERAPI_WANT_ColorFromNative
+#define REAPERAPI_WANT_GetSetProjectNotes
+#define REAPERAPI_WANT_GetSetProjectInfo_String
+#define REAPERAPI_WANT_projectconfig_var_getoffs
+#define REAPERAPI_WANT_projectconfig_var_addr
 #define REAPERAPI_WANT_CountProjectMarkers
 #define REAPERAPI_WANT_EnumProjectMarkers3
 #define REAPERAPI_WANT_AddProjectMarker2
@@ -84,6 +95,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <string>
@@ -101,9 +113,37 @@ struct TrackState {
   double vol = 1.0;
   double pan = 0.0;
   bool mute = false;
-  bool solo = false;
-  std::string fxchain;  // normalized <FXCHAIN> block, "" when no FX
-  std::string env;      // concatenated normalized top-level *ENV* blocks
+  // Solo is deliberately absent: soloing is per-user *monitoring* state: one
+  // peer auditioning a track must not silence everyone else's mix.
+  bool fxen = true;         // I_FXEN: FX chain enable (the TCP "FX" button)
+  double width = 1.0;       // D_WIDTH
+  int panmode = -1;         // I_PANMODE
+  double dualpanl = -1.0;   // D_DUALPANL (meaningful when panmode == 6)
+  double dualpanr = 1.0;    // D_DUALPANR
+  double panlaw = -1.0;     // D_PANLAW (<0 = project default)
+  int panlawflags = 0;      // I_PANLAW_FLAGS
+  bool phase = false;       // B_PHASE
+  bool solodefeat = false;  // B_SOLO_DEFEAT
+  int nchan = 2;            // I_NCHAN
+  int color = 0;            // platform-neutral 0x1RRGGBB, 0 = no custom color
+  int folderdepth = 0;      // I_FOLDERDEPTH
+  bool mainsend = true;     // B_MAINSEND
+  int mainsendoffs = 0;     // C_MAINSEND_OFFS
+  int mainsendnch = 0;      // C_MAINSEND_NCH
+  int timebase = -1;        // C_BEATATTACHMODE (-1 = project default)
+  double playoffs = 0.0;    // D_PLAY_OFFSET
+  int playoffsflag = 0;     // I_PLAY_OFFSET_FLAG
+  int freemode = 0;         // I_FREEMODE (1 = free positioning, 2 = fixed lanes)
+  int numlanes = 0;         // I_NUMFIXEDLANES
+  int lanesettings = 0;     // C_LANESETTINGS
+  std::string lanenames;    // '\n'-joined P_LANENAME:n (fixed lanes only)
+  std::string laneplays;    // ' '-joined C_LANEPLAYS:n (fixed lanes only)
+  std::string fxchain;      // normalized <FXCHAIN> block, "" when no FX
+  std::string recfx;        // normalized <FXCHAIN_REC> input-FX block
+  std::string env;          // concatenated top-level *ENV* blocks (non-send)
+  std::string recv;         // AUXRECV lines + send envelopes, source as GUID
+  std::string group;        // GROUP_FLAGS / GROUP_FLAGS_HIGH lines
+  std::string lock;         // LOCK line (track control lock)
   bool operator==(const TrackState&) const = default;
 };
 
@@ -119,6 +159,11 @@ struct ItemState {
 struct ProjectState {
   std::string tempo;
   std::string markers;
+  std::string notes;       // project notes
+  std::string title;       // PROJECT_TITLE
+  std::string author;      // PROJECT_AUTHOR
+  std::string groupnames;  // 64 '\n'-joined TRACK_GROUP_NAME:X entries
+  std::string timebase;    // "itemtimelock tempoenvtimelock" config ints
   bool operator==(const ProjectState&) const = default;
 };
 
@@ -150,6 +195,7 @@ static unsigned g_lastPeerCount = 0;
 static std::string g_lastError;  // last session-ending message, shown by the app
 static std::vector<DeferredItem> g_deferredItems;
 static std::chrono::steady_clock::time_point g_lastCapture{};
+static std::chrono::steady_clock::time_point g_lastFullScan{};
 
 // Two parameter-free convenience actions; the companion app is the real UI
 // and drives everything (browse/join/leave) over the control server instead.
@@ -191,11 +237,15 @@ static std::string_view ltrim(std::string_view s) {
 // Volatile per-user UI state inside chunks: selection, which FX window is
 // open, dock state, floating window rects. Synced verbatim they would make
 // peers fight over selection and pop each other's plugin windows open, and
-// they bump the diff on every click.
+// they bump the diff on every click. Envelope ARM and VIS lines are in the
+// same bucket: which envelope is armed/visible is the local user's automation
+// workflow, not document state (REAPER falls back to defaults when an applied
+// envelope block carries neither).
 static bool isVolatileChunkLine(std::string_view trimmed) {
   return trimmed.rfind("SEL ", 0) == 0 || trimmed.rfind("SHOW ", 0) == 0 ||
          trimmed.rfind("LASTSEL ", 0) == 0 || trimmed.rfind("DOCKED ", 0) == 0 ||
-         trimmed.rfind("FLOAT", 0) == 0 || trimmed.rfind("WNDRECT ", 0) == 0;
+         trimmed.rfind("FLOAT", 0) == 0 || trimmed.rfind("WNDRECT ", 0) == 0 ||
+         trimmed.rfind("ARM ", 0) == 0 || trimmed.rfind("VIS ", 0) == 0;
 }
 
 static std::string normalizeChunk(const std::string& chunk) {
@@ -215,67 +265,115 @@ static std::string normalizeChunk(const std::string& chunk) {
   return out;
 }
 
-// The synced top-level child blocks of a track chunk: the FX chain and the
-// automation envelopes. Items (<ITEM>) deliberately stay out; they are
-// synced per-item through the "items" section.
+// The synced top-level parts of a track chunk:
+//   <FXCHAIN>      the track FX chain
+//   <FXCHAIN_REC>  the input (record) FX chain
+//   *ENV* blocks   automation envelopes, except AUX*ENV send envelopes,
+//                  which belong to the AUXRECV receive they follow and ride
+//                  in `recv` so the pairing survives splicing
+//   AUXRECV lines  receives (with their AUX*ENV send-envelope blocks)
+//   GROUP_FLAGS*   grouping/VCA membership bitmasks
+//   LOCK           track control lock
+// Items (<ITEM>) deliberately stay out: they are synced per-item through the
+// "items" section.
 static bool isEnvTag(std::string_view tag) {
   return tag.find("ENV") != std::string_view::npos;
 }
 
 struct TrackBlocks {
   std::string fxchain;
+  std::string recfx;
   std::string env;
+  std::string recv;
+  std::string group;
+  std::string lock;
 };
 
-// Extract the FXCHAIN and envelope blocks from a (normalized) track chunk.
+// Part kinds, in the order they are emitted when several land at the same
+// insertion point (roughly REAPER's own chunk order; the parser is
+// order-tolerant).
+enum TrackPartKind { kLock = 0, kGroup, kRecv, kRecFx, kFxChain, kEnv, kPartCount };
+
+static std::string_view blockTag(std::string_view trimmed) {
+  if (trimmed.empty() || trimmed.front() != '<') return {};
+  std::string_view tag = trimmed.substr(1);
+  return tag.substr(0, tag.find_first_of(" \t"));
+}
+
+// Classify a depth-1 line of a track chunk; `tag` is the block tag when the
+// line opens a block, empty otherwise. -1 for everything that isn't a synced
+// part (scalar lines, <ITEM> blocks, ...).
+static int trackPartKind(std::string_view trimmed, std::string_view tag) {
+  if (!tag.empty()) {
+    if (tag == "FXCHAIN") return kFxChain;
+    if (tag == "FXCHAIN_REC") return kRecFx;
+    if (isEnvTag(tag)) return tag.rfind("AUX", 0) == 0 ? kRecv : kEnv;
+    return -1;
+  }
+  if (trimmed.rfind("AUXRECV ", 0) == 0) return kRecv;
+  if (trimmed.rfind("GROUP_FLAGS", 0) == 0) return kGroup;  // + GROUP_FLAGS_HIGH
+  if (trimmed.rfind("LOCK ", 0) == 0) return kLock;
+  return -1;
+}
+
+// Extract the synced parts from a (normalized) track chunk, in document order
+// within each part (receives keep their send envelopes interleaved).
 static TrackBlocks extractTrackBlocks(const std::string& chunk) {
   TrackBlocks out;
+  std::string* dest[kPartCount] = {&out.lock,  &out.group,   &out.recv,
+                                   &out.recfx, &out.fxchain, &out.env};
   int depth = 0;
-  bool collecting = false;
-  std::string cur, curTag;
+  int collectKind = -1;  // >= 0 while inside a collected block
   size_t pos = 0;
   while (pos < chunk.size()) {
     size_t eol = chunk.find('\n', pos);
     if (eol == std::string::npos) eol = chunk.size();
     std::string_view line(chunk.data() + pos, eol - pos);
     std::string_view t = ltrim(line);
-    if (!collecting && depth == 1 && !t.empty() && t.front() == '<') {
-      std::string_view tag = t.substr(1);
-      tag = tag.substr(0, tag.find_first_of(" \t"));
-      if (tag == "FXCHAIN" || isEnvTag(tag)) {
-        collecting = true;
-        curTag = std::string(tag);
-        cur.clear();
+    bool opens = !t.empty() && t.front() == '<';
+    if (collectKind < 0 && depth == 1 && !t.empty()) {
+      int k = trackPartKind(t, blockTag(t));
+      if (k >= 0) {
+        if (opens) {
+          collectKind = k;  // the block, opener included, collects below
+        } else {
+          dest[k]->append(line);
+          dest[k]->push_back('\n');
+        }
       }
     }
-    if (collecting) {
-      cur.append(line);
-      cur.push_back('\n');
+    if (collectKind >= 0) {
+      dest[collectKind]->append(line);
+      dest[collectKind]->push_back('\n');
     }
-    if (!t.empty() && t.front() == '<') {
+    if (opens) {
       ++depth;
     } else if (t == ">") {
       --depth;
-      if (collecting && depth == 1) {
-        if (curTag == "FXCHAIN") {
-          out.fxchain = cur;
-        } else {
-          out.env += cur;
-        }
-        collecting = false;
-      }
+      if (collectKind >= 0 && depth == 1) collectKind = -1;
     }
     pos = eol + 1;
   }
   return out;
 }
 
-// Rebuild a track chunk with its FXCHAIN block replaced by `fxchain` and/or
-// its envelope blocks replaced by `env` (nullptr = leave that kind alone,
-// empty string = remove). Replacements land where the old blocks were, else
-// before the first item, else before the closing ">".
-static std::string replaceTrackBlocks(const std::string& chunk, const std::string* fxchain,
-                                      const std::string* env) {
+// Patch for replaceTrackBlocks: non-null members replace that part of the
+// chunk (empty string = remove that part), null members are left alone.
+struct TrackBlocksPatch {
+  const std::string* fxchain = nullptr;
+  const std::string* recfx = nullptr;
+  const std::string* env = nullptr;
+  const std::string* recv = nullptr;  // local (track-index) AUXRECV form
+  const std::string* group = nullptr;
+  const std::string* lock = nullptr;
+};
+
+// Rebuild a track chunk with the patched parts replaced. Each replacement
+// lands where the first old segment of its kind was, else before the first
+// item, else before the closing ">".
+static std::string replaceTrackBlocks(const std::string& chunk, const TrackBlocksPatch& p) {
+  const std::string* repl[kPartCount] = {p.lock, p.group, p.recv, p.recfx, p.fxchain, p.env};
+
   std::vector<std::string> lines;
   {
     size_t pos = 0;
@@ -291,7 +389,8 @@ static std::string replaceTrackBlocks(const std::string& chunk, const std::strin
   out.reserve(lines.size());
   int depth = 0;
   int skipUntilDepth = -1;  // inside a block being removed
-  size_t insertAt = std::string::npos;
+  size_t anchor[kPartCount];
+  for (size_t& a : anchor) a = std::string::npos;
   size_t firstItemAt = std::string::npos;
 
   for (const std::string& line : lines) {
@@ -299,18 +398,19 @@ static std::string replaceTrackBlocks(const std::string& chunk, const std::strin
     bool opens = !t.empty() && t.front() == '<';
     bool closes = (t == ">");
 
-    if (skipUntilDepth < 0 && depth == 1 && opens) {
-      std::string_view tag = t.substr(1);
-      tag = tag.substr(0, tag.find_first_of(" \t"));
-      bool removeFx = fxchain && tag == "FXCHAIN";
-      bool removeEnv = env && isEnvTag(tag);
-      if (removeFx || removeEnv) {
-        if (insertAt == std::string::npos) insertAt = out.size();
-        skipUntilDepth = depth;  // skip until we return to this depth
-        ++depth;
-        continue;
+    if (skipUntilDepth < 0 && depth == 1 && !t.empty()) {
+      std::string_view tag = blockTag(t);
+      int k = trackPartKind(t, tag);
+      if (k >= 0 && repl[k]) {
+        if (anchor[k] == std::string::npos) anchor[k] = out.size();
+        if (opens) {
+          skipUntilDepth = depth;  // skip until the block closes
+          ++depth;
+        }
+        continue;  // line dropped / block skipped
       }
-      if (tag == "ITEM" && firstItemAt == std::string::npos) firstItemAt = out.size();
+      if (opens && tag == "ITEM" && firstItemAt == std::string::npos)
+        firstItemAt = out.size();
     }
 
     if (opens) {
@@ -326,28 +426,75 @@ static std::string replaceTrackBlocks(const std::string& chunk, const std::strin
     out.push_back(line);
   }
 
-  if (insertAt == std::string::npos)
-    insertAt = (firstItemAt != std::string::npos) ? firstItemAt
-                                                  : (out.empty() ? 0 : out.size() - 1);
+  const size_t fallback =
+      (firstItemAt != std::string::npos) ? firstItemAt : (out.empty() ? 0 : out.size() - 1);
+  std::vector<std::vector<int>> insAt(out.size() + 1);
+  for (int k = 0; k < kPartCount; ++k) {
+    if (!repl[k]) continue;
+    size_t a = (anchor[k] != std::string::npos) ? anchor[k] : fallback;
+    if (a > out.size()) a = out.size();
+    insAt[a].push_back(k);  // ascending k = canonical order at equal spots
+  }
 
   std::string result;
-  result.reserve(chunk.size() + (fxchain ? fxchain->size() : 0) + (env ? env->size() : 0));
-  auto emit = [&](const std::string& l) {
-    result += l;
-    result += '\n';
-  };
-  for (size_t i = 0; i < out.size(); ++i) {
-    if (i == insertAt) {
-      if (fxchain && !fxchain->empty()) result += *fxchain;  // blocks end in '\n'
-      if (env && !env->empty()) result += *env;
+  result.reserve(chunk.size() + 256);
+  for (size_t i = 0; i <= out.size(); ++i) {
+    for (int k : insAt[i]) {
+      if (repl[k]->empty()) continue;
+      result += *repl[k];  // parts end in '\n' by construction
+      if (result.back() != '\n') result.push_back('\n');
     }
-    emit(out[i]);
-  }
-  if (insertAt >= out.size()) {
-    if (fxchain && !fxchain->empty()) result += *fxchain;
-    if (env && !env->empty()) result += *env;
+    if (i < out.size()) {
+      result += out[i];
+      result.push_back('\n');
+    }
   }
   return result;
+}
+
+// Receives cross the wire with the source-track GUID in place of the AUXRECV
+// line's leading track index: indices are per-peer, GUIDs are the shared
+// identity, and the GUID form is stable across reorders, so a track move
+// doesn't re-emit every receive as an edit. `mapEndpoint` converts the
+// leading token; returning "" drops the whole unit (the AUXRECV line plus the
+// AUX*ENV send-envelope blocks that follow it), used when the source track
+// doesn't exist on this side.
+static std::string transformRecvUnits(
+    const std::string& recv, const std::function<std::string(const std::string&)>& mapEndpoint) {
+  std::string out;
+  bool dropping = false;
+  int depth = 0;
+  size_t pos = 0;
+  while (pos < recv.size()) {
+    size_t eol = recv.find('\n', pos);
+    if (eol == std::string::npos) eol = recv.size();
+    std::string_view line(recv.data() + pos, eol - pos);
+    std::string_view t = ltrim(line);
+    if (depth == 0 && t.rfind("AUXRECV ", 0) == 0) {
+      std::string_view rest = t.substr(8);
+      size_t sp = rest.find_first_of(" \t");
+      std::string tok(rest.substr(0, sp == std::string_view::npos ? rest.size() : sp));
+      std::string mapped = mapEndpoint(tok);
+      dropping = mapped.empty();
+      if (!dropping) {
+        out.append(line.substr(0, line.size() - t.size()));  // keep indentation
+        out += "AUXRECV ";
+        out += mapped;
+        out.append(rest.substr(tok.size()));
+        out.push_back('\n');
+      }
+    } else if (!dropping) {
+      out.append(line);
+      out.push_back('\n');
+    }
+    if (!t.empty() && t.front() == '<') {
+      ++depth;
+    } else if (t == ">") {
+      --depth;
+    }
+    pos = eol + 1;
+  }
+  return out;
 }
 
 // All quoted FILE references in an item chunk (media sources).
@@ -512,10 +659,106 @@ static void applyMarkers(const std::string& s) {
   }
 }
 
+// Track colors cross the wire as platform-neutral 0x1RRGGBB (the 0x1000000
+// "custom color in use" flag plus RGB); macOS and Windows pack native colors
+// with opposite byte order, so the native int must never be shared.
+static int colorToWire(int native) {
+  if (!(native & 0x1000000)) return 0;
+  int r = 0, g = 0, b = 0;
+  ColorFromNative(native & 0xFFFFFF, &r, &g, &b);
+  return 0x1000000 | (r << 16) | (g << 8) | b;
+}
+
+static int colorFromWire(int wire) {
+  if (!(wire & 0x1000000)) return 0;
+  return 0x1000000 | ColorToNative((wire >> 16) & 0xFF, (wire >> 8) & 0xFF, wire & 0xFF);
+}
+
+// Pointer to a 4-byte project config var, or null when REAPER doesn't know
+// it. Used for the project timebase, which has no setter API
+// (GetSetProjectInfo's PROJECT_TIMEBASE is read-only).
+static int* projConfigInt(const char* name) {
+  int sz = 0;
+  const int offs = projectconfig_var_getoffs(name, &sz);
+  if (offs < 0 || sz != (int)sizeof(int)) return nullptr;
+  return (int*)projectconfig_var_addr(nullptr, offs);
+}
+
+// "itemtimelock tempoenvtimelock": project timebase for items/envelopes/
+// markers and for the tempo map. Synced because tempo edits ARE synced: with
+// diverging timebases the same tempo change moves items differently per peer.
+static std::string captureProjectTimebase() {
+  int* item = projConfigInt("itemtimelock");
+  int* tempo = projConfigInt("tempoenvtimelock");
+  if (!item || !tempo) return "";
+  return std::to_string(*item) + " " + std::to_string(*tempo);
+}
+
+static void applyProjectTimebase(const std::string& s) {
+  int it = 0, te = 0;
+  if (sscanf(s.c_str(), "%d %d", &it, &te) != 2) return;
+  if (int* item = projConfigInt("itemtimelock")) *item = it;
+  if (int* tempo = projConfigInt("tempoenvtimelock")) *tempo = te;
+}
+
+static std::string captureProjectString(const char* desc) {
+  char buf[4096] = "";
+  GetSetProjectInfo_String(nullptr, desc, buf, false);
+  return buf;
+}
+
+static void applyProjectString(const char* desc, const std::string& value) {
+  std::vector<char> buf(value.begin(), value.end());
+  buf.push_back('\0');
+  GetSetProjectInfo_String(nullptr, desc, buf.data(), true);
+}
+
+static std::string captureProjectNotes() {
+  std::vector<char> buf(1 << 16, '\0');
+  GetSetProjectNotes(nullptr, false, buf.data(), (int)buf.size());
+  return buf.data();
+}
+
+static void applyProjectNotes(const std::string& notes) {
+  std::vector<char> buf(notes.begin(), notes.end());
+  buf.push_back('\0');
+  GetSetProjectNotes(nullptr, true, buf.data(), 0);
+}
+
+// All 64 track-group names as one '\n'-joined field (names can't contain
+// newlines; the Project Settings field is single-line).
+static std::string captureGroupNames() {
+  std::string out;
+  for (int i = 1; i <= 64; ++i) {
+    char desc[32];
+    snprintf(desc, sizeof(desc), "TRACK_GROUP_NAME:%d", i);
+    if (i > 1) out += '\n';
+    out += captureProjectString(desc);
+  }
+  return out;
+}
+
+static void applyGroupNames(const std::string& s) {
+  size_t pos = 0;
+  for (int i = 1; i <= 64 && pos <= s.size(); ++i) {
+    size_t eol = s.find('\n', pos);
+    if (eol == std::string::npos) eol = s.size();
+    char desc[32];
+    snprintf(desc, sizeof(desc), "TRACK_GROUP_NAME:%d", i);
+    applyProjectString(desc, s.substr(pos, eol - pos));
+    pos = eol + 1;
+  }
+}
+
 static Snapshot snapshotProject() {
   Snapshot snap;
   snap.project.tempo = captureTempo();
   snap.project.markers = captureMarkers();
+  snap.project.notes = captureProjectNotes();
+  snap.project.title = captureProjectString("PROJECT_TITLE");
+  snap.project.author = captureProjectString("PROJECT_AUTHOR");
+  snap.project.groupnames = captureGroupNames();
+  snap.project.timebase = captureProjectTimebase();
   const int n = CountTracks(nullptr);
   for (int i = 0; i < n; ++i) {
     MediaTrack* tr = GetTrack(nullptr, i);
@@ -527,10 +770,52 @@ static Snapshot snapshotProject() {
     ts.vol = GetMediaTrackInfo_Value(tr, "D_VOL");
     ts.pan = GetMediaTrackInfo_Value(tr, "D_PAN");
     ts.mute = GetMediaTrackInfo_Value(tr, "B_MUTE") != 0.0;
-    ts.solo = GetMediaTrackInfo_Value(tr, "I_SOLO") != 0.0;
+    ts.fxen = GetMediaTrackInfo_Value(tr, "I_FXEN") != 0.0;
+    ts.width = GetMediaTrackInfo_Value(tr, "D_WIDTH");
+    ts.panmode = (int)GetMediaTrackInfo_Value(tr, "I_PANMODE");
+    ts.dualpanl = GetMediaTrackInfo_Value(tr, "D_DUALPANL");
+    ts.dualpanr = GetMediaTrackInfo_Value(tr, "D_DUALPANR");
+    ts.panlaw = GetMediaTrackInfo_Value(tr, "D_PANLAW");
+    ts.panlawflags = (int)GetMediaTrackInfo_Value(tr, "I_PANLAW_FLAGS");
+    ts.phase = GetMediaTrackInfo_Value(tr, "B_PHASE") != 0.0;
+    ts.solodefeat = GetMediaTrackInfo_Value(tr, "B_SOLO_DEFEAT") != 0.0;
+    ts.nchan = (int)GetMediaTrackInfo_Value(tr, "I_NCHAN");
+    ts.color = colorToWire((int)GetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR"));
+    ts.folderdepth = (int)GetMediaTrackInfo_Value(tr, "I_FOLDERDEPTH");
+    ts.mainsend = GetMediaTrackInfo_Value(tr, "B_MAINSEND") != 0.0;
+    ts.mainsendoffs = (int)GetMediaTrackInfo_Value(tr, "C_MAINSEND_OFFS");
+    ts.mainsendnch = (int)GetMediaTrackInfo_Value(tr, "C_MAINSEND_NCH");
+    ts.timebase = (int)GetMediaTrackInfo_Value(tr, "C_BEATATTACHMODE");
+    ts.playoffs = GetMediaTrackInfo_Value(tr, "D_PLAY_OFFSET");
+    ts.playoffsflag = (int)GetMediaTrackInfo_Value(tr, "I_PLAY_OFFSET_FLAG");
+    ts.freemode = (int)GetMediaTrackInfo_Value(tr, "I_FREEMODE");
+    ts.numlanes = (int)GetMediaTrackInfo_Value(tr, "I_NUMFIXEDLANES");
+    ts.lanesettings = (int)GetMediaTrackInfo_Value(tr, "C_LANESETTINGS");
+    if (ts.freemode == 2 && ts.numlanes > 0) {
+      for (int lane = 0; lane < ts.numlanes; ++lane) {
+        char key[32], lname[512] = "";
+        snprintf(key, sizeof(key), "P_LANENAME:%d", lane);
+        GetSetMediaTrackInfo_String(tr, key, lname, false);
+        if (lane) ts.lanenames += '\n';
+        ts.lanenames += lname;
+        snprintf(key, sizeof(key), "C_LANEPLAYS:%d", lane);
+        if (lane) ts.laneplays += ' ';
+        ts.laneplays += std::to_string((int)GetMediaTrackInfo_Value(tr, key));
+      }
+    }
     TrackBlocks blocks = extractTrackBlocks(normalizeChunk(objectStateChunk(tr)));
     ts.fxchain = std::move(blocks.fxchain);
+    ts.recfx = std::move(blocks.recfx);
     ts.env = std::move(blocks.env);
+    ts.group = std::move(blocks.group);
+    ts.lock = std::move(blocks.lock);
+    ts.recv = transformRecvUnits(blocks.recv, [](const std::string& tok) -> std::string {
+      char* end = nullptr;
+      const long idx = strtol(tok.c_str(), &end, 10);
+      if (end == tok.c_str() || idx < 0) return "";
+      MediaTrack* src = GetTrack(nullptr, (int)idx);
+      return src ? trackGuid(src) : "";
+    });
     snap.tracks[trackGuid(tr)] = std::move(ts);
   }
   const int ni = CountMediaItems(nullptr);
@@ -545,9 +830,41 @@ static Snapshot snapshotProject() {
 }
 
 static json trackToJson(const TrackState& ts) {
-  return json{{"present", true}, {"index", ts.index},     {"name", ts.name},
-              {"vol", ts.vol},   {"pan", ts.pan},         {"mute", ts.mute},
-              {"solo", ts.solo}, {"fxchain", ts.fxchain}, {"env", ts.env}};
+  return json{{"present", true},
+              {"index", ts.index},
+              {"name", ts.name},
+              {"vol", ts.vol},
+              {"pan", ts.pan},
+              {"mute", ts.mute},
+              {"fxen", ts.fxen},
+              {"width", ts.width},
+              {"panmode", ts.panmode},
+              {"dualpanl", ts.dualpanl},
+              {"dualpanr", ts.dualpanr},
+              {"panlaw", ts.panlaw},
+              {"panlawflags", ts.panlawflags},
+              {"phase", ts.phase},
+              {"solodefeat", ts.solodefeat},
+              {"nchan", ts.nchan},
+              {"color", ts.color},
+              {"folderdepth", ts.folderdepth},
+              {"mainsend", ts.mainsend},
+              {"mainsendoffs", ts.mainsendoffs},
+              {"mainsendnch", ts.mainsendnch},
+              {"timebase", ts.timebase},
+              {"playoffs", ts.playoffs},
+              {"playoffsflag", ts.playoffsflag},
+              {"freemode", ts.freemode},
+              {"numlanes", ts.numlanes},
+              {"lanesettings", ts.lanesettings},
+              {"lanenames", ts.lanenames},
+              {"laneplays", ts.laneplays},
+              {"fxchain", ts.fxchain},
+              {"recfx", ts.recfx},
+              {"env", ts.env},
+              {"recv", ts.recv},
+              {"group", ts.group},
+              {"lock", ts.lock}};
 }
 
 // Minimal changeset: full field set for new entities, changed fields only for
@@ -569,9 +886,35 @@ static std::string diffSnapshots(const Snapshot& prev, const Snapshot& now) {
     if (old.vol != ts.vol) delta["vol"] = ts.vol;
     if (old.pan != ts.pan) delta["pan"] = ts.pan;
     if (old.mute != ts.mute) delta["mute"] = ts.mute;
-    if (old.solo != ts.solo) delta["solo"] = ts.solo;
+    if (old.fxen != ts.fxen) delta["fxen"] = ts.fxen;
+    if (old.width != ts.width) delta["width"] = ts.width;
+    if (old.panmode != ts.panmode) delta["panmode"] = ts.panmode;
+    if (old.dualpanl != ts.dualpanl) delta["dualpanl"] = ts.dualpanl;
+    if (old.dualpanr != ts.dualpanr) delta["dualpanr"] = ts.dualpanr;
+    if (old.panlaw != ts.panlaw) delta["panlaw"] = ts.panlaw;
+    if (old.panlawflags != ts.panlawflags) delta["panlawflags"] = ts.panlawflags;
+    if (old.phase != ts.phase) delta["phase"] = ts.phase;
+    if (old.solodefeat != ts.solodefeat) delta["solodefeat"] = ts.solodefeat;
+    if (old.nchan != ts.nchan) delta["nchan"] = ts.nchan;
+    if (old.color != ts.color) delta["color"] = ts.color;
+    if (old.folderdepth != ts.folderdepth) delta["folderdepth"] = ts.folderdepth;
+    if (old.mainsend != ts.mainsend) delta["mainsend"] = ts.mainsend;
+    if (old.mainsendoffs != ts.mainsendoffs) delta["mainsendoffs"] = ts.mainsendoffs;
+    if (old.mainsendnch != ts.mainsendnch) delta["mainsendnch"] = ts.mainsendnch;
+    if (old.timebase != ts.timebase) delta["timebase"] = ts.timebase;
+    if (old.playoffs != ts.playoffs) delta["playoffs"] = ts.playoffs;
+    if (old.playoffsflag != ts.playoffsflag) delta["playoffsflag"] = ts.playoffsflag;
+    if (old.freemode != ts.freemode) delta["freemode"] = ts.freemode;
+    if (old.numlanes != ts.numlanes) delta["numlanes"] = ts.numlanes;
+    if (old.lanesettings != ts.lanesettings) delta["lanesettings"] = ts.lanesettings;
+    if (old.lanenames != ts.lanenames) delta["lanenames"] = ts.lanenames;
+    if (old.laneplays != ts.laneplays) delta["laneplays"] = ts.laneplays;
     if (old.fxchain != ts.fxchain) delta["fxchain"] = ts.fxchain;
+    if (old.recfx != ts.recfx) delta["recfx"] = ts.recfx;
     if (old.env != ts.env) delta["env"] = ts.env;
+    if (old.recv != ts.recv) delta["recv"] = ts.recv;
+    if (old.group != ts.group) delta["group"] = ts.group;
+    if (old.lock != ts.lock) delta["lock"] = ts.lock;
     if (!delta.empty()) tracks[guid] = delta;
   }
   for (const auto& [guid, ts] : prev.tracks) {
@@ -602,6 +945,12 @@ static std::string diffSnapshots(const Snapshot& prev, const Snapshot& now) {
     json delta = json::object();
     if (prev.project.tempo != now.project.tempo) delta["tempo"] = now.project.tempo;
     if (prev.project.markers != now.project.markers) delta["markers"] = now.project.markers;
+    if (prev.project.notes != now.project.notes) delta["notes"] = now.project.notes;
+    if (prev.project.title != now.project.title) delta["title"] = now.project.title;
+    if (prev.project.author != now.project.author) delta["author"] = now.project.author;
+    if (prev.project.groupnames != now.project.groupnames)
+      delta["groupnames"] = now.project.groupnames;
+    if (prev.project.timebase != now.project.timebase) delta["timebase"] = now.project.timebase;
     if (!delta.empty()) project["project"] = delta;
   }
 
@@ -659,11 +1008,19 @@ static void internalizeExternalMedia() {
 
 static void captureLocalChanges() {
   const int cc = GetProjectStateChangeCount(nullptr);
-  if (cc == g_lastChangeCount) return;
-  // Chunk serialization isn't free; cap capture rate (sync target is ~1s).
   const auto now = std::chrono::steady_clock::now();
-  if (now - g_lastCapture < std::chrono::milliseconds(250)) return;
+  // Fast path: the project change counter moved (any undoable edit). Safety
+  // net: some edits reach the chunks without promptly bumping the counter
+  // (FX-parameter gestures get batched undo points, some toggles defer
+  // theirs), so a full re-diff also runs unconditionally every 2s; the gate
+  // is a latency optimization, never a correctness dependency.
+  const bool counterMoved = cc != g_lastChangeCount;
+  const bool rescanDue = now - g_lastFullScan >= std::chrono::seconds(2);
+  if (!counterMoved && !rescanDue) return;
+  // Chunk serialization isn't free; cap capture rate (sync target is ~1s).
+  if (!rescanDue && now - g_lastCapture < std::chrono::milliseconds(250)) return;
   g_lastCapture = now;
+  g_lastFullScan = now;
   g_lastChangeCount = cc;
 
   internalizeExternalMedia();
@@ -684,27 +1041,96 @@ static void applyTrackFields(MediaTrack* tr, const json& fields) {
     buf.push_back('\0');
     GetSetMediaTrackInfo_String(tr, "P_NAME", buf.data(), true);
   }
-  if (fields.contains("vol") && fields["vol"].is_number())
-    SetMediaTrackInfo_Value(tr, "D_VOL", fields["vol"].get<double>());
-  if (fields.contains("pan") && fields["pan"].is_number())
-    SetMediaTrackInfo_Value(tr, "D_PAN", fields["pan"].get<double>());
-  if (fields.contains("mute") && fields["mute"].is_boolean())
-    SetMediaTrackInfo_Value(tr, "B_MUTE", fields["mute"].get<bool>() ? 1.0 : 0.0);
-  if (fields.contains("solo") && fields["solo"].is_boolean())
-    SetMediaTrackInfo_Value(tr, "I_SOLO", fields["solo"].get<bool>() ? 1.0 : 0.0);
+  auto setNum = [&](const char* key, const char* parm) {
+    auto it = fields.find(key);
+    if (it != fields.end() && it->is_number())
+      SetMediaTrackInfo_Value(tr, parm, it->get<double>());
+  };
+  auto setBool = [&](const char* key, const char* parm) {
+    auto it = fields.find(key);
+    if (it != fields.end() && it->is_boolean())
+      SetMediaTrackInfo_Value(tr, parm, it->get<bool>() ? 1.0 : 0.0);
+  };
+  setNum("vol", "D_VOL");
+  setNum("pan", "D_PAN");
+  setBool("mute", "B_MUTE");
+  setBool("fxen", "I_FXEN");
+  setNum("width", "D_WIDTH");
+  setNum("panmode", "I_PANMODE");
+  setNum("dualpanl", "D_DUALPANL");
+  setNum("dualpanr", "D_DUALPANR");
+  setNum("panlaw", "D_PANLAW");
+  setNum("panlawflags", "I_PANLAW_FLAGS");
+  setBool("phase", "B_PHASE");
+  setBool("solodefeat", "B_SOLO_DEFEAT");
+  setNum("nchan", "I_NCHAN");
+  if (fields.contains("color") && fields["color"].is_number())
+    SetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR", colorFromWire(fields["color"].get<int>()));
+  setNum("folderdepth", "I_FOLDERDEPTH");
+  setBool("mainsend", "B_MAINSEND");
+  setNum("mainsendoffs", "C_MAINSEND_OFFS");
+  setNum("mainsendnch", "C_MAINSEND_NCH");
+  setNum("timebase", "C_BEATATTACHMODE");
+  // Flag before value: it decides whether the offset is seconds or samples.
+  setNum("playoffsflag", "I_PLAY_OFFSET_FLAG");
+  setNum("playoffs", "D_PLAY_OFFSET");
+  // Lane layout before the per-lane fields below, so the lanes exist.
+  setNum("freemode", "I_FREEMODE");
+  setNum("numlanes", "I_NUMFIXEDLANES");
+  setNum("lanesettings", "C_LANESETTINGS");
+  if (fields.contains("lanenames") && fields["lanenames"].is_string()) {
+    const std::string names = fields["lanenames"].get<std::string>();
+    size_t pos = 0;
+    for (int lane = 0; pos <= names.size(); ++lane) {
+      size_t eol = names.find('\n', pos);
+      if (eol == std::string::npos) eol = names.size();
+      std::string n = names.substr(pos, eol - pos);
+      char key[32];
+      snprintf(key, sizeof(key), "P_LANENAME:%d", lane);
+      std::vector<char> buf(n.begin(), n.end());
+      buf.push_back('\0');
+      GetSetMediaTrackInfo_String(tr, key, buf.data(), true);
+      pos = eol + 1;
+    }
+  }
+  if (fields.contains("laneplays") && fields["laneplays"].is_string()) {
+    const std::string plays = fields["laneplays"].get<std::string>();
+    int lane = 0;
+    size_t pos = 0;
+    while (pos < plays.size()) {
+      size_t sp = plays.find(' ', pos);
+      if (sp == std::string::npos) sp = plays.size();
+      char key[32];
+      snprintf(key, sizeof(key), "C_LANEPLAYS:%d", lane++);
+      SetMediaTrackInfo_Value(tr, key, atof(plays.substr(pos, sp - pos).c_str()));
+      pos = sp + 1;
+    }
+  }
 
-  // FX chain / envelopes arrive as normalized chunk blocks; splice them into
-  // the track's current chunk (after the scalar setters above, so their
-  // values survive the chunk round-trip).
-  const bool hasFx = fields.contains("fxchain") && fields["fxchain"].is_string();
-  const bool hasEnv = fields.contains("env") && fields["env"].is_string();
-  if (hasFx || hasEnv) {
-    std::string fx = hasFx ? fields["fxchain"].get<std::string>() : "";
-    std::string env = hasEnv ? fields["env"].get<std::string>() : "";
+  // Chunk-level parts arrive as normalized blocks/lines; splice them into the
+  // track's current chunk (after the scalar setters above, so their values
+  // survive the chunk round-trip). Receives ("recv") are deliberately NOT
+  // handled here: applyChangeset splices them in a second pass once every
+  // track in the changeset exists, because their wire form references source
+  // tracks by GUID.
+  TrackBlocksPatch patch;
+  std::string fx, recfx, env, group, lock;
+  auto strField = [&](const char* key, std::string& store, const std::string*& slot) {
+    auto it = fields.find(key);
+    if (it != fields.end() && it->is_string()) {
+      store = it->get<std::string>();
+      slot = &store;
+    }
+  };
+  strField("fxchain", fx, patch.fxchain);
+  strField("recfx", recfx, patch.recfx);
+  strField("env", env, patch.env);
+  strField("group", group, patch.group);
+  strField("lock", lock, patch.lock);
+  if (patch.fxchain || patch.recfx || patch.env || patch.group || patch.lock) {
     std::string cur = objectStateChunk(tr);
     if (!cur.empty()) {
-      std::string next =
-          replaceTrackBlocks(cur, hasFx ? &fx : nullptr, hasEnv ? &env : nullptr);
+      std::string next = replaceTrackBlocks(cur, patch);
       if (next != cur) setObjectStateChunk(tr, next);
     }
   }
@@ -791,6 +1217,7 @@ static void applyChangeset(const json& changeset) {
     }
 
     std::map<std::string, double> desiredIndex;
+    std::vector<std::pair<std::string, std::string>> pendingRecv;  // guid -> wire recv
     for (auto it = tracks.begin(); it != tracks.end(); ++it) {
       const std::string& guid = it.key();
       const json& fields = it.value();
@@ -810,10 +1237,34 @@ static void applyChangeset(const json& changeset) {
         GetSetMediaTrackInfo_String(tr, "GUID", gbuf.data(), true);
       }
       applyTrackFields(tr, fields);
+      if (fields.contains("recv") && fields["recv"].is_string())
+        pendingRecv.emplace_back(guid, fields["recv"].get<std::string>());
       if (fields.contains("index") && fields["index"].is_number())
         desiredIndex[guid] = fields["index"].get<double>();
     }
     if (!desiredIndex.empty()) applyReorder(desiredIndex);
+
+    // Receives last, after every track in the changeset exists and the order
+    // is settled: the wire form carries source-track GUIDs, resolved to local
+    // indices here. A receive whose source track is missing on this side is
+    // dropped (it re-applies the next time the field changes or full state is
+    // rebroadcast).
+    for (const auto& [guid, wire] : pendingRecv) {
+      MediaTrack* tr = findTrackByGuid(guid);
+      if (!tr) continue;
+      std::string local = transformRecvUnits(wire, [](const std::string& tok) -> std::string {
+        MediaTrack* src = findTrackByGuid(tok);
+        if (!src) return "";
+        const int n = (int)GetMediaTrackInfo_Value(src, "IP_TRACKNUMBER");
+        return n > 0 ? std::to_string(n - 1) : "";
+      });
+      std::string cur = objectStateChunk(tr);
+      if (cur.empty()) continue;
+      TrackBlocksPatch patch;
+      patch.recv = &local;
+      std::string next = replaceTrackBlocks(cur, patch);
+      if (next != cur) setObjectStateChunk(tr, next);
+    }
   }
 
   if (changeset.contains("items") && changeset["items"].is_object()) {
@@ -848,6 +1299,16 @@ static void applyChangeset(const json& changeset) {
         applyTempo(f["tempo"].get<std::string>());
       if (f.contains("markers") && f["markers"].is_string())
         applyMarkers(f["markers"].get<std::string>());
+      if (f.contains("notes") && f["notes"].is_string())
+        applyProjectNotes(f["notes"].get<std::string>());
+      if (f.contains("title") && f["title"].is_string())
+        applyProjectString("PROJECT_TITLE", f["title"].get<std::string>());
+      if (f.contains("author") && f["author"].is_string())
+        applyProjectString("PROJECT_AUTHOR", f["author"].get<std::string>());
+      if (f.contains("groupnames") && f["groupnames"].is_string())
+        applyGroupNames(f["groupnames"].get<std::string>());
+      if (f.contains("timebase") && f["timebase"].is_string())
+        applyProjectTimebase(f["timebase"].get<std::string>());
     }
   }
 }
@@ -865,14 +1326,15 @@ static void applyRemoteChanges() {
   // the flag set and the re-baseline at the end, the capture loop never sees
   // (and never re-broadcasts) the delta we are about to create.
   g_applyingRemote = true;
-  // Wrap in an undo block so a remote edit is a single Ctrl+Z step. Undoing it
-  // is captured as a normal local change next tick (and, on a client, proposed
-  // back); there is no re-application loop because we re-baseline below.
-  Undo_BeginBlock2(nullptr);
+  // No undo point for remote edits: Ctrl+Z must only ever target the user's
+  // own actions, never silently roll back a peer's work. (REAPER undo is
+  // snapshot-based, so undoing your own last action can still take remote
+  // edits that landed after it along for the ride: that revert is captured
+  // as a normal local change next tick and synced back out; there is no
+  // re-application loop because we re-baseline below.)
   PreventUIRefresh(1);
   for (const auto& cs : changesets) applyChangeset(cs);
   PreventUIRefresh(-1);
-  Undo_EndBlock2(nullptr, "ReaMesh: apply remote changes", -1);
   TrackList_AdjustWindows(false);
   UpdateArrange();
 
@@ -907,11 +1369,9 @@ static void processDeferredItems() {
 
   if (ready.empty()) return;
   g_applyingRemote = true;
-  Undo_BeginBlock2(nullptr);
   PreventUIRefresh(1);
   for (const DeferredItem& d : ready) applyItem(d.guid, d.fields);
   PreventUIRefresh(-1);
-  Undo_EndBlock2(nullptr, "ReaMesh: apply deferred media items", -1);
   UpdateArrange();
   g_snapshot = snapshotProject();
   g_lastChangeCount = GetProjectStateChangeCount(nullptr);
@@ -1015,6 +1475,7 @@ static void onHost(const std::string& passphrase) {
   g_snapshot = Snapshot{};
   g_lastChangeCount = -1;  // force a full capture; this seeds the shared doc
   g_lastCapture = {};
+  g_lastFullScan = {};
   g_lastPeerCount = 0;
   logLine(passphrase.empty()
               ? "hosting \"" + name + "\", sharing all files under " + dir

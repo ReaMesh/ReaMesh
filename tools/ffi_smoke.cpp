@@ -128,7 +128,7 @@ int main() {
   printf("owner pushes a track...\n");
   reamesh_push_local(owner,
       "{\"tracks\":{\"{SMOKE-1}\":{\"present\":true,\"index\":0,\"name\":\"Vox\","
-      "\"vol\":0.8,\"pan\":0.1,\"mute\":false,\"solo\":false}}}");
+      "\"vol\":0.8,\"pan\":0.1,\"mute\":false,\"fxen\":true}}}");
   if (!drainUntil(client, "Vox", 10)) {
     fprintf(stderr, "FAIL: client never drained the owner's track\n");
     return 1;
