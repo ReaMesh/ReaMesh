@@ -15,6 +15,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { ChevronUp, Crown } from "lucide-react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { PeerAvatar } from "@/components/PeerAvatar";
+import { t, useLang } from "@/lib/i18n";
 import { displayName, type Peer } from "@/lib/types";
 import { useOverlayState } from "./useOverlayState";
 
@@ -56,12 +57,14 @@ function PeerRow({ peer }: { peer: Peer }) {
         {displayName(peer)}
       </span>
       {peer.is_owner && (
-        <span title="Session host" className="shrink-0">
+        <span title={t("sessionHost")} className="shrink-0">
           <Crown className="size-3 text-amber-400" />
         </span>
       )}
       {peer.is_self && (
-        <span className="shrink-0 text-[9px] text-muted-foreground">you</span>
+        <span className="shrink-0 text-[9px] text-muted-foreground">
+          {t("youBadge")}
+        </span>
       )}
       <TrackNumber track={peer.track} />
     </motion.div>
@@ -89,6 +92,7 @@ export function Overlay({ port }: { port: number | null }) {
   const { state } = useOverlayState(port);
   const [collapsed, setCollapsed] = useState(false);
   const cardRef = useRef<HTMLDivElement>(null);
+  useLang(); // re-render on language change
 
   // Keep the OS window glued to the card's actual height. The window is
   // transparent, so any slack would block REAPER underneath; instead it grows
@@ -149,7 +153,7 @@ export function Overlay({ port }: { port: number | null }) {
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}
-          aria-label={collapsed ? "Expand" : "Collapse"}
+          aria-label={collapsed ? t("expand") : t("collapse")}
           className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-white/5 hover:text-foreground"
         >
           <motion.span
@@ -175,7 +179,7 @@ export function Overlay({ port }: { port: number | null }) {
             <div className="border-t border-white/10 px-1.5 py-1.5">
               {peers.length === 0 ? (
                 <p className="px-1.5 py-1 text-[12px] text-muted-foreground">
-                  Connecting…
+                  {t("connecting")}
                 </p>
               ) : (
                 <AnimatePresence initial={false} mode="popLayout">

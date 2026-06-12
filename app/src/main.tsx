@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import "./index.css";
+import { initLanguage } from "./lib/i18n";
 
 // Two entry points share this bundle. The floating presence overlay is opened
 // as a separate Tauri window pointed at `index.html?overlay=1&port=<n>`; every
@@ -9,6 +10,10 @@ import "./index.css";
 // (and vice versa).
 const params = new URLSearchParams(window.location.search);
 const root = ReactDOM.createRoot(document.getElementById("root") as HTMLElement);
+
+// Both windows render localized strings; sync the language preference with the
+// backend before (and while) either tree is mounted.
+initLanguage();
 
 if (params.get("overlay") === "1") {
   document.documentElement.classList.add("overlay-window");

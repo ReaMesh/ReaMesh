@@ -11,6 +11,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { t } from "@/lib/i18n";
 import {
   installExtension,
   refreshStatus,
@@ -47,12 +48,8 @@ function Wordmark() {
         ))}
       </div>
       <div className="space-y-1 text-center">
-        <h1 className="text-lg font-semibold tracking-tight">
-          Welcome to ReaMesh
-        </h1>
-        <p className="text-[13px] text-muted-foreground">
-          Real-time collaboration for REAPER
-        </p>
+        <h1 className="text-lg font-semibold tracking-tight">{t("welcome")}</h1>
+        <p className="text-[13px] text-muted-foreground">{t("tagline")}</p>
       </div>
     </div>
   );
@@ -62,7 +59,7 @@ function LocateStep({ status }: { status: ReaperStatus }) {
   const pick = async () => {
     const dir = await open({
       directory: true,
-      title: "Locate your REAPER folder",
+      title: t("locateReaperFolder"),
     });
     if (typeof dir === "string") {
       await setReaperPath(dir);
@@ -77,10 +74,9 @@ function LocateStep({ status }: { status: ReaperStatus }) {
           <FolderSearch className="size-4.5 text-amber-500" />
         </div>
         <div className="min-w-0 space-y-1">
-          <h2 className="text-[14px] font-semibold">REAPER not found</h2>
+          <h2 className="text-[14px] font-semibold">{t("reaperNotFound")}</h2>
           <p className="text-[13px] leading-relaxed text-muted-foreground">
-            REAPER may not be installed, or it keeps its data somewhere else
-            (portable install).
+            {t("reaperNotFoundBody")}
           </p>
         </div>
       </div>
@@ -94,7 +90,7 @@ function LocateStep({ status }: { status: ReaperStatus }) {
           className="h-8 shrink-0 text-[12px]"
           onClick={pick}
         >
-          Change…
+          {t("change")}
         </Button>
       </div>
       <div className="flex gap-2">
@@ -103,7 +99,7 @@ function LocateStep({ status }: { status: ReaperStatus }) {
           className="h-8 flex-1 gap-1.5 text-[12px]"
           onClick={() => openUrl("https://www.reaper.fm/download.php")}
         >
-          Download REAPER
+          {t("downloadReaper")}
           <ExternalLink className="size-3" />
         </Button>
         <Button
@@ -112,7 +108,7 @@ function LocateStep({ status }: { status: ReaperStatus }) {
           className="h-8 flex-1 text-[12px]"
           onClick={() => refreshStatus()}
         >
-          Check again
+          {t("checkAgain")}
         </Button>
       </div>
     </div>
@@ -146,12 +142,9 @@ function InstallStep({
           <Puzzle className="size-4.5 text-foreground/80" />
         </div>
         <div className="min-w-0 space-y-1">
-          <h2 className="text-[14px] font-semibold">
-            Install the REAPER extension
-          </h2>
+          <h2 className="text-[14px] font-semibold">{t("installExtTitle")}</h2>
           <p className="text-[13px] leading-relaxed text-muted-foreground">
-            ReaMesh adds a small extension to REAPER so this app can talk to
-            it. It goes into{" "}
+            {t("installExtBody")}{" "}
             <span className="break-all text-foreground/80">
               {status.userPlugins}
             </span>
@@ -162,9 +155,7 @@ function InstallStep({
       {!status.isReaperDir && (
         <p className="flex items-start gap-2 rounded-lg bg-amber-500/10 p-2.5 text-[12px] leading-relaxed text-amber-500">
           <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
-          This folder doesn't look like a REAPER data folder yet (no
-          reaper.ini). Installing is harmless, but double-check the location
-          in Settings if REAPER doesn't pick it up.
+          {t("notReaperDirWarning")}
         </p>
       )}
       <Button
@@ -173,7 +164,7 @@ function InstallStep({
         disabled={busy}
         onClick={install}
       >
-        {busy ? "Installing…" : "Install extension"}
+        {busy ? t("installing") : t("installExtension")}
       </Button>
     </div>
   );
@@ -187,10 +178,9 @@ function DoneStep() {
           <CheckCircle2 className="size-4.5 text-emerald-500" />
         </div>
         <div className="min-w-0 space-y-1">
-          <h2 className="text-[14px] font-semibold">You're all set</h2>
+          <h2 className="text-[14px] font-semibold">{t("allSet")}</h2>
           <p className="text-[13px] leading-relaxed text-muted-foreground">
-            The extension is installed. Start REAPER (or restart it if it's
-            already running) and ReaMesh will connect automatically.
+            {t("allSetBody")}
           </p>
         </div>
       </div>
@@ -199,7 +189,7 @@ function DoneStep() {
         className="h-8 w-full text-[12px]"
         onClick={() => refreshStatus()}
       >
-        Finish
+        {t("finish")}
       </Button>
     </div>
   );

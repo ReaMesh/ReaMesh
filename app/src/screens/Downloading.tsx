@@ -1,6 +1,7 @@
 import { motion } from "motion/react";
 import { Button } from "@/components/ui/button";
 import { send } from "@/lib/connection";
+import { t } from "@/lib/i18n";
 import type { ExtState } from "@/lib/types";
 
 // Project transfer in progress. The bar is spring-animated toward the real
@@ -11,9 +12,9 @@ export function Downloading({ state }: { state: ExtState }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-8 px-10">
       <div className="w-full space-y-3 text-center">
-        <p className="text-[13px] text-muted-foreground">Joining</p>
+        <p className="text-[13px] text-muted-foreground">{t("joiningLabel")}</p>
         <h2 className="truncate text-lg font-semibold tracking-tight">
-          {state.session || "session"}
+          {state.session || t("sessionFallback")}
         </h2>
       </div>
       <div className="w-full space-y-2">
@@ -26,7 +27,7 @@ export function Downloading({ state }: { state: ExtState }) {
           />
         </div>
         <div className="flex justify-between text-[12px] text-muted-foreground">
-          <span>Downloading the project…</span>
+          <span>{t("downloadingProject")}</span>
           <span className="tabular-nums">{pct}%</span>
         </div>
       </div>
@@ -36,7 +37,7 @@ export function Downloading({ state }: { state: ExtState }) {
         className="text-muted-foreground"
         onClick={() => send({ cmd: "leave" })}
       >
-        Cancel
+        {t("cancel")}
       </Button>
     </div>
   );

@@ -15,6 +15,14 @@ typedef struct {
     int32_t has_custom_path;
 } ReaperStatusC;
 
+// Language preference values shared with Rust (the stored *preference*, not
+// the resolved language: "system" resolves through the device locale).
+enum {
+    kReaMeshLangSystem = 0,
+    kReaMeshLangEnglish = 1,
+    kReaMeshLangGerman = 2,
+};
+
 // Callbacks the native window uses to read state and act. `ctx` is an opaque
 // Rust pointer passed back into every call.
 typedef struct {
@@ -22,6 +30,8 @@ typedef struct {
     ReaperStatusC (*get_status)(void *ctx);
     int32_t (*install)(void *ctx);            // returns 1 on success, 0 on failure
     void (*set_path)(void *ctx, const char *path); // path == NULL => use default
+    int32_t (*get_language)(void *ctx);       // kReaMeshLang* preference
+    void (*set_language)(void *ctx, int32_t pref);
 } SettingsCallbacks;
 
 // Opens (or re-focuses) the native settings window. Must be called on the

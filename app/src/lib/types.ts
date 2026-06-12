@@ -1,6 +1,8 @@
 // Shapes of the JSON the extension's control server sends. One `state`
 // message mirrors the whole extension state; the app holds no other truth.
 
+import { t } from "./i18n";
+
 export type Mode = "idle" | "browsing" | "downloading" | "hosting" | "client";
 
 export interface Peer {
@@ -48,7 +50,7 @@ export interface Instance {
 
 export function displayName(p: Peer): string {
   if (p.name) return p.name;
-  return "Guest";
+  return t("guest");
 }
 
 export function initials(name: string): string {

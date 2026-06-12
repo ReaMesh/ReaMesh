@@ -2,6 +2,7 @@ import { motion } from "motion/react";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { t } from "@/lib/i18n";
 
 // Shown until a REAPER instance with the ReaMesh extension answers on
 // localhost. A slim indeterminate sweep reads as "scanning" without the
@@ -11,7 +12,7 @@ export function Disconnected() {
     try {
       await openPath("/Applications/REAPER.app");
     } catch {
-      toast.error("Couldn't open REAPER. Launch it manually.");
+      toast.error(t("couldntOpenReaper"));
     }
   };
 
@@ -25,13 +26,13 @@ export function Disconnected() {
         />
       </div>
       <div className="space-y-1.5">
-        <h2 className="text-[15px] font-semibold">Waiting for REAPER</h2>
+        <h2 className="text-[15px] font-semibold">{t("waitingForReaper")}</h2>
         <p className="text-[13px] leading-relaxed text-muted-foreground">
-          Start REAPER to connect.
+          {t("startReaperToConnect")}
         </p>
       </div>
       <Button size="sm" onClick={openReaper}>
-        Open REAPER
+        {t("openReaper")}
       </Button>
     </div>
   );

@@ -1,10 +1,20 @@
+import { useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { Crown } from "lucide-react";
+import { Crown, TriangleAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { send } from "@/lib/connection";
+import { t } from "@/lib/i18n";
 import { displayName, type ExtState, type Peer } from "@/lib/types";
 
 function PeerRow({ peer }: { peer: Peer }) {
@@ -22,13 +32,13 @@ function PeerRow({ peer }: { peer: Peer }) {
         {displayName(peer)}
       </span>
       {peer.is_owner && (
-        <span title="Session host">
+        <span title={t("sessionHost")}>
           <Crown className="size-3.5 text-amber-400" />
         </span>
       )}
       {peer.is_self && (
         <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
-          you
+          {t("youBadge")}
         </Badge>
       )}
     </motion.div>
@@ -37,23 +47,34 @@ function PeerRow({ peer }: { peer: Peer }) {
 
 export function Session({ state }: { state: ExtState }) {
   const hosting = state.mode === "hosting";
+  const [confirmStop, setConfirmStop] = useState(false);
+  const others = state.peers.length - 1;
+  const leave = () => {
+    setConfirmStop(false);
+    send({ cmd: "leave" });
+  };
+  // Confirm only when stopping the session would disconnect other people.
+  const requestLeave = () => {
+    if (hosting && others > 0) setConfirmStop(true);
+    else leave();
+  };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
       <div className="flex items-center gap-3">
         <h2 className="min-w-0 flex-1 truncate text-[15px] font-semibold tracking-tight">
-          {state.session || "Session"}
+          {state.session || t("sessionFallback")}
         </h2>
         <Badge variant={hosting ? "default" : "secondary"} className="shrink-0">
-          {hosting ? "Hosting" : "Connected"}
+          {hosting ? t("hostingBadge") : t("connectedBadge")}
         </Badge>
       </div>
 
       <div className="flex min-h-0 flex-col gap-2">
         <h3 className="px-1 text-[12px] font-medium text-muted-foreground">
           {state.peers.length === 1
-            ? "Just you so far"
-            : `${state.peers.length} people in this session`}
+            ? t("justYou")
+            : t("peopleInSession", { count: state.peers.length })}
         </h3>
         <ScrollArea className="min-h-0 rounded-xl bg-card p-2">
           {/* initial={false} suppresses entrance animations for people
@@ -71,13 +92,37 @@ export function Session({ state }: { state: ExtState }) {
           button stays pinned to the bottom. */}
       <div className="min-h-0 flex-1" />
 
-      <Button
-        variant="secondary"
-        className="shrink-0"
-        onClick={() => send({ cmd: "leave" })}
-      >
-        {hosting ? "Stop hosting" : "Leave session"}
+      <Button variant="secondary" className="shrink-0" onClick={requestLeave}>
+        {hosting ? t("stopHosting") : t("leaveSession")}
       </Button>
+
+      <Dialog open={confirmStop} onOpenChange={setConfirmStop}>
+        <DialogContent className="max-w-[340px] gap-4 rounded-2xl">
+          <DialogHeader>
+            <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-amber-500/15 sm:mx-0">
+              <TriangleAlert className="size-5 text-amber-500" />
+            </div>
+            <DialogTitle className="text-[15px]">{t("stopHostingTitle")}</DialogTitle>
+            <DialogDescription className="text-[13px] leading-relaxed">
+              {others === 1
+                ? t("stopHostingBodyOne")
+                : t("stopHostingBodyMany", { count: others })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              className="flex-1"
+              onClick={() => setConfirmStop(false)}
+            >
+              {t("cancel")}
+            </Button>
+            <Button className="flex-1" onClick={leave}>
+              {t("stopHosting")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

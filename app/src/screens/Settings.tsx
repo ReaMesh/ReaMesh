@@ -5,6 +5,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { getLangPref, setLangPref, t, useLang, type LangPref } from "@/lib/i18n";
 import {
   getReaperPath,
   installExtension,
@@ -12,19 +13,22 @@ import {
   setReaperPath,
   useReaperStatus,
 } from "@/lib/install";
+import { cn } from "@/lib/utils";
 
-// Full-screen app settings, opened from the native menu (ReaMesh →
-// Settings…, Cmd+,). Holds the REAPER folder override (portable installs)
-// and the extension install/update controls.
+// Full-screen app settings, opened from the native menu on non-macOS
+// platforms (macOS opens the native AppKit settings window instead). Holds
+// the REAPER folder override (portable installs), the extension
+// install/update controls, and the app language.
 export function Settings({ onBack }: { onBack: () => void }) {
   const [busy, setBusy] = useState(false);
   const status = useReaperStatus();
   const hasCustom = !!getReaperPath();
+  useLang(); // re-render when the language changes
 
   const pickFolder = async () => {
     const dir = await open({
       directory: true,
-      title: "Locate your REAPER folder",
+      title: t("locateReaperFolder"),
     });
     if (typeof dir === "string") {
       await setReaperPath(dir);
@@ -41,7 +45,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
     setBusy(true);
     try {
       await installExtension();
-      toast.success("Extension installed. Restart REAPER to load it.");
+      toast.success(t("extInstalledToast"));
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -51,23 +55,29 @@ export function Settings({ onBack }: { onBack: () => void }) {
 
   const extBadge = !status ? null : !status.installed ? (
     <Badge variant="outline" className="text-[11px] text-muted-foreground">
-      Not installed
+      {t("notInstalled")}
     </Badge>
   ) : status.upToDate ? (
     <Badge
       variant="outline"
       className="border-emerald-500/30 text-[11px] text-emerald-500"
     >
-      Installed
+      {t("installed")}
     </Badge>
   ) : (
     <Badge
       variant="outline"
       className="border-amber-500/30 text-[11px] text-amber-500"
     >
-      Update available
+      {t("updateAvailable")}
     </Badge>
   );
+
+  const langOptions: { value: LangPref; label: string }[] = [
+    { value: "system", label: t("languageSystem") },
+    { value: "en", label: "English" },
+    { value: "de", label: "Deutsch" },
+  ];
 
   return (
     <div className="flex flex-1 flex-col overflow-y-auto">
@@ -80,14 +90,36 @@ export function Settings({ onBack }: { onBack: () => void }) {
             onClick={onBack}
           >
             <ArrowLeft className="size-4" />
-            Back
+            {t("back")}
           </Button>
-          <h1 className="text-[15px] font-semibold">Settings</h1>
+          <h1 className="text-[15px] font-semibold">{t("settings")}</h1>
         </div>
 
         <section className="space-y-2">
           <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-            REAPER folder
+            {t("language")}
+          </h3>
+          <div className="flex gap-1 rounded-xl bg-card p-1.5">
+            {langOptions.map((o) => (
+              <button
+                key={o.value}
+                onClick={() => setLangPref(o.value)}
+                className={cn(
+                  "flex-1 rounded-lg px-2 py-1.5 text-[12px] transition-colors",
+                  getLangPref() === o.value
+                    ? "bg-secondary text-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {o.label}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="space-y-2">
+          <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            {t("reaperFolder")}
           </h3>
           <div className="space-y-3 rounded-xl bg-card p-3.5">
             <div className="flex items-center justify-between gap-2">
@@ -99,7 +131,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
                   variant="outline"
                   className="shrink-0 border-amber-500/30 text-[11px] text-amber-500"
                 >
-                  Not found
+                  {t("notFoundBadge")}
                 </Badge>
               )}
             </div>
@@ -110,7 +142,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
                 className="h-7 flex-1 text-[12px]"
                 onClick={pickFolder}
               >
-                Change…
+                {t("change")}
               </Button>
               {hasCustom && (
                 <Button
@@ -119,7 +151,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
                   className="h-7 flex-1 text-[12px]"
                   onClick={useDefault}
                 >
-                  Use default
+                  {t("useDefault")}
                 </Button>
               )}
             </div>
@@ -130,7 +162,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
                 className="h-7 w-full gap-1.5 text-[12px] text-muted-foreground hover:text-foreground"
                 onClick={() => openUrl("https://www.reaper.fm/download.php")}
               >
-                Don't have REAPER? Download it
+                {t("dontHaveReaper")}
                 <ExternalLink className="size-3" />
               </Button>
             )}
@@ -139,7 +171,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
 
         <section className="space-y-2">
           <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-            REAPER extension
+            {t("reaperExtension")}
           </h3>
           <div className="space-y-3 rounded-xl bg-card p-3.5">
             <div className="flex items-center justify-between gap-2">
@@ -153,16 +185,15 @@ export function Settings({ onBack }: { onBack: () => void }) {
               onClick={install}
             >
               {busy
-                ? "Installing…"
+                ? t("installing")
                 : !status?.installed
-                  ? "Install extension"
+                  ? t("installExtension")
                   : status.upToDate
-                    ? "Reinstall extension"
-                    : "Update extension"}
+                    ? t("reinstallExtension")
+                    : t("updateExtension")}
             </Button>
             <p className="text-[11px] leading-relaxed text-muted-foreground">
-              REAPER loads the extension at startup. Restart it after
-              installing or updating.
+              {t("restartNote")}
             </p>
           </div>
         </section>

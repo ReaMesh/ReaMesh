@@ -107,6 +107,98 @@ fn files_equal(a: &Path, b: &Path) -> bool {
     }
 }
 
+// ---------- language ----------
+//
+// The app speaks English and German. The preference ("system" | "en" | "de")
+// is persisted backend-side (like the REAPER folder) so the webview and the
+// native macOS settings window share one source of truth; "system" resolves
+// through the device locale, anything that isn't German falls back to English.
+
+#[derive(Clone, Copy, PartialEq)]
+enum Lang {
+    En,
+    De,
+}
+
+fn lang_file(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|d| d.join("language"))
+}
+
+/// The stored preference: "system" (default), "en" or "de".
+fn load_lang_pref(app: &AppHandle) -> String {
+    let stored = lang_file(app)
+        .and_then(|p| fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string());
+    match stored.as_deref() {
+        Some("en") => "en".into(),
+        Some("de") => "de".into(),
+        _ => "system".into(),
+    }
+}
+
+fn store_lang_pref(app: &AppHandle, pref: &str) {
+    let Some(p) = lang_file(app) else { return };
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(p, pref);
+}
+
+fn device_lang() -> Lang {
+    match sys_locale::get_locale() {
+        Some(l) if l.to_lowercase().starts_with("de") => Lang::De,
+        _ => Lang::En,
+    }
+}
+
+fn resolved_lang(app: &AppHandle) -> Lang {
+    match load_lang_pref(app).as_str() {
+        "en" => Lang::En,
+        "de" => Lang::De,
+        _ => device_lang(),
+    }
+}
+
+/// Two-language string table for the native side (menu, quit dialog).
+fn tr(lang: Lang, en: &'static str, de: &'static str) -> &'static str {
+    match lang {
+        Lang::En => en,
+        Lang::De => de,
+    }
+}
+
+#[tauri::command]
+fn get_language(app: AppHandle) -> String {
+    load_lang_pref(&app)
+}
+
+#[tauri::command]
+fn set_language(app: AppHandle, pref: String) {
+    apply_language(&app, &pref);
+}
+
+/// Persist the preference, rebuild the (localized) native menu, and tell every
+/// webview window so the UI re-renders. Shared by the webview command and the
+/// native settings window callback.
+fn apply_language(app: &AppHandle, pref: &str) {
+    let pref = match pref {
+        "en" | "de" => pref,
+        _ => "system",
+    };
+    store_lang_pref(app, pref);
+    #[cfg(target_os = "macos")]
+    {
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Err(e) = build_menu(&app2) {
+                eprintln!("rebuilding menu failed: {e}");
+            }
+        });
+    }
+    use tauri::Emitter;
+    let _ = app.emit("language-changed", load_lang_pref(app));
+}
+
 fn compute_status(app: &AppHandle, custom_path: &Option<String>) -> Result<ReaperStatus, String> {
     let dir = resource_dir(custom_path)?;
     let user_plugins = dir.join("UserPlugins");
@@ -268,20 +360,115 @@ static QUIT_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// observer, throws an ObjC exception that aborts the process.)
 fn confirm_quit_while_hosting(app: &AppHandle) -> bool {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let lang = resolved_lang(app);
     app.dialog()
-        .message("Quitting will stop your session and disconnect everyone connected to you.")
-        .title("Stop hosting and quit?")
+        .message(tr(
+            lang,
+            "Quitting will stop your session and disconnect everyone connected to you.",
+            "Beim Beenden wird deine Session gestoppt und alle Verbundenen werden getrennt.",
+        ))
+        .title(tr(lang, "Stop hosting and quit?", "Hosting beenden und schließen?"))
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::OkCancelCustom(
-            "Stop hosting".into(),
-            "Cancel".into(),
+            tr(lang, "Stop hosting", "Hosting beenden").into(),
+            tr(lang, "Cancel", "Abbrechen").into(),
         ))
         .blocking_show()
 }
 
-/// Confirm (hosts only), leave the session, give the extension a tick to drain
-/// it so peers see us go, then actually quit. Runs entirely on a background
-/// thread: never touches AppKit on the main thread / run-loop observer.
+/// Build (or rebuild, after a language change) the macOS menu bar with a
+/// Settings… item (Cmd+,) and a custom Quit that routes through the
+/// ExitRequested handler. The Edit submenu is required for clipboard shortcuts
+/// to work in inputs once a custom menu is set.
+#[cfg(target_os = "macos")]
+fn build_menu(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
+    let lang = resolved_lang(app);
+    let settings = MenuItemBuilder::with_id("settings", tr(lang, "Settings…", "Einstellungen…"))
+        .accelerator("Cmd+,")
+        .build(app)?;
+    // Custom Quit (instead of the predefined item) so it routes through
+    // on_menu_event → app.exit(0) → our ExitRequested handler, which stops
+    // hosting before the app dies.
+    let quit = MenuItemBuilder::with_id("quit", tr(lang, "Quit ReaMesh", "ReaMesh beenden"))
+        .accelerator("Cmd+Q")
+        .build(app)?;
+    let app_menu = SubmenuBuilder::new(app, "ReaMesh")
+        .item(&PredefinedMenuItem::about(
+            app,
+            Some(tr(lang, "About ReaMesh", "Über ReaMesh")),
+            None,
+        )?)
+        .separator()
+        .item(&settings)
+        .separator()
+        .item(&PredefinedMenuItem::services(
+            app,
+            Some(tr(lang, "Services", "Dienste")),
+        )?)
+        .separator()
+        .item(&PredefinedMenuItem::hide(
+            app,
+            Some(tr(lang, "Hide ReaMesh", "ReaMesh ausblenden")),
+        )?)
+        .item(&PredefinedMenuItem::hide_others(
+            app,
+            Some(tr(lang, "Hide Others", "Andere ausblenden")),
+        )?)
+        .item(&PredefinedMenuItem::show_all(
+            app,
+            Some(tr(lang, "Show All", "Alle einblenden")),
+        )?)
+        .separator()
+        .item(&quit)
+        .build()?;
+    let edit = SubmenuBuilder::new(app, tr(lang, "Edit", "Bearbeiten"))
+        .item(&PredefinedMenuItem::undo(
+            app,
+            Some(tr(lang, "Undo", "Widerrufen")),
+        )?)
+        .item(&PredefinedMenuItem::redo(
+            app,
+            Some(tr(lang, "Redo", "Wiederholen")),
+        )?)
+        .separator()
+        .item(&PredefinedMenuItem::cut(
+            app,
+            Some(tr(lang, "Cut", "Ausschneiden")),
+        )?)
+        .item(&PredefinedMenuItem::copy(
+            app,
+            Some(tr(lang, "Copy", "Kopieren")),
+        )?)
+        .item(&PredefinedMenuItem::paste(
+            app,
+            Some(tr(lang, "Paste", "Einsetzen")),
+        )?)
+        .item(&PredefinedMenuItem::select_all(
+            app,
+            Some(tr(lang, "Select All", "Alles auswählen")),
+        )?)
+        .build()?;
+    let window = SubmenuBuilder::new(app, tr(lang, "Window", "Fenster"))
+        .item(&PredefinedMenuItem::minimize(
+            app,
+            Some(tr(lang, "Minimize", "Im Dock ablegen")),
+        )?)
+        .separator()
+        .item(&PredefinedMenuItem::close_window(
+            app,
+            Some(tr(lang, "Close Window", "Fenster schließen")),
+        )?)
+        .build()?;
+    let menu = MenuBuilder::new(app)
+        .items(&[&app_menu, &edit, &window])
+        .build()?;
+    app.set_menu(menu)?;
+    Ok(())
+}
+
+/// Confirm quitting, leave the session, and allow the extension to process
+/// the command before exiting. Confirmation runs on a background thread.
 fn confirm_leave_then_exit(app: AppHandle, hosting: bool, port: u16) {
     use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
@@ -307,56 +494,13 @@ pub fn run() {
             close_overlay,
             get_reaper_path,
             set_reaper_path,
+            get_language,
+            set_language,
             set_session_state
         ])
         .setup(|app| {
-            // macOS menu bar with a Settings… item (Cmd+,) that the webview
-            // listens for. The Edit submenu is required for clipboard
-            // shortcuts to work in inputs once a custom menu is set.
             #[cfg(target_os = "macos")]
-            {
-                use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
-                let settings = MenuItemBuilder::with_id("settings", "Settings…")
-                    .accelerator("Cmd+,")
-                    .build(app)?;
-                // Custom Quit (instead of the predefined item) so it routes
-                // through on_menu_event → app.exit(0) → our ExitRequested handler,
-                // which stops hosting before the app dies.
-                let quit = MenuItemBuilder::with_id("quit", "Quit ReaMesh")
-                    .accelerator("Cmd+Q")
-                    .build(app)?;
-                let app_menu = SubmenuBuilder::new(app, "ReaMesh")
-                    .about(None)
-                    .separator()
-                    .item(&settings)
-                    .separator()
-                    .services()
-                    .separator()
-                    .hide()
-                    .hide_others()
-                    .show_all()
-                    .separator()
-                    .item(&quit)
-                    .build()?;
-                let edit = SubmenuBuilder::new(app, "Edit")
-                    .undo()
-                    .redo()
-                    .separator()
-                    .cut()
-                    .copy()
-                    .paste()
-                    .select_all()
-                    .build()?;
-                let window = SubmenuBuilder::new(app, "Window")
-                    .minimize()
-                    .separator()
-                    .close_window()
-                    .build()?;
-                let menu = MenuBuilder::new(app)
-                    .items(&[&app_menu, &edit, &window])
-                    .build()?;
-                app.set_menu(menu)?;
-            }
+            build_menu(app.handle())?;
             Ok(())
         })
         .on_menu_event(|app, event| {
@@ -418,7 +562,10 @@ pub fn run() {
 /// `AppHandle` pointer.
 #[cfg(target_os = "macos")]
 mod native_settings {
-    use super::{compute_status, do_install, load_custom_path, store_custom_path, ReaperStatus};
+    use super::{
+        apply_language, compute_status, do_install, load_custom_path, load_lang_pref,
+        store_custom_path, ReaperStatus,
+    };
     use std::cell::RefCell;
     use std::ffi::{c_char, c_void, CStr, CString};
     use std::sync::OnceLock;
@@ -440,6 +587,8 @@ mod native_settings {
         get_status: extern "C" fn(*mut c_void) -> ReaperStatusC,
         install: extern "C" fn(*mut c_void) -> i32,
         set_path: extern "C" fn(*mut c_void, *const c_char),
+        get_language: extern "C" fn(*mut c_void) -> i32,
+        set_language: extern "C" fn(*mut c_void, i32),
     }
 
     extern "C" {
@@ -498,6 +647,26 @@ mod native_settings {
         let _ = app.emit("menu:settings-changed", ());
     }
 
+    // Language preference, 0 = system / 1 = en / 2 = de (kReaMeshLang* in
+    // settings_window.h).
+    extern "C" fn get_language(ctx: *mut c_void) -> i32 {
+        match load_lang_pref(handle(ctx)).as_str() {
+            "en" => 1,
+            "de" => 2,
+            _ => 0,
+        }
+    }
+
+    extern "C" fn set_language(ctx: *mut c_void, pref: i32) {
+        let app = handle(ctx);
+        let pref = match pref {
+            1 => "en",
+            2 => "de",
+            _ => "system",
+        };
+        apply_language(app, pref);
+    }
+
     // The AppHandle is leaked once so the pointer stays valid for the lifetime
     // of the (long-lived) native window.
     static APP_PTR: OnceLock<usize> = OnceLock::new();
@@ -509,6 +678,8 @@ mod native_settings {
             get_status,
             install,
             set_path,
+            get_language,
+            set_language,
         };
         unsafe { reamesh_settings_open(cb) };
     }

@@ -15,8 +15,29 @@ static const CGFloat kWindowWidth = 480;
 static const CGFloat kWindowHeight = 300;
 static const CGFloat kMargin = 24;
 
-// A flipped container so we can lay controls out top-down (y grows downward),
-// which is far easier to reason about than AppKit's default bottom-left origin.
+// The window is bilingual (English/German), driven by the same stored
+// preference the webview uses. Resolved here so a popup change retitles the
+// pane immediately, without a round trip through the webview.
+static BOOL gUseGerman = NO;
+
+static NSString *L(NSString *en, NSString *de) {
+    return gUseGerman ? de : en;
+}
+
+// Resolve the stored preference (kReaMeshLang*) to the UI language; "system"
+// follows the device's preferred language, non-German falls back to English.
+static void resolveUILanguage(int32_t pref) {
+    if (pref == kReaMeshLangEnglish) {
+        gUseGerman = NO;
+    } else if (pref == kReaMeshLangGerman) {
+        gUseGerman = YES;
+    } else {
+        NSString *device = [[NSLocale preferredLanguages] firstObject] ?: @"en";
+        gUseGerman = [device.lowercaseString hasPrefix:@"de"];
+    }
+}
+
+// Use a flipped container for top-down layout coordinates.
 @interface ReaMeshFlippedView : NSView
 @end
 @implementation ReaMeshFlippedView
@@ -39,6 +60,7 @@ static ReaMeshSettingsController *gController = nil;
     if (!self) return self;
     _cb = cb;
     _selectedTab = kTabGeneral;
+    resolveUILanguage(cb.get_language(cb.ctx));
 
     NSRect frame = NSMakeRect(0, 0, kWindowWidth, kWindowHeight);
     NSWindow *win = [[NSWindow alloc]
@@ -47,7 +69,7 @@ static ReaMeshSettingsController *gController = nil;
                              NSWindowStyleMaskMiniaturizable)
                     backing:NSBackingStoreBuffered
                       defer:NO];
-    win.title = @"ReaMesh Settings";
+    win.title = L(@"ReaMesh Settings", @"ReaMesh-Einstellungen");
     win.releasedWhenClosed = NO; // keep the controller reusable across opens
     win.delegate = self;
     [win center];
@@ -93,16 +115,16 @@ static ReaMeshSettingsController *gController = nil;
     item.target = self;
     item.action = @selector(tabSelected:);
     if ([identifier isEqualToString:kTabGeneral]) {
-        item.label = @"General";
+        item.label = L(@"General", @"Allgemein");
         if (@available(macOS 11.0, *)) {
             item.image = [NSImage imageWithSystemSymbolName:@"folder"
-                                   accessibilityDescription:@"General"];
+                                   accessibilityDescription:item.label];
         }
     } else {
-        item.label = @"Extension";
+        item.label = L(@"Extension", @"Erweiterung");
         if (@available(macOS 11.0, *)) {
             item.image = [NSImage imageWithSystemSymbolName:@"puzzlepiece.extension"
-                                   accessibilityDescription:@"Extension"];
+                                   accessibilityDescription:item.label];
         }
     }
     return item;
@@ -135,6 +157,9 @@ static ReaMeshSettingsController *gController = nil;
     for (NSView *v in [self.container.subviews copy]) {
         [v removeFromSuperview];
     }
+    // The webview may have changed the language while this window was open.
+    resolveUILanguage(self.cb.get_language(self.cb.ctx));
+    self.window.title = L(@"ReaMesh Settings", @"ReaMesh-Einstellungen");
     ReaperStatusC st = self.cb.get_status(self.cb.ctx);
     if ([identifier isEqualToString:kTabExtension]) {
         [self buildExtensionPane:st];
@@ -147,7 +172,23 @@ static ReaMeshSettingsController *gController = nil;
     CGFloat w = kWindowWidth - 2 * kMargin;
     CGFloat y = kMargin;
 
-    [self.container addSubview:[self headerWithString:@"REAPER folder" y:y]];
+    [self.container addSubview:[self headerWithString:L(@"Language", @"Sprache") y:y]];
+    y += 26;
+
+    NSPopUpButton *langPopup =
+        [[NSPopUpButton alloc] initWithFrame:NSMakeRect(kMargin, y, 220, 25) pullsDown:NO];
+    [langPopup addItemWithTitle:L(@"System", @"System")];
+    [langPopup addItemWithTitle:@"English"];
+    [langPopup addItemWithTitle:@"Deutsch"];
+    // Item order matches the kReaMeshLang* values.
+    [langPopup selectItemAtIndex:self.cb.get_language(self.cb.ctx)];
+    langPopup.target = self;
+    langPopup.action = @selector(languageChanged:);
+    [self.container addSubview:langPopup];
+    y += 38;
+
+    [self.container addSubview:[self headerWithString:L(@"REAPER folder", @"REAPER-Ordner")
+                                                    y:y]];
     y += 28;
 
     NSString *path = st.resource_path ? @(st.resource_path) : @"";
@@ -165,7 +206,8 @@ static ReaMeshSettingsController *gController = nil;
 
     if (!st.reaper_found) {
         NSTextField *warn =
-            [self labelWithString:@"No REAPER folder found at this location."
+            [self labelWithString:L(@"No REAPER folder found at this location.",
+                                    @"An diesem Ort wurde kein REAPER-Ordner gefunden.")
                             frame:NSMakeRect(kMargin, y, w, 16)];
         warn.textColor = [NSColor systemOrangeColor];
         warn.font = [NSFont systemFontOfSize:11];
@@ -173,23 +215,24 @@ static ReaMeshSettingsController *gController = nil;
         y += 24;
     }
 
-    NSButton *change = [NSButton buttonWithTitle:@"Change…"
+    NSButton *change = [NSButton buttonWithTitle:L(@"Change…", @"Ändern…")
                                           target:self
                                           action:@selector(changeFolder:)];
     change.frame = NSMakeRect(kMargin, y, 100, 24);
     [self.container addSubview:change];
 
     if (st.has_custom_path) {
-        NSButton *reset = [NSButton buttonWithTitle:@"Use default"
+        NSButton *reset = [NSButton buttonWithTitle:L(@"Use default", @"Standard verwenden")
                                              target:self
                                              action:@selector(useDefault:)];
-        reset.frame = NSMakeRect(kMargin + 108, y, 110, 24);
+        reset.frame = NSMakeRect(kMargin + 108, y, 160, 24);
         [self.container addSubview:reset];
     }
     y += 34;
 
     if (!st.reaper_found) {
-        NSButton *dl = [NSButton buttonWithTitle:@"Don't have REAPER? Download it"
+        NSButton *dl = [NSButton buttonWithTitle:L(@"Don't have REAPER? Download it",
+                                                   @"Kein REAPER? Hier herunterladen")
                                           target:self
                                           action:@selector(openDownload:)];
         dl.bezelStyle = NSBezelStyleInline;
@@ -207,19 +250,22 @@ static ReaMeshSettingsController *gController = nil;
     CGFloat w = kWindowWidth - 2 * kMargin;
     CGFloat y = kMargin;
 
-    [self.container addSubview:[self headerWithString:@"REAPER extension" y:y]];
+    [self.container addSubview:[self headerWithString:L(@"REAPER extension",
+                                                        @"REAPER-Erweiterung")
+                                                    y:y]];
     y += 28;
 
     NSString *statusText;
     NSColor *statusColor;
     if (!st.installed) {
-        statusText = @"reaper_reamesh: Not installed";
+        statusText = L(@"reaper_reamesh: Not installed", @"reaper_reamesh: Nicht installiert");
         statusColor = [NSColor secondaryLabelColor];
     } else if (st.up_to_date) {
-        statusText = @"reaper_reamesh: Installed";
+        statusText = L(@"reaper_reamesh: Installed", @"reaper_reamesh: Installiert");
         statusColor = [NSColor systemGreenColor];
     } else {
-        statusText = @"reaper_reamesh: Update available";
+        statusText = L(@"reaper_reamesh: Update available",
+                       @"reaper_reamesh: Update verfügbar");
         statusColor = [NSColor systemOrangeColor];
     }
     NSTextField *statusLabel =
@@ -229,13 +275,14 @@ static ReaMeshSettingsController *gController = nil;
     [self.container addSubview:statusLabel];
     y += 34;
 
-    NSString *title = !st.installed ? @"Install extension"
-                    : st.up_to_date ? @"Reinstall extension"
-                                    : @"Update extension";
+    NSString *title = !st.installed
+        ? L(@"Install extension", @"Erweiterung installieren")
+        : st.up_to_date ? L(@"Reinstall extension", @"Erweiterung neu installieren")
+                        : L(@"Update extension", @"Erweiterung aktualisieren");
     NSButton *installBtn = [NSButton buttonWithTitle:title
                                               target:self
                                               action:@selector(install:)];
-    installBtn.frame = NSMakeRect(kMargin, y, 180, 28);
+    installBtn.frame = NSMakeRect(kMargin, y, 230, 28);
     installBtn.bezelStyle = NSBezelStyleRounded;
     installBtn.keyEquivalent = @"\r";
     installBtn.enabled = st.reaper_found ? YES : NO;
@@ -243,8 +290,10 @@ static ReaMeshSettingsController *gController = nil;
     y += 40;
 
     NSTextField *help = [self
-        labelWithString:@"REAPER loads the extension at startup. Restart it "
-                         "after installing or updating."
+        labelWithString:L(@"REAPER loads the extension at startup. Restart it "
+                          @"after installing or updating.",
+                          @"REAPER lädt die Erweiterung beim Start. Starte es "
+                          @"nach Installation oder Update neu.")
                   frame:NSMakeRect(kMargin, y, w, 40)];
     help.textColor = [NSColor secondaryLabelColor];
     help.font = [NSFont systemFontOfSize:11];
@@ -255,12 +304,26 @@ static ReaMeshSettingsController *gController = nil;
 
 #pragma mark - Actions
 
+- (void)languageChanged:(NSPopUpButton *)sender {
+    // Item index == kReaMeshLang* value. Rust persists it, rebuilds the menu
+    // bar, and notifies the webview; this window retitles itself via showTab.
+    self.cb.set_language(self.cb.ctx, (int32_t)sender.indexOfSelectedItem);
+    // The toolbar caches its item labels: rebuild it so the tab names follow.
+    resolveUILanguage(self.cb.get_language(self.cb.ctx));
+    NSToolbar *toolbar = [[NSToolbar alloc] initWithIdentifier:@"ReaMeshSettingsToolbar"];
+    toolbar.delegate = self;
+    toolbar.allowsUserCustomization = NO;
+    toolbar.selectedItemIdentifier = self.selectedTab;
+    self.window.toolbar = toolbar;
+    [self showTab:self.selectedTab];
+}
+
 - (void)changeFolder:(id)sender {
     NSOpenPanel *panel = [NSOpenPanel openPanel];
     panel.canChooseDirectories = YES;
     panel.canChooseFiles = NO;
     panel.allowsMultipleSelection = NO;
-    panel.title = @"Locate your REAPER folder";
+    panel.title = L(@"Locate your REAPER folder", @"Wähle deinen REAPER-Ordner");
     [panel beginSheetModalForWindow:self.window
                   completionHandler:^(NSModalResponse result) {
         if (result == NSModalResponseOK && panel.URLs.count > 0) {
@@ -285,15 +348,18 @@ static ReaMeshSettingsController *gController = nil;
     [self showTab:self.selectedTab];
     NSAlert *alert = [[NSAlert alloc] init];
     if (ok) {
-        alert.messageText = @"Extension installed";
+        alert.messageText = L(@"Extension installed", @"Erweiterung installiert");
         alert.informativeText =
-            @"Restart REAPER (or start it) to load the latest ReaMesh extension.";
+            L(@"Restart REAPER (or start it) to load the latest ReaMesh extension.",
+              @"Starte REAPER (neu), um die aktuelle ReaMesh-Erweiterung zu laden.");
     } else {
         alert.alertStyle = NSAlertStyleWarning;
-        alert.messageText = @"Installation failed";
+        alert.messageText = L(@"Installation failed", @"Installation fehlgeschlagen");
         alert.informativeText =
-            @"Couldn't copy the extension into REAPER's UserPlugins folder. "
-             "Check that the REAPER folder is correct in the General tab.";
+            L(@"Couldn't copy the extension into REAPER's UserPlugins folder. "
+              @"Check that the REAPER folder is correct in the General tab.",
+              @"Die Erweiterung konnte nicht in REAPERs UserPlugins-Ordner kopiert "
+              @"werden. Prüfe im Tab „Allgemein“, ob der REAPER-Ordner stimmt.");
     }
     [alert beginSheetModalForWindow:self.window completionHandler:nil];
 }

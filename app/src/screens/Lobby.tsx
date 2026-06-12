@@ -13,9 +13,15 @@ import {
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { send, sendProfile } from "@/lib/connection";
+import { t } from "@/lib/i18n";
 import { getProfile, saveProfile, PALETTE, type Profile } from "@/lib/profile";
 import { initials, type ExtState, type SessionAd } from "@/lib/types";
 import { cn } from "@/lib/utils";
+
+// The "only join people you trust" warning is shown once per app run: the
+// first join after launch gets it, later joins in the same run don't. Module
+// state (not localStorage) is exactly that lifetime: a restart shows it again.
+let trustWarningAccepted = false;
 
 function ProfileRow({
   profile,
@@ -35,7 +41,7 @@ function ProfileRow({
       <div className="min-w-0 flex-1 space-y-3">
         <Input
           value={profile.name}
-          placeholder="Your name"
+          placeholder={t("yourName")}
           maxLength={32}
           className="h-8 border-0 bg-secondary text-[13px]"
           onChange={(e) => onChange({ ...profile, name: e.target.value })}
@@ -68,6 +74,7 @@ function SessionCard({ session }: { session: SessionAd }) {
   const [pass, setPass] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
   const join = () => {
+    trustWarningAccepted = true;
     setConfirmOpen(false);
     send({
       cmd: "join",
@@ -75,6 +82,10 @@ function SessionCard({ session }: { session: SessionAd }) {
       session_name: session.session_name,
       passphrase: pass,
     });
+  };
+  const requestJoin = () => {
+    if (trustWarningAccepted) join();
+    else setConfirmOpen(true);
   };
 
   return (
@@ -104,60 +115,47 @@ function SessionCard({ session }: { session: SessionAd }) {
           size="sm"
           className="h-7 px-3 text-[12px]"
           disabled={session.auth && !pass}
-          onClick={() => setConfirmOpen(true)}
+          onClick={requestJoin}
         >
-          Join
+          {t("join")}
         </Button>
       </div>
       {session.auth && (
         <Input
           type="password"
           value={pass}
-          placeholder="Password"
+          placeholder={t("password")}
           className="h-8 border-0 bg-secondary text-[13px]"
           onChange={(e) => setPass(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && pass && setConfirmOpen(true)}
+          onKeyDown={(e) => e.key === "Enter" && pass && requestJoin()}
         />
       )}
 
       {/* Joining downloads and opens the host's project, and the host can load
           track effects/plugins live during the session; both run code on this
-          machine. Make that trust decision explicit before connecting. */}
+          machine. Make that trust decision explicit before the first join of
+          this app run. */}
       <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <DialogContent className="max-w-[340px] gap-4 rounded-2xl">
           <DialogHeader>
             <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-amber-500/15 sm:mx-0">
               <ShieldAlert className="size-5 text-amber-500" />
             </div>
-            <DialogTitle className="text-[15px]">
-              Only join people you trust
-            </DialogTitle>
+            <DialogTitle className="text-[15px]">{t("trustTitle")}</DialogTitle>
             <DialogDescription className="text-[13px] leading-relaxed">
-              Joining{" "}
-              <span className="font-medium text-foreground">
-                {session.session_name}
-              </span>{" "}
-              downloads and opens the host's project. Its tracks can load audio
-              effects and plugins, and the host can add more while you're
-              connected. These run as code on your computer. Only continue if
-              you trust the person hosting.
+              {t("trustBody", { name: session.session_name })}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter className="gap-2 sm:gap-2">
             <Button
               variant="outline"
-              size="sm"
-              className="h-8 flex-1 text-[12px]"
+              className="flex-1"
               onClick={() => setConfirmOpen(false)}
             >
-              Cancel
+              {t("cancel")}
             </Button>
-            <Button
-              size="sm"
-              className="h-8 flex-1 text-[12px]"
-              onClick={join}
-            >
-              Join anyway
+            <Button className="flex-1" onClick={join}>
+              {t("joinAnyway")}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -173,24 +171,22 @@ function HostCard({ project }: { project: string }) {
       <div className="flex items-center gap-3">
         <div className="min-w-0 flex-1">
           <span className="block truncate text-[13px] font-semibold">
-            {project || "Untitled project"}
+            {project || t("untitledProject")}
           </span>
-          <p className="text-[12px] text-muted-foreground">
-            Share this project with your network
-          </p>
+          <p className="text-[12px] text-muted-foreground">{t("shareProject")}</p>
         </div>
         <Button
           size="sm"
           className="h-7 px-4 text-[12px]"
           onClick={() => send({ cmd: "host", passphrase: pass })}
         >
-          Host
+          {t("hostAction")}
         </Button>
       </div>
       <Input
         type="password"
         value={pass}
-        placeholder="Password (optional)"
+        placeholder={t("passwordOptional")}
         className="h-8 border-0 bg-secondary text-[13px]"
         onChange={(e) => setPass(e.target.value)}
       />
@@ -212,7 +208,7 @@ export function Lobby({ state }: { state: ExtState }) {
 
       <div className="flex min-h-0 flex-1 flex-col gap-2">
         <h3 className="px-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-          Sessions on this network
+          {t("sessionsOnNetwork")}
         </h3>
         <ScrollArea className="min-h-0 flex-1 -mx-1 px-1">
           <div className="space-y-2">
@@ -223,7 +219,7 @@ export function Lobby({ state }: { state: ExtState }) {
             </AnimatePresence>
             {state.sessions.length === 0 && (
               <div className="flex items-center justify-center rounded-xl border border-dashed border-border p-5 text-muted-foreground">
-                <span className="text-[13px]">No sessions yet</span>
+                <span className="text-[13px]">{t("noSessionsYet")}</span>
               </div>
             )}
           </div>

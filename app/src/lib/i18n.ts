@@ -1,0 +1,285 @@
+// Tiny i18n layer: English + German, no library. The preference
+// ("system" | "en" | "de") is persisted backend-side (like the REAPER folder)
+// so the native macOS settings window and this webview share one source of
+// truth, and mirrored into localStorage for a synchronous first render.
+// "system" resolves through the device language; anything that isn't German
+// falls back to English.
+
+import { useSyncExternalStore } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+export type Lang = "en" | "de";
+export type LangPref = "system" | Lang;
+
+const KEY = "reamesh.lang";
+
+const en = {
+  // Disconnected
+  waitingForReaper: "Waiting for REAPER",
+  startReaperToConnect: "Start REAPER to connect.",
+  openReaper: "Open REAPER",
+  couldntOpenReaper: "Couldn't open REAPER. Launch it manually.",
+
+  // Lobby
+  yourName: "Your name",
+  sessionsOnNetwork: "Sessions on this network",
+  noSessionsYet: "No sessions yet",
+  join: "Join",
+  password: "Password",
+  passwordOptional: "Password (optional)",
+  hostAction: "Host",
+  untitledProject: "Untitled project",
+  shareProject: "Share this project with your network",
+  trustTitle: "Only join people you trust",
+  trustBody:
+    "Joining {name} downloads and opens the host's project. Its effects and plugins run as code on your computer.",
+  cancel: "Cancel",
+  joinAnyway: "Join anyway",
+
+  // Session
+  sessionFallback: "Session",
+  hostingBadge: "Hosting",
+  connectedBadge: "Connected",
+  justYou: "Just you so far",
+  peopleInSession: "{count} people in this session",
+  stopHosting: "Stop hosting",
+  leaveSession: "Leave session",
+  youBadge: "you",
+  sessionHost: "Session host",
+  stopHostingTitle: "Stop hosting?",
+  stopHostingBodyOne: "One other person is connected; stopping the session disconnects them.",
+  stopHostingBodyMany:
+    "{count} other people are connected; stopping the session disconnects them all.",
+
+  // Downloading
+  joiningLabel: "Joining",
+  downloadingProject: "Downloading the project…",
+
+  // Onboarding
+  welcome: "Welcome to ReaMesh",
+  tagline: "Real-time collaboration for REAPER",
+  reaperNotFound: "REAPER not found",
+  reaperNotFoundBody:
+    "REAPER may not be installed, or it keeps its data somewhere else (portable install).",
+  change: "Change…",
+  downloadReaper: "Download REAPER",
+  checkAgain: "Check again",
+  installExtTitle: "Install the REAPER extension",
+  installExtBody:
+    "ReaMesh adds a small extension to REAPER so this app can talk to it. It goes into",
+  notReaperDirWarning:
+    "This folder doesn't look like a REAPER data folder yet (no reaper.ini). Installing is harmless, but double-check the location in Settings if REAPER doesn't pick it up.",
+  installing: "Installing…",
+  installExtension: "Install extension",
+  allSet: "You're all set",
+  allSetBody:
+    "The extension is installed. Start REAPER (or restart it if it's already running) and ReaMesh will connect automatically.",
+  finish: "Finish",
+  locateReaperFolder: "Locate your REAPER folder",
+
+  // Settings
+  back: "Back",
+  settings: "Settings",
+  reaperFolder: "REAPER folder",
+  notFoundBadge: "Not found",
+  useDefault: "Use default",
+  dontHaveReaper: "Don't have REAPER? Download it",
+  reaperExtension: "REAPER extension",
+  notInstalled: "Not installed",
+  installed: "Installed",
+  updateAvailable: "Update available",
+  reinstallExtension: "Reinstall extension",
+  updateExtension: "Update extension",
+  restartNote: "REAPER loads the extension at startup; restart it after installing or updating.",
+  extInstalledToast: "Extension installed. Restart REAPER to load it.",
+  language: "Language",
+  languageSystem: "System",
+
+  // Presence / shared
+  guest: "Guest",
+  joinedSessionSuffix: "joined the session",
+  leftSessionSuffix: "left the session",
+
+  // Overlay
+  connecting: "Connecting…",
+  expand: "Expand",
+  collapse: "Collapse",
+
+  // Extension messages worth translating (matched by content in App.tsx)
+  hostEndedSession: "The host ended the session.",
+  wrongPassword: "Wrong password.",
+} as const;
+
+export type MsgKey = keyof typeof en;
+
+const de: Record<MsgKey, string> = {
+  waitingForReaper: "Warte auf REAPER",
+  startReaperToConnect: "Starte REAPER, um dich zu verbinden.",
+  openReaper: "REAPER öffnen",
+  couldntOpenReaper: "REAPER konnte nicht geöffnet werden. Starte es manuell.",
+
+  yourName: "Dein Name",
+  sessionsOnNetwork: "Sessions in diesem Netzwerk",
+  noSessionsYet: "Noch keine Sessions",
+  join: "Beitreten",
+  password: "Passwort",
+  passwordOptional: "Passwort (optional)",
+  hostAction: "Hosten",
+  untitledProject: "Unbenanntes Projekt",
+  shareProject: "Teile dieses Projekt mit deinem Netzwerk",
+  trustTitle: "Tritt nur Leuten bei, denen du vertraust",
+  trustBody:
+    "Beim Beitritt zu {name} wird das Projekt des Hosts heruntergeladen und geöffnet. Seine Effekte und Plugins laufen als Code auf deinem Computer.",
+  cancel: "Abbrechen",
+  joinAnyway: "Trotzdem beitreten",
+
+  sessionFallback: "Session",
+  hostingBadge: "Hosting",
+  connectedBadge: "Verbunden",
+  justYou: "Bisher nur du",
+  peopleInSession: "{count} Personen in dieser Session",
+  stopHosting: "Hosting beenden",
+  leaveSession: "Session verlassen",
+  youBadge: "du",
+  sessionHost: "Session-Host",
+  stopHostingTitle: "Hosting beenden?",
+  stopHostingBodyOne:
+    "Eine weitere Person ist verbunden. Wenn du die Session beendest, wird sie getrennt.",
+  stopHostingBodyMany:
+    "{count} weitere Personen sind verbunden. Wenn du die Session beendest, werden alle getrennt.",
+
+  joiningLabel: "Trete bei",
+  downloadingProject: "Projekt wird heruntergeladen…",
+
+  welcome: "Willkommen bei ReaMesh",
+  tagline: "Echtzeit-Kollaboration für REAPER",
+  reaperNotFound: "REAPER nicht gefunden",
+  reaperNotFoundBody:
+    "REAPER ist möglicherweise nicht installiert oder speichert seine Daten woanders (portable Installation).",
+  change: "Ändern…",
+  downloadReaper: "REAPER herunterladen",
+  checkAgain: "Erneut prüfen",
+  installExtTitle: "REAPER-Erweiterung installieren",
+  installExtBody:
+    "ReaMesh fügt REAPER eine kleine Erweiterung hinzu, damit diese App mit ihm sprechen kann. Sie wird installiert nach",
+  notReaperDirWarning:
+    "Dieser Ordner sieht noch nicht nach einem REAPER-Datenordner aus (keine reaper.ini). Die Installation ist unbedenklich, prüfe aber den Ort in den Einstellungen, falls REAPER sie nicht lädt.",
+  installing: "Installiere…",
+  installExtension: "Erweiterung installieren",
+  allSet: "Alles bereit",
+  allSetBody:
+    "Die Erweiterung ist installiert. Starte REAPER (oder starte es neu, falls es bereits läuft). ReaMesh verbindet sich automatisch.",
+  finish: "Fertig",
+  locateReaperFolder: "Wähle deinen REAPER-Ordner",
+
+  back: "Zurück",
+  settings: "Einstellungen",
+  reaperFolder: "REAPER-Ordner",
+  notFoundBadge: "Nicht gefunden",
+  useDefault: "Standard verwenden",
+  dontHaveReaper: "Kein REAPER? Hier herunterladen",
+  reaperExtension: "REAPER-Erweiterung",
+  notInstalled: "Nicht installiert",
+  installed: "Installiert",
+  updateAvailable: "Update verfügbar",
+  reinstallExtension: "Erweiterung neu installieren",
+  updateExtension: "Erweiterung aktualisieren",
+  restartNote:
+    "REAPER lädt die Erweiterung beim Start. Starte es nach Installation oder Update neu.",
+  extInstalledToast: "Erweiterung installiert. Starte REAPER neu, um sie zu laden.",
+  language: "Sprache",
+  languageSystem: "System",
+
+  guest: "Gast",
+  joinedSessionSuffix: "ist der Session beigetreten",
+  leftSessionSuffix: "hat die Session verlassen",
+
+  connecting: "Verbinde…",
+  expand: "Ausklappen",
+  collapse: "Einklappen",
+
+  hostEndedSession: "Der Host hat die Session beendet.",
+  wrongPassword: "Falsches Passwort.",
+};
+
+function readStoredPref(): LangPref {
+  try {
+    const v = localStorage.getItem(KEY);
+    if (v === "en" || v === "de" || v === "system") return v;
+  } catch {
+    // fall through
+  }
+  return "system";
+}
+
+let pref: LangPref = readStoredPref();
+const listeners = new Set<() => void>();
+
+function emit() {
+  for (const l of listeners) l();
+}
+
+export function resolveLang(p: LangPref = pref): Lang {
+  if (p !== "system") return p;
+  const device = (navigator.language || "").toLowerCase();
+  return device.startsWith("de") ? "de" : "en";
+}
+
+export function t(key: MsgKey, params?: Record<string, string | number>): string {
+  let s: string = (resolveLang() === "de" ? de : en)[key];
+  if (params) {
+    for (const [k, v] of Object.entries(params)) s = s.split(`{${k}}`).join(String(v));
+  }
+  return s;
+}
+
+export function getLangPref(): LangPref {
+  return pref;
+}
+
+/** Set the preference, mirror it to localStorage, and persist it backend-side
+ *  (where the native macOS settings window reads it). */
+export function setLangPref(p: LangPref) {
+  applyPref(p);
+  invoke("set_language", { pref: p }).catch(() => {});
+}
+
+function applyPref(p: LangPref) {
+  if (p === pref) return;
+  pref = p;
+  try {
+    localStorage.setItem(KEY, p);
+  } catch {
+    // localStorage unavailable; keep the in-memory value
+  }
+  emit();
+}
+
+/** Subscribe a component to language changes; returns the resolved language. */
+export function useLang(): Lang {
+  useSyncExternalStore(
+    (cb) => {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    () => pref,
+  );
+  return resolveLang();
+}
+
+/** One-time backend sync: adopt the persisted preference (the backend file is
+ *  the source of truth: native settings may have changed it while the
+ *  webview was gone) and follow native-side changes live. No-ops in
+ *  plain-browser dev where the Tauri APIs reject. */
+export function initLanguage() {
+  invoke<string | null>("get_language")
+    .then((v) => {
+      if (v === "en" || v === "de" || v === "system") applyPref(v);
+    })
+    .catch(() => {});
+  listen<string>("language-changed", (ev) => {
+    const v = ev.payload;
+    if (v === "en" || v === "de" || v === "system") applyPref(v);
+  }).catch(() => {});
+}

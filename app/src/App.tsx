@@ -13,6 +13,7 @@ import { Settings } from "@/screens/Settings";
 import { startScanning, send, useActiveInstance } from "@/lib/connection";
 import { openOverlay, closeOverlay, setSessionState } from "@/lib/overlay";
 import { loadReaperPath, refreshStatus, useReaperStatus } from "@/lib/install";
+import { t, useLang } from "@/lib/i18n";
 import { displayName, type ExtState, type Mode } from "@/lib/types";
 
 startScanning();
@@ -53,7 +54,7 @@ function usePresenceToasts(state: ExtState | undefined) {
           <span className="flex items-center gap-2">
             {dot(info.color)}
             <span>
-              <b>{info.name}</b> joined the session
+              <b>{info.name}</b> {t("joinedSessionSuffix")}
             </span>
           </span>,
         );
@@ -65,7 +66,7 @@ function usePresenceToasts(state: ExtState | undefined) {
           <span className="flex items-center gap-2">
             {dot(info.color)}
             <span>
-              <b>{info.name}</b> left the session
+              <b>{info.name}</b> {t("leftSessionSuffix")}
             </span>
           </span>,
         );
@@ -74,11 +75,19 @@ function usePresenceToasts(state: ExtState | undefined) {
   }, [state]);
 }
 
+/** The extension's error strings are English; map the ones a user actually
+ *  hits to translated text and fall back to the raw message otherwise. */
+function localizeExtensionError(err: string): string {
+  if (err.includes("the host ended the session")) return t("hostEndedSession");
+  if (err.includes("wrong or missing session passphrase")) return t("wrongPassword");
+  return err;
+}
+
 function useErrorToasts(state: ExtState | undefined) {
   const last = useRef("");
   useEffect(() => {
     const err = state?.error ?? "";
-    if (err && err !== last.current) toast.error(err);
+    if (err && err !== last.current) toast.error(localizeExtensionError(err));
     last.current = err;
   }, [state?.error]);
 }
@@ -88,6 +97,7 @@ export default function App() {
   const state = instance?.state;
   const reaper = useReaperStatus();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  useLang(); // re-render the whole tree when the language changes
   usePresenceToasts(state);
   useErrorToasts(state);
 
