@@ -10,6 +10,8 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=Cocoa");
         // CGWindowListCopyWindowInfo, for following REAPER's window.
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
+        // CADisplayLink, driving the overlay's follow tick.
+        println!("cargo:rustc-link-lib=framework=QuartzCore");
         println!("cargo:rerun-if-changed=src/settings_window.m");
         println!("cargo:rerun-if-changed=src/settings_window.h");
         println!("cargo:rerun-if-changed=src/overlay_panel.m");

@@ -1,6 +1,7 @@
 #import "overlay_panel.h"
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 
 // Native chrome for the presence overlay. The webview owns the HUD's content
@@ -13,8 +14,8 @@
 //   • dragging it (via the webview's drag region → AppKit window move) rewrites
 //     that offset for the rest of this session; it is never persisted, so every
 //     relaunch starts from the default anchor below.
-// All of this runs on the main thread (timer + AppKit notifications), so the
-// state below needs no locking.
+// All of this runs on the main thread (display link / timer + AppKit
+// notifications), so the state below needs no locking.
 
 static NSString *const kReaperBundleId = @"com.cockos.reaper";
 // Default anchor: tuck the overlay's top-right corner just inside REAPER's
@@ -37,7 +38,8 @@ static const NSTimeInterval kDragPause = 0.25; // suspend follow during a drag
 
 @interface ReaMeshOverlayController : NSObject <NSWindowDelegate>
 @property (strong) NSPanel *panel;
-@property (strong) NSTimer *followTimer;
+@property (strong) NSTimer *followTimer; // pre-macOS-14 fallback for followLink
+@property (strong) id followLink; // CADisplayLink (macOS 14+), vsync-aligned
 @property (weak) id<NSWindowDelegate> prevDelegate;
 @property (assign) Class originalClass; // tao's NSWindow subclass, restored on detach
 @property (assign) NSPoint userOffset; // overlayTopRight - reaperTopRight, CG space
@@ -45,6 +47,8 @@ static const NSTimeInterval kDragPause = 0.25; // suspend follow during a drag
 @property (assign) BOOL visible;
 @property (assign) NSTimeInterval followPausedUntil;
 @property (assign) pid_t cachedReaperPID;
+@property (assign) CGWindowID cachedWindowID; // REAPER's main window, re-resolved when stale
+@property (assign) NSTimeInterval nextWindowScan; // throttle for failed full scans
 @end
 
 static ReaMeshOverlayController *gOverlay = nil;
@@ -69,20 +73,24 @@ static ReaMeshOverlayController *gOverlay = nil;
     return [front.bundleIdentifier isEqualToString:kReaperBundleId];
 }
 
-// REAPER's main window rect in CoreGraphics global space (top-left origin).
-// Picks the largest layer-0 on-screen window owned by REAPER: its arrange
-// window dominates the floating FX/docked windows. Geometry-only query, so it
-// needs no Screen-Recording permission (we never ask for kCGWindowName).
-- (BOOL)reaperWindowBounds:(CGRect *)out {
+// (Re)resolve which REAPER window to follow: the largest layer-0 on-screen
+// window: its arrange window dominates the floating FX/docked windows. This
+// scans every window on the system, far too expensive per display frame, so it
+// runs only when there is no cached window id (throttled when it keeps
+// failing, e.g. REAPER minimized). Geometry-only query, so it needs no
+// Screen-Recording permission (we never ask for kCGWindowName).
+- (BOOL)resolveReaperWindow:(CGRect *)out {
     pid_t pid = [self reaperPID];
     if (pid <= 0) return NO;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now < self.nextWindowScan) return NO;
     CFArrayRef list = CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
         kCGNullWindowID);
     if (!list) return NO;
     CGRect best = CGRectZero;
     CGFloat bestArea = 0;
-    BOOL found = NO;
+    CGWindowID bestID = kCGNullWindowID;
     CFIndex n = CFArrayGetCount(list);
     for (CFIndex i = 0; i < n; i++) {
         NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(list, i);
@@ -98,11 +106,52 @@ static ReaMeshOverlayController *gOverlay = nil;
         if (area > bestArea) {
             bestArea = area;
             best = b;
-            found = YES;
+            bestID = (CGWindowID)[info[(__bridge NSString *)kCGWindowNumber] unsignedIntValue];
         }
     }
     CFRelease(list);
-    if (found) *out = best;
+    if (bestID == kCGNullWindowID) {
+        self.nextWindowScan = now + 0.25;
+        return NO;
+    }
+    self.cachedWindowID = bestID;
+    *out = best;
+    return YES;
+}
+
+// REAPER's main window rect in CoreGraphics global space (top-left origin).
+// The per-frame path queries only the cached window id: a single-window
+// lookup, cheap enough for a 120 Hz display link.
+- (BOOL)reaperWindowBounds:(CGRect *)out {
+    if (self.cachedWindowID == kCGNullWindowID) return [self resolveReaperWindow:out];
+    BOOL stale = YES, found = NO;
+    CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow,
+                                                 self.cachedWindowID);
+    if (list) {
+        if (CFArrayGetCount(list) == 1) {
+            NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(list, 0);
+            NSNumber *owner = info[(__bridge NSString *)kCGWindowOwnerPID];
+            if (owner.intValue == [self reaperPID]) {
+                stale = NO;
+                // Off-screen (minimized/hidden): report nothing so the overlay
+                // freezes in place, but keep the cache: the window is alive.
+                NSNumber *onscreen = info[(__bridge NSString *)kCGWindowIsOnscreen];
+                CGRect b;
+                CFDictionaryRef boundsDict =
+                    (__bridge CFDictionaryRef)info[(__bridge NSString *)kCGWindowBounds];
+                if (onscreen.boolValue && boundsDict &&
+                    CGRectMakeWithDictionaryRepresentation(boundsDict, &b)) {
+                    *out = b;
+                    found = YES;
+                }
+            }
+        }
+        CFRelease(list);
+    }
+    if (stale) { // window closed or the id got recycled by another process
+        self.cachedWindowID = kCGNullWindowID;
+        return [self resolveReaperWindow:out];
+    }
     return found;
 }
 
@@ -137,6 +186,12 @@ static ReaMeshOverlayController *gOverlay = nil;
     self.isProgrammaticMove = NO;
 }
 
+// CADisplayLink requires a one-argument selector; typed id so the method
+// compiles below the macOS 14 deployment guard.
+- (void)followTick:(id)link {
+    [self reposition];
+}
+
 #pragma mark - Visibility / fade
 
 - (void)updateVisibility {
@@ -164,6 +219,8 @@ static ReaMeshOverlayController *gOverlay = nil;
 
 - (void)activeAppChanged:(NSNotification *)note {
     self.cachedReaperPID = 0; // REAPER may have relaunched with a new pid
+    self.cachedWindowID = kCGNullWindowID; // …and its windows with it
+    self.nextWindowScan = 0;
     [self updateVisibility];
 }
 
@@ -230,7 +287,9 @@ static ReaMeshOverlayController *gOverlay = nil;
     self.prevDelegate = panel.delegate;
     panel.delegate = self;
     self.cachedReaperPID = 0;
-    // Always start from the default anchor; the dragged offset lives only for
+    self.cachedWindowID = kCGNullWindowID;
+    self.nextWindowScan = 0;
+    // Always start from the default anchor: the dragged offset lives only for
     // the life of this attach (one session), never across relaunches.
     self.userOffset = NSMakePoint(kDefaultOffsetX, kDefaultOffsetY);
 
@@ -240,12 +299,23 @@ static ReaMeshOverlayController *gOverlay = nil;
                name:NSWorkspaceDidActivateApplicationNotification
              object:nil];
 
-    self.followTimer = [NSTimer timerWithTimeInterval:(1.0 / 60.0)
-                                               target:self
-                                             selector:@selector(reposition)
-                                             userInfo:nil
-                                              repeats:YES];
-    [[NSRunLoop mainRunLoop] addTimer:self.followTimer forMode:NSRunLoopCommonModes];
+    // Follow on the display's refresh where available: the callback fires
+    // vsync-aligned (no free-running-timer phase lag) at the panel's display
+    // rate: 120 Hz on ProMotion. The link tracks the panel across displays
+    // and auto-suspends while it's ordered out.
+    if (@available(macOS 14.0, *)) {
+        CADisplayLink *link = [panel displayLinkWithTarget:self
+                                                  selector:@selector(followTick:)];
+        [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        self.followLink = link;
+    } else {
+        self.followTimer = [NSTimer timerWithTimeInterval:(1.0 / 60.0)
+                                                   target:self
+                                                 selector:@selector(reposition)
+                                                 userInfo:nil
+                                                  repeats:YES];
+        [[NSRunLoop mainRunLoop] addTimer:self.followTimer forMode:NSRunLoopCommonModes];
+    }
 
     self.visible = NO;
     [panel setAlphaValue:0.0];
@@ -254,6 +324,8 @@ static ReaMeshOverlayController *gOverlay = nil;
 }
 
 - (void)detach {
+    [self.followLink invalidate]; // also releases its strong ref to self
+    self.followLink = nil;
     [self.followTimer invalidate];
     self.followTimer = nil;
     [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
