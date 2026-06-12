@@ -88,6 +88,12 @@ const TAG_PROPOSAL: u8 = b'P';
 const TAG_PRESENCE: u8 = b'N';
 /// Presence entries not refreshed within this window are dropped.
 const PRESENCE_STALE: Duration = Duration::from_secs(8);
+/// Session farewell: published by the owner right before it stops hosting so
+/// clients end cleanly instead of waiting out a silence.
+const TAG_SESSION_END: u8 = b'E';
+/// Client fallback: if the owner has been gone from the session topic this
+/// long (crash, network drop: no farewell seen), treat the session as ended.
+const OWNER_GONE_TIMEOUT: Duration = Duration::from_secs(12);
 
 type Fields = JsonMap<String, JsonValue>;
 type SectionState = HashMap<String, Fields>;
@@ -166,7 +172,8 @@ struct SessionInfo {
 
 #[derive(Clone, Debug)]
 struct StatusState {
-    /// "hosting" | "browsing" | "connecting" | "downloading" | "ready" | "failed"
+    /// "hosting" | "browsing" | "connecting" | "downloading" | "ready" |
+    /// "failed" | "ended" (the owner stopped the session)
     state: String,
     progress: f64,
     project_path: Option<String>,
@@ -389,6 +396,10 @@ pub struct Reamesh {
     shared: Arc<Shared>,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<Command>,
     runtime: Option<tokio::runtime::Runtime>,
+    /// Signalled by the network task right before it exits. Drop waits on it
+    /// (bounded) so the owner's session-end farewell is flushed to the wire
+    /// before the runtime tear-down cancels the task mid-send.
+    net_done: std_mpsc::Receiver<()>,
     local_peer_id: String,
     role: Role,
 }
@@ -500,6 +511,7 @@ impl Reamesh {
         });
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (init_tx, init_rx) = std_mpsc::channel();
+        let (done_tx, done_rx) = std_mpsc::channel();
 
         {
             let shared = shared.clone();
@@ -513,6 +525,7 @@ impl Reamesh {
                 };
                 let _ = init_tx.send(Ok(swarm.local_peer_id().to_string()));
                 run_network(swarm, cfg, shared, cmd_rx).await;
+                let _ = done_tx.send(());
             });
         }
 
@@ -526,6 +539,7 @@ impl Reamesh {
             shared,
             cmd_tx,
             runtime: Some(runtime),
+            net_done: done_rx,
             local_peer_id,
             role,
         }))
@@ -847,6 +861,11 @@ impl Reamesh {
 impl Drop for Reamesh {
     fn drop(&mut self) {
         let _ = self.cmd_tx.send(Command::Shutdown);
+        // Wait (bounded) for the network task to exit on its own: tearing the
+        // runtime down would cancel it at its next await, before the owner's
+        // session-end farewell ever reaches the socket. Clients exit
+        // immediately; owners after their ~250ms farewell flush.
+        let _ = self.net_done.recv_timeout(Duration::from_secs(1));
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_timeout(Duration::from_secs(2));
         }
@@ -1098,6 +1117,9 @@ struct Piece {
 /// byte-for-byte are skipped (dedup/resume). Each file lands atomically.
 struct Download {
     owner: PeerId,
+    /// Joined session id: the session topic is subscribed only once the owner
+    /// accepts our token (manifest served), never at request time.
+    session_id: String,
     dir: PathBuf,
     project_file: String,
     auth: String,
@@ -1487,6 +1509,9 @@ async fn run_network(
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tick_count: u64 = 0;
+    // Client: last time the session owner was seen on the session topic (for
+    // the owner-vanished fallback below).
+    let mut last_owner_seen = Instant::now();
 
     loop {
         tokio::select! {
@@ -1533,11 +1558,13 @@ async fn run_network(
                     let token = auth_token(&info.salt, &passphrase);
                     *shared.auth_token.lock().unwrap() = token.clone();
                     *shared.owner_peer.lock().unwrap() = info.owner.clone();
-                    let t = session_topic(&session_id);
-                    if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&t) {
-                        eprintln!("[reamesh] subscribe to session topic failed: {e}");
-                    }
-                    sess_topic = Some(t);
+                    // Deliberately NOT subscribing to the session topic yet:
+                    // joining the topic is what makes a peer visible in the
+                    // session (peer lists, presence). That visibility must be
+                    // gated on the owner accepting our token; otherwise a
+                    // wrong-passphrase joiner flashes up as a ghost peer on
+                    // everyone's roster until its download fails. The
+                    // subscribe happens when the manifest arrives.
                     let staging = cfg.staging_dir.clone().unwrap_or_else(std::env::temp_dir);
                     let dir = staging.join(format!(
                         "{}-{}",
@@ -1557,6 +1584,7 @@ async fn run_network(
                         .send_request(&owner, XferRequest::Manifest { auth: token.clone() });
                     download = Some(Download {
                         owner,
+                        session_id: session_id.clone(),
                         dir,
                         project_file: info.project_file.clone(),
                         auth: token,
@@ -1580,7 +1608,24 @@ async fn run_network(
                         eprintln!("[reamesh] dial failed: {e}");
                     }
                 }
-                Some(Command::Shutdown) | None => break,
+                Some(Command::Shutdown) | None => {
+                    // Owner farewell: tell the session it is over, then keep
+                    // driving the swarm briefly so the message actually leaves
+                    // the socket before the runtime is torn down. Clients that
+                    // miss it (or an owner crash) are covered by the
+                    // OWNER_GONE_TIMEOUT fallback on their side.
+                    if hosting.is_some() && let Some(t) = &sess_topic {
+                        let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), vec![TAG_SESSION_END]);
+                        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+                        loop {
+                            tokio::select! {
+                                _ = tokio::time::sleep_until(deadline) => break,
+                                _ = swarm.select_next_some() => {}
+                            }
+                        }
+                    }
+                    break;
+                }
             },
             _ = tick.tick() => {
                 tick_count += 1;
@@ -1595,6 +1640,30 @@ async fn run_network(
                         .collect();
                     shared.topic_peers.store(peers.len(), Ordering::Relaxed);
                     *shared.session_peers.lock().unwrap() = peers;
+                }
+                // Client fallback: the owner vanished from the session topic
+                // (crash, quit without the farewell reaching us): end the
+                // session instead of leaving the user stranded in a dead one.
+                if cfg.role == Role::Client && sess_topic.is_some() {
+                    let owner = shared.owner_peer.lock().unwrap().clone();
+                    let owner_present = !owner.is_empty()
+                        && shared
+                            .session_peers
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|p| p.to_string() == owner);
+                    if owner_present {
+                        last_owner_seen = Instant::now();
+                    } else if last_owner_seen.elapsed() > OWNER_GONE_TIMEOUT
+                        && shared.status.lock().unwrap().state == "ready"
+                    {
+                        eprintln!("[reamesh] the owner disappeared; ending the session");
+                        set_status(&shared, |s| {
+                            s.state = "ended".into();
+                            s.message = Some("the host ended the session".into());
+                        });
+                    }
                 }
                 // Owner: announce the session on the lobby every ~1s.
                 if let (Some(bytes), true) = (&announce, tick_count % 2 == 0) {
@@ -1823,6 +1892,21 @@ async fn run_network(
                                     shared.dirty.store(true, Ordering::SeqCst);
                                 }
                             }
+                            (Some(&TAG_SESSION_END), Role::Client) => {
+                                // Only the owner may end the session (any topic
+                                // member can publish; signed messages carry the
+                                // authenticated source).
+                                let from_owner = message.source.is_some_and(|src| {
+                                    src.to_string() == *shared.owner_peer.lock().unwrap()
+                                });
+                                if from_owner {
+                                    eprintln!("[reamesh] the owner ended the session");
+                                    set_status(&shared, |s| {
+                                        s.state = "ended".into();
+                                        s.message = Some("the host ended the session".into());
+                                    });
+                                }
+                            }
                             (Some(&TAG_PROPOSAL), Role::Owner) => {
                                 if let Some(update) = admit_proposal(&shared, &message.data[1..]) {
                                     let mut data = vec![TAG_AUTHORITATIVE];
@@ -1847,6 +1931,23 @@ async fn run_network(
                         }
                         request_response::Message::Response { request_id, response } => {
                             if download.as_ref().is_some_and(|dl| dl.manifest_req == Some(request_id)) {
+                                // A manifest only arrives once the owner accepted
+                                // our session token: this is the moment we become
+                                // a legitimate session member, so join the topic
+                                // now (an Error response never subscribes; the
+                                // wrong-passphrase peer stays invisible).
+                                if matches!(response, XferResponse::Manifest { .. }) && sess_topic.is_none()
+                                    && let Some(dl) = &download
+                                {
+                                    let t = session_topic(&dl.session_id);
+                                    if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&t) {
+                                        eprintln!("[reamesh] subscribe to session topic failed: {e}");
+                                    }
+                                    sess_topic = Some(t);
+                                    // Fresh anchor for the owner-gone fallback;
+                                    // the pre-join idle time must not count.
+                                    last_owner_seen = Instant::now();
+                                }
                                 handle_download_manifest(&mut swarm, &shared, &mut download, response);
                             } else if download.as_ref().is_some_and(|dl| dl.inflight.contains_key(&request_id)) {
                                 handle_download_piece(&mut swarm, &shared, &mut download, request_id, Some(response));

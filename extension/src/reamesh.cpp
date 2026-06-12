@@ -7,15 +7,16 @@
 // on the network.
 //
 // v3 sync model (owner-authoritative):
-//   tracks:  index plus the shared scalar fields (name/vol/pan/mute, FX-chain
+//   tracks: index plus the shared scalar fields (name/vol/pan, FX-chain
 //            enable, width/pan mode/dual pan/pan law, phase, solo defeat,
 //            channel count, color, folder depth, parent send, track timebase,
 //            play offset, fixed-lane config), and the track's chunk-level
 //            parts (FX chain, input FX chain, automation envelopes, receives
 //            with their send envelopes, group/VCA flags, control lock) as
-//            normalized state-chunk strings. Solo is deliberately NOT synced:
-//            soloing is per-user monitoring, not document state.
-//   items:   each media item as its full normalized state chunk (covers
+//            normalized state-chunk strings. Solo and mute are deliberately
+//            NOT synced: both are per-user monitoring, not document state
+//            (their initial values still arrive with the downloaded .rpp).
+//   items:  each media item as its full normalized state chunk (covers
 //            position, length, splits, fades, takes, take FX, MIDI content)
 //            plus the GUID of the track it sits on.
 //   project: tempo map, markers/regions, project notes/title/author, track
@@ -112,9 +113,10 @@ struct TrackState {
   std::string name;
   double vol = 1.0;
   double pan = 0.0;
-  bool mute = false;
-  // Solo is deliberately absent: soloing is per-user *monitoring* state: one
-  // peer auditioning a track must not silence everyone else's mix.
+  // Solo and mute are deliberately absent: both are per-user *monitoring*
+  // state: one peer auditioning (or silencing) a track must not change
+  // everyone else's mix. Their initial values still arrive with the
+  // downloaded .rpp; they just never sync afterwards.
   bool fxen = true;         // I_FXEN: FX chain enable (the TCP "FX" button)
   double width = 1.0;       // D_WIDTH
   int panmode = -1;         // I_PANMODE
@@ -769,7 +771,6 @@ static Snapshot snapshotProject() {
     ts.name = name;
     ts.vol = GetMediaTrackInfo_Value(tr, "D_VOL");
     ts.pan = GetMediaTrackInfo_Value(tr, "D_PAN");
-    ts.mute = GetMediaTrackInfo_Value(tr, "B_MUTE") != 0.0;
     ts.fxen = GetMediaTrackInfo_Value(tr, "I_FXEN") != 0.0;
     ts.width = GetMediaTrackInfo_Value(tr, "D_WIDTH");
     ts.panmode = (int)GetMediaTrackInfo_Value(tr, "I_PANMODE");
@@ -835,7 +836,6 @@ static json trackToJson(const TrackState& ts) {
               {"name", ts.name},
               {"vol", ts.vol},
               {"pan", ts.pan},
-              {"mute", ts.mute},
               {"fxen", ts.fxen},
               {"width", ts.width},
               {"panmode", ts.panmode},
@@ -885,7 +885,6 @@ static std::string diffSnapshots(const Snapshot& prev, const Snapshot& now) {
     if (old.name != ts.name) delta["name"] = ts.name;
     if (old.vol != ts.vol) delta["vol"] = ts.vol;
     if (old.pan != ts.pan) delta["pan"] = ts.pan;
-    if (old.mute != ts.mute) delta["mute"] = ts.mute;
     if (old.fxen != ts.fxen) delta["fxen"] = ts.fxen;
     if (old.width != ts.width) delta["width"] = ts.width;
     if (old.panmode != ts.panmode) delta["panmode"] = ts.panmode;
@@ -1053,7 +1052,9 @@ static void applyTrackFields(MediaTrack* tr, const json& fields) {
   };
   setNum("vol", "D_VOL");
   setNum("pan", "D_PAN");
-  setBool("mute", "B_MUTE");
+  // "mute" is intentionally not applied (nor captured): per-user monitoring,
+  // like solo. An older peer may still send it; ignoring it here keeps the
+  // local mix the user's own.
   setBool("fxen", "I_FXEN");
   setNum("width", "D_WIDTH");
   setNum("panmode", "I_PANMODE");
@@ -1653,6 +1654,16 @@ static void timerTick() {
       if (currentProjectPath() != g_sessionProjectPath) {
         leaveSession("project changed; session ended");
         return;
+      }
+      // The owner stopping the session (farewell broadcast, or the
+      // owner-vanished fallback) surfaces as status "ended"; drop out
+      // cleanly instead of editing into a dead doc.
+      if (g_mode == Mode::ClientActive) {
+        json st = handleJson(reamesh_status, json::object());
+        if (jsonStr(st, "state") == "ended") {
+          leaveSession("the host ended the session");
+          return;
+        }
       }
       unsigned peers = reamesh_peer_count(g_handle);
       if (peers != g_lastPeerCount) {

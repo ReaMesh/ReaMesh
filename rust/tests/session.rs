@@ -464,6 +464,20 @@ fn passphrase_gates_download() {
         s["state"] == "failed"
     });
     assert!(failed, "download with wrong passphrase should fail");
+    // The refused peer never joined the session topic, so it must never have
+    // appeared in the owner's roster: no ghost "Guest" flashing up on the
+    // host while an unauthorized join is being refused.
+    assert_eq!(
+        owner.connected_peers(),
+        0,
+        "wrong-passphrase peer reached the session topic"
+    );
+    let roster: Value = serde_json::from_str(&owner.peers_json()).unwrap();
+    assert_eq!(
+        roster.as_array().unwrap().len(),
+        1,
+        "owner roster should hold only the owner itself: {roster}"
+    );
     drop(wrong);
 
     // Right passphrase: downloads normally.
@@ -513,6 +527,31 @@ fn track_delete_propagates_as_tombstone() {
 
     drop(client);
     drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
+fn owner_shutdown_ends_session_for_clients() {
+    let project = temp_dir("proj-ended");
+    let staging = temp_dir("staging-ended");
+    make_project(&project);
+    let (owner, client) = establish("ended-test", &project, &staging);
+
+    // Stopping the host must reach the client as an explicit session end (the
+    // farewell broadcast, or (had that been lost) the owner-gone fallback).
+    drop(owner);
+    let ended = wait_until(Duration::from_secs(25), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        s["state"] == "ended"
+    });
+    assert!(
+        ended,
+        "client never learned the session ended: {}",
+        client.status_json()
+    );
+
+    drop(client);
     let _ = fs::remove_dir_all(project);
     let _ = fs::remove_dir_all(staging);
 }
