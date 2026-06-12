@@ -75,6 +75,10 @@ const SESSION_STALE: Duration = Duration::from_secs(10);
 /// legitimate burst (a full-state sync is one message); a flood past this is
 /// dropped rather than allowed to exhaust memory.
 const MAX_PENDING_UPDATES: usize = 4096;
+/// Companion byte cap on the same queue. The per-message `max_transmit_size` is
+/// 64 MB, so bounding only the *count* would still let ~256 GB accumulate;
+/// bounding total bytes keeps the worst case to a fixed, modest ceiling.
+const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 
 // Session-topic message tags.
 const TAG_AUTHORITATIVE: u8 = b'A';
@@ -1722,16 +1726,26 @@ async fn run_network(
                             && v.get("kind").and_then(|k| k.as_str()) == Some("announce")
                         {
                             let get = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                            // Bind the announcement to its authenticated signer:
+                            // the claimed `owner` peer id must match the message
+                            // source. Otherwise any LAN peer could announce a
+                            // session naming someone else as owner, steering a
+                            // joining client's manifest request (and trust) at an
+                            // attacker-chosen peer.
+                            let owner = get("owner");
+                            let signer_is_owner = message
+                                .source
+                                .is_some_and(|src| src.to_string() == owner);
                             let info = SessionInfo {
                                 session_id: get("session_id"),
                                 session_name: get("session_name"),
                                 project_file: get("project_file"),
-                                owner: get("owner"),
+                                owner,
                                 auth: v.get("auth").and_then(|x| x.as_bool()).unwrap_or(false),
                                 salt: get("salt"),
                                 last_seen: Instant::now(),
                             };
-                            if !info.session_id.is_empty() && !info.owner.is_empty() {
+                            if signer_is_owner && !info.session_id.is_empty() {
                                 shared.sessions.lock().unwrap().insert(info.session_id.clone(), info);
                             }
                         }
@@ -1756,13 +1770,36 @@ async fn run_network(
                                 }
                             }
                             (Some(&TAG_AUTHORITATIVE), Role::Client) => {
-                                // Bound the queue so a malicious owner can't pin
-                                // unbounded memory by publishing faster than the
-                                // host drains. yrs updates are idempotent and the
-                                // owner re-sends full state on (re)subscribe, so
-                                // dropping under a flood is safe.
+                                // Authority is the owner's alone. gossipsub lets
+                                // *any* topic member publish, so without this
+                                // check a non-owner LAN peer (who only needs the
+                                // publicly-announced session id, not the
+                                // passphrase) could inject authoritative updates,
+                                // including item or FX chunks that load arbitrary
+                                // plugin code, into every client. Signed
+                                // messages carry an authenticated source, so we
+                                // accept 'A' only from the known owner peer.
+                                let from_owner = message.source.is_some_and(|src| {
+                                    src.to_string() == *shared.owner_peer.lock().unwrap()
+                                });
+                                if !from_owner {
+                                    eprintln!(
+                                        "[reamesh] dropped authoritative update from non-owner {:?}",
+                                        message.source
+                                    );
+                                    continue;
+                                }
+                                // Bound the queue (by count and by total bytes) so
+                                // a compromised owner can't pin unbounded memory by
+                                // publishing faster than the host drains. yrs
+                                // updates are idempotent and the owner re-sends full
+                                // state on (re)subscribe, so dropping under a flood
+                                // is safe.
                                 let mut q = shared.inbound.lock().unwrap();
-                                if q.len() < MAX_PENDING_UPDATES {
+                                let queued_bytes: usize = q.iter().map(|u| u.len()).sum();
+                                if q.len() < MAX_PENDING_UPDATES
+                                    && queued_bytes + message.data.len() <= MAX_PENDING_BYTES
+                                {
                                     q.push(message.data[1..].to_vec());
                                     shared.dirty.store(true, Ordering::SeqCst);
                                 }
