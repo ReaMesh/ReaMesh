@@ -11,13 +11,12 @@
 //   • it follows REAPER's main window, staying at a fixed offset from REAPER's
 //     top-right corner as REAPER moves/resizes;
 //   • dragging it (via the webview's drag region → AppKit window move) rewrites
-//     that offset, persisted in NSUserDefaults.
+//     that offset for the rest of this session; it is never persisted, so every
+//     relaunch starts from the default anchor below.
 // All of this runs on the main thread (timer + AppKit notifications), so the
 // state below needs no locking.
 
 static NSString *const kReaperBundleId = @"com.cockos.reaper";
-static NSString *const kOffsetXKey = @"ReaMeshOverlayOffsetX";
-static NSString *const kOffsetYKey = @"ReaMeshOverlayOffsetY";
 // Default anchor: tuck the overlay's top-right corner just inside REAPER's
 // top-right (16pt in from the right edge, 48pt below the top, clear of the
 // toolbar).
@@ -107,23 +106,6 @@ static ReaMeshOverlayController *gOverlay = nil;
     return found;
 }
 
-#pragma mark - Offset persistence
-
-- (void)loadOffset {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    if ([d objectForKey:kOffsetXKey]) {
-        self.userOffset = NSMakePoint([d doubleForKey:kOffsetXKey], [d doubleForKey:kOffsetYKey]);
-    } else {
-        self.userOffset = NSMakePoint(kDefaultOffsetX, kDefaultOffsetY);
-    }
-}
-
-- (void)persistOffset {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    [d setDouble:self.userOffset.x forKey:kOffsetXKey];
-    [d setDouble:self.userOffset.y forKey:kOffsetYKey];
-}
-
 #pragma mark - Positioning
 
 // Height of the primary screen (the one carrying the menu bar): the constant
@@ -199,8 +181,8 @@ static ReaMeshOverlayController *gOverlay = nil;
     CGFloat overlayTopY_cg = H - NSMaxY(f);
     CGFloat reaperRightX = r.origin.x + r.size.width;
     CGFloat reaperTopY = r.origin.y;
+    // Session-only: the drag holds until the overlay detaches; it is never saved.
     self.userOffset = NSMakePoint(overlayRightX_cg - reaperRightX, overlayTopY_cg - reaperTopY);
-    [self persistOffset];
     self.followPausedUntil = [NSDate timeIntervalSinceReferenceDate] + kDragPause;
 }
 
@@ -248,7 +230,9 @@ static ReaMeshOverlayController *gOverlay = nil;
     self.prevDelegate = panel.delegate;
     panel.delegate = self;
     self.cachedReaperPID = 0;
-    [self loadOffset];
+    // Always start from the default anchor; the dragged offset lives only for
+    // the life of this attach (one session), never across relaunches.
+    self.userOffset = NSMakePoint(kDefaultOffsetX, kDefaultOffsetY);
 
     [[[NSWorkspace sharedWorkspace] notificationCenter]
         addObserver:self
