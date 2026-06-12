@@ -12,11 +12,11 @@ import { Session } from "@/screens/Session";
 import { Settings } from "@/screens/Settings";
 import { startScanning, send, useActiveInstance } from "@/lib/connection";
 import { openOverlay, closeOverlay } from "@/lib/overlay";
-import { refreshStatus, useReaperStatus } from "@/lib/install";
+import { loadReaperPath, refreshStatus, useReaperStatus } from "@/lib/install";
 import { displayName, type ExtState, type Mode } from "@/lib/types";
 
 startScanning();
-refreshStatus();
+loadReaperPath().then(refreshStatus);
 
 /** Toast people joining/leaving by diffing the peers list between states.
  *  Suppressed across mode changes so entering a session doesn't announce
@@ -91,14 +91,22 @@ export default function App() {
   usePresenceToasts(state);
   useErrorToasts(state);
 
-  // Settings is opened from the native menu (ReaMesh → Settings…, Cmd+,).
+  // Settings is opened from the native menu (ReaMesh → Settings…, Cmd+,). On
+  // macOS the backend opens a native AppKit window instead and emits
+  // `menu:settings-changed` after edits so we can re-read status; the
+  // `menu:settings` event only fires on platforms using the in-webview screen.
   useEffect(() => {
-    const un = listen("menu:settings", () => {
-      refreshStatus();
-      setSettingsOpen(true);
-    });
+    const subs = [
+      listen("menu:settings", () => {
+        refreshStatus();
+        setSettingsOpen(true);
+      }),
+      listen("menu:settings-changed", () => {
+        loadReaperPath().then(refreshStatus);
+      }),
+    ];
     return () => {
-      un.then((f) => f());
+      subs.forEach((un) => un.then((f) => f()));
     };
   }, []);
 

@@ -3,8 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 
 // Extension-install plumbing: the Tauri backend checks REAPER's resource
 // folder and copies the bundled reaper_reamesh.dylib into UserPlugins.
-// A custom REAPER folder (portable installs) persists in localStorage and
-// is passed along with every command.
+// The custom REAPER folder (portable installs) is persisted backend-side so
+// the native macOS settings window and this webview share one source of truth;
+// we cache it here for synchronous reads in render.
 
 export interface ReaperStatus {
   reaperFound: boolean;
@@ -15,20 +16,26 @@ export interface ReaperStatus {
   upToDate: boolean;
 }
 
-const PATH_KEY = "reamesh.reaperPath";
+let cachedPath: string | null = null;
 
-export function getReaperPath(): string | null {
+// Loads the persisted override into the cache. Call once before the first
+// refreshStatus, and again whenever the backend reports a change.
+export async function loadReaperPath(): Promise<void> {
   try {
-    return localStorage.getItem(PATH_KEY);
+    cachedPath = (await invoke<string | null>("get_reaper_path")) ?? null;
   } catch {
-    return null;
+    cachedPath = null;
   }
 }
 
-export function setReaperPath(path: string | null) {
+export function getReaperPath(): string | null {
+  return cachedPath;
+}
+
+export async function setReaperPath(path: string | null): Promise<void> {
+  cachedPath = path;
   try {
-    if (path) localStorage.setItem(PATH_KEY, path);
-    else localStorage.removeItem(PATH_KEY);
+    await invoke("set_reaper_path", { path });
   } catch {
     /* ignore */
   }
@@ -45,9 +52,7 @@ function emit() {
 
 export async function refreshStatus(): Promise<ReaperStatus | null> {
   try {
-    status = await invoke<ReaperStatus>("reaper_status", {
-      customPath: getReaperPath(),
-    });
+    status = await invoke<ReaperStatus>("reaper_status");
   } catch {
     status = null;
   }
@@ -56,9 +61,7 @@ export async function refreshStatus(): Promise<ReaperStatus | null> {
 }
 
 export async function installExtension(): Promise<ReaperStatus> {
-  const s = await invoke<ReaperStatus>("install_extension", {
-    customPath: getReaperPath(),
-  });
+  const s = await invoke<ReaperStatus>("install_extension");
   status = s;
   emit();
   return s;

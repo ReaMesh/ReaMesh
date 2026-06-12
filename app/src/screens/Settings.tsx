@@ -27,13 +27,13 @@ export function Settings({ onBack }: { onBack: () => void }) {
       title: "Locate your REAPER folder",
     });
     if (typeof dir === "string") {
-      setReaperPath(dir);
+      await setReaperPath(dir);
       await refreshStatus();
     }
   };
 
   const useDefault = async () => {
-    setReaperPath(null);
+    await setReaperPath(null);
     await refreshStatus();
   };
 

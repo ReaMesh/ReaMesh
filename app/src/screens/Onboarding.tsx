@@ -65,7 +65,7 @@ function LocateStep({ status }: { status: ReaperStatus }) {
       title: "Locate your REAPER folder",
     });
     if (typeof dir === "string") {
-      setReaperPath(dir);
+      await setReaperPath(dir);
       await refreshStatus();
     }
   };

@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tauri::path::BaseDirectory;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 #[cfg(target_os = "macos")]
 const PLUGIN_NAME: &str = "reaper_reamesh.dylib";
@@ -63,6 +63,43 @@ fn bundled_plugin(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())
 }
 
+/// The custom REAPER folder override is persisted backend-side (not in the
+/// webview's localStorage) so the native macOS settings window and the webview
+/// share one source of truth. Absent file = use the default location.
+fn custom_path_file(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|d| d.join("reaper_path"))
+}
+
+fn load_custom_path(app: &AppHandle) -> Option<String> {
+    let p = custom_path_file(app)?;
+    let s = fs::read_to_string(p).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+fn store_custom_path(app: &AppHandle, path: Option<String>) -> Result<(), String> {
+    let p = custom_path_file(app).ok_or("could not resolve config directory")?;
+    match path {
+        Some(v) if !v.is_empty() => {
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            fs::write(&p, v).map_err(|e| e.to_string())
+        }
+        _ => {
+            let _ = fs::remove_file(&p);
+            Ok(())
+        }
+    }
+}
+
 fn files_equal(a: &Path, b: &Path) -> bool {
     match (fs::read(a), fs::read(b)) {
         (Ok(x), Ok(y)) => x == y,
@@ -89,18 +126,12 @@ fn compute_status(app: &AppHandle, custom_path: &Option<String>) -> Result<Reape
     })
 }
 
-#[tauri::command]
-fn reaper_status(app: AppHandle, custom_path: Option<String>) -> Result<ReaperStatus, String> {
-    compute_status(&app, &custom_path)
-}
-
-#[tauri::command]
-fn install_extension(app: AppHandle, custom_path: Option<String>) -> Result<ReaperStatus, String> {
-    let dir = resource_dir(&custom_path)?;
+fn do_install(app: &AppHandle, custom_path: &Option<String>) -> Result<ReaperStatus, String> {
+    let dir = resource_dir(custom_path)?;
     if !dir.is_dir() {
         return Err(format!("REAPER folder not found at {}", dir.display()));
     }
-    let src = bundled_plugin(&app)?;
+    let src = bundled_plugin(app)?;
     if !src.is_file() {
         return Err("the bundled extension is missing from the app resources".into());
     }
@@ -111,7 +142,27 @@ fn install_extension(app: AppHandle, custom_path: Option<String>) -> Result<Reap
     let tmp = user_plugins.join(format!(".{PLUGIN_NAME}.tmp"));
     fs::copy(&src, &tmp).map_err(|e| format!("copy failed: {e}"))?;
     fs::rename(&tmp, user_plugins.join(PLUGIN_NAME)).map_err(|e| format!("install failed: {e}"))?;
-    compute_status(&app, &custom_path)
+    compute_status(app, custom_path)
+}
+
+#[tauri::command]
+fn reaper_status(app: AppHandle) -> Result<ReaperStatus, String> {
+    compute_status(&app, &load_custom_path(&app))
+}
+
+#[tauri::command]
+fn install_extension(app: AppHandle) -> Result<ReaperStatus, String> {
+    do_install(&app, &load_custom_path(&app))
+}
+
+#[tauri::command]
+fn get_reaper_path(app: AppHandle) -> Option<String> {
+    load_custom_path(&app)
+}
+
+#[tauri::command]
+fn set_reaper_path(app: AppHandle, path: Option<String>) -> Result<(), String> {
+    store_custom_path(&app, path)
 }
 
 /// Width of the floating presence overlay, in logical pixels. The webview
@@ -182,7 +233,9 @@ pub fn run() {
             reaper_status,
             install_extension,
             open_overlay,
-            close_overlay
+            close_overlay,
+            get_reaper_path,
+            set_reaper_path
         ])
         .setup(|app| {
             // macOS menu bar with a Settings… item (Cmd+,) that the webview
@@ -230,9 +283,124 @@ pub fn run() {
         })
         .on_menu_event(|app, event| {
             if event.id() == "settings" {
-                let _ = app.emit("menu:settings", ());
+                // macOS opens the real AppKit settings window; other platforms
+                // fall back to the in-webview Settings screen.
+                #[cfg(target_os = "macos")]
+                {
+                    let app = app.clone();
+                    let _ = app
+                        .clone()
+                        .run_on_main_thread(move || native_settings::open(&app));
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    use tauri::Emitter;
+                    let _ = app.emit("menu:settings", ());
+                }
             }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Bridge to the native AppKit settings window (src/settings_window.m). The
+/// window calls back into these `extern "C"` functions to read status, run the
+/// install, and persist the REAPER-folder override. `ctx` is a leaked, stable
+/// `AppHandle` pointer.
+#[cfg(target_os = "macos")]
+mod native_settings {
+    use super::{compute_status, do_install, load_custom_path, store_custom_path, ReaperStatus};
+    use std::cell::RefCell;
+    use std::ffi::{c_char, c_void, CStr, CString};
+    use std::sync::OnceLock;
+    use tauri::{AppHandle, Emitter};
+
+    #[repr(C)]
+    struct ReaperStatusC {
+        resource_path: *const c_char,
+        reaper_found: i32,
+        is_reaper_dir: i32,
+        installed: i32,
+        up_to_date: i32,
+        has_custom_path: i32,
+    }
+
+    #[repr(C)]
+    struct SettingsCallbacks {
+        ctx: *mut c_void,
+        get_status: extern "C" fn(*mut c_void) -> ReaperStatusC,
+        install: extern "C" fn(*mut c_void) -> i32,
+        set_path: extern "C" fn(*mut c_void, *const c_char),
+    }
+
+    extern "C" {
+        fn reamesh_settings_open(cb: SettingsCallbacks);
+    }
+
+    thread_local! {
+        // Keeps the resource-path C string alive for the duration of the
+        // get_status call (the window copies it into an NSString immediately).
+        static PATH_BUF: RefCell<Option<CString>> = const { RefCell::new(None) };
+    }
+
+    fn handle<'a>(ctx: *mut c_void) -> &'a AppHandle {
+        unsafe { &*(ctx as *const AppHandle) }
+    }
+
+    extern "C" fn get_status(ctx: *mut c_void) -> ReaperStatusC {
+        let app = handle(ctx);
+        let custom = load_custom_path(app);
+        let st = compute_status(app, &custom).unwrap_or(ReaperStatus {
+            reaper_found: false,
+            is_reaper_dir: false,
+            resource_path: String::new(),
+            user_plugins: String::new(),
+            installed: false,
+            up_to_date: false,
+        });
+        let cstr = CString::new(st.resource_path).unwrap_or_default();
+        let ptr = cstr.as_ptr();
+        PATH_BUF.with(|b| *b.borrow_mut() = Some(cstr));
+        ReaperStatusC {
+            resource_path: ptr,
+            reaper_found: st.reaper_found as i32,
+            is_reaper_dir: st.is_reaper_dir as i32,
+            installed: st.installed as i32,
+            up_to_date: st.up_to_date as i32,
+            has_custom_path: custom.is_some() as i32,
+        }
+    }
+
+    extern "C" fn install(ctx: *mut c_void) -> i32 {
+        let app = handle(ctx);
+        let ok = do_install(app, &load_custom_path(app)).is_ok();
+        let _ = app.emit("menu:settings-changed", ());
+        ok as i32
+    }
+
+    extern "C" fn set_path(ctx: *mut c_void, p: *const c_char) {
+        let app = handle(ctx);
+        let path = if p.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+        };
+        let _ = store_custom_path(app, path);
+        let _ = app.emit("menu:settings-changed", ());
+    }
+
+    // The AppHandle is leaked once so the pointer stays valid for the lifetime
+    // of the (long-lived) native window.
+    static APP_PTR: OnceLock<usize> = OnceLock::new();
+
+    pub fn open(app: &AppHandle) {
+        let ptr = *APP_PTR.get_or_init(|| Box::into_raw(Box::new(app.clone())) as usize);
+        let cb = SettingsCallbacks {
+            ctx: ptr as *mut c_void,
+            get_status,
+            install,
+            set_path,
+        };
+        unsafe { reamesh_settings_open(cb) };
+    }
 }
