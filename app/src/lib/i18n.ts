@@ -106,9 +106,34 @@ const en = {
   expand: "Expand",
   collapse: "Collapse",
 
-  // Extension messages worth translating (matched by content in App.tsx)
+  // Activity-log / error events from the extension, rendered by code (see
+  // lib/log.ts). `text` on the wire is the English fallback for unknown codes.
   hostEndedSession: "The host ended the session.",
+  hostLost: "Lost the connection to the host.",
   wrongPassword: "Wrong password.",
+  logBrowsing: "Searching for sessions on the network",
+  logHosting: "Hosting “{name}”",
+  logJoining: "Joining “{name}”, downloading the project",
+  logJoinUnavailable: "Couldn’t join “{name}”. It may have just closed. Try again.",
+  logJoinFailed: "Join failed: {reason}",
+  logDownloadComplete: "Download complete, opening the project",
+  logConnected: "Connected: the session host wins conflicts",
+  logPeerJoined: "Someone joined the session",
+  logPeerLeft: "Someone left the session",
+  logLeft: "Left the session",
+  logProjectChanged: "Project changed, session ended",
+  logSaveFirst: "Save the project first, then host again.",
+  logHostFailed: "Could not start hosting.",
+  logBrowseFailed: "Could not start session discovery.",
+  logWaitingMedia: "Waiting for media of an incoming item…",
+  logMediaApplied: "Applied {count} item(s) after media arrived",
+  logMediaCopied: "Copied {file} into the project folder so peers get it",
+  logMediaCopyFailed: "Couldn’t copy {file} into the project",
+  logMediaTimeout: "Gave up waiting for media: {file}",
+  logReconnecting: "Lost the host, reconnecting to “{name}”…",
+  reconnectFailed: "Couldn’t reconnect to “{name}”.",
+  editOverridden: "The host overrode your change.",
+  reconnectingBanner: "Connection to the host lost, reconnecting…",
 } as const;
 
 export type MsgKey = keyof typeof en;
@@ -200,7 +225,32 @@ const de: Record<MsgKey, string> = {
   collapse: "Einklappen",
 
   hostEndedSession: "Der Host hat die Session beendet.",
+  hostLost: "Verbindung zum Host verloren.",
   wrongPassword: "Falsches Passwort.",
+  logBrowsing: "Suche nach Sessions im Netzwerk",
+  logHosting: "Hoste „{name}“",
+  logJoining: "Trete „{name}“ bei, Projekt wird heruntergeladen",
+  logJoinUnavailable:
+    "„{name}“ konnte nicht beigetreten werden. Die Session wurde evtl. gerade geschlossen. Versuch es erneut.",
+  logJoinFailed: "Beitritt fehlgeschlagen: {reason}",
+  logDownloadComplete: "Download abgeschlossen, Projekt wird geöffnet",
+  logConnected: "Verbunden. Bei Konflikten gewinnt der Session-Host",
+  logPeerJoined: "Jemand ist der Session beigetreten",
+  logPeerLeft: "Jemand hat die Session verlassen",
+  logLeft: "Session verlassen",
+  logProjectChanged: "Projekt gewechselt, Session beendet",
+  logSaveFirst: "Speichere zuerst das Projekt und hoste dann erneut.",
+  logHostFailed: "Hosting konnte nicht gestartet werden.",
+  logBrowseFailed: "Session-Suche konnte nicht gestartet werden.",
+  logWaitingMedia: "Warte auf Medien eines eingehenden Items…",
+  logMediaApplied: "{count} Item(s) angewendet, nachdem die Medien angekommen sind",
+  logMediaCopied: "{file} in den Projektordner kopiert, damit andere sie bekommen",
+  logMediaCopyFailed: "{file} konnte nicht ins Projekt kopiert werden",
+  logMediaTimeout: "Warten auf Medien aufgegeben: {file}",
+  logReconnecting: "Host verloren, verbinde erneut mit „{name}“…",
+  reconnectFailed: "Erneutes Verbinden mit „{name}“ ist fehlgeschlagen.",
+  editOverridden: "Der Host hat deine Änderung überschrieben.",
+  reconnectingBanner: "Verbindung zum Host verloren, verbinde erneut…",
 };
 
 function readStoredPref(): LangPref {

@@ -14,6 +14,7 @@ import { startScanning, send, useActiveInstance } from "@/lib/connection";
 import { openOverlay, closeOverlay, setSessionState } from "@/lib/overlay";
 import { loadReaperPath, refreshStatus, useReaperStatus } from "@/lib/install";
 import { t, useLang } from "@/lib/i18n";
+import { localizeLogEntry } from "@/lib/log";
 import { displayName, type ExtState, type Mode } from "@/lib/types";
 
 startScanning();
@@ -75,21 +76,29 @@ function usePresenceToasts(state: ExtState | undefined) {
   }, [state]);
 }
 
-/** The extension's error strings are English; map the ones a user actually
- *  hits to translated text and fall back to the raw message otherwise. */
-function localizeExtensionError(err: string): string {
-  if (err.includes("the host ended the session")) return t("hostEndedSession");
-  if (err.includes("wrong or missing session passphrase")) return t("wrongPassword");
-  return err;
-}
-
 function useErrorToasts(state: ExtState | undefined) {
   const last = useRef("");
   useEffect(() => {
-    const err = state?.error ?? "";
-    if (err && err !== last.current) toast.error(localizeExtensionError(err));
-    last.current = err;
+    const err = state?.error ?? null;
+    const key = err ? JSON.stringify(err) : "";
+    if (err && key !== last.current) toast.error(localizeLogEntry(err));
+    last.current = key;
   }, [state?.error]);
+}
+
+/** Client side: the host silently overrode one of our edits (it snapped back
+ *  ~3s after we made it). Without a word from the UI that reads as a glitch, so
+ *  tell the user what happened. The extension reports a cumulative count. */
+function useOverrideToasts(state: ExtState | undefined) {
+  const prev = useRef<{ mode?: Mode; count: number }>({ count: 0 });
+  useEffect(() => {
+    const count = state?.overridden ?? 0;
+    const sameSession = prev.current.mode === state?.mode;
+    if (state?.mode === "client" && sameSession && count > prev.current.count) {
+      toast(t("editOverridden"));
+    }
+    prev.current = { mode: state?.mode, count };
+  }, [state?.overridden, state?.mode]);
 }
 
 export default function App() {
@@ -100,6 +109,7 @@ export default function App() {
   useLang(); // re-render the whole tree when the language changes
   usePresenceToasts(state);
   useErrorToasts(state);
+  useOverrideToasts(state);
 
   // Settings is opened from the native menu (ReaMesh → Settings…, Cmd+,). On
   // macOS the backend opens a native AppKit window instead and emits

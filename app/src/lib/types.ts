@@ -27,16 +27,31 @@ export interface SessionAd {
   auth: boolean;
 }
 
+/** Structured activity-log entry / error from the extension. `code` (plus
+ *  `params`) names the event so the app can render it in the user's language;
+ *  `text` is the English fallback for unknown codes (and the whole message
+ *  when `code` is empty). */
+export interface LogEntry {
+  code: string;
+  params?: Record<string, string | number>;
+  text: string;
+}
+
 export interface ExtState {
   mode: Mode;
-  /** Rust-side session state: hosting|browsing|connecting|downloading|ready|failed */
+  /** Rust-side session state: hosting|browsing|connecting|downloading|ready|failed|ended */
   state: string;
   progress: number;
   session: string;
   /** Name (stem) of the project currently open in this REAPER instance. */
   project: string;
-  error: string;
-  log: string[];
+  /** Last session-ending event; null when there is none. */
+  error: LogEntry | null;
+  log: LogEntry[];
+  /** Client only: cumulative count of own edits the host overrode. */
+  overridden?: number;
+  /** True while the extension is trying to rejoin a lost host automatically. */
+  reconnecting?: boolean;
   sessions: SessionAd[];
   peers: Peer[];
 }

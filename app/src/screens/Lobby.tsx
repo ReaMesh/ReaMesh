@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { LockKeyhole, ShieldAlert } from "lucide-react";
+import { LoaderCircle, LockKeyhole, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -204,6 +204,15 @@ export function Lobby({ state }: { state: ExtState }) {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
+      {/* The extension lost the host without a farewell and is watching the
+          lobby to rejoin the same session automatically. */}
+      {state.reconnecting && (
+        <div className="flex items-center gap-2.5 rounded-xl bg-amber-500/10 px-3 py-2.5 text-amber-500">
+          <LoaderCircle className="size-4 shrink-0 animate-spin" />
+          <span className="text-[12px] font-medium">{t("reconnectingBanner")}</span>
+        </div>
+      )}
+
       <ProfileRow profile={profile} onChange={updateProfile} />
 
       <div className="flex min-h-0 flex-1 flex-col gap-2">

@@ -16,6 +16,7 @@ import { ChevronUp, Crown } from "lucide-react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { t, useLang } from "@/lib/i18n";
+import { localizeLogEntry } from "@/lib/log";
 import { displayName, type Peer } from "@/lib/types";
 import { useOverlayState } from "./useOverlayState";
 
@@ -120,7 +121,7 @@ export function Overlay({ port }: { port: number | null }) {
 
   const peers = state?.peers ?? [];
   const log = state?.log ?? [];
-  const latest = log.length ? log[log.length - 1] : "";
+  const latest = log.length ? localizeLogEntry(log[log.length - 1]) : "";
 
   return (
     <div
