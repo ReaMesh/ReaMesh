@@ -71,6 +71,10 @@ const OWNER_PRIORITY_TTL: Duration = Duration::from_secs(3);
 const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(3);
 /// Lobby announcements older than this are considered gone.
 const SESSION_STALE: Duration = Duration::from_secs(10);
+/// Cap on authoritative updates queued for the host to drain. Far above any
+/// legitimate burst (a full-state sync is one message); a flood past this is
+/// dropped rather than allowed to exhaust memory.
+const MAX_PENDING_UPDATES: usize = 4096;
 
 // Session-topic message tags.
 const TAG_AUTHORITATIVE: u8 = b'A';
@@ -275,13 +279,66 @@ fn hsl_to_hex(h: f64, s: f64, l: f64) -> String {
 /// Token a peer must present to download from / propose to a session.
 /// Derived from the public per-session salt and the secret passphrase, so only
 /// holders of the passphrase can produce it. Empty passphrase = open session.
+///
+/// Uses Argon2id (memory-hard) rather than a plain hash: the salt is broadcast
+/// in the clear on the lobby, so a fast hash would let a LAN eavesdropper
+/// brute-force a weak passphrase offline. Both peers derive the same token from
+/// the same (salt, passphrase), so the KDF must be deterministic: hence the
+/// low-level `hash_password_into` with the public salt rather than a random
+/// PHC salt.
 fn auth_token(salt: &str, passphrase: &str) -> String {
     if passphrase.is_empty() {
         return String::new();
     }
-    blake3::hash(format!("reamesh/v3/auth\0{salt}\0{passphrase}").as_bytes())
-        .to_hex()
-        .to_string()
+    // Domain-separate and guarantee the salt meets Argon2's 8-byte minimum.
+    let salted = format!("reamesh/v3/auth\0{salt}");
+    let argon = argon2::Argon2::default();
+    let mut out = [0u8; 32];
+    match argon.hash_password_into(passphrase.as_bytes(), salted.as_bytes(), &mut out) {
+        Ok(()) => hex_encode(&out),
+        Err(e) => {
+            eprintln!("[reamesh] auth_token derivation failed: {e}");
+            String::new()
+        }
+    }
+}
+
+/// Lower-case hex of a byte slice (no external dep for this one use).
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
+    }
+    s
+}
+
+/// Cryptographically-random lower-case hex string of `n_bytes` bytes.
+fn random_hex(n_bytes: usize) -> String {
+    let mut buf = vec![0u8; n_bytes];
+    if let Err(e) = getrandom::getrandom(&mut buf) {
+        // getrandom only fails if the OS RNG is unavailable; fall back to a
+        // time/address probe rather than panicking. (Salt secrecy is not the
+        // security property (the passphrase is) but uniqueness still matters.)
+        eprintln!("[reamesh] getrandom failed ({e}); using weak salt fallback");
+        return new_session_id();
+    }
+    hex_encode(&buf)
+}
+
+/// Constant-time byte-slice equality. The length difference is allowed to leak
+/// (token length is fixed and not secret); the contents are not compared with
+/// an early-exit, so a timing side-channel can't recover the token byte by
+/// byte.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 enum Command {
@@ -335,7 +392,7 @@ impl Reamesh {
         }
         let files = build_manifest(&dir)?;
         let session_id = new_session_id();
-        let salt = new_session_id(); // fresh public salt, distinct from the id
+        let salt = random_hex(16); // fresh CSPRNG public salt, distinct from the id
         let token = auth_token(&salt, passphrase);
         let hosting = Hosting {
             session_id: session_id.clone(),
@@ -526,9 +583,16 @@ impl Reamesh {
                     }
                 }
                 drop(ds);
+                // Wrap the changeset in an authenticated envelope: the owner
+                // only admits proposals carrying the session token, so topic
+                // membership alone can't write to the doc.
+                let envelope = json!({
+                    "auth": self.shared.auth_token.lock().unwrap().clone(),
+                    "cs": parsed,
+                });
                 let _ = self
                     .cmd_tx
-                    .send(Command::PublishProposal(changeset_json.as_bytes().to_vec()));
+                    .send(Command::PublishProposal(envelope.to_string().into_bytes()));
             }
         }
     }
@@ -875,6 +939,22 @@ fn is_compressible(path: &str) -> bool {
         .any(|ext| lower.ends_with(ext))
 }
 
+/// Decompress a zstd stream, refusing to allocate more than `limit` bytes.
+/// A compressed chunk arrives from an arbitrary session-topic peer (no auth is
+/// required to answer a File request), so an unbounded `decode_all` would let a
+/// crafted ~1 MB stream inflate to gigabytes and OOM the receiver. Every
+/// legitimate chunk is at most `CHUNK_SIZE`, so anything larger is hostile.
+fn zstd_decode_bounded(data: &[u8], limit: usize) -> std::io::Result<Vec<u8>> {
+    let dec = zstd::stream::Decoder::new(data)?;
+    let mut out = Vec::new();
+    // Read one past the limit so an over-long stream is detected, not truncated.
+    dec.take(limit as u64 + 1).read_to_end(&mut out)?;
+    if out.len() > limit {
+        return Err(std::io::Error::other("decompressed chunk exceeds limit"));
+    }
+    Ok(out)
+}
+
 fn sanitize_dir_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -1135,9 +1215,9 @@ fn handle_fetch_response(
         Some(XferResponse::FileChunk { size, compressed, data }) => {
             fetch.attempts = 0;
             let chunk = if compressed {
-                match zstd::decode_all(&data[..]) {
+                match zstd_decode_bounded(&data, CHUNK_SIZE as usize) {
                     Ok(d) => d,
-                    Err(_) => return, // corrupt; in-order request stays in flight
+                    Err(_) => return, // corrupt/oversized; in-order request stays in flight
                 }
             } else {
                 data
@@ -1221,7 +1301,7 @@ fn serve_xfer(
     let presented = match req {
         XferRequest::Manifest { auth } | XferRequest::File { auth, .. } => auth.as_str(),
     };
-    if presented != auth_token {
+    if !ct_eq(presented.as_bytes(), auth_token.as_bytes()) {
         return XferResponse::Error {
             message: "wrong or missing session passphrase".into(),
         };
@@ -1279,7 +1359,17 @@ fn serve_xfer(
 /// (owner wins), apply the rest to the authoritative doc. Returns the update
 /// to re-broadcast.
 fn admit_proposal(shared: &Shared, payload: &[u8]) -> Option<Vec<u8>> {
-    let parsed: JsonValue = serde_json::from_slice(payload).ok()?;
+    let envelope: JsonValue = serde_json::from_slice(payload).ok()?;
+    // Gate live edits on the session token, exactly as file serving is gated in
+    // serve_xfer: subscribing to the (publicly-announced) session topic must
+    // not by itself authorize writing to the authoritative doc.
+    let presented = envelope.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+    let expected = shared.auth_token.lock().unwrap().clone();
+    if !ct_eq(presented.as_bytes(), expected.as_bytes()) {
+        eprintln!("[reamesh] proposal rejected: wrong or missing session token");
+        return None;
+    }
+    let parsed = envelope.get("cs")?;
 
     let mut ds = shared.doc.lock().unwrap();
     let now = Instant::now();
@@ -1666,8 +1756,16 @@ async fn run_network(
                                 }
                             }
                             (Some(&TAG_AUTHORITATIVE), Role::Client) => {
-                                shared.inbound.lock().unwrap().push(message.data[1..].to_vec());
-                                shared.dirty.store(true, Ordering::SeqCst);
+                                // Bound the queue so a malicious owner can't pin
+                                // unbounded memory by publishing faster than the
+                                // host drains. yrs updates are idempotent and the
+                                // owner re-sends full state on (re)subscribe, so
+                                // dropping under a flood is safe.
+                                let mut q = shared.inbound.lock().unwrap();
+                                if q.len() < MAX_PENDING_UPDATES {
+                                    q.push(message.data[1..].to_vec());
+                                    shared.dirty.store(true, Ordering::SeqCst);
+                                }
                             }
                             (Some(&TAG_PROPOSAL), Role::Owner) => {
                                 if let Some(update) = admit_proposal(&shared, &message.data[1..]) {
@@ -1932,6 +2030,17 @@ fn handle_download_manifest(
                 if dl.got_manifest {
                     return; // duplicate (a retry raced the response)
                 }
+                // The owner-supplied project file name is later joined onto the
+                // staging dir and handed to Main_openProject; validate it like
+                // every other manifest path so a malicious owner can't point the
+                // open outside the staging directory.
+                if safe_relative_path(&project_file).is_none() {
+                    return download_fail(
+                        download,
+                        shared,
+                        format!("unsafe project file in manifest: {project_file}"),
+                    );
+                }
                 if let Err(e) = fs::create_dir_all(&dl.dir) {
                     return download_fail(download, shared, format!("create staging dir: {e}"));
                 }
@@ -1984,7 +2093,7 @@ fn handle_download_piece(
     let chunk: Option<Vec<u8>> = match response {
         Some(XferResponse::FileChunk { compressed, data, .. }) => {
             let bytes = if compressed {
-                zstd::decode_all(&data[..]).ok()
+                zstd_decode_bounded(&data, CHUNK_SIZE as usize).ok()
             } else {
                 Some(data)
             };
@@ -2416,5 +2525,61 @@ pub extern "C" fn reamesh_free_string(s: *mut c_char) {
 pub extern "C" fn reamesh_shutdown(handle: *mut Reamesh) {
     if !handle.is_null() {
         unsafe { drop(Box::from_raw(handle)) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ct_eq_matches_only_identical_slices() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"deadbeef", b"deadbeef"));
+        assert!(!ct_eq(b"deadbeef", b"deadbee0"));
+        assert!(!ct_eq(b"short", b"longer"));
+    }
+
+    #[test]
+    fn auth_token_is_deterministic_and_passphrase_bound() {
+        // Empty passphrase => open session => empty token.
+        assert_eq!(auth_token("salt", ""), "");
+        // Same (salt, passphrase) => same token (both peers must agree).
+        let a = auth_token("salt-abc", "hunter2");
+        let b = auth_token("salt-abc", "hunter2");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64); // 32 bytes hex
+        // A different passphrase or salt yields a different token.
+        assert_ne!(a, auth_token("salt-abc", "hunter3"));
+        assert_ne!(a, auth_token("salt-xyz", "hunter2"));
+    }
+
+    #[test]
+    fn random_hex_is_unique_and_correct_length() {
+        let a = random_hex(16);
+        let b = random_hex(16);
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b, "two CSPRNG salts must not collide");
+    }
+
+    #[test]
+    fn zstd_decode_bounded_accepts_normal_chunk() {
+        let plain = vec![7u8; 4096];
+        let comp = zstd::encode_all(&plain[..], 3).unwrap();
+        let out = zstd_decode_bounded(&comp, CHUNK_SIZE as usize).unwrap();
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn zstd_decode_bounded_rejects_decompression_bomb() {
+        // Highly compressible 8 MB payload -> tiny compressed stream that would
+        // inflate well past the 1 MB chunk limit.
+        let bomb_plain = vec![0u8; 8 * 1024 * 1024];
+        let comp = zstd::encode_all(&bomb_plain[..], 3).unwrap();
+        assert!(comp.len() < CHUNK_SIZE as usize, "test setup: bomb must be small compressed");
+        assert!(
+            zstd_decode_bounded(&comp, CHUNK_SIZE as usize).is_err(),
+            "decompression past the limit must be rejected, not allocated"
+        );
     }
 }

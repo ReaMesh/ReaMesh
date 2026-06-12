@@ -1,7 +1,15 @@
 import { useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { LockKeyhole } from "lucide-react";
+import { LockKeyhole, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { send, sendProfile } from "@/lib/connection";
@@ -58,13 +66,16 @@ function ProfileRow({
 
 function SessionCard({ session }: { session: SessionAd }) {
   const [pass, setPass] = useState("");
-  const join = () =>
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const join = () => {
+    setConfirmOpen(false);
     send({
       cmd: "join",
       session_id: session.session_id,
       session_name: session.session_name,
       passphrase: pass,
     });
+  };
 
   return (
     <motion.div
@@ -93,7 +104,7 @@ function SessionCard({ session }: { session: SessionAd }) {
           size="sm"
           className="h-7 px-3 text-[12px]"
           disabled={session.auth && !pass}
-          onClick={join}
+          onClick={() => setConfirmOpen(true)}
         >
           Join
         </Button>
@@ -105,9 +116,52 @@ function SessionCard({ session }: { session: SessionAd }) {
           placeholder="Password"
           className="h-8 border-0 bg-secondary text-[13px]"
           onChange={(e) => setPass(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && pass && join()}
+          onKeyDown={(e) => e.key === "Enter" && pass && setConfirmOpen(true)}
         />
       )}
+
+      {/* Joining downloads and opens the host's project, and the host can load
+          track effects/plugins live during the session; both run code on this
+          machine. Make that trust decision explicit before connecting. */}
+      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <DialogContent className="max-w-[340px] gap-4 rounded-2xl">
+          <DialogHeader>
+            <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-amber-500/15 sm:mx-0">
+              <ShieldAlert className="size-5 text-amber-500" />
+            </div>
+            <DialogTitle className="text-[15px]">
+              Only join people you trust
+            </DialogTitle>
+            <DialogDescription className="text-[13px] leading-relaxed">
+              Joining{" "}
+              <span className="font-medium text-foreground">
+                {session.session_name}
+              </span>{" "}
+              downloads and opens the host's project. Its tracks can load audio
+              effects and plugins, and the host can add more while you're
+              connected. These run as code on your computer. Only continue if
+              you trust the person hosting.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 flex-1 text-[12px]"
+              onClick={() => setConfirmOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              className="h-8 flex-1 text-[12px]"
+              onClick={join}
+            >
+              Join anyway
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </motion.div>
   );
 }

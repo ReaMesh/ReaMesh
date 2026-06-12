@@ -24,12 +24,34 @@ use std::time::Duration;
 use libp2p::futures::{SinkExt, StreamExt};
 use serde_json::{Value as JsonValue, json};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::StatusCode;
 
 /// Ports tried in order; one per running REAPER instance.
 pub const CTL_PORTS: [u16; 4] = [47415, 47416, 47417, 47418];
 /// Commands queued but not yet drained by the extension tick. Bounded so a
 /// stuck extension can't accumulate unbounded input.
 const INBOUND_CAP: usize = 64;
+
+/// WebSocket `Origin` values allowed to control the extension. The companion
+/// app's webview presents its page origin (`tauri://localhost` in the bundled
+/// app, the Vite dev origin while developing); a browser will not let page
+/// JavaScript cannot forge this header, so the allow list prevents websites
+/// from sending host, join, or leave commands to the local control server.
+/// Requests with no `Origin`
+/// (non-browser clients) are allowed: those run as the user already.
+fn origin_allowed(origin: Option<&str>) -> bool {
+    match origin {
+        None => true,
+        Some(o) => matches!(
+            o,
+            "tauri://localhost"          // macOS / Linux bundled app
+                | "https://tauri.localhost" // Windows bundled app
+                | "http://localhost:1420"   // `tauri dev`
+                | "http://127.0.0.1:1420"
+        ),
+    }
+}
 
 struct CtlShared {
     inbound: Mutex<VecDeque<String>>,
@@ -127,7 +149,22 @@ async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<CtlShared>) 
         };
         let shared = shared.clone();
         tokio::spawn(async move {
-            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+            // Reject cross-origin handshakes (CSWSH) before upgrading.
+            let check = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+                let origin = req
+                    .headers()
+                    .get("origin")
+                    .and_then(|v| v.to_str().ok());
+                if origin_allowed(origin) {
+                    Ok(resp)
+                } else {
+                    eprintln!("[reamesh] ctl: rejected connection from origin {origin:?}");
+                    let mut err = ErrorResponse::new(Some("origin not allowed".to_string()));
+                    *err.status_mut() = StatusCode::FORBIDDEN;
+                    Err(err)
+                }
+            };
+            let Ok(ws) = tokio_tungstenite::accept_hdr_async(stream, check).await else {
                 return;
             };
             let (mut ws_tx, mut ws_rx) = ws.split();
@@ -178,5 +215,25 @@ fn handle_inbound(shared: &CtlShared, msg: String) {
     let mut q = shared.inbound.lock().unwrap();
     if q.len() < INBOUND_CAP {
         q.push_back(msg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin_allowed;
+
+    #[test]
+    fn allows_app_and_devserver_origins() {
+        assert!(origin_allowed(None)); // non-browser client
+        assert!(origin_allowed(Some("tauri://localhost")));
+        assert!(origin_allowed(Some("https://tauri.localhost")));
+        assert!(origin_allowed(Some("http://localhost:1420")));
+    }
+
+    #[test]
+    fn rejects_cross_site_origins() {
+        assert!(!origin_allowed(Some("https://evil.example")));
+        assert!(!origin_allowed(Some("http://evil.example")));
+        assert!(!origin_allowed(Some("null")));
     }
 }

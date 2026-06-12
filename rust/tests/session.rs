@@ -66,7 +66,19 @@ fn interconnect(a: &Reamesh, b: &Reamesh) {
 /// Host a session over `project_dir`, join it from a client, and wait until
 /// the download finished and both sides see each other on the session topic.
 fn establish(session_name: &str, project_dir: &Path, staging: &Path) -> (Box<Reamesh>, Box<Reamesh>) {
-    let owner = Reamesh::host(session_name, project_dir.to_str().unwrap(), "Song.rpp", "")
+    establish_pass(session_name, project_dir, staging, "")
+}
+
+/// Like `establish`, but the session is passphrase-protected; the client joins
+/// with `pass`. Exercises the authenticated download and (token-gated) edit
+/// paths end to end.
+fn establish_pass(
+    session_name: &str,
+    project_dir: &Path,
+    staging: &Path,
+    pass: &str,
+) -> (Box<Reamesh>, Box<Reamesh>) {
+    let owner = Reamesh::host(session_name, project_dir.to_str().unwrap(), "Song.rpp", pass)
         .expect("host failed");
     let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
     let sid = session_id_of(&owner);
@@ -78,7 +90,7 @@ fn establish(session_name: &str, project_dir: &Path, staging: &Path) -> (Box<Rea
     });
     assert!(discovered, "client never saw the session announcement");
 
-    assert!(client.join_session(&sid, ""), "join_session refused");
+    assert!(client.join_session(&sid, pass), "join_session refused");
     let ready = wait_until(Duration::from_secs(30), || {
         let s: Value = serde_json::from_str(&client.status_json()).unwrap();
         assert_ne!(s["state"], "failed", "download failed: {}", s["message"]);
@@ -220,6 +232,42 @@ fn client_edit_proposes_and_propagates() {
         client_state["{T2}"]["name"], "Vox",
         "confirmed proposal must not echo back to the proposing client"
     );
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
+fn authenticated_client_proposal_propagates() {
+    // Proposals are gated on the session token (only token-holders may write
+    // the doc); a correctly-joined client must still be able to propose. This
+    // exercises the authenticated envelope round-trip end to end.
+    let project = temp_dir("proj-authprop");
+    let staging = temp_dir("staging-authprop");
+    make_project(&project);
+    let (owner, client) = establish_pass("authprop-test", &project, &staging, "hunter2");
+
+    owner.push_local(
+        r#"{"tracks":{"{T9}":{"present":true,"index":0,"name":"Vox","vol":1.0,"pan":0.0,"mute":false,"solo":false}}}"#,
+    );
+    let mut client_state = serde_json::Map::new();
+    assert!(wait_until(Duration::from_secs(10), || {
+        drain_into(&client, &mut client_state);
+        client_state.contains_key("{T9}")
+    }));
+
+    // Wait for the locks acquired during track creation to expire.
+    std::thread::sleep(Duration::from_millis(3200));
+    client.push_local(r#"{"tracks":{"{T9}":{"name":"Lead Vox"}}}"#);
+
+    let mut owner_state = serde_json::Map::new();
+    let on_owner = wait_until(Duration::from_secs(10), || {
+        drain_into(&owner, &mut owner_state);
+        owner_state.get("{T9}").map(|t| t["name"] == "Lead Vox").unwrap_or(false)
+    });
+    assert!(on_owner, "authenticated client proposal never surfaced on the owner");
 
     drop(client);
     drop(owner);
