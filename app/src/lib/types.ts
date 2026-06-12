@@ -11,6 +11,10 @@ export interface Peer {
   color: string;
   is_self: boolean;
   is_owner: boolean;
+  /** 1-based number of the track this peer currently has focused, resolved
+   *  locally from their broadcast track GUID. Absent/0 when they're not on a
+   *  track (or an older extension that doesn't report focus). */
+  track?: number | null;
 }
 
 export interface SessionAd {

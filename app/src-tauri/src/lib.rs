@@ -114,12 +114,76 @@ fn install_extension(app: AppHandle, custom_path: Option<String>) -> Result<Reap
     compute_status(&app, &custom_path)
 }
 
+/// Width of the floating presence overlay, in logical pixels. The webview
+/// drives the height (it fits the window to the HUD card); width is fixed here
+/// so the right edge stays put as the roster grows and shrinks.
+const OVERLAY_WIDTH: f64 = 232.0;
+
+/// Open (or reveal) the floating presence overlay for one REAPER instance.
+/// It's a frameless, transparent, always-on-top window that doesn't take focus
+/// because opening it must never steal keys from REAPER mid-take. The `port` pins it
+/// to the same control server the main window is in a session on.
+#[tauri::command]
+fn open_overlay(app: AppHandle, port: u16) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("overlay") {
+        let _ = win.show();
+        return Ok(());
+    }
+    let url = format!("index.html?overlay=1&port={port}");
+    let win = tauri::WebviewWindowBuilder::new(
+        &app,
+        "overlay",
+        tauri::WebviewUrl::App(url.into()),
+    )
+    .title("ReaMesh overlay")
+    .inner_size(OVERLAY_WIDTH, 120.0)
+    .resizable(true)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .focused(false)
+    .shadow(false)
+    .build()
+    .map_err(|e| e.to_string())?;
+
+    // Park it in the top-right corner of the primary display, just below the
+    // menu bar. The webview persists nothing yet; each session re-anchors here
+    // and the user can drag it from there.
+    if let Ok(Some(mon)) = win.primary_monitor() {
+        let size = mon.size();
+        let scale = mon.scale_factor();
+        let inset = (20.0 * scale) as i32;
+        let w_px = (OVERLAY_WIDTH * scale) as i32;
+        let x = (size.width as i32 - w_px - inset).max(0);
+        let y = inset + (28.0 * scale) as i32;
+        let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+    }
+    // Ride across Spaces so it stays with the user when they switch desktops.
+    let _ = win.set_visible_on_all_workspaces(true);
+    Ok(())
+}
+
+/// Close the presence overlay (on leaving/stopping a session).
+#[tauri::command]
+fn close_overlay(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("overlay") {
+        let _ = win.close();
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![reaper_status, install_extension])
+        .invoke_handler(tauri::generate_handler![
+            reaper_status,
+            install_extension,
+            open_overlay,
+            close_overlay
+        ])
         .setup(|app| {
             // macOS menu bar with a Settings… item (Cmd+,) that the webview
             // listens for. The Edit submenu is required for clipboard

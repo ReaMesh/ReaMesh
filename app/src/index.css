@@ -75,4 +75,14 @@
     user-select: text;
     cursor: text;
   }
+  /* Let only the HUD card paint inside the transparent overlay window. */
+  html.overlay-window,
+  html.overlay-window body,
+  html.overlay-window #root {
+    height: auto;
+    background: transparent;
+  }
+  html.overlay-window body {
+    overflow: visible;
+  }
 }

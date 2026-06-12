@@ -27,6 +27,7 @@
         "backgroundColor": "#101013"
       }
     ],
+    "macOSPrivateApi": true,
     "security": {
       "csp": null
     }

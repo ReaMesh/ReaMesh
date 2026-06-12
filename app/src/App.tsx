@@ -11,6 +11,7 @@ import { Onboarding } from "@/screens/Onboarding";
 import { Session } from "@/screens/Session";
 import { Settings } from "@/screens/Settings";
 import { startScanning, send, useActiveInstance } from "@/lib/connection";
+import { openOverlay, closeOverlay } from "@/lib/overlay";
 import { refreshStatus, useReaperStatus } from "@/lib/install";
 import { displayName, type ExtState, type Mode } from "@/lib/types";
 
@@ -108,10 +109,16 @@ export default function App() {
     if (mode === "idle") send({ cmd: "browse" });
   }, [mode, port]);
 
-  // Until the bundled extension is installed into REAPER's UserPlugins,
-  // nothing can connect; run onboarding first. `undefined` means the
-  // backend check hasn't answered yet (it's local fs, near-instant), and
-  // `null` means no Tauri backend (plain-browser dev); both skip the gate.
+  // The floating presence overlay rides along with the active instance for as
+  // long as it's in a session, pinned to that instance's control port.
+  const inSession = mode === "hosting" || mode === "client";
+  useEffect(() => {
+    if (inSession && port != null) openOverlay(port);
+    else closeOverlay();
+  }, [inSession, port]);
+
+  // Run onboarding until the bundled extension is installed. Skip the gate
+  // while the check is pending and in plain-browser development.
   let screen: { key: string; node: React.ReactNode };
   if (settingsOpen) {
     screen = {
