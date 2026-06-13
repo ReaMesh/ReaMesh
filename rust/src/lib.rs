@@ -5,15 +5,21 @@
 //! LAN-wide lobby topic, join, download the full project directory over a
 //! request-response transfer protocol, then collaborate live.
 //!
-//! Authority: the Owner's yrs doc is the single source of truth. Owner-local
-//! edits apply to the doc directly and are broadcast as authoritative updates
-//! (`'A'` + yrs update bytes) on the session topic. Client-local edits are
-//! *proposals* (`'P'` + changeset JSON): only the Owner consumes them, applies
-//! the admitted fields to the doc and re-broadcasts the result. Fields the
-//! Owner itself edited within the last `OWNER_PRIORITY_TTL` are dropped from
-//! proposals; the owner wins live read/write conflicts. Clients keep their
-//! optimistic local value while a proposal is in flight and revert to the
-//! authoritative value if it is not confirmed within `PROPOSAL_TIMEOUT`.
+//! Authority: the Owner's yrs doc is the single source of truth; it is the
+//! one serialization point, not the one editor. Owner-local edits apply to the
+//! doc directly and are broadcast as authoritative updates (`'A'` + yrs update
+//! bytes) on the session topic. Client-local edits are *proposals* (`'P'` +
+//! changeset JSON): only the Owner consumes them, applies the admitted fields
+//! to the doc and re-broadcasts the result. Admission is *active-editor-wins*:
+//! whoever edited a given field more recently keeps it, so a guest working on a
+//! field the owner last touched seconds ago wins it. The owner only keeps its
+//! own value when it edited the SAME field within `CONFLICT_TIE_WINDOW` of the
+//! proposal's own edit: a genuine simultaneous tie. To stay free of
+//! cross-machine clock skew the comparison never uses absolute wall clocks: the
+//! proposal carries the *age* of its edit (a duration measured on the sender's
+//! clock), which the owner re-anchors to its own clock as `now - age`. Clients
+//! keep their optimistic local value while a proposal is in flight and revert
+//! to the authoritative value if it is not confirmed within `PROPOSAL_TIMEOUT`.
 //!
 //! Threading model (unchanged from v1): the host (the REAPER extension) calls
 //! every FFI function from REAPER's main thread; all networking runs on a
@@ -64,10 +70,18 @@ const CHUNK_SIZE: u64 = 1024 * 1024;
 /// How many chunk requests a downloader keeps in flight at once. Pipelining:
 /// the link stays full instead of idling one round-trip per chunk.
 const DOWNLOAD_WINDOW: usize = 12;
-/// Fields the owner edited this recently beat any client proposal.
-const OWNER_PRIORITY_TTL: Duration = Duration::from_secs(3);
+/// An owner edit and a client proposal to the same field whose edit times fall
+/// within this window of each other are treated as a genuine simultaneous tie,
+/// which the owner wins. Outside it, the more recent edit wins, so whoever is
+/// actively working on a field keeps it (active-editor-wins).
+const CONFLICT_TIE_WINDOW: Duration = Duration::from_millis(700);
+/// How long an owner-edit timestamp is kept for tie-breaking. Older entries
+/// can only ever resolve to "the client edited later", so retention past a few
+/// seconds is pure memory; it just bounds the map.
+const OWNER_EDIT_RETENTION: Duration = Duration::from_secs(5);
 /// How long a client keeps its optimistic value before reverting to the
-/// authoritative one when a proposal is never confirmed (i.e. was dropped).
+/// authoritative one when a proposal is never confirmed (i.e. was dropped
+/// because the owner won a genuine tie, or lost in transit).
 const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(3);
 /// Lobby announcements older than this are considered gone.
 const SESSION_STALE: Duration = Duration::from_secs(10);
@@ -626,7 +640,7 @@ impl Reamesh {
                     }
                 }
                 ds.recent_edits
-                    .retain(|_, t| now.duration_since(*t) < OWNER_PRIORITY_TTL * 4);
+                    .retain(|_, t| now.duration_since(*t) < OWNER_EDIT_RETENTION);
                 let Some(update) = apply_changeset_to_doc(&mut ds, &parsed) else {
                     return;
                 };
@@ -660,10 +674,15 @@ impl Reamesh {
                 drop(ds);
                 // Wrap the changeset in an authenticated envelope: the owner
                 // only admits proposals carrying the session token, so topic
-                // membership alone can't write to the doc.
+                // membership alone can't write to the doc. `age_ms` is how long
+                // ago (on this clock) the edit was made; the owner re-anchors it
+                // to its own clock for skew-free tie-breaking. Proposals are
+                // sent the instant an edit is captured, so it is ~0 here, but
+                // carrying it keeps the comparison correct under any delay.
                 let envelope = json!({
                     "auth": self.shared.auth_token.lock().unwrap().clone(),
                     "cs": parsed,
+                    "age_ms": now.elapsed().as_millis() as u64,
                 });
                 let _ = self
                     .cmd_tx
@@ -1470,9 +1489,11 @@ fn serve_xfer(
     }
 }
 
-/// Owner-side proposal admission: drop fields the owner edited recently
-/// (owner wins), apply the rest to the authoritative doc. Returns the update
-/// to re-broadcast.
+/// Owner-side proposal admission: active-editor-wins. Keep the owner's own
+/// value for a field only when the owner edited it as recently as the proposal
+/// did (a genuine simultaneous tie); otherwise admit the proposal; the guest
+/// is the one actively working on that field. Returns the update to
+/// re-broadcast.
 fn admit_proposal(shared: &Shared, payload: &[u8]) -> Option<Vec<u8>> {
     let envelope: JsonValue = serde_json::from_slice(payload).ok()?;
     // Gate live edits on the session token, exactly as file serving is gated in
@@ -1488,6 +1509,11 @@ fn admit_proposal(shared: &Shared, payload: &[u8]) -> Option<Vec<u8>> {
 
     let mut ds = shared.doc.lock().unwrap();
     let now = Instant::now();
+    // Re-anchor the proposal's edit time onto our own clock: `now - age`. Using
+    // the age (a duration on the sender's clock) instead of an absolute wall
+    // time keeps cross-machine clock skew out of the comparison entirely.
+    let age = Duration::from_millis(envelope.get("age_ms").and_then(|v| v.as_u64()).unwrap_or(0));
+    let proposal_edit = now.checked_sub(age).unwrap_or(now);
     let mut admitted = JsonMap::new();
     for section in SECTIONS {
         let Some(entities) = parsed.get(section).and_then(|v| v.as_object()) else {
@@ -1498,12 +1524,18 @@ fn admit_proposal(shared: &Shared, payload: &[u8]) -> Option<Vec<u8>> {
             let Some(fields) = fields.as_object() else { continue };
             let mut keep = Fields::new();
             for (key, value) in fields {
-                let owner_recent = ds
+                // The owner keeps its value only if it edited this exact field
+                // no earlier than the proposal's edit minus the tie window, i.e.
+                // the owner edited it later, or near-simultaneously. Otherwise
+                // the proposal is the more recent edit and wins.
+                let owner_wins = ds
                     .recent_edits
                     .get(&(section.into(), id.clone(), key.clone()))
-                    .is_some_and(|t| now.duration_since(*t) < OWNER_PRIORITY_TTL);
-                if owner_recent {
-                    eprintln!("[reamesh] proposal for {section}/{id}.{key} dropped (owner priority)");
+                    .is_some_and(|owner_edit| *owner_edit + CONFLICT_TIE_WINDOW >= proposal_edit);
+                if owner_wins {
+                    eprintln!(
+                        "[reamesh] proposal for {section}/{id}.{key} dropped (owner edited it as recently: tie)"
+                    );
                 } else {
                     keep.insert(key.clone(), value.clone());
                 }
@@ -1655,6 +1687,11 @@ async fn run_network(
                     });
                     shared.reverts.store(0, Ordering::Relaxed);
                     shared.reverts_detail.lock().unwrap().clear();
+                    // Drop any proposals left in flight from a previous session
+                    // (e.g. before an auto-rejoin): their stale timestamps would
+                    // otherwise time out and surface as phantom "overridden"
+                    // reverts the moment we reconnect.
+                    shared.doc.lock().unwrap().pending.clear();
                     let req = swarm
                         .behaviour_mut()
                         .xfer

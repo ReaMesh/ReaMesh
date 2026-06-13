@@ -1533,6 +1533,10 @@ static bool joinSessionById(const std::string& sid, const std::string& sname,
              "could not join \"" + sname + "\" (it may have just closed); try again");
     return false;
   }
+  // Rust resets its cumulative revert counter for the new session; match it
+  // here so the first real override is detected as a delta rather than masked
+  // by a count left over from a previous session (e.g. across an auto-rejoin).
+  g_lastReverts = 0;
   g_mode = Mode::Downloading;
   g_lastError = json();
   g_joinPassphrase = passphrase;
@@ -1765,12 +1769,16 @@ static void ctlTick() {
           if (!nm.empty()) names.push_back(nm);
         }
       }
+      // With active-editor-wins these only fire on a genuine simultaneous
+      // conflict, so they're rare, but route them through activityEvent so a
+      // burst on the same track still collapses to one notice (de-dupes
+      // identical text within a few seconds) instead of spamming the feed.
       if (names.empty()) {
-        logEvent("edit_overridden", {{"count", delta}}, "the host overrode your change");
+        activityEvent("edit_overridden", {{"count", delta}}, "the host overrode your change");
       } else {
         for (const std::string& nm : names)
-          logEvent("edit_overridden", {{"track", nm}},
-                   "the host overrode your change to " + nm);
+          activityEvent("edit_overridden", {{"track", nm}},
+                        "the host overrode your change to " + nm);
       }
       g_lastReverts = reverts;
     }

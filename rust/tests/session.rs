@@ -334,6 +334,63 @@ fn owner_wins_live_conflict() {
     let _ = fs::remove_dir_all(staging);
 }
 
+/// Active-editor-wins: when the owner edited a field a while ago and the client
+/// edits it now, the client is the one working on it, so its proposal must be
+/// admitted (not shadowed by stale owner priority). This is the case that made
+/// collaboration feel like a fight before: the owner no longer statically wins.
+#[test]
+fn client_wins_when_it_edits_after_the_owner() {
+    let project = temp_dir("proj-active");
+    let staging = temp_dir("staging-active");
+    make_project(&project);
+    let (owner, client) = establish("active-test", &project, &staging);
+
+    // Baseline, then an owner edit to vol the client receives.
+    owner.push_local(
+        r#"{"tracks":{"{T7}":{"present":true,"index":0,"name":"Keys","vol":0.5,"pan":0.0,"mute":false,"solo":false}}}"#,
+    );
+    owner.push_local(r#"{"tracks":{"{T7}":{"vol":0.9}}}"#);
+    let mut client_state = serde_json::Map::new();
+    assert!(wait_until(Duration::from_secs(10), || {
+        drain_into(&client, &mut client_state);
+        client_state.get("{T7}").map(|t| t["vol"].clone()) == Some(serde_json::json!(0.9))
+    }));
+
+    // Wait well past the tie window so the next edit is unambiguously "later",
+    // then the client edits the same field. It is now the active editor.
+    std::thread::sleep(Duration::from_millis(1800));
+    client.push_local(r#"{"tracks":{"{T7}":{"vol":0.1}}}"#);
+
+    let mut owner_state = serde_json::Map::new();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        drain_into(&owner, &mut owner_state);
+        drain_into(&client, &mut client_state);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The owner admitted the client's later edit on both sides...
+    assert_eq!(field(&owner.snapshot_json(), "{T7}", "vol"), 0.1);
+    assert_eq!(field(&client.snapshot_json(), "{T7}", "vol"), 0.1);
+    assert_eq!(
+        owner_state.get("{T7}").map(|t| t["vol"].clone()),
+        Some(serde_json::json!(0.1)),
+        "owner never applied the client's later edit"
+    );
+    // ...and the client was not overridden, so nothing snapped back.
+    let st: Value = serde_json::from_str(&client.status_json()).unwrap();
+    assert_eq!(
+        st["reverts"].as_u64().unwrap_or(0),
+        0,
+        "client's later edit was wrongly counted as overridden: {st}"
+    );
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
 #[test]
 fn items_section_propagates_and_client_items_propose() {
     let project = temp_dir("proj-items");
