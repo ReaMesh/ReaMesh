@@ -3,11 +3,13 @@
 // Word/Figma cursors:
 //   • a labeled caret at each peer's edit cursor ("Alice is here"),
 //   • a separate sweeping playhead while they're rolling,
-//   • a translucent band over their time selection,
-//   • a tinted "ghost" around the items they hold, and a subtle accent on the
-//     tracks they have selected.
-// It maps each peer's project-time / track GUID onto YOUR local view using
-// geometry the extension measures every tick (computeArrangeView in
+//   • a translucent band over their time selection.
+// Per-object selection (which items / tracks a peer has selected) is
+// deliberately NOT drawn here: a peer's editing *lock* on a media item shows up
+// instead as a local dark-grey tint on the item itself (the extension recolors
+// the item via reamesh_locked_entities), which reads better than a floating
+// ghost. It maps each peer's project-time / track GUID onto YOUR local view
+// using geometry the extension measures every tick (computeArrangeView in
 // reamesh.cpp), so it stays correct whatever your layout or scroll position.
 //
 // Coordinate model: the extension reports geometry in REAPER SCREEN coordinates
@@ -165,21 +167,6 @@ interface BandDraw {
   bottom: number;
   color: string;
 }
-interface GhostDraw {
-  id: string;
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  color: string;
-}
-interface TintDraw {
-  id: string;
-  x: number;
-  y: number;
-  h: number;
-  color: string;
-}
 
 export function ArrangeOverlay({ port }: { port: number | null }) {
   const { state } = useOverlayState(port);
@@ -208,14 +195,10 @@ export function ArrangeOverlay({ port }: { port: number | null }) {
   const carets: CaretDraw[] = [];
   const heads: HeadDraw[] = [];
   const bands: BandDraw[] = [];
-  const ghosts: GhostDraw[] = [];
-  const tints: TintDraw[] = [];
 
-  let peerIndex = 0;
   for (const peer of peers) {
     if (peer.is_self) continue;
     const color = peer.color || "#888";
-    const idx = peerIndex++;
 
     if (settings.playheads) {
       // Edit-cursor caret: the "Alice is here" marker, always shown. Falls
@@ -247,30 +230,6 @@ export function ArrangeOverlay({ port }: { port: number | null }) {
         const x2 = clampX(timeToX(peer.tsb));
         if (x2 - x1 >= 1) bands.push({ id: peer.id, x: x1, w: x2 - x1, top, bottom, color });
       }
-      // Item ghosts: outline the items the peer holds.
-      for (const guid of peer.seli ?? []) {
-        const it = view.items?.[guid];
-        const tr = it && tracks[it.tr];
-        if (!it || !tr) continue;
-        const x = timeToX(it.pos);
-        if (!visibleX(x) && !visibleX(x + it.len / view.spp)) continue;
-        ghosts.push({
-          id: `${peer.id}:it:${guid}`,
-          x,
-          y: relY(tr.y),
-          w: Math.max(2, it.len / view.spp),
-          h: tr.h,
-          color,
-        });
-      }
-      // Track selection: a subtle per-peer accent bar at the left edge of each
-      // selected row (never a full-row flood; that was far too loud). Peers
-      // stack side by side so two people on one track both read.
-      for (const guid of peer.seltr ?? []) {
-        const tr = tracks[guid];
-        if (!tr) continue;
-        tints.push({ id: `${peer.id}:tr:${guid}`, x: arrangeLeft + idx * 4, y: relY(tr.y), h: tr.h, color });
-      }
     }
   }
 
@@ -278,10 +237,7 @@ export function ArrangeOverlay({ port }: { port: number | null }) {
     <svg
       style={{ position: "fixed", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}
     >
-      {/* Track accents and selection bands sit behind everything else. */}
-      {tints.map((s) => (
-        <rect key={s.id} x={s.x} y={s.y} width={3} height={s.h} fill={s.color} fillOpacity={0.5} />
-      ))}
+      {/* Time-selection bands sit behind everything else. */}
       {bands.map((b) => (
         <g key={b.id}>
           <rect x={b.x} y={b.top} width={b.w} height={b.bottom - b.top} fill={b.color} fillOpacity={0.07} />
@@ -297,21 +253,6 @@ export function ArrangeOverlay({ port }: { port: number | null }) {
           />
         </g>
       ))}
-      {ghosts.map((g) => (
-        <rect
-          key={g.id}
-          x={g.x}
-          y={g.y}
-          width={g.w}
-          height={g.h}
-          rx={2}
-          fill={g.color}
-          fillOpacity={0.06}
-          stroke={g.color}
-          strokeOpacity={0.4}
-          strokeWidth={1}
-        />
-      ))}
       {/* Sweeping playheads: brighter line + a small ▶ at the top. */}
       {heads.map((p) => (
         <g key={`h:${p.id}`}>
@@ -320,7 +261,7 @@ export function ArrangeOverlay({ port }: { port: number | null }) {
         </g>
       ))}
       {/* Edit-cursor carets: thin line + a low-key name tab. Drawn last so the
-          labels sit on top of bands/ghosts. */}
+          labels sit on top of the bands. */}
       {carets.map((p) => (
         <g key={`c:${p.id}`}>
           <line x1={p.x} y1={p.top} x2={p.x} y2={p.bottom} stroke={p.color} strokeWidth={1} strokeOpacity={0.7} />

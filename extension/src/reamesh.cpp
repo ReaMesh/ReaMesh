@@ -82,13 +82,13 @@
 #define REAPERAPI_WANT_GetTempoTimeSigMarker
 #define REAPERAPI_WANT_SetTempoTimeSigMarker
 #define REAPERAPI_WANT_DeleteTempoTimeSigMarker
-// Live presence (playhead + selection) and arrange-view geometry for the
-// peer-presence overlay. All long-stable APIs, so importing them is safe on
-// older REAPER (REAPERAPI_LoadAPI only aborts on a missing wanted function).
-#define REAPERAPI_WANT_CountSelectedTracks
-#define REAPERAPI_WANT_CountSelectedMediaItems
-#define REAPERAPI_WANT_GetSelectedMediaItem
+// Live presence (playhead + time selection) and arrange-view geometry for the
+// peer-presence overlay, plus the local dark-grey item tint that marks media
+// items another peer is editing (SetMediaItemInfo_Value writes I_CUSTOMCOLOR).
+// All long-stable APIs, so importing them is safe on older REAPER
+// (REAPERAPI_LoadAPI only aborts on a missing wanted function).
 #define REAPERAPI_WANT_GetMediaItemInfo_Value
+#define REAPERAPI_WANT_SetMediaItemInfo_Value
 #define REAPERAPI_WANT_GetPlayState
 #define REAPERAPI_WANT_GetPlayPosition
 #define REAPERAPI_WANT_GetCursorPosition
@@ -113,6 +113,7 @@
 #include <iterator>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -221,6 +222,14 @@ static Snapshot g_snapshot;               // last known state, by GUID
 static int g_lastChangeCount = -1;
 static bool g_applyingRemote = false;  // echo-suppression / reentrancy guard
 static unsigned g_lastPeerCount = 0;
+// Media items locally tinted dark grey to signal "another peer is editing this"
+// (their editing lock is live, per reamesh_locked_entities). Maps each tinted
+// item's GUID -> the REAL native I_CUSTOMCOLOR to restore once the lock
+// releases. The tint is a PURE LOCAL VIEW TRANSFORM: it recolors the item in
+// REAPER but must never enter the sync diff (the snapshot is re-baselined to the
+// tinted state after every change) and so is never captured, proposed, or
+// written into anyone's .rpp. See reconcileItemTints / restoreAllItemTints.
+static std::map<std::string, int> g_itemTints;
 // Last session-ending event, shown by the app as an error toast. Structured
 // like a log entry ({code, params, text}); JSON null when there is none.
 static json g_lastError;
@@ -1348,6 +1357,11 @@ static std::vector<std::string> missingMediaIn(const json& fields) {
 // Apply one item's fields (creation, move across tracks, content update,
 // deletion). Caller has verified the referenced media exists.
 static void applyItem(const std::string& guid, const json& fields) {
+  // Any remote change to this item restores its real (synced) color, so drop a
+  // tint record we hold for it: reconcileItemTints will re-stash the FRESH real
+  // color and re-tint if the item is still locked. This is what keeps a tinted
+  // item's restore color current when its real color changes mid-lock.
+  g_itemTints.erase(guid);
   MediaItem* item = findItemByGuid(guid);
   if (fields.value("present", true) == false) {
     if (item) DeleteTrackMediaItem(GetMediaItem_Track(item), item);
@@ -1598,9 +1612,133 @@ static std::string fileStem(const std::string& path) {
 static std::string jsonStr(const json& j, const char* key);
 static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback);
 
+// ---------- item-tint lock signal (local view transform only) ----------
+//
+// When another peer holds the editing lock on a media item, that item is painted
+// dark grey locally ("the WAV is grey → someone's working on it"). This is a
+// pure VIEW transform: the color is written into REAPER but the snapshot is
+// re-baselined right after, so it never enters the capture diff and is never
+// captured, proposed, synced, or written into anyone's .rpp. Our OWN held items
+// are never tinted (reamesh_locked_entities filters our own holds out).
+//
+// The one place the tint could leak to disk is a project SAVE, which serializes
+// the live (grey) item color. Protection: dispatchCommand intercepts the
+// deliberate-save actions (Ctrl+S / menu Save / Save As) and calls
+// restoreAllItemTints() first, so REAPER writes the REAL colors; the next tick
+// re-applies the tints. leaveSession does the same on every session exit.
+// RESIDUAL RISK (best effort, documented): auto-save and REAPER's quit-time
+// "save changes?" prompt do NOT route through the command hooks, so a save on
+// one of those paths while an item is tinted can persist grey into the .rpp.
+// This is bounded (only items a peer is editing at that instant) and a manual
+// save afterwards (which IS hooked) re-cleans it. A crash writes nothing, so the
+// last on-disk file stays clean. There is no per-item sentinel to auto-undo a
+// persisted tint on the next load; that would itself be project pollution.
+
+// The dark grey a locked item is tinted with. Computed LOCALLY: never
+// colorToWire, since this color never rides the wire; the high 0x1000000 bit is
+// REAPER's "custom color is set" flag.
+static int lockTintNative() { return 0x1000000 | ColorToNative(64, 64, 64); }
+
+// Which save action ids we intercept (in dispatchCommand) to drop the tints
+// before REAPER serializes the project, so grey never reaches the .rpp:
+// 40026 = File: Save project, 40022 = File: Save project as…
+static bool isSaveCommand(int command) { return command == 40026 || command == 40022; }
+
+// Item GUIDs whose editing lock is currently held by a peer OTHER than us, from
+// the live lock table Rust maintains. These are the items to show as grey.
+static std::set<std::string> lockedItemsByOthers() {
+  std::set<std::string> out;
+  if (!g_handle) return out;
+  char* raw = reamesh_locked_entities(g_handle);
+  std::string payload = raw ? raw : "[]";
+  reamesh_free_string(raw);
+  json arr = json::parse(payload, nullptr, false);
+  if (!arr.is_array()) return out;
+  for (const auto& e : arr) {
+    if (!e.is_object() || jsonStr(e, "section") != "items") continue;
+    std::string id = jsonStr(e, "id");
+    if (!id.empty()) out.insert(std::move(id));
+  }
+  return out;
+}
+
+// Restore every tinted item to its real color and forget the tints. Used before
+// a deliberate SAVE (so grey never reaches the .rpp) and whenever the session
+// ends. Echo-suppressed and re-baselined like a remote apply, so the restore is
+// never seen as a local edit and makes no undo point. After this the next
+// reconcile tick re-applies whatever is still locked.
+static void restoreAllItemTints() {
+  if (g_itemTints.empty()) return;
+  const bool inSession = g_mode == Mode::Hosting || g_mode == Mode::ClientActive;
+  g_applyingRemote = true;
+  for (const auto& [guid, real] : g_itemTints)
+    if (MediaItem* it = findItemByGuid(guid))
+      SetMediaItemInfo_Value(it, "I_CUSTOMCOLOR", static_cast<double>(real));
+  g_itemTints.clear();
+  UpdateArrange();
+  if (inSession) {
+    g_snapshot = snapshotProject();
+    g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+  }
+  g_applyingRemote = false;
+}
+
+// Reconcile the dark-grey tints against the live set of items another peer is
+// editing. Newly-locked items get their real color stashed and are painted grey;
+// released items are restored to that real color. The color writes are
+// echo-suppressed and the snapshot is re-baselined to the tinted state, so the
+// tint NEVER enters the capture diff. Runs on the main thread at the END of the
+// Hosting/ClientActive tick: after remote applies, which restore the real color
+// and drop the tint record (see applyItem), so a tinted item that was remotely
+// recolored re-stashes its FRESH real color here and goes grey again. The
+// restore color therefore tracks the live synced color, never a stale snapshot.
+static void reconcileItemTints() {
+  if (g_mode != Mode::Hosting && g_mode != Mode::ClientActive) return;
+  const std::set<std::string> desired = lockedItemsByOthers();
+  const int tint = lockTintNative();
+  bool changed = false;
+
+  g_applyingRemote = true;
+  // Tint items newly locked by a peer (or freshly un-tinted by a remote apply,
+  // which dropped their record so we re-stash the current real color).
+  for (const std::string& guid : desired) {
+    if (g_itemTints.count(guid)) continue;
+    MediaItem* it = findItemByGuid(guid);
+    if (!it) continue;  // not local yet (e.g. its media is still downloading)
+    g_itemTints[guid] = static_cast<int>(GetMediaItemInfo_Value(it, "I_CUSTOMCOLOR"));
+    SetMediaItemInfo_Value(it, "I_CUSTOMCOLOR", static_cast<double>(tint));
+    changed = true;
+  }
+  // Restore items whose lock has released.
+  for (auto it = g_itemTints.begin(); it != g_itemTints.end();) {
+    if (desired.count(it->first)) {
+      ++it;
+      continue;
+    }
+    if (MediaItem* item = findItemByGuid(it->first))
+      SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", static_cast<double>(it->second));
+    it = g_itemTints.erase(it);
+    changed = true;
+  }
+
+  if (changed) {
+    UpdateArrange();
+    // Re-baseline so the color writes are folded into the baseline and the next
+    // capture diffs to nothing for these items. Mirrors applyRemoteChanges.
+    g_snapshot = snapshotProject();
+    g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+  }
+  g_applyingRemote = false;
+}
+
 // Tear the session down. `code`/`params`/`text` describe why as a structured
 // log event (also flagged to the app as the error); empty text = silent.
 static void leaveSession(const char* code, json params, const std::string& text) {
+  // Repaint any locked-item tints back to their real colors before we drop the
+  // session, so the user's still-open project is never left with grey items
+  // (and a later save can't persist the tint). Runs while still in-session so
+  // the suppress + re-baseline is correct; it's a no-op when nothing is tinted.
+  restoreAllItemTints();
   if (g_handle) {
     reamesh_shutdown(g_handle);
     g_handle = nullptr;
@@ -1725,6 +1863,7 @@ static void onHost(const std::string& passphrase) {
   g_lastError = json();
   g_sessionProjectPath = path;
   g_snapshot = Snapshot{};
+  g_itemTints.clear();  // fresh session: no carried-over lock tints
   g_lastChangeCount = -1;  // force a full capture; this seeds the shared doc
   g_lastCapture = {};
   g_lastFullScan = {};
@@ -1850,9 +1989,9 @@ static void ctlDispatch(const json& cmd) {
   }
 }
 
-// Geometry for the arrange overlay (peer playheads + selection ghosts), in
-// REAPER SCREEN coordinates (logical points, TOP-LEFT origin). The overlay
-// window covers REAPER's whole main window, so the webview converts to
+// Geometry for the arrange overlay (peer playheads / carets + time-selection
+// bands), in REAPER SCREEN coordinates (logical points, TOP-LEFT origin). The
+// overlay window covers REAPER's whole main window, so the webview converts to
 // window-relative by subtracting its own screen origin, which is why we never
 // need the arrange VIEWPORT rect (REAPER doesn't expose it through the stable
 // API). Per-track `P_UI_RECT:tcp.size` already reflects vertical scroll, and the
@@ -1865,7 +2004,7 @@ static void ctlDispatch(const json& cmd) {
 // (top of the first track to the bottom of the last), so it stops above a
 // docked mixer / bottom dock instead of running off the window. Returns {} when
 // there's nothing to draw (not in a session, or no resolvable geometry).
-static json computeArrangeView(const json& peers) {
+static json computeArrangeView() {
   if (g_mode != Mode::Hosting && g_mode != Mode::ClientActive) return json::object();
 
   // Time axis: t0 = project time at the arrange's left edge; spp = seconds per
@@ -1922,29 +2061,8 @@ static json computeArrangeView(const json& peers) {
   }
   if (!haveAx) return json::object();
 
-  // Items any peer has selected -> their owning track + position/length, so the
-  // overlay can outline what each person is "holding".
-  json items = json::object();
-  if (peers.is_array()) {
-    for (const auto& p : peers) {
-      if (!p.is_object() || !p.contains("seli") || !p["seli"].is_array()) continue;
-      for (const auto& g : p["seli"]) {
-        if (!g.is_string()) continue;
-        const std::string ig = g.get<std::string>();
-        if (items.contains(ig)) continue;
-        MediaItem* it = findItemByGuid(ig);
-        if (!it) continue;
-        MediaTrack* itr = GetMediaItem_Track(it);
-        items[ig] = {{"tr", itr ? trackGuid(itr) : std::string()},
-                     {"pos", GetMediaItemInfo_Value(it, "D_POSITION")},
-                     {"len", GetMediaItemInfo_Value(it, "D_LENGTH")}};
-      }
-    }
-  }
-
   return json{{"ax", ax},   {"t0", t0},         {"spp", spp},
-              {"top", top}, {"bottom", bottom}, {"tracks", std::move(tracks)},
-              {"items", std::move(items)}};
+              {"top", top}, {"bottom", bottom}, {"tracks", std::move(tracks)}};
 }
 
 static void ctlTick() {
@@ -2043,7 +2161,7 @@ static void ctlTick() {
   if (session.empty() && !g_sessionProjectPath.empty()) session = fileStem(g_sessionProjectPath);
   state["session"] = session;
   state["sessions"] = handleJson(reamesh_sessions, json::array());
-  state["view"] = computeArrangeView(peers);
+  state["view"] = computeArrangeView();
   state["peers"] = std::move(peers);
 
   static std::string lastPublished;
@@ -2058,11 +2176,14 @@ static void ctlTick() {
 
 // Report the user's live presence so peers can see where each person is: the
 // focused track, the playhead (the edit cursor, or the play position while the
-// transport is rolling), and the selected tracks/items. GUIDs are the shared
-// identity; each peer resolves them to its own project. Cheap value reads on
-// the main-thread tick, pushed only when something changes; while playing,
-// `play` advances every tick, which is exactly what keeps a sweeping playhead
-// live on peers' overlays.
+// transport is rolling), and the time selection. GUIDs are the shared identity;
+// each peer resolves them to its own project. Cheap value reads on the
+// main-thread tick, pushed only when something changes; while playing, `play`
+// advances every tick, which is exactly what keeps a sweeping playhead live on
+// peers' overlays. (Per-object selection, which tracks/items a peer has
+// selected, is deliberately NOT beaconed: peer item selection is no longer
+// drawn in the overlay; a peer's *editing lock* on an item shows up instead as
+// a local dark-grey item tint, computed from reamesh_locked_entities.)
 static void pushLocalPresence() {
   MediaTrack* focusTr = GetSelectedTrack(nullptr, 0);
   std::string focus = focusTr ? trackGuid(focusTr) : std::string();
@@ -2080,17 +2201,8 @@ static void pushLocalPresence() {
   double tsa = 0, tsb = 0;
   GetSet_LoopTimeRange(false, false, &tsa, &tsb, false);
 
-  json seltr = json::array();
-  for (int i = 0, n = CountSelectedTracks(nullptr); i < n && (int)seltr.size() < 128; ++i)
-    if (MediaTrack* tr = GetSelectedTrack(nullptr, i)) seltr.push_back(trackGuid(tr));
-
-  json seli = json::array();
-  for (int i = 0, n = CountSelectedMediaItems(nullptr); i < n && (int)seli.size() < 128; ++i)
-    if (MediaItem* it = GetSelectedMediaItem(nullptr, i)) seli.push_back(itemGuid(it));
-
-  json p = {{"focus", focus}, {"play", play},       {"playing", playing},
-            {"cursor", cursor}, {"tsa", tsa},       {"tsb", tsb},
-            {"seltr", std::move(seltr)}, {"seli", std::move(seli)}};
+  json p = {{"focus", focus},   {"play", play}, {"playing", playing},
+            {"cursor", cursor}, {"tsa", tsa},   {"tsb", tsb}};
   static std::string last;
   std::string s = p.dump();
   if (s != last) {
@@ -2116,6 +2228,7 @@ static void pollDownload() {
     // never diffed as a burst of local edits.
     g_snapshot = snapshotProject();
     g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+    g_itemTints.clear();  // fresh download: start with no lock tints
     g_applyingRemote = false;
     g_mode = Mode::ClientActive;
     // Don't propose anything until the owner's authoritative state has applied
@@ -2196,6 +2309,10 @@ static void timerTick() {
       captureLocalChanges();
       applyRemoteChanges();
       processDeferredItems();
+      // Last: re-paint the local lock tints. After capture (so the grey is
+      // already invisible to it via the re-baseline) and after the applies (so a
+      // remotely-recolored locked item re-tints with its fresh real color).
+      reconcileItemTints();
       return;
     }
   }
@@ -2205,6 +2322,13 @@ static void timerTick() {
 
 static bool dispatchCommand(int command) {
   if (command == 0) return false;
+  // Save protection: just before REAPER serializes the project, drop the local
+  // lock tints so the REAL item colors hit the .rpp, never our grey. We do NOT
+  // consume the action (return false): REAPER still performs the save; the next
+  // tick's reconcileItemTints re-applies whatever is still locked. Covers the
+  // deliberate-save actions (Ctrl+S / menu); auto-save and the quit "save?"
+  // prompt don't route through the command hooks (see the note in the header).
+  if (isSaveCommand(command)) restoreAllItemTints();
   if (command == g_cmdHost) { onHost(""); return true; }
   if (command == g_cmdLeave) { onLeave(); return true; }
   return false;

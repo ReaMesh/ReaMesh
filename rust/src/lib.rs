@@ -385,16 +385,8 @@ struct PeerPresence {
     /// Time selection / loop range (project seconds); `tsa == tsb` means none.
     tsa: f64,
     tsb: f64,
-    /// GUIDs of the tracks and items this peer has selected: the "Alice is
-    /// holding these" set the overlay draws as tinted ghosts.
-    seltracks: Vec<String>,
-    selitems: Vec<String>,
     last_seen: Instant,
 }
-
-/// Selection arrays are capped before they ride the ~1s beacon so a
-/// select-all can't balloon presence traffic.
-const PRESENCE_SEL_CAP: usize = 128;
 
 /// Process-wide display profile (name, color hex), set by the companion app
 /// through the control server (or `reamesh_set_profile`). Global rather than
@@ -410,10 +402,10 @@ pub fn set_profile(name: &str, color: &str) {
 
 /// The local user's live "where am I" state, set by the extension each tick and
 /// gossiped on the presence beacon so peers can show where each person is:
-/// which track they're focused on, where their playhead sits, and what they
-/// have selected. Like PROFILE it's process-global: it describes the user, not
-/// the session. GUIDs (never indices) are the shared identity; peers resolve
-/// them against their own project.
+/// which track they're focused on and where their playhead / time selection
+/// sits. Like PROFILE it's process-global: it describes the user, not the
+/// session. GUIDs (never indices) are the shared identity; peers resolve them
+/// against their own project.
 #[derive(Clone)]
 struct LivePresence {
     focus: String,
@@ -425,8 +417,6 @@ struct LivePresence {
     /// Time selection / loop range (project seconds); `tsa == tsb` means none.
     tsa: f64,
     tsb: f64,
-    seltracks: Vec<String>,
-    selitems: Vec<String>,
 }
 
 static LIVE: Mutex<LivePresence> = Mutex::new(LivePresence {
@@ -436,8 +426,6 @@ static LIVE: Mutex<LivePresence> = Mutex::new(LivePresence {
     cursor: 0.0,
     tsa: 0.0,
     tsb: 0.0,
-    seltracks: Vec::new(),
-    selitems: Vec::new(),
 });
 
 pub fn set_focus(guid: &str) {
@@ -445,22 +433,11 @@ pub fn set_focus(guid: &str) {
 }
 
 /// Replace the live presence from a JSON blob the extension composes each tick:
-/// `{"focus","play","playing","seltr":[guid…],"seli":[guid…]}`. Any missing
-/// field resets to its empty/zero default; selection arrays are capped.
+/// `{"focus","play","playing","cursor","tsa","tsb"}`. Any missing field resets
+/// to its empty/zero default.
 pub fn set_presence(json: &str) {
     let Ok(v) = serde_json::from_str::<JsonValue>(json) else {
         return;
-    };
-    let guids = |key: &str| -> Vec<String> {
-        v.get(key)
-            .and_then(|x| x.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|g| g.as_str().map(|s| s.chars().take(64).collect()))
-                    .take(PRESENCE_SEL_CAP)
-                    .collect()
-            })
-            .unwrap_or_default()
     };
     let mut p = LIVE.lock().unwrap();
     p.focus = v
@@ -475,8 +452,6 @@ pub fn set_presence(json: &str) {
     p.cursor = v.get("cursor").and_then(|x| x.as_f64()).unwrap_or(0.0);
     p.tsa = v.get("tsa").and_then(|x| x.as_f64()).unwrap_or(0.0);
     p.tsb = v.get("tsb").and_then(|x| x.as_f64()).unwrap_or(0.0);
-    p.seltracks = guids("seltr");
-    p.selitems = guids("seli");
 }
 
 /// Stable fallback identity color for a peer that never told us one: a
@@ -1171,8 +1146,6 @@ impl Reamesh {
                      cursor: f64,
                      tsa: f64,
                      tsb: f64,
-                     seltracks: &[String],
-                     selitems: &[String],
                      is_self: bool| {
             json!({
                 "id": id,
@@ -1184,8 +1157,6 @@ impl Reamesh {
                 "cursor": cursor,
                 "tsa": tsa,
                 "tsb": tsb,
-                "seltr": seltracks,
-                "seli": selitems,
                 "is_self": is_self,
                 "is_owner": id == owner,
             })
@@ -1200,8 +1171,6 @@ impl Reamesh {
             me.cursor,
             me.tsa,
             me.tsb,
-            &me.seltracks,
-            &me.selitems,
             true,
         )];
         let mut infos = self.shared.peers_info.lock().unwrap();
@@ -1220,12 +1189,31 @@ impl Reamesh {
                     info.cursor,
                     info.tsa,
                     info.tsb,
-                    &info.seltracks,
-                    &info.selitems,
                     false,
                 ));
             }
         }
+        json!(arr).to_string()
+    }
+
+    /// The live editing locks currently held by a peer *other than us*, as a
+    /// JSON array of `{"section","id","field","holder"}`. Read from the live
+    /// lock table (`peer_locks`: what the owner broadcasts and a client last
+    /// received), so it only ever lists locks still inside `LOCK_HOLD`; the
+    /// owner's own held fields and a client's own held fields are filtered out
+    /// (holder == us). The extension uses this purely to tint media items
+    /// another peer is editing: it is a local view hint, never project state
+    /// and never anything that rides back out on the wire.
+    pub fn locked_entities_json(&self) -> String {
+        let me = self.local_peer_id.as_str();
+        let locks = self.shared.peer_locks.lock().unwrap();
+        let arr: Vec<JsonValue> = locks
+            .iter()
+            .filter(|(_, holder)| holder.as_str() != me)
+            .map(|((section, id, field), holder)| {
+                json!({ "section": section, "id": id, "field": field, "holder": holder })
+            })
+            .collect();
         json!(arr).to_string()
     }
 
@@ -2167,8 +2155,6 @@ async fn run_network(
                             "cursor": live.cursor,
                             "tsa": live.tsa,
                             "tsb": live.tsb,
-                            "seltr": live.seltracks,
-                            "seli": live.selitems,
                             "mac": mac,
                         })
                         .to_string()
@@ -2368,17 +2354,6 @@ async fn run_network(
                                     let get = |k: &str| {
                                         v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
                                     };
-                                    let get_guids = |k: &str| -> Vec<String> {
-                                        v.get(k)
-                                            .and_then(|x| x.as_array())
-                                            .map(|a| {
-                                                a.iter()
-                                                    .filter_map(|g| g.as_str().map(String::from))
-                                                    .take(PRESENCE_SEL_CAP)
-                                                    .collect()
-                                            })
-                                            .unwrap_or_default()
-                                    };
                                     // Only token holders may appear in the
                                     // roster: verify the beacon's MAC against
                                     // the sender's authenticated peer id.
@@ -2406,8 +2381,6 @@ async fn run_network(
                                             cursor: v.get("cursor").and_then(|x| x.as_f64()).unwrap_or(0.0),
                                             tsa: v.get("tsa").and_then(|x| x.as_f64()).unwrap_or(0.0),
                                             tsb: v.get("tsb").and_then(|x| x.as_f64()).unwrap_or(0.0),
-                                            seltracks: get_guids("seltr"),
-                                            selitems: get_guids("seli"),
                                             last_seen: Instant::now(),
                                         },
                                     );
@@ -3259,6 +3232,24 @@ pub extern "C" fn reamesh_peers(handle: *mut Reamesh) -> *mut c_char {
     into_c_string(out)
 }
 
+/// Live editing locks held by a peer *other than us*, as a JSON array of
+/// `{"section","id","field","holder"}`: the entities someone else is actively
+/// editing right now (pruned to `LOCK_HOLD`; our own held fields excluded). The
+/// extension tints locked media items locally from this; the tint is a pure
+/// view hint and is never captured, proposed, synced or written to the project.
+/// Free the result with `reamesh_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_locked_entities(handle: *mut Reamesh) -> *mut c_char {
+    let out = if handle.is_null() {
+        "[]".to_string()
+    } else {
+        let r = unsafe { &*handle };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.locked_entities_json()))
+            .unwrap_or_else(|_| "[]".to_string())
+    };
+    into_c_string(out)
+}
+
 /// Set the process-wide display profile (name + color hex) included in this
 /// peer's presence beacons. Survives host/join/leave; usually set by the
 /// companion app through the control server rather than called directly.
@@ -3279,9 +3270,9 @@ pub extern "C" fn reamesh_set_focus(guid: *const c_char) {
 }
 
 /// Set the local user's full live presence from a JSON blob
-/// `{"focus","play","playing","seltr":[guid…],"seli":[guid…]}`, gossiped on the
-/// presence beacon so peers can show where each person is (focused track,
-/// playhead, and selected tracks/items). Supersedes `reamesh_set_focus`; the
+/// `{"focus","play","playing","cursor","tsa","tsb"}`, gossiped on the presence
+/// beacon so peers can show where each person is (focused track, playhead /
+/// edit cursor, and time selection). Supersedes `reamesh_set_focus`; the
 /// extension calls it each tick. Missing fields reset to empty/zero.
 #[unsafe(no_mangle)]
 pub extern "C" fn reamesh_set_presence(json: *const c_char) {

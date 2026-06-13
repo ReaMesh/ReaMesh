@@ -29,10 +29,6 @@ export interface Peer {
    *  translucent band across the tracks. Equal values = no selection. */
   tsa?: number;
   tsb?: number;
-  /** GUIDs of the tracks / items the peer has selected, drawn as tinted
-   *  "ghosts" in the arrange overlay. */
-  seltr?: string[];
-  seli?: string[];
 }
 
 export interface SessionAd {
@@ -53,7 +49,7 @@ export interface LogEntry {
   text: string;
 }
 
-/** Live arrange-view geometry for the peer-playhead / selection-ghost overlay,
+/** Live arrange-view geometry for the peer-playhead / time-selection overlay,
  *  in REAPER SCREEN coordinates (logical points). The arrange overlay window
  *  covers REAPER's whole window, so it converts these to window-relative by
  *  subtracting its own screen origin. `{}` (no `tracks`) means nothing to draw. */
@@ -68,8 +64,6 @@ export interface ArrangeView {
   bottom: number;
   /** Per-track screen rect (reflects vertical scroll), keyed by track GUID. */
   tracks?: Record<string, { y: number; h: number }>;
-  /** Geometry of every item some peer has selected, keyed by item GUID. */
-  items?: Record<string, { tr: string; pos: number; len: number }>;
 }
 
 export interface ExtState {

@@ -110,6 +110,16 @@ uint32_t reamesh_peer_count(struct ReameshHandle *handle);
 char *reamesh_peers(struct ReameshHandle *handle);
 
 /**
+ * Live editing locks held by a peer *other than us*, as a JSON array of
+ * `{"section","id","field","holder"}`: the entities someone else is actively
+ * editing right now (pruned to `LOCK_HOLD`; our own held fields excluded). The
+ * extension tints locked media items locally from this; the tint is a pure
+ * view hint and is never captured, proposed, synced or written to the project.
+ * Free the result with `reamesh_free_string`.
+ */
+char *reamesh_locked_entities(struct ReameshHandle *handle);
+
+/**
  * Set the process-wide display profile (name + color hex) included in this
  * peer's presence beacons. Survives host/join/leave; usually set by the
  * companion app through the control server rather than called directly.
@@ -125,9 +135,9 @@ void reamesh_set_focus(const char *guid);
 
 /**
  * Set the local user's full live presence from a JSON blob
- * `{"focus","play","playing","seltr":[guid…],"seli":[guid…]}`, gossiped on the
- * presence beacon so peers can show where each person is (focused track,
- * playhead, and selected tracks/items). Supersedes `reamesh_set_focus`; the
+ * `{"focus","play","playing","cursor","tsa","tsb"}`, gossiped on the presence
+ * beacon so peers can show where each person is (focused track, playhead /
+ * edit cursor, and time selection). Supersedes `reamesh_set_focus`; the
  * extension calls it each tick. Missing fields reset to empty/zero.
  */
 void reamesh_set_presence(const char *json);

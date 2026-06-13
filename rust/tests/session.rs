@@ -502,6 +502,89 @@ fn items_section_propagates_and_client_items_propose() {
     let _ = fs::remove_dir_all(staging);
 }
 
+// The local item-tint lock signal rides on `locked_entities_json`: an item a
+// *peer* is editing must show up (attributed to that peer) so the extension can
+// grey it, while our OWN held items must never appear (we don't tint our own).
+#[test]
+fn locked_entities_reports_other_peers_item_holds_not_own() {
+    let project = temp_dir("proj-locked-ent");
+    let staging = temp_dir("staging-locked-ent");
+    make_project(&project);
+    let (owner, client) = establish("locked-ent-test", &project, &staging);
+
+    // Owner creates an item; the client receives it.
+    owner.push_local(
+        r#"{"items":{"{I1}":{"present":true,"track":"{T1}","chunk":"<ITEM\nPOSITION 1.0\n>"}}}"#,
+    );
+    let mut client_items = serde_json::Map::new();
+    assert!(wait_until(Duration::from_secs(10), || {
+        let drained: Value = serde_json::from_str(&client.drain_remote()).unwrap();
+        for cs in drained.as_array().unwrap() {
+            if let Some(items) = cs.get("items").and_then(|v| v.as_object()) {
+                for (id, fields) in items {
+                    client_items.insert(id.clone(), fields.clone());
+                }
+            }
+        }
+        client_items.contains_key("{I1}")
+    }));
+
+    // Wait for the creation lock to expire. locked_entities_json excludes
+    // our own locks, so the owner cannot observe its expiry through that API.
+    std::thread::sleep(Duration::from_millis(3200));
+    // Nobody is editing now -> neither peer reports another peer's hold.
+    assert_eq!(owner.locked_entities_json(), "[]");
+    assert_eq!(client.locked_entities_json(), "[]");
+
+    // The client edits the item; the owner admits it, so the client now HOLDS
+    // the item's chunk lock: exactly what the extension tints from.
+    client.push_local(r#"{"items":{"{I1}":{"chunk":"<ITEM\nPOSITION 2.0\n>"}}}"#);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let v: Value = serde_json::from_str(&owner.snapshot_json()).unwrap();
+            v["items"]["{I1}"]["chunk"]
+                .as_str()
+                .is_some_and(|c| c.contains("POSITION 2.0"))
+        }),
+        "owner never admitted the client item edit"
+    );
+
+    let client_id = client.local_peer_id().to_string();
+    let owner_id = owner.local_peer_id().to_string();
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let v: Value = serde_json::from_str(&owner.locked_entities_json()).unwrap();
+            v.as_array().unwrap().iter().any(|e| {
+                e["section"] == "items"
+                    && e["id"] == "{I1}"
+                    && e["holder"] == serde_json::json!(client_id)
+            })
+        }),
+        "owner never saw the client's item lock: {}",
+        owner.locked_entities_json()
+    );
+    // The owner never lists a field it holds itself (no self-tint).
+    let ow: Value = serde_json::from_str(&owner.locked_entities_json()).unwrap();
+    assert!(
+        ow.as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["holder"] != serde_json::json!(owner_id)),
+        "owner listed a self-held field: {ow}"
+    );
+    // The holding client must not list its OWN hold either (it doesn't tint it).
+    let cl: Value = serde_json::from_str(&client.locked_entities_json()).unwrap();
+    assert!(
+        cl.as_array().unwrap().iter().all(|e| e["id"] != "{I1}"),
+        "client listed its own held item: {cl}"
+    );
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
 #[test]
 fn mid_session_media_fetch() {
     let project = temp_dir("proj-fetch");
