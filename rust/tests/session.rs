@@ -558,6 +558,52 @@ fn mid_session_media_fetch() {
     let _ = fs::remove_dir_all(staging);
 }
 
+/// The passphrase pre-check verifies against the owner without joining: a wrong
+/// one reports `ok=false`, the right one `ok=true`, both via `status.probe`.
+/// This is what lets the app show an inline "wrong password" before any join.
+#[test]
+fn passphrase_precheck_reports_right_and_wrong() {
+    let project = temp_dir("proj-probe");
+    let staging = temp_dir("staging-probe");
+    make_project(&project);
+
+    let owner = Reamesh::host("probe-test", project.to_str().unwrap(), "Song.rpp", "hunter2")
+        .expect("host failed");
+    let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
+    let sid = session_id_of(&owner);
+    assert!(wait_until(Duration::from_secs(20), || {
+        interconnect(&owner, &client);
+        client.sessions_json().contains(&sid)
+    }));
+
+    let probe_is = |ok: bool| {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        s["probe"]["session_id"] == sid && s["probe"]["ok"] == Value::Bool(ok)
+    };
+
+    // Wrong passphrase -> ok=false, and the client never transitions (still
+    // browsing: no failed/downloading state from a mere pre-check).
+    assert!(client.check_passphrase(&sid, "nope"));
+    assert!(
+        wait_until(Duration::from_secs(12), || probe_is(false)),
+        "wrong passphrase wasn't reported false: {}",
+        client.status_json()
+    );
+
+    // Right passphrase -> ok=true.
+    assert!(client.check_passphrase(&sid, "hunter2"));
+    assert!(
+        wait_until(Duration::from_secs(12), || probe_is(true)),
+        "right passphrase wasn't accepted: {}",
+        client.status_json()
+    );
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
 #[test]
 fn passphrase_gates_download() {
     let project = temp_dir("proj-pass");

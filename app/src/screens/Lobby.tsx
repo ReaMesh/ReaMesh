@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { LoaderCircle, LockKeyhole, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -70,9 +70,21 @@ function ProfileRow({
   );
 }
 
-function SessionCard({ session }: { session: SessionAd }) {
+function SessionCard({
+  session,
+  probe,
+}: {
+  session: SessionAd;
+  probe?: ExtState["probe"];
+}) {
   const [pass, setPass] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [pwError, setPwError] = useState(false);
+  // Guards against an earlier check's stale result resolving the new one: we
+  // only act once we've seen the fresh "in flight" (ok === null) for our check.
+  const sawPending = useRef(false);
+
   const join = () => {
     trustWarningAccepted = true;
     setConfirmOpen(false);
@@ -83,10 +95,37 @@ function SessionCard({ session }: { session: SessionAd }) {
       passphrase: pass,
     });
   };
-  const requestJoin = () => {
+  // Passphrase already verified (or none needed): the trust gate shows once per
+  // run, otherwise join straight away.
+  const proceedJoin = () => {
     if (trustWarningAccepted) join();
     else setConfirmOpen(true);
   };
+  // The Join button: for a locked session, verify the passphrase with the owner
+  // FIRST (no dialog, no animation, no transition) so a wrong one shows an
+  // inline error instead of flashing the whole join. Open sessions join directly.
+  const beginJoin = () => {
+    if (checking) return;
+    if (!session.auth) return proceedJoin();
+    if (!pass) return;
+    setPwError(false);
+    setChecking(true);
+    sawPending.current = false;
+    send({ cmd: "check", session_id: session.session_id, passphrase: pass });
+  };
+
+  // Resolve our in-flight passphrase check from the extension's `probe` field.
+  useEffect(() => {
+    if (!checking || probe?.session_id !== session.session_id) return;
+    if (probe.ok === null || probe.ok === undefined) {
+      sawPending.current = true; // fresh check is in flight
+      return;
+    }
+    if (!sawPending.current) return; // ignore a stale prior result
+    setChecking(false);
+    if (probe.ok) proceedJoin();
+    else setPwError(true);
+  }, [probe, checking]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <motion.div
@@ -113,22 +152,33 @@ function SessionCard({ session }: { session: SessionAd }) {
         </div>
         <Button
           size="sm"
-          className="h-7 px-3 text-[12px]"
-          disabled={session.auth && !pass}
-          onClick={requestJoin}
+          className="h-7 w-16 px-3 text-[12px]"
+          disabled={(session.auth && !pass) || checking}
+          onClick={beginJoin}
         >
-          {t("join")}
+          {checking ? <LoaderCircle className="size-3.5 animate-spin" /> : t("join")}
         </Button>
       </div>
       {session.auth && (
-        <Input
-          type="password"
-          value={pass}
-          placeholder={t("password")}
-          className="h-8 border-0 bg-secondary text-[13px]"
-          onChange={(e) => setPass(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && pass && requestJoin()}
-        />
+        <>
+          <Input
+            type="password"
+            value={pass}
+            placeholder={t("password")}
+            className={cn(
+              "h-8 border-0 bg-secondary text-[13px]",
+              pwError && "ring-1 ring-red-500/70",
+            )}
+            onChange={(e) => {
+              setPass(e.target.value);
+              setPwError(false);
+            }}
+            onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
+          />
+          {pwError && (
+            <p className="px-0.5 text-[12px] text-red-400">{t("wrongPassword")}</p>
+          )}
+        </>
       )}
 
       {/* Joining downloads and opens the host's project, and the host can load
@@ -223,7 +273,7 @@ export function Lobby({ state }: { state: ExtState }) {
           <div className="space-y-2">
             <AnimatePresence mode="popLayout">
               {state.sessions.map((s) => (
-                <SessionCard key={s.session_id} session={s} />
+                <SessionCard key={s.session_id} session={s} probe={state.probe} />
               ))}
             </AnimatePresence>
             {state.sessions.length === 0 && (

@@ -216,7 +216,7 @@ struct StatusState {
 }
 
 impl StatusState {
-    fn to_json(&self, reverts: usize, reverted: Vec<JsonValue>) -> String {
+    fn to_json(&self, reverts: usize, reverted: Vec<JsonValue>, probe: JsonValue) -> String {
         json!({
             "state": self.state,
             "progress": self.progress,
@@ -226,10 +226,12 @@ impl StatusState {
             "message": self.message,
             "end_reason": self.end_reason,
             "reverts": reverts,
-            // Tail of recently-overridden (section,id) pairs, most recent last.
-            // The cumulative `reverts` counter tells the consumer how many of
-            // these are new, so it can name *what* the owner overrode.
+            // Tail of recent (section,id,by) snap-backs, most recent last. The
+            // cumulative `reverts` counter tells the consumer how many are new,
+            // so it can name *what* snapped back and *who* holds it.
             "reverted": reverted,
+            // Passphrase pre-check outcome: {session_id, ok|null} or null.
+            "probe": probe,
         })
         .to_string()
     }
@@ -359,6 +361,13 @@ struct Shared {
     /// for these so the owner's own REAPER snaps back: the lock binds the owner
     /// too. Carries the holder id for the "X is editing this" notice.
     force_revert: Mutex<Vec<(FieldKey, String)>>,
+    /// Result of the latest passphrase pre-check (`check_passphrase`):
+    /// `(session_id, Some(ok))` once it resolves, `(session_id, None)` while in
+    /// flight, `None` when no probe is active. Lets the app validate a
+    /// passphrase against the owner *before* it shows the trust dialog or starts
+    /// the download, so a wrong passphrase shows an inline error in the input
+    /// instead of flashing the whole join animation.
+    probe_result: Mutex<Option<(String, Option<bool>)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -564,6 +573,9 @@ enum Command {
     PublishAuthoritative(Vec<u8>),
     PublishProposal(Vec<u8>),
     JoinSession { session_id: String, passphrase: String },
+    /// Pre-check a passphrase against the owner without joining (a lone manifest
+    /// request whose accept/reject answers "is this passphrase right?").
+    ProbeAuth { session_id: String, passphrase: String },
     FetchFile(String),
     Dial(Multiaddr),
     Shutdown,
@@ -709,6 +721,7 @@ impl Reamesh {
             reverts_detail: Mutex::new(VecDeque::new()),
             peer_locks: Mutex::new(HashMap::new()),
             force_revert: Mutex::new(Vec::new()),
+            probe_result: Mutex::new(None),
         });
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (init_tx, init_rx) = std_mpsc::channel();
@@ -1044,6 +1057,28 @@ impl Reamesh {
             .is_ok()
     }
 
+    /// Pre-check a passphrase against the owner without joining (client only).
+    /// Fires a lone manifest request; the owner's accept/reject answers "is this
+    /// passphrase right?". The outcome surfaces in `status_json` under `probe`.
+    /// The app calls this when the user clicks Join so a wrong passphrase shows
+    /// an inline error instead of starting the whole download animation.
+    pub fn check_passphrase(&self, session_id: &str, passphrase: &str) -> bool {
+        if self.role != Role::Client {
+            return false;
+        }
+        if !self.shared.sessions.lock().unwrap().contains_key(session_id) {
+            return false;
+        }
+        // Mark the probe in flight so the app can show "checking…".
+        *self.shared.probe_result.lock().unwrap() = Some((session_id.to_string(), None));
+        self.cmd_tx
+            .send(Command::ProbeAuth {
+                session_id: session_id.to_string(),
+                passphrase: passphrase.to_string(),
+            })
+            .is_ok()
+    }
+
     /// Current session status as JSON:
     /// `{"state","progress","project_path","session_id","session_name",
     ///   "message","end_reason","reverts","reverted"}`.
@@ -1057,11 +1092,15 @@ impl Reamesh {
             .iter()
             .map(|(s, i, by)| json!({ "section": s, "id": i, "by": by }))
             .collect();
+        let probe = match &*self.shared.probe_result.lock().unwrap() {
+            Some((sid, ok)) => json!({ "session_id": sid, "ok": ok }),
+            None => JsonValue::Null,
+        };
         self.shared
             .status
             .lock()
             .unwrap()
-            .to_json(reverts, reverted)
+            .to_json(reverts, reverted, probe)
     }
 
     /// Full current doc state in changeset shape. For tests and debugging.
@@ -1523,6 +1562,18 @@ impl Fetch {
 type FetchMap = HashMap<String, Fetch>;
 type FetchReqs = HashMap<request_response::OutboundRequestId, String>;
 
+/// Passphrase pre-check, matched by request id. A manifest confirms access;
+/// errors distinguish rejection, a ban, and an unreachable host.
+struct Probe {
+    req: request_response::OutboundRequestId,
+    session_id: String,
+    started: Instant,
+}
+
+/// Deadline for a passphrase pre-check. Expiry reports a timeout,
+/// not an incorrect passphrase.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
 fn fetch_send(
     swarm: &mut Swarm<Behaviour>,
     fetch_reqs: &mut FetchReqs,
@@ -1840,6 +1891,8 @@ async fn run_network(
     // initial project download).
     let mut fetches: FetchMap = HashMap::new();
     let mut fetch_reqs: FetchReqs = HashMap::new();
+    // In-flight passphrase pre-check (at most one at a time).
+    let mut probe: Option<Probe> = None;
 
     // Anti-entropy (owner): whenever a peer (re)appears on the session topic,
     // or a publish fails because nobody was listening, we owe the network a
@@ -1879,6 +1932,26 @@ async fn run_network(
                             }
                         }
                         None => eprintln!("[reamesh] dropped proposal: not in a session"),
+                    }
+                }
+                Some(Command::ProbeAuth { session_id, passphrase }) => {
+                    // Lone manifest request: the owner accepts iff the derived
+                    // token is right, so the response answers "is this passphrase
+                    // correct?" without any download or topic subscription.
+                    let info = shared.sessions.lock().unwrap().get(&session_id).cloned();
+                    match info.and_then(|i| i.owner.parse::<PeerId>().ok().map(|o| (o, i.salt))) {
+                        Some((owner, salt)) => {
+                            let token = auth_token(&salt, &passphrase);
+                            let req = swarm
+                                .behaviour_mut()
+                                .xfer
+                                .send_request(&owner, XferRequest::Manifest { auth: token });
+                            probe = Some(Probe { req, session_id, started: Instant::now() });
+                        }
+                        None => {
+                            // Session gone or unparseable owner -> can't verify.
+                            *shared.probe_result.lock().unwrap() = Some((session_id, Some(false)));
+                        }
                     }
                 }
                 Some(Command::JoinSession { session_id, passphrase }) => {
@@ -1991,6 +2064,11 @@ async fn run_network(
             },
             _ = tick.tick() => {
                 tick_count += 1;
+                // End an unanswered passphrase check with a timeout result.
+                if probe.as_ref().is_some_and(|p| p.started.elapsed() > PROBE_TIMEOUT) {
+                    let p = probe.take().unwrap();
+                    *shared.probe_result.lock().unwrap() = Some((p.session_id, Some(false)));
+                }
                 // Recompute session-topic peers from gossipsub's view. (Event
                 // counting misses subscriptions learned before we joined the
                 // topic ourselves.)
@@ -2396,7 +2474,13 @@ async fn run_network(
                             let _ = swarm.behaviour_mut().xfer.send_response(channel, resp);
                         }
                         request_response::Message::Response { request_id, response } => {
-                            if download.as_ref().is_some_and(|dl| dl.manifest_req == Some(request_id)) {
+                            if probe.as_ref().is_some_and(|p| p.req == request_id) {
+                                // Passphrase pre-check answer: Manifest = right,
+                                // Error = wrong. No download, no subscription.
+                                let p = probe.take().unwrap();
+                                let ok = matches!(response, XferResponse::Manifest { .. });
+                                *shared.probe_result.lock().unwrap() = Some((p.session_id, Some(ok)));
+                            } else if download.as_ref().is_some_and(|dl| dl.manifest_req == Some(request_id)) {
                                 // A manifest only arrives once the owner accepted
                                 // our session token: this is the moment we become
                                 // a legitimate session member, so join the topic
@@ -2425,7 +2509,11 @@ async fn run_network(
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Xfer(request_response::Event::OutboundFailure { peer, error, request_id, .. })) => {
                     eprintln!("[reamesh] transfer request to {peer} failed: {error}");
-                    if download.as_ref().is_some_and(|dl| dl.manifest_req == Some(request_id)) {
+                    if probe.as_ref().is_some_and(|p| p.req == request_id) {
+                        // Report an unreachable host separately from a rejected passphrase.
+                        let p = probe.take().unwrap();
+                        *shared.probe_result.lock().unwrap() = Some((p.session_id, Some(false)));
+                    } else if download.as_ref().is_some_and(|dl| dl.manifest_req == Some(request_id)) {
                         // Manifest never arrived; re-request on the next tick.
                         if let Some(dl) = &mut download {
                             dl.manifest_req = None;
@@ -3030,6 +3118,25 @@ pub extern "C" fn reamesh_join_session(
     let pass = cstr_arg(passphrase).unwrap_or_default();
     let r = unsafe { &*handle };
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.join_session(&sid, &pass)))
+        .unwrap_or(false)
+}
+
+/// Pre-check a passphrase against an announced session's owner without joining.
+/// Returns true if the check was started; watch `reamesh_status`'s `probe`
+/// field (`{session_id, ok|null}`) for the result. Used so a wrong passphrase
+/// shows an inline error before the join animation / trust dialog.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_check_passphrase(
+    handle: *mut Reamesh,
+    session_id: *const c_char,
+    passphrase: *const c_char,
+) -> bool {
+    let (false, Some(sid)) = (handle.is_null(), cstr_arg(session_id)) else {
+        return false;
+    };
+    let pass = cstr_arg(passphrase).unwrap_or_default();
+    let r = unsafe { &*handle };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.check_passphrase(&sid, &pass)))
         .unwrap_or(false)
 }
 

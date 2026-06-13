@@ -85,6 +85,9 @@ export interface ExtState {
   peers: Peer[];
   /** Local arrange-view geometry for the playhead/ghost overlay (may be `{}`). */
   view?: ArrangeView;
+  /** Result of a passphrase pre-check: `ok` is null while in flight, then a
+   *  boolean. `null` (the whole field) when no check is active. */
+  probe?: { session_id: string; ok: boolean | null } | null;
 }
 
 /** One running REAPER instance (= one control server port). */

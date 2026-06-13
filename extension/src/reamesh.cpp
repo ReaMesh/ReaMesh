@@ -1760,6 +1760,14 @@ static void ctlDispatch(const json& cmd) {
     std::string name = jsonStr(cmd, "session_name");
     joinSessionById(jsonStr(cmd, "session_id"), name.empty() ? "session" : name,
                     jsonStr(cmd, "passphrase"));
+  } else if (c == "check") {
+    // Passphrase pre-check: verify with the owner BEFORE the app shows the
+    // trust dialog or starts downloading. Stays in Browsing; the result rides
+    // the status `probe` field. Never transitions the session.
+    if (g_mode == Mode::Idle) startBrowse();
+    if (g_handle && g_mode == Mode::Browsing)
+      reamesh_check_passphrase(g_handle, jsonStr(cmd, "session_id").c_str(),
+                               jsonStr(cmd, "passphrase").c_str());
   } else if (c == "leave") {
     onLeave();
   } else if (c == "reveal_peer") {
@@ -1950,6 +1958,9 @@ static void ctlTick() {
   state["log"] = g_log;
   state["overridden"] = reverts;
   state["reconnecting"] = static_cast<bool>(g_reconnect);
+  // Passphrase pre-check result ({session_id, ok|null} or null), passed through
+  // so the Lobby can show "wrong password" inline without a session transition.
+  state["probe"] = (st.contains("probe")) ? st["probe"] : json();
   state["state"] = jsonStr(st, "state");
   state["progress"] =
       (st.contains("progress") && st["progress"].is_number()) ? st["progress"].get<double>() : 0.0;

@@ -56,6 +56,16 @@ bool reamesh_join_session(struct ReameshHandle *handle,
                           const char *passphrase);
 
 /**
+ * Pre-check a passphrase against an announced session's owner without joining.
+ * Returns true if the check was started; watch `reamesh_status`'s `probe`
+ * field (`{session_id, ok|null}`) for the result. Used so a wrong passphrase
+ * shows an inline error before the join animation / trust dialog.
+ */
+bool reamesh_check_passphrase(struct ReameshHandle *handle,
+                              const char *session_id,
+                              const char *passphrase);
+
+/**
  * Current session status as JSON:
  * `{"state","progress","project_path","session_id","session_name","message"}`
  * where state is hosting|browsing|connecting|downloading|ready|failed.
