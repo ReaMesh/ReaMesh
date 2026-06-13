@@ -116,6 +116,19 @@
 #include <string_view>
 #include <vector>
 
+#ifdef __APPLE__
+#include <CoreGraphics/CoreGraphics.h>
+// Height of the main (menu-bar) display in logical points. REAPER's
+// `P_UI_RECT` reports macOS-native *bottom-left*-origin screen coordinates, but
+// the overlay (Tauri/winit, top-left origin) wants top-left, so a screen y is
+// flipped through this height (see computeArrangeView). The global Cocoa origin
+// is always the main display's bottom-left, even for windows on other monitors,
+// so the main display height is the correct (and only) flip constant.
+static double mainDisplayHeightPoints() {
+  return CGDisplayBounds(CGMainDisplayID()).size.height;
+}
+#endif
+
 using nlohmann::json;
 namespace fs = std::filesystem;
 
@@ -1745,15 +1758,19 @@ static void ctlDispatch(const json& cmd) {
 }
 
 // Geometry for the arrange overlay (peer playheads + selection ghosts), in
-// REAPER SCREEN coordinates (logical points, top-left origin). The overlay
+// REAPER SCREEN coordinates (logical points, TOP-LEFT origin). The overlay
 // window covers REAPER's whole main window, so the webview converts to
 // window-relative by subtracting its own screen origin, which is why we never
 // need the arrange VIEWPORT rect (REAPER doesn't expose it through the stable
 // API). Per-track `P_UI_RECT:tcp.size` already reflects vertical scroll, and the
 // time axis comes from GetSet_ArrangeView2; together they're enough.
 //
-// The exact P_UI_RECT string format and screen-coordinate space want a one-time
-// on-device check, so the first raw rect is logged to stderr. Returns {} when
+// IMPORTANT (coordinate space): on macOS `P_UI_RECT` returns *bottom-left*-origin
+// screen points (y grows upward, the topmost track has the LARGEST y), verified
+// on device. The overlay is top-left origin, so each y is flipped here through
+// the main display height. The playhead spans only the visible track stack
+// (top of the first track to the bottom of the last), so it stops above a
+// docked mixer / bottom dock instead of running off the window. Returns {} when
 // there's nothing to draw (not in a session, or no resolvable geometry).
 static json computeArrangeView(const json& peers) {
   if (g_mode != Mode::Hosting && g_mode != Mode::ClientActive) return json::object();
@@ -1766,6 +1783,18 @@ static json computeArrangeView(const json& peers) {
   const double spp = (b - a) / 1000.0;
   if (!(spp > 0.0)) return json::object();
 
+#ifdef __APPLE__
+  // On macOS, `P_UI_RECT` y is the track's TOP edge measured UP from the screen
+  // bottom (so the topmost track has the LARGEST y; the track extends DOWNWARD).
+  // Verified on device by checking adjacent tracks' edges against the gaps left
+  // by envelope lanes. Top-left top edge is therefore just H - y.
+  const double H = mainDisplayHeightPoints();
+  const auto topEdge = [H](double ry) { return H - ry; };
+#else
+  // Windows/Linux: P_UI_RECT is already top-left origin; ry is the top edge.
+  const auto topEdge = [](double ry) { return ry; };
+#endif
+
   // Per-track screen rects. P_UI_RECT reflects the live vertical scroll, so a
   // track's y is correct right now; the arrange's left x is the right edge of
   // the (uniform-width) TCP.
@@ -1774,33 +1803,29 @@ static json computeArrangeView(const json& peers) {
   bool haveAx = false;
   double top = 0, bottom = 0;
   bool haveSpan = false;
-  static bool loggedRect = false;
   const int n = CountTracks(nullptr);
   for (int i = 0; i < n; ++i) {
     MediaTrack* tr = GetTrack(nullptr, i);
     if (!tr) continue;
     char buf[128] = {0};
     if (!GetSetMediaTrackInfo_String(tr, "P_UI_RECT:tcp.size", buf, false)) continue;
-    if (!loggedRect) {
-      fprintf(stderr, "[reamesh] P_UI_RECT:tcp.size = \"%s\"\n", buf);
-      loggedRect = true;
-    }
     double rx = 0, ry = 0, rw = 0, rh = 0;
     if (sscanf(buf, "%lf %lf %lf %lf", &rx, &ry, &rw, &rh) != 4) continue;
     if (rh <= 0) continue;  // collapsed / hidden
+    const double y = topEdge(ry);  // top-left y of the track's top edge
     if (!haveAx) {
       ax = rx + rw;
       haveAx = true;
     }
     if (!haveSpan) {
-      top = ry;
-      bottom = ry + rh;
+      top = y;
+      bottom = y + rh;
       haveSpan = true;
     } else {
-      if (ry < top) top = ry;
-      if (ry + rh > bottom) bottom = ry + rh;
+      if (y < top) top = y;
+      if (y + rh > bottom) bottom = y + rh;
     }
-    tracks[trackGuid(tr)] = {{"y", ry}, {"h", rh}};
+    tracks[trackGuid(tr)] = {{"y", y}, {"h", rh}};
   }
   if (!haveAx) return json::object();
 

@@ -40,6 +40,7 @@ target_link_libraries(reaper_reamesh PRIVATE "${REAMESH_RUST_LIB}")
 if(APPLE)
   target_link_libraries(reaper_reamesh PRIVATE
     "-framework CoreFoundation"
+    "-framework CoreGraphics"  # main-display height for the overlay y-flip
     "-framework Security"
     "-framework SystemConfiguration"
     resolv
