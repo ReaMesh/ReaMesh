@@ -5,21 +5,20 @@
 //! LAN-wide lobby topic, join, download the full project directory over a
 //! request-response transfer protocol, then collaborate live.
 //!
-//! Authority: the Owner's yrs doc is the single source of truth; it is the
-//! one serialization point, not the one editor. Owner-local edits apply to the
-//! doc directly and are broadcast as authoritative updates (`'A'` + yrs update
-//! bytes) on the session topic. Client-local edits are *proposals* (`'P'` +
-//! changeset JSON): only the Owner consumes them, applies the admitted fields
-//! to the doc and re-broadcasts the result. Admission is *active-editor-wins*:
-//! whoever edited a given field more recently keeps it, so a guest working on a
-//! field the owner last touched seconds ago wins it. The owner only keeps its
-//! own value when it edited the SAME field within `CONFLICT_TIE_WINDOW` of the
-//! proposal's own edit: a genuine simultaneous tie. To stay free of
-//! cross-machine clock skew the comparison never uses absolute wall clocks: the
-//! proposal carries the *age* of its edit (a duration measured on the sender's
-//! clock), which the owner re-anchors to its own clock as `now - age`. Clients
-//! keep their optimistic local value while a proposal is in flight and revert
-//! to the authoritative value if it is not confirmed within `PROPOSAL_TIMEOUT`.
+//! Authority: the owner's yrs document is the single source of truth and the
+//! sole lock arbiter. The owner is not necessarily the active editor.
+//! Owner-local edits apply to the doc directly and are broadcast as
+//! authoritative updates (`'A'` + yrs update bytes) on the session topic.
+//! Client-local edits are *proposals* (`'P'` + changeset JSON): only the Owner
+//! consumes them, applies the admitted fields to the doc and re-broadcasts the
+//! result. Admission uses a **soft editing lock** (`LOCK_HOLD`): whoever first
+//! edits a field holds it exclusively until `LOCK_HOLD` after their last touch;
+//! anyone else's edit to that field, including the owner's, is rejected
+//! and snapped back. The owner republishes the live lock table (`'L'`) so peers
+//! snap rejected edits back at once and can name the holder. Clients keep their
+//! optimistic local value while a proposal is in flight and revert to the
+//! authoritative value when the lock table shows someone else holds the field
+//! (or, as a fallback, after `PROPOSAL_TIMEOUT`).
 //!
 //! Threading model (unchanged from v1): the host (the REAPER extension) calls
 //! every FFI function from REAPER's main thread; all networking runs on a
@@ -70,19 +69,22 @@ const CHUNK_SIZE: u64 = 1024 * 1024;
 /// How many chunk requests a downloader keeps in flight at once. Pipelining:
 /// the link stays full instead of idling one round-trip per chunk.
 const DOWNLOAD_WINDOW: usize = 12;
-/// An owner edit and a client proposal to the same field whose edit times fall
-/// within this window of each other are treated as a genuine simultaneous tie,
-/// which the owner wins. Outside it, the more recent edit wins, so whoever is
-/// actively working on a field keeps it (active-editor-wins).
-const CONFLICT_TIE_WINDOW: Duration = Duration::from_millis(700);
-/// How long an owner-edit timestamp is kept for tie-breaking. Older entries
-/// can only ever resolve to "the client edited later", so retention past a few
-/// seconds is pure memory; it just bounds the map.
-const OWNER_EDIT_RETENTION: Duration = Duration::from_secs(5);
-/// How long a client keeps its optimistic value before reverting to the
-/// authoritative one when a proposal is never confirmed (i.e. was dropped
-/// because the owner won a genuine tie, or lost in transit).
-const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Soft editing lock (Word/Docs style): whoever edits a field holds it
+/// exclusively for this long after their LAST touch. While a field is held,
+/// edits to it from anyone else are rejected and snap back with a "X is editing
+/// this" notice. The hold refreshes on each touch by the holder and
+/// lapses this long after they stop, freeing the field for the next editor. It
+/// is symmetric: a client locks the owner out of a field it is editing exactly
+/// as the owner locks out a client (the owner is the arbiter, not a privileged
+/// editor). The owner is the single serialization point, so a genuine
+/// dead-simultaneous first touch resolves to whoever the owner processes first
+/// (its own local edits beat an inbound proposal by the network delay).
+const LOCK_HOLD: Duration = Duration::from_millis(2000);
+/// Fallback for a client's optimistic value when a proposal is never confirmed
+/// and no lock broadcast arrives to explain it (lost in transit). The owner's
+/// lock broadcast normally snaps a rejected edit back within a tick, well
+/// inside this; it only bounds the worst case.
+const PROPOSAL_TIMEOUT: Duration = Duration::from_millis(2500);
 /// Lobby announcements older than this are considered gone.
 const SESSION_STALE: Duration = Duration::from_secs(10);
 /// Cap on authoritative updates queued for the host to drain. Far above any
@@ -97,6 +99,11 @@ const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 // Session-topic message tags.
 const TAG_AUTHORITATIVE: u8 = b'A';
 const TAG_PROPOSAL: u8 = b'P';
+/// Lock table: `'L'` + JSON `{"locks":[[section,id,field,holder]...]}`, owner
+/// -> all. The owner is the sole lock arbiter; it republishes the live set
+/// whenever it changes so every peer knows who is editing what (to snap a
+/// rejected edit back at once, name the holder, and (later) show it).
+const TAG_LOCKS: u8 = b'L';
 /// Presence beacon: `'N'` + JSON `{"name","color"}`, published by every
 /// session participant every ~1s so peers can show who is in the session.
 const TAG_PRESENCE: u8 = b'N';
@@ -235,10 +242,73 @@ struct DocState {
     /// previous drain_remote on a client). drain_remote diffs the doc against
     /// this, which is what keeps already-seen changes from echoing back out.
     last_state: StateMap,
-    /// Owner only: (section, id, field) -> when the owner last edited it.
-    recent_edits: HashMap<FieldKey, Instant>,
+    /// Owner only: (section, id, field) -> who holds the soft editing lock and
+    /// when they last touched it. A lock is "live" for `LOCK_HOLD` after its
+    /// last touch; see `lock_holder`. The holder is a peer id string (the
+    /// owner's own id for owner-held fields).
+    locks: HashMap<FieldKey, Lock>,
     /// Client only: (section, id, field) -> (proposed value, when proposed).
     pending: HashMap<FieldKey, (JsonValue, Instant)>,
+}
+
+#[derive(Clone, Debug)]
+struct Lock {
+    holder: String,
+    touched: Instant,
+}
+
+/// The current holder of a field's lock, or None if unlocked / lapsed. Prunes
+/// the entry when it has lapsed so the map stays bounded and so a later edit by
+/// the same peer is treated as a fresh acquisition (not a refresh of a dead
+/// lock).
+fn lock_holder(locks: &mut HashMap<FieldKey, Lock>, key: &FieldKey, now: Instant) -> Option<String> {
+    match locks.get(key) {
+        Some(l) if now.duration_since(l.touched) < LOCK_HOLD => Some(l.holder.clone()),
+        Some(_) => {
+            locks.remove(key);
+            None
+        }
+        None => None,
+    }
+}
+
+/// The live lock table as `[[section, id, field, holder] ...]`, pruning lapsed
+/// entries. Used by the owner to broadcast who is editing what.
+fn live_locks(locks: &mut HashMap<FieldKey, Lock>, now: Instant) -> Vec<(FieldKey, String)> {
+    locks.retain(|_, l| now.duration_since(l.touched) < LOCK_HOLD);
+    let mut out: Vec<(FieldKey, String)> = locks
+        .iter()
+        .map(|(k, l)| (k.clone(), l.holder.clone()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Serialize a live-lock list to the `{"locks":[[section,id,field,holder]...]}`
+/// wire shape (TAG_LOCKS payload).
+fn lock_table_json(locks: &[(FieldKey, String)]) -> Vec<u8> {
+    let arr: Vec<JsonValue> = locks
+        .iter()
+        .map(|((s, id, f), h)| json!([s, id, f, h]))
+        .collect();
+    json!({ "locks": arr }).to_string().into_bytes()
+}
+
+/// Parse a TAG_LOCKS payload back into a `(section,id,field) -> holder` map.
+fn parse_lock_table(v: &JsonValue) -> HashMap<FieldKey, String> {
+    let mut map = HashMap::new();
+    if let Some(arr) = v.get("locks").and_then(|x| x.as_array()) {
+        for e in arr {
+            if let Some(t) = e.as_array()
+                && t.len() == 4
+                && let (Some(s), Some(id), Some(f), Some(h)) =
+                    (t[0].as_str(), t[1].as_str(), t[2].as_str(), t[3].as_str())
+            {
+                map.insert((s.to_string(), id.to_string(), f.to_string()), h.to_string());
+            }
+        }
+    }
+    map
 }
 
 struct Shared {
@@ -270,14 +340,25 @@ struct Shared {
     peers_info: Mutex<HashMap<String, PeerPresence>>,
     /// Peer id string of the session owner (self when hosting).
     owner_peer: Mutex<String>,
-    /// Client only: how many of this peer's proposals were reverted to the
-    /// owner's value (cumulative). Surfaced via status so the UI can tell the
-    /// user their edit was overridden instead of letting it silently snap back.
+    /// Client only: how many of this peer's edits were snapped back because
+    /// someone else held the field's lock (cumulative). Surfaced via status so
+    /// the UI can tell the user their edit didn't stick rather than letting it
+    /// silently revert.
     reverts: AtomicUsize,
-    /// Client only: (section, id) of recently overridden fields, most recent
-    /// last, bounded. Pairs with `reverts` so the UI can name *what* was
-    /// overridden (e.g. the track), not just count it.
-    reverts_detail: Mutex<VecDeque<(String, String)>>,
+    /// Client only: (section, id, holder) of recently snapped-back fields, most
+    /// recent last, bounded. Pairs with `reverts` so the UI can name *what* was
+    /// reverted (e.g. the track) and *who* was editing it.
+    reverts_detail: Mutex<VecDeque<(String, String, String)>>,
+    /// The live editing-lock table as last seen: the owner stores what it last
+    /// broadcast (to detect changes worth resending); a client stores what the
+    /// owner last sent. Keyed (section, id, field) -> holder peer id. Lets a
+    /// client snap a rejected edit back at once and name who holds the field.
+    peer_locks: Mutex<HashMap<FieldKey, String>>,
+    /// Owner only: fields whose owner-local edit was rejected because a client
+    /// holds the lock. drain_remote re-emits the authoritative (holder's) value
+    /// for these so the owner's own REAPER snaps back: the lock binds the owner
+    /// too. Carries the holder id for the "X is editing this" notice.
+    force_revert: Mutex<Vec<(FieldKey, String)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -610,7 +691,7 @@ impl Reamesh {
             doc: Mutex::new(DocState {
                 doc,
                 last_state: StateMap::new(),
-                recent_edits: HashMap::new(),
+                locks: HashMap::new(),
                 pending: HashMap::new(),
             }),
             inbound: Mutex::new(Vec::new()),
@@ -626,6 +707,8 @@ impl Reamesh {
             owner_peer: Mutex::new(String::new()),
             reverts: AtomicUsize::new(0),
             reverts_detail: Mutex::new(VecDeque::new()),
+            peer_locks: Mutex::new(HashMap::new()),
+            force_revert: Mutex::new(Vec::new()),
         });
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (init_tx, init_rx) = std_mpsc::channel();
@@ -684,31 +767,63 @@ impl Reamesh {
 
         match self.role {
             Role::Owner => {
+                let owner_id = self.local_peer_id.to_string();
                 let mut ds = self.shared.doc.lock().unwrap();
                 let now = Instant::now();
+                // Split by the soft editing lock. The owner keeps a field only
+                // if it's unlocked or already owner-held: acquiring/refreshing
+                // the lock; a field a *client* holds is rejected and queued for
+                // a snap-back (the lock binds the owner too, so the active
+                // editor wins even against the host).
+                let mut kept = JsonMap::new();
+                let mut rejected: Vec<((String, String, String), String)> = Vec::new();
                 for section in SECTIONS {
                     let Some(entities) = parsed.get(section).and_then(|t| t.as_object()) else {
                         continue;
                     };
+                    let mut sec_out = JsonMap::new();
                     for (id, fields) in entities {
-                        if let Some(fields) = fields.as_object() {
-                            for key in fields.keys() {
-                                ds.recent_edits
-                                    .insert((section.into(), id.clone(), key.clone()), now);
+                        let Some(fields) = fields.as_object() else { continue };
+                        let mut keep = Fields::new();
+                        for (key, value) in fields {
+                            let fk = (section.to_string(), id.clone(), key.clone());
+                            match lock_holder(&mut ds.locks, &fk, now) {
+                                Some(h) if h != owner_id => rejected.push((fk, h)),
+                                _ => {
+                                    ds.locks.insert(
+                                        fk,
+                                        Lock { holder: owner_id.clone(), touched: now },
+                                    );
+                                    keep.insert(key.clone(), value.clone());
+                                }
                             }
                         }
+                        if !keep.is_empty() {
+                            sec_out.insert(id.clone(), JsonValue::Object(keep));
+                        }
+                    }
+                    if !sec_out.is_empty() {
+                        kept.insert(section.to_string(), JsonValue::Object(sec_out));
                     }
                 }
-                ds.recent_edits
-                    .retain(|_, t| now.duration_since(*t) < OWNER_EDIT_RETENTION);
-                let Some(update) = apply_changeset_to_doc(&mut ds, &parsed) else {
-                    return;
-                };
-                // Re-baseline so this local change never re-surfaces from
-                // drain_remote.
-                ds.last_state = snapshot(&ds.doc);
-                drop(ds);
-                let _ = self.cmd_tx.send(Command::PublishAuthoritative(update));
+                if !rejected.is_empty() {
+                    let mut fr = self.shared.force_revert.lock().unwrap();
+                    fr.extend(rejected);
+                    // The owner's REAPER already moved; make drain_remote run so
+                    // it snaps back even if nothing else changed.
+                    self.shared.dirty.store(true, Ordering::SeqCst);
+                }
+                if !kept.is_empty() {
+                    if let Some(update) =
+                        apply_changeset_to_doc(&mut ds, &JsonValue::Object(kept))
+                    {
+                        // Re-baseline so this local change never re-surfaces from
+                        // drain_remote.
+                        ds.last_state = snapshot(&ds.doc);
+                        drop(ds);
+                        let _ = self.cmd_tx.send(Command::PublishAuthoritative(update));
+                    }
+                }
             }
             Role::Client => {
                 let mut ds = self.shared.doc.lock().unwrap();
@@ -778,10 +893,67 @@ impl Reamesh {
         }
         let new_state = snapshot(&ds.doc);
         let mut diff = diff_states(&ds.last_state, &new_state);
+        let now = Instant::now();
+        let own_id = self.local_peer_id.to_string();
+
+        // Helpers: add/remove one field from the diff being returned to REAPER.
+        // `diff` is the changeset object {section -> {id -> {field -> value}}}.
+        type Diff = JsonMap<String, JsonValue>;
+        let put = |diff: &mut Diff, section: &str, id: &str, field: &str, v: JsonValue| {
+            diff.entry(section.to_string())
+                .or_insert_with(|| JsonValue::Object(JsonMap::new()))
+                .as_object_mut()
+                .unwrap()
+                .entry(id.to_string())
+                .or_insert_with(|| JsonValue::Object(JsonMap::new()))
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), v);
+        };
+        let drop_field = |diff: &mut Diff, section: &str, id: &str, field: &str| {
+            if let Some(m) = diff
+                .get_mut(section)
+                .and_then(|s| s.get_mut(id))
+                .and_then(|v| v.as_object_mut())
+            {
+                m.remove(field);
+            }
+        };
+        let count_revert = |section: &str, id: &str, holder: &str| {
+            self.shared.reverts.fetch_add(1, Ordering::Relaxed);
+            let mut d = self.shared.reverts_detail.lock().unwrap();
+            d.push_back((section.to_string(), id.to_string(), holder.to_string()));
+            while d.len() > 32 {
+                d.pop_front();
+            }
+        };
+
+        // Owner: snap back the owner's own edits that a client's lock rejected
+        // (push_local queued them in force_revert). Re-emit the authoritative
+        // (holder's) value so the owner's REAPER reverts, and surface it like a
+        // client revert so the owner is told who is editing that field: the
+        // lock binds the host too.
+        if self.role == Role::Owner {
+            let queued =
+                std::mem::take(&mut *self.shared.force_revert.lock().unwrap());
+            for ((section, id, field), holder) in queued {
+                if let Some(dv) = new_state
+                    .get(&section)
+                    .and_then(|s| s.get(&id))
+                    .and_then(|f| f.get(&field))
+                    .cloned()
+                {
+                    count_revert(&section, &id, &holder);
+                    put(&mut diff, &section, &id, &field, dv);
+                }
+            }
+        }
 
         // Client-side proposal reconciliation (pending is always empty on the
-        // owner, so this is a no-op there).
-        let now = Instant::now();
+        // owner). A field someone else now holds is snapped back at once (the
+        // owner's lock broadcast names the holder); an unexplained miss falls
+        // back to the proposal timeout.
+        let locks = self.shared.peer_locks.lock().unwrap();
         let pending = &mut ds.pending;
         pending.retain(|(section, id, field), (proposed, when)| {
             let doc_val = new_state
@@ -790,51 +962,27 @@ impl Reamesh {
                 .and_then(|f| f.get(field));
             if doc_val == Some(proposed) {
                 // Confirmed by the owner; suppress the no-op echo.
-                if let Some(m) = diff
-                    .get_mut(section.as_str())
-                    .and_then(|s| s.get_mut(id.as_str()))
-                    .and_then(|v| v.as_object_mut())
-                {
-                    m.remove(field);
-                }
-                false
-            } else if now.duration_since(*when) > PROPOSAL_TIMEOUT {
-                // Never confirmed: the owner dropped it (or overrode it).
-                // Revert the host to the authoritative value, and count it so
-                // the UI can tell the user (the snap-back looks like a glitch
-                // otherwise).
+                drop_field(&mut diff, section, id, field);
+                return false;
+            }
+            let holder = locks.get(&(section.clone(), id.clone(), field.clone()));
+            let held_by_other = holder.is_some_and(|h| *h != own_id);
+            if held_by_other || now.duration_since(*when) > PROPOSAL_TIMEOUT {
+                // Lost the field: snap REAPER back to the authoritative value
+                // and record who holds it (when known) so the UI can name them.
                 if let Some(dv) = doc_val {
-                    self.shared.reverts.fetch_add(1, Ordering::Relaxed);
-                    {
-                        let mut d = self.shared.reverts_detail.lock().unwrap();
-                        d.push_back((section.clone(), id.clone()));
-                        while d.len() > 32 {
-                            d.pop_front();
-                        }
-                    }
-                    diff.entry(section.clone())
-                        .or_insert_with(|| JsonValue::Object(JsonMap::new()))
-                        .as_object_mut()
-                        .unwrap()
-                        .entry(id.clone())
-                        .or_insert_with(|| JsonValue::Object(JsonMap::new()))
-                        .as_object_mut()
-                        .unwrap()
-                        .insert(field.clone(), dv.clone());
+                    let who = holder.filter(|h| **h != own_id).cloned().unwrap_or_default();
+                    count_revert(section, id, &who);
+                    put(&mut diff, section, id, field, dv.clone());
                 }
                 false
             } else {
-                // Still in flight: keep the optimistic local value for now.
-                if let Some(m) = diff
-                    .get_mut(section.as_str())
-                    .and_then(|s| s.get_mut(id.as_str()))
-                    .and_then(|v| v.as_object_mut())
-                {
-                    m.remove(field);
-                }
+                // Still in flight (held by us, or no word yet): keep optimistic.
+                drop_field(&mut diff, section, id, field);
                 true
             }
         });
+        drop(locks);
         // Drop empty entities, then empty sections.
         for (_, section) in diff.iter_mut() {
             if let Some(s) = section.as_object_mut() {
@@ -907,7 +1055,7 @@ impl Reamesh {
             .lock()
             .unwrap()
             .iter()
-            .map(|(s, i)| json!({ "section": s, "id": i }))
+            .map(|(s, i, by)| json!({ "section": s, "id": i, "by": by }))
             .collect();
         self.shared
             .status
@@ -1582,12 +1730,13 @@ fn serve_xfer(
     }
 }
 
-/// Owner-side proposal admission: active-editor-wins. Keep the owner's own
-/// value for a field only when the owner edited it as recently as the proposal
-/// did (a genuine simultaneous tie); otherwise admit the proposal; the guest
-/// is the one actively working on that field. Returns the update to
-/// re-broadcast.
-fn admit_proposal(shared: &Shared, payload: &[u8]) -> Option<Vec<u8>> {
+/// Owner-side proposal admission under the soft editing lock. A field is
+/// admitted (and `proposer` becomes/refreshes its lock holder) unless someone
+/// else currently holds it: i.e. the proposer is the active editor, or the
+/// field is free. A field a different peer holds is rejected; the proposer's
+/// own lock broadcast will snap it back. `proposer` is the authenticated
+/// gossipsub source. Returns the update to re-broadcast.
+fn admit_proposal(shared: &Shared, payload: &[u8], proposer: &str) -> Option<Vec<u8>> {
     let envelope: JsonValue = serde_json::from_slice(payload).ok()?;
     // Gate live edits on the session token, exactly as file serving is gated in
     // serve_xfer: subscribing to the (publicly-announced) session topic must
@@ -1602,11 +1751,6 @@ fn admit_proposal(shared: &Shared, payload: &[u8]) -> Option<Vec<u8>> {
 
     let mut ds = shared.doc.lock().unwrap();
     let now = Instant::now();
-    // Re-anchor the proposal's edit time onto our own clock: `now - age`. Using
-    // the age (a duration on the sender's clock) instead of an absolute wall
-    // time keeps cross-machine clock skew out of the comparison entirely.
-    let age = Duration::from_millis(envelope.get("age_ms").and_then(|v| v.as_u64()).unwrap_or(0));
-    let proposal_edit = now.checked_sub(age).unwrap_or(now);
     let mut admitted = JsonMap::new();
     for section in SECTIONS {
         let Some(entities) = parsed.get(section).and_then(|v| v.as_object()) else {
@@ -1617,20 +1761,21 @@ fn admit_proposal(shared: &Shared, payload: &[u8]) -> Option<Vec<u8>> {
             let Some(fields) = fields.as_object() else { continue };
             let mut keep = Fields::new();
             for (key, value) in fields {
-                // The owner keeps its value only if it edited this exact field
-                // no earlier than the proposal's edit minus the tie window, i.e.
-                // the owner edited it later, or near-simultaneously. Otherwise
-                // the proposal is the more recent edit and wins.
-                let owner_wins = ds
-                    .recent_edits
-                    .get(&(section.into(), id.clone(), key.clone()))
-                    .is_some_and(|owner_edit| *owner_edit + CONFLICT_TIE_WINDOW >= proposal_edit);
-                if owner_wins {
-                    eprintln!(
-                        "[reamesh] proposal for {section}/{id}.{key} dropped (owner edited it as recently: tie)"
-                    );
-                } else {
-                    keep.insert(key.clone(), value.clone());
+                let fk = (section.to_string(), id.clone(), key.clone());
+                match lock_holder(&mut ds.locks, &fk, now) {
+                    Some(h) if h != proposer => {
+                        eprintln!(
+                            "[reamesh] proposal for {section}/{id}.{key} rejected (held by {h})"
+                        );
+                    }
+                    _ => {
+                        // Free or already the proposer's: grant + refresh.
+                        ds.locks.insert(
+                            fk,
+                            Lock { holder: proposer.to_string(), touched: now },
+                        );
+                        keep.insert(key.clone(), value.clone());
+                    }
                 }
             }
             if !keep.is_empty() {
@@ -1780,10 +1925,12 @@ async fn run_network(
                     });
                     shared.reverts.store(0, Ordering::Relaxed);
                     shared.reverts_detail.lock().unwrap().clear();
+                    shared.peer_locks.lock().unwrap().clear();
+                    shared.force_revert.lock().unwrap().clear();
                     // Drop any proposals left in flight from a previous session
                     // (e.g. before an auto-rejoin): their stale timestamps would
-                    // otherwise time out and surface as phantom "overridden"
-                    // reverts the moment we reconnect.
+                    // otherwise time out and surface as phantom snap-backs the
+                    // moment we reconnect.
                     shared.doc.lock().unwrap().pending.clear();
                     let req = swarm
                         .behaviour_mut()
@@ -1918,6 +2065,32 @@ async fn run_network(
                         .as_bytes(),
                     );
                     let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), data);
+                }
+                // Owner: republish the editing-lock table whenever the live set
+                // changes (an acquisition or a lapse), so peers can snap a
+                // rejected edit back at once and name who holds each field.
+                // `peer_locks` doubles as the owner's last-broadcast cache (the
+                // owner never receives a lock table; only clients do).
+                if hosting.is_some() && let Some(t) = &sess_topic {
+                    let live = {
+                        let mut ds = shared.doc.lock().unwrap();
+                        live_locks(&mut ds.locks, Instant::now())
+                    };
+                    let current: HashMap<FieldKey, String> = live.iter().cloned().collect();
+                    let changed = {
+                        let mut last = shared.peer_locks.lock().unwrap();
+                        if *last != current {
+                            *last = current;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if changed {
+                        let mut data = vec![TAG_LOCKS];
+                        data.extend_from_slice(&lock_table_json(&live));
+                        let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), data);
+                    }
                 }
                 // Owner: full-state anti-entropy.
                 if need_full_sync && shared.topic_peers.load(Ordering::Relaxed) > 0 {
@@ -2183,13 +2356,31 @@ async fn run_network(
                                 }
                             }
                             (Some(&TAG_PROPOSAL), Role::Owner) => {
-                                if let Some(update) = admit_proposal(&shared, &message.data[1..]) {
+                                // The lock holder is the authenticated source.
+                                let proposer =
+                                    message.source.map(|p| p.to_string()).unwrap_or_default();
+                                if let Some(update) =
+                                    admit_proposal(&shared, &message.data[1..], &proposer)
+                                {
                                     let mut data = vec![TAG_AUTHORITATIVE];
                                     data.extend_from_slice(&update);
                                     if let Some(t) = &sess_topic
                                         && swarm.behaviour_mut().gossipsub.publish(t.clone(), data).is_err() {
                                         need_full_sync = true;
                                     }
+                                }
+                            }
+                            (Some(&TAG_LOCKS), Role::Client) => {
+                                // The owner is the sole lock arbiter; ignore any
+                                // table from a non-owner topic member.
+                                let from_owner = message.source.is_some_and(|src| {
+                                    src.to_string() == *shared.owner_peer.lock().unwrap()
+                                });
+                                if from_owner
+                                    && let Ok(v) =
+                                        serde_json::from_slice::<JsonValue>(&message.data[1..])
+                                {
+                                    *shared.peer_locks.lock().unwrap() = parse_lock_table(&v);
                                 }
                             }
                             _ => {}

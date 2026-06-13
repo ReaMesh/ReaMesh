@@ -625,6 +625,16 @@ static std::string trackNameByGuid(const std::string& guid) {
   return "";
 }
 
+// Display name of a peer (the editing-lock holder), resolved from the roster by
+// peer id. Empty when the id is unknown or the peer never sent a name beacon.
+static std::string peerNameById(const json& peers, const std::string& id) {
+  if (id.empty() || !peers.is_array()) return "";
+  for (const auto& p : peers)
+    if (p.is_object() && p.value("id", std::string()) == id)
+      return p.value("name", std::string());
+  return "";
+}
+
 static std::string itemGuid(MediaItem* item) {
   char buf[64] = "";
   GetSetMediaItemInfo_String(item, "GUID", buf, false);
@@ -1883,19 +1893,20 @@ static void ctlTick() {
     }
   }
   json st = handleJson(reamesh_status, json::object());
-  // Client: the owner overrode some of this peer's proposals since the last
-  // tick: log it (before the log is mirrored below) and surface a cumulative
-  // counter so the app can toast on the increase.
+  // An edit of this user's just snapped back because someone else holds the
+  // soft editing lock on that field. This fires for the client whose proposal
+  // lost AND for the owner the lock bound (the host isn't privileged). Surface
+  // a calm "X is editing <track>" notice plus a cumulative counter the app
+  // toasts on the increase.
   long reverts = (st.contains("reverts") && st["reverts"].is_number_integer())
                      ? st["reverts"].get<long>()
                      : 0;
-  if (g_mode == Mode::ClientActive) {
+  if (g_mode == Mode::ClientActive || g_mode == Mode::Hosting) {
     if (reverts > g_lastReverts) {
       const long delta = reverts - g_lastReverts;
-      // The status carries a tail of recently-overridden (section,id) pairs; the
-      // last `delta` are new. Name the tracks among them so the app can say
-      // *what* the host overrode, not just that something snapped back.
-      std::vector<std::string> names;
+      // The status carries a tail of recent (section,id,by) snap-backs; the last
+      // `delta` are new. Name the track and who is holding it.
+      std::vector<std::pair<std::string, std::string>> events;  // (track, holder)
       std::vector<std::string> seenIds;
       if (st.contains("reverted") && st["reverted"].is_array()) {
         const json& rv = st["reverted"];
@@ -1906,20 +1917,26 @@ static void ctlTick() {
           std::string id = jsonStr(e, "id");
           if (std::find(seenIds.begin(), seenIds.end(), id) != seenIds.end()) continue;
           seenIds.push_back(id);
-          std::string nm = trackNameByGuid(id);
-          if (!nm.empty()) names.push_back(nm);
+          events.emplace_back(trackNameByGuid(id), peerNameById(peers, jsonStr(e, "by")));
         }
       }
-      // With active-editor-wins these only fire on a genuine simultaneous
-      // conflict, so they're rare, but route them through activityEvent so a
-      // burst on the same track still collapses to one notice (de-dupes
-      // identical text within a few seconds) instead of spamming the feed.
-      if (names.empty()) {
-        activityEvent("edit_overridden", {{"count", delta}}, "the host overrode your change");
+      // Route through activityEvent so a burst on the same track collapses to
+      // one notice (de-dupes identical text within a few seconds).
+      if (events.empty()) {
+        activityEvent("edit_locked", {{"count", delta}},
+                      "your edit snapped back; someone else is editing it");
       } else {
-        for (const std::string& nm : names)
-          activityEvent("edit_overridden", {{"track", nm}},
-                        "the host overrode your change to " + nm);
+        for (const auto& [nm, by] : events) {
+          json params = json::object();
+          if (!nm.empty()) params["track"] = nm;
+          if (!by.empty()) params["by"] = by;
+          std::string text =
+              by.empty()
+                  ? (nm.empty() ? "your edit snapped back"
+                                : "your edit to " + nm + " snapped back")
+                  : (nm.empty() ? by + " is editing this" : by + " is editing " + nm);
+          activityEvent("edit_locked", params, text);
+        }
       }
       g_lastReverts = reverts;
     }

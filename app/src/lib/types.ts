@@ -76,7 +76,8 @@ export interface ExtState {
   /** Last session-ending event; null when there is none. */
   error: LogEntry | null;
   log: LogEntry[];
-  /** Client only: cumulative count of own edits the host overrode. */
+  /** Cumulative count of own edits that snapped back because another peer held
+   *  the field's editing lock (either role: the lock binds the host too). */
   overridden?: number;
   /** True while the extension is trying to rejoin a lost host automatically. */
   reconnecting?: boolean;

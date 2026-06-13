@@ -86,27 +86,27 @@ function useErrorToasts(state: ExtState | undefined) {
   }, [state?.error]);
 }
 
-/** Client side: a genuine simultaneous conflict was resolved in the host's
- *  favour, so one of our edits snapped back. Without a word that reads as a
- *  glitch, so tell the user. With active-editor-wins these are rare; still
- *  debounce, so a quick back-and-forth can never stack notices. */
+/** One of our edits snapped back because someone else holds the soft editing
+ *  lock on that field. It reads as a glitch otherwise, so tell the user calmly.
+ *  Fires in either role, since the lock binds the host too. Debounced so a quick
+ *  back-and-forth can't stack notices. */
 function useOverrideToasts(state: ExtState | undefined) {
   const prev = useRef<{ mode?: Mode; count: number; lastAt: number }>({ count: 0, lastAt: 0 });
   useEffect(() => {
     const count = state?.overridden ?? 0;
     const sameSession = prev.current.mode === state?.mode;
+    const inSession = state?.mode === "client" || state?.mode === "hosting";
     const now = Date.now();
     if (
-      state?.mode === "client" &&
+      inSession &&
       sameSession &&
       count > prev.current.count &&
       now - prev.current.lastAt > 4000
     ) {
-      // Name the track when the extension could resolve it (the most recent
-      // override event carries it); otherwise fall back to the generic notice.
-      const last = [...(state?.log ?? [])].reverse().find((e) => e.code === "edit_overridden");
-      const track = last?.params?.track;
-      toast(track ? t("editOverriddenTrack", { track }) : t("editOverridden"));
+      // The most recent lock event carries the track and who's editing it; fall
+      // back to the generic notice when the extension couldn't resolve them.
+      const last = [...(state?.log ?? [])].reverse().find((e) => e.code === "edit_locked");
+      toast(last ? localizeLogEntry(last) : t("editLocked"));
       prev.current.lastAt = now;
     }
     prev.current.mode = state?.mode;

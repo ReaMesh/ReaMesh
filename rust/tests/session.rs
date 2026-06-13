@@ -334,12 +334,12 @@ fn owner_wins_live_conflict() {
     let _ = fs::remove_dir_all(staging);
 }
 
-/// Active-editor-wins: when the owner edited a field a while ago and the client
-/// edits it now, the client is the one working on it, so its proposal must be
-/// admitted (not shadowed by stale owner priority). This is the case that made
-/// collaboration feel like a fight before: the owner no longer statically wins.
+/// Lock lapse: once the owner's edit lock on a field expires (it stopped
+/// touching it), a client editing that field becomes the new holder and its
+/// proposal is admitted: collaboration hands the field over instead of the
+/// owner statically winning forever.
 #[test]
-fn client_wins_when_it_edits_after_the_owner() {
+fn client_wins_after_owner_lock_lapses() {
     let project = temp_dir("proj-active");
     let staging = temp_dir("staging-active");
     make_project(&project);
@@ -356,9 +356,9 @@ fn client_wins_when_it_edits_after_the_owner() {
         client_state.get("{T7}").map(|t| t["vol"].clone()) == Some(serde_json::json!(0.9))
     }));
 
-    // Wait well past the tie window so the next edit is unambiguously "later",
-    // then the client edits the same field. It is now the active editor.
-    std::thread::sleep(Duration::from_millis(1800));
+    // Wait past LOCK_HOLD so the owner's lock on vol lapses, then the client
+    // edits it; it is now the (only) active editor and takes the field.
+    std::thread::sleep(Duration::from_millis(2400));
     client.push_local(r#"{"tracks":{"{T7}":{"vol":0.1}}}"#);
 
     let mut owner_state = serde_json::Map::new();
@@ -369,7 +369,7 @@ fn client_wins_when_it_edits_after_the_owner() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // The owner admitted the client's later edit on both sides...
+    // The owner admitted the client's edit on both sides...
     assert_eq!(field(&owner.snapshot_json(), "{T7}", "vol"), 0.1);
     assert_eq!(field(&client.snapshot_json(), "{T7}", "vol"), 0.1);
     assert_eq!(
@@ -377,12 +377,77 @@ fn client_wins_when_it_edits_after_the_owner() {
         Some(serde_json::json!(0.1)),
         "owner never applied the client's later edit"
     );
-    // ...and the client was not overridden, so nothing snapped back.
+    // ...and the client was not snapped back.
     let st: Value = serde_json::from_str(&client.status_json()).unwrap();
     assert_eq!(
         st["reverts"].as_u64().unwrap_or(0),
         0,
-        "client's later edit was wrongly counted as overridden: {st}"
+        "client's later edit was wrongly snapped back: {st}"
+    );
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+/// While a client holds a field's editing lock, an owner edit to the same
+/// field must be rejected and reverted to the client's value.
+#[test]
+fn client_lock_protects_against_owner() {
+    let project = temp_dir("proj-cl-lock");
+    let staging = temp_dir("staging-cl-lock");
+    make_project(&project);
+    let (owner, client) = establish("cl-lock-test", &project, &staging);
+
+    // Baseline from the owner; wait past LOCK_HOLD so the baseline's lock on
+    // vol lapses and the client can take the field cleanly.
+    owner.push_local(
+        r#"{"tracks":{"{T5}":{"present":true,"index":0,"name":"Bass","vol":0.5,"pan":0.0,"mute":false,"solo":false}}}"#,
+    );
+    let mut client_state = serde_json::Map::new();
+    assert!(wait_until(Duration::from_secs(10), || {
+        drain_into(&client, &mut client_state);
+        client_state.contains_key("{T5}")
+    }));
+    std::thread::sleep(Duration::from_millis(2400));
+
+    // The client edits vol and the owner admits it -> the client now HOLDS vol.
+    client.push_local(r#"{"tracks":{"{T5}":{"vol":0.2}}}"#);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            field(&owner.snapshot_json(), "{T5}", "vol") == 0.2
+        }),
+        "owner never admitted the client's edit (so the client never held the lock)"
+    );
+
+    // Immediately (well within LOCK_HOLD) the owner tries to grab the same
+    // field. The client holds it, so the owner is rejected and snapped back.
+    owner.push_local(r#"{"tracks":{"{T5}":{"vol":0.9}}}"#);
+
+    let mut owner_state = serde_json::Map::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        drain_into(&owner, &mut owner_state);
+        drain_into(&client, &mut client_state);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The client's value stands everywhere; the owner's 0.9 never took.
+    assert_eq!(field(&owner.snapshot_json(), "{T5}", "vol"), 0.2);
+    assert_eq!(field(&client.snapshot_json(), "{T5}", "vol"), 0.2);
+    // The owner's own REAPER was snapped back to the client's value.
+    assert_eq!(
+        owner_state.get("{T5}").map(|t| t["vol"].clone()),
+        Some(serde_json::json!(0.2)),
+        "owner's REAPER never snapped back off its rejected edit"
+    );
+    // The client's edit was not snapped back (it won the field).
+    let cst: Value = serde_json::from_str(&client.status_json()).unwrap();
+    assert_eq!(
+        cst["reverts"].as_u64().unwrap_or(0),
+        0,
+        "the holding client was wrongly snapped back: {cst}"
     );
 
     drop(client);
