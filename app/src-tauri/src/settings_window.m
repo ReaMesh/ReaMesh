@@ -9,6 +9,7 @@
 
 static NSString *const kTabGeneral = @"general";
 static NSString *const kTabExtension = @"extension";
+static NSString *const kTabOverlay = @"overlay";
 static NSString *const kReaperDownloadURL = @"https://www.reaper.fm/download.php";
 
 static const CGFloat kWindowWidth = 480;
@@ -99,13 +100,13 @@ static ReaMeshSettingsController *gController = nil;
 #pragma mark - NSToolbarDelegate
 
 - (NSArray<NSToolbarItemIdentifier> *)toolbarDefaultItemIdentifiers:(NSToolbar *)t {
-    return @[ kTabGeneral, kTabExtension ];
+    return @[ kTabGeneral, kTabExtension, kTabOverlay ];
 }
 - (NSArray<NSToolbarItemIdentifier> *)toolbarAllowedItemIdentifiers:(NSToolbar *)t {
-    return @[ kTabGeneral, kTabExtension ];
+    return @[ kTabGeneral, kTabExtension, kTabOverlay ];
 }
 - (NSArray<NSToolbarItemIdentifier> *)toolbarSelectableItemIdentifiers:(NSToolbar *)t {
-    return @[ kTabGeneral, kTabExtension ];
+    return @[ kTabGeneral, kTabExtension, kTabOverlay ];
 }
 
 - (NSToolbarItem *)toolbar:(NSToolbar *)toolbar
@@ -118,6 +119,12 @@ static ReaMeshSettingsController *gController = nil;
         item.label = L(@"General", @"Allgemein");
         if (@available(macOS 11.0, *)) {
             item.image = [NSImage imageWithSystemSymbolName:@"folder"
+                                   accessibilityDescription:item.label];
+        }
+    } else if ([identifier isEqualToString:kTabOverlay]) {
+        item.label = L(@"Overlay", @"Overlay");
+        if (@available(macOS 11.0, *)) {
+            item.image = [NSImage imageWithSystemSymbolName:@"rectangle.on.rectangle"
                                    accessibilityDescription:item.label];
         }
     } else {
@@ -163,9 +170,65 @@ static ReaMeshSettingsController *gController = nil;
     ReaperStatusC st = self.cb.get_status(self.cb.ctx);
     if ([identifier isEqualToString:kTabExtension]) {
         [self buildExtensionPane:st];
+    } else if ([identifier isEqualToString:kTabOverlay]) {
+        [self buildOverlayPane];
     } else {
         [self buildGeneralPane:st];
     }
+}
+
+// The floating presence overlay's visibility toggles. The source of truth is
+// backend-side (a bitmask); each checkbox flips its bit and the change is
+// pushed to the live overlay webview via the set_overlay callback.
+- (void)buildOverlayPane {
+    CGFloat w = kWindowWidth - 2 * kMargin;
+    CGFloat y = kMargin;
+
+    [self.container addSubview:[self headerWithString:L(@"Presence overlay",
+                                                        @"Präsenz-Overlay")
+                                                    y:y]];
+    y += 26;
+
+    NSTextField *intro = [self
+        labelWithString:L(@"Choose what the overlay shows over REAPER while you're in a session.",
+                          @"Wähle, was das Overlay während einer Session über REAPER anzeigt.")
+                  frame:NSMakeRect(kMargin, y, w, 32)];
+    intro.textColor = [NSColor secondaryLabelColor];
+    intro.font = [NSFont systemFontOfSize:11];
+    intro.lineBreakMode = NSLineBreakByWordWrapping;
+    intro.maximumNumberOfLines = 0;
+    [self.container addSubview:intro];
+    y += 36;
+
+    int32_t mask = self.cb.get_overlay(self.cb.ctx);
+    NSArray *rows = @[
+        @[ @(kReaMeshOverlayRoster), L(@"Participants", @"Teilnehmer") ],
+        @[ @(kReaMeshOverlayActivity), L(@"Activity feed", @"Aktivität") ],
+        @[ @(kReaMeshOverlayPlayheads), L(@"Peer playheads", @"Abspielpositionen") ],
+        @[ @(kReaMeshOverlayGhosts), L(@"Selection highlights", @"Auswahlen") ],
+    ];
+    for (NSArray *row in rows) {
+        int32_t bit = (int32_t)[row[0] integerValue];
+        NSButton *cb = [NSButton checkboxWithTitle:row[1]
+                                            target:self
+                                            action:@selector(overlayToggled:)];
+        cb.tag = bit;
+        cb.state = (mask & bit) ? NSControlStateValueOn : NSControlStateValueOff;
+        cb.frame = NSMakeRect(kMargin, y, w, 22);
+        [self.container addSubview:cb];
+        y += 28;
+    }
+}
+
+- (void)overlayToggled:(NSButton *)sender {
+    int32_t mask = self.cb.get_overlay(self.cb.ctx);
+    int32_t bit = (int32_t)sender.tag;
+    if (sender.state == NSControlStateValueOn) {
+        mask |= bit;
+    } else {
+        mask &= ~bit;
+    }
+    self.cb.set_overlay(self.cb.ctx, mask);
 }
 
 - (void)buildGeneralPane:(ReaperStatusC)st {

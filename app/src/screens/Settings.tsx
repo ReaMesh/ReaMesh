@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ArrowLeft, ExternalLink } from "lucide-react";
+import { ArrowLeft, Check, ExternalLink } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -13,7 +13,19 @@ import {
   setReaperPath,
   useReaperStatus,
 } from "@/lib/install";
+import {
+  type OverlaySettings,
+  setOverlaySetting,
+  useOverlaySettings,
+} from "@/lib/overlaySettings";
 import { cn } from "@/lib/utils";
+
+const OVERLAY_TOGGLES: { key: keyof OverlaySettings; label: () => string }[] = [
+  { key: "roster", label: () => t("olRoster") },
+  { key: "activity", label: () => t("olActivity") },
+  { key: "playheads", label: () => t("olPlayheads") },
+  { key: "ghosts", label: () => t("olSelections") },
+];
 
 // Full-screen app settings, opened from the native menu on non-macOS
 // platforms (macOS opens the native AppKit settings window instead). Holds
@@ -23,6 +35,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
   const [busy, setBusy] = useState(false);
   const status = useReaperStatus();
   const hasCustom = !!getReaperPath();
+  const overlay = useOverlaySettings();
   useLang(); // re-render when the language changes
 
   const pickFolder = async () => {
@@ -195,6 +208,37 @@ export function Settings({ onBack }: { onBack: () => void }) {
             <p className="text-[11px] leading-relaxed text-muted-foreground">
               {t("restartNote")}
             </p>
+          </div>
+        </section>
+
+        <section className="space-y-2">
+          <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            {t("overlaySettingsTitle")}
+          </h3>
+          <div className="flex flex-col gap-0.5 rounded-xl bg-card p-1.5">
+            {OVERLAY_TOGGLES.map((row) => {
+              const on = overlay[row.key];
+              return (
+                <button
+                  key={row.key}
+                  type="button"
+                  onClick={() => setOverlaySetting(row.key, !on)}
+                  className="flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-secondary/60"
+                >
+                  <span
+                    className={cn(
+                      "grid size-4 shrink-0 place-items-center rounded-[5px] border transition-colors",
+                      on
+                        ? "border-foreground/30 bg-foreground/85 text-background"
+                        : "border-border text-transparent",
+                    )}
+                  >
+                    <Check className="size-3" strokeWidth={3} />
+                  </span>
+                  <span className="flex-1 text-foreground/90">{row.label()}</span>
+                </button>
+              );
+            })}
           </div>
         </section>
       </div>

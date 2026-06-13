@@ -23,6 +23,14 @@ enum {
     kReaMeshLangGerman = 2,
 };
 
+// Overlay toggle bits (a bitmask shared with Rust + overlaySettings.ts).
+enum {
+    kReaMeshOverlayRoster = 1,
+    kReaMeshOverlayActivity = 2,
+    kReaMeshOverlayPlayheads = 4,
+    kReaMeshOverlayGhosts = 8,
+};
+
 // Callbacks the native window uses to read state and act. `ctx` is an opaque
 // Rust pointer passed back into every call.
 typedef struct {
@@ -32,6 +40,8 @@ typedef struct {
     void (*set_path)(void *ctx, const char *path); // path == NULL => use default
     int32_t (*get_language)(void *ctx);       // kReaMeshLang* preference
     void (*set_language)(void *ctx, int32_t pref);
+    int32_t (*get_overlay)(void *ctx);        // kReaMeshOverlay* bitmask
+    void (*set_overlay)(void *ctx, int32_t mask);
 } SettingsCallbacks;
 
 // Opens (or re-focuses) the native settings window. Must be called on the

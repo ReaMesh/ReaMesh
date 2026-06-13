@@ -144,6 +144,52 @@ fn store_lang_pref(app: &AppHandle, pref: &str) {
     let _ = fs::write(p, pref);
 }
 
+// Overlay visibility toggles, persisted backend-side as a small bitmask so the
+// native settings window AND the overlay webview share one source of truth.
+// Bits: roster=1, activity=2, playheads=4, ghosts=8 (must match
+// settings_window.h's kReaMeshOverlay* and overlaySettings.ts).
+const OVERLAY_ALL: u8 = 0b1111;
+
+fn overlay_file(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|d| d.join("overlay"))
+}
+
+fn load_overlay(app: &AppHandle) -> u8 {
+    overlay_file(app)
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<u8>().ok())
+        .map(|m| m & OVERLAY_ALL)
+        .unwrap_or(OVERLAY_ALL) // default: everything on
+}
+
+fn store_overlay(app: &AppHandle, mask: u8) {
+    let Some(p) = overlay_file(app) else { return };
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(p, (mask & OVERLAY_ALL).to_string());
+}
+
+/// Persist the overlay toggles and tell every webview (overlay windows + the
+/// in-app Settings screen) so they re-render. Shared by the webview command and
+/// the native settings window callback.
+fn apply_overlay(app: &AppHandle, mask: u8) {
+    let mask = mask & OVERLAY_ALL;
+    store_overlay(app, mask);
+    use tauri::Emitter;
+    let _ = app.emit("overlay-settings-changed", mask);
+}
+
+#[tauri::command]
+fn get_overlay_settings(app: AppHandle) -> u8 {
+    load_overlay(&app)
+}
+
+#[tauri::command]
+fn set_overlay_settings(app: AppHandle, mask: u8) {
+    apply_overlay(&app, mask);
+}
+
 fn device_lang() -> Lang {
     match sys_locale::get_locale() {
         Some(l) if l.to_lowercase().starts_with("de") => Lang::De,
@@ -549,6 +595,8 @@ pub fn run() {
             set_reaper_path,
             get_language,
             set_language,
+            get_overlay_settings,
+            set_overlay_settings,
             set_session_state
         ])
         .setup(|app| {
@@ -616,8 +664,8 @@ pub fn run() {
 #[cfg(target_os = "macos")]
 mod native_settings {
     use super::{
-        apply_language, compute_status, do_install, load_custom_path, load_lang_pref,
-        store_custom_path, ReaperStatus,
+        apply_language, apply_overlay, compute_status, do_install, load_custom_path,
+        load_lang_pref, load_overlay, store_custom_path, ReaperStatus,
     };
     use std::cell::RefCell;
     use std::ffi::{c_char, c_void, CStr, CString};
@@ -642,6 +690,8 @@ mod native_settings {
         set_path: extern "C" fn(*mut c_void, *const c_char),
         get_language: extern "C" fn(*mut c_void) -> i32,
         set_language: extern "C" fn(*mut c_void, i32),
+        get_overlay: extern "C" fn(*mut c_void) -> i32,
+        set_overlay: extern "C" fn(*mut c_void, i32),
     }
 
     extern "C" {
@@ -720,6 +770,16 @@ mod native_settings {
         apply_language(app, pref);
     }
 
+    // Overlay toggles as a bitmask (roster=1, activity=2, playheads=4,
+    // ghosts=8; see kReaMeshOverlay* in settings_window.h).
+    extern "C" fn get_overlay(ctx: *mut c_void) -> i32 {
+        load_overlay(handle(ctx)) as i32
+    }
+
+    extern "C" fn set_overlay(ctx: *mut c_void, mask: i32) {
+        apply_overlay(handle(ctx), mask as u8);
+    }
+
     // The AppHandle is leaked once so the pointer stays valid for the lifetime
     // of the (long-lived) native window.
     static APP_PTR: OnceLock<usize> = OnceLock::new();
@@ -733,6 +793,8 @@ mod native_settings {
             set_path,
             get_language,
             set_language,
+            get_overlay,
+            set_overlay,
         };
         unsafe { reamesh_settings_open(cb) };
     }
