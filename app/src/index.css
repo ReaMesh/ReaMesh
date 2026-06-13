@@ -81,8 +81,11 @@
   html.overlay-window #root {
     height: auto;
     background: transparent;
+    /* Clip brief size differences while the native window follows the card. */
+    overflow: hidden;
   }
-  html.overlay-window body {
-    overflow: visible;
+  /* Belt and suspenders for WebKit: hide the scrollbar gutter outright. */
+  html.overlay-window ::-webkit-scrollbar {
+    display: none;
   }
 }

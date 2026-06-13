@@ -17,6 +17,15 @@ export interface Peer {
    *  locally from their broadcast track GUID. Absent/0 when they're not on a
    *  track (or an older extension that doesn't report focus). */
   track?: number | null;
+  /** Peer's playhead in project seconds (edit cursor, or play position while
+   *  rolling). For peer playheads in the arrange overlay. */
+  play?: number;
+  /** True while the peer's transport is rolling (their playhead is sweeping). */
+  playing?: boolean;
+  /** GUIDs of the tracks / items the peer has selected, drawn as tinted
+   *  "ghosts" in the arrange overlay. */
+  seltr?: string[];
+  seli?: string[];
 }
 
 export interface SessionAd {

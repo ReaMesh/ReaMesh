@@ -13,6 +13,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { ChevronUp, Crown } from "lucide-react";
+import { SlotText } from "slot-text/react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { t, useLang } from "@/lib/i18n";
@@ -26,22 +27,24 @@ const WIDTH = 232;
 function TrackNumber({ track }: { track?: number | null }) {
   if (track == null || track <= 0) return <span className="w-4" />;
   return (
-    <div className="relative h-4 w-4 shrink-0 overflow-hidden text-right">
-      <AnimatePresence initial={false} mode="popLayout">
-        <motion.span
-          key={track}
-          initial={{ y: -14, opacity: 0 }}
-          animate={{ y: 0, opacity: 1 }}
-          exit={{ y: 14, opacity: 0 }}
-          transition={{ type: "spring", stiffness: 520, damping: 34 }}
-          className="absolute inset-0 text-[12px] tabular-nums text-muted-foreground"
-        >
-          {track}
-        </motion.span>
-      </AnimatePresence>
-    </div>
+    <SlotText
+      text={String(track)}
+      options={{ direction: "up", duration: 260 }}
+      className="w-4 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground"
+    />
   );
 }
+
+// Pure lifecycle/status codes: the overlay's one-line feed is for collaboration
+// activity (who did what), not connection chatter, so these never take the slot.
+const SKIP_LOG_CODES = new Set([
+  "browsing",
+  "hosting",
+  "joining",
+  "connected",
+  "download_complete",
+  "left",
+]);
 
 function PeerRow({
   peer,
@@ -149,8 +152,10 @@ export function Overlay({ port }: { port: number | null }) {
 
   const peers = state?.peers ?? [];
   const log = state?.log ?? [];
-  // A short feed of what's happening, newest first.
-  const recent = log.slice(-3).reverse();
+  // One line only: the single newest piece of collaboration activity, rolled
+  // smoothly with slot-text as it changes. Status chatter is filtered out.
+  const newest = [...log].reverse().find((e) => !SKIP_LOG_CODES.has(e.code));
+  const newestText = newest ? localizeLogEntry(newest) : "";
   const reveal = (peer: Peer) => send({ cmd: "reveal_peer", peer_id: peer.id });
 
   return (
@@ -221,20 +226,14 @@ export function Overlay({ port }: { port: number | null }) {
               )}
             </div>
 
-            {recent.length > 0 && (
-              <div className="flex flex-col gap-1 border-t border-white/10 px-2.5 py-2">
-                {recent.map((entry, i) => (
-                  <div
-                    key={`${i}-${entry.code}-${entry.text}`}
-                    className="flex items-center gap-2"
-                    style={{ opacity: 1 - i * 0.28 }}
-                  >
-                    <span className="size-1.5 shrink-0 rounded-full bg-muted-foreground/60" />
-                    <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
-                      {localizeLogEntry(entry)}
-                    </span>
-                  </div>
-                ))}
+            {newestText && (
+              <div className="flex items-center gap-2 border-t border-white/10 px-2.5 py-2">
+                <span className="size-1.5 shrink-0 rounded-full bg-muted-foreground/60" />
+                <SlotText
+                  text={newestText}
+                  options={{ duration: 260, skipUnchanged: false }}
+                  className="block min-w-0 flex-1 overflow-hidden whitespace-nowrap text-[11px] text-muted-foreground"
+                />
               </div>
             )}
           </motion.div>

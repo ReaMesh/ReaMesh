@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import "./index.css";
+import "slot-text/style.css";
 import { initLanguage } from "./lib/i18n";
 
 // Two entry points share this bundle. The floating presence overlay is opened
