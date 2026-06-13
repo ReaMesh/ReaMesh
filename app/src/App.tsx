@@ -86,22 +86,31 @@ function useErrorToasts(state: ExtState | undefined) {
   }, [state?.error]);
 }
 
-/** Client side: the host silently overrode one of our edits (it snapped back
- *  ~3s after we made it). Without a word from the UI that reads as a glitch, so
- *  tell the user what happened. The extension reports a cumulative count. */
+/** Client side: a genuine simultaneous conflict was resolved in the host's
+ *  favour, so one of our edits snapped back. Without a word that reads as a
+ *  glitch, so tell the user. With active-editor-wins these are rare; still
+ *  debounce, so a quick back-and-forth can never stack notices. */
 function useOverrideToasts(state: ExtState | undefined) {
-  const prev = useRef<{ mode?: Mode; count: number }>({ count: 0 });
+  const prev = useRef<{ mode?: Mode; count: number; lastAt: number }>({ count: 0, lastAt: 0 });
   useEffect(() => {
     const count = state?.overridden ?? 0;
     const sameSession = prev.current.mode === state?.mode;
-    if (state?.mode === "client" && sameSession && count > prev.current.count) {
+    const now = Date.now();
+    if (
+      state?.mode === "client" &&
+      sameSession &&
+      count > prev.current.count &&
+      now - prev.current.lastAt > 4000
+    ) {
       // Name the track when the extension could resolve it (the most recent
       // override event carries it); otherwise fall back to the generic notice.
       const last = [...(state?.log ?? [])].reverse().find((e) => e.code === "edit_overridden");
       const track = last?.params?.track;
       toast(track ? t("editOverriddenTrack", { track }) : t("editOverridden"));
+      prev.current.lastAt = now;
     }
-    prev.current = { mode: state?.mode, count };
+    prev.current.mode = state?.mode;
+    prev.current.count = count;
   }, [state?.overridden, state?.mode]);
 }
 

@@ -124,7 +124,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
           <div className="space-y-3 rounded-xl bg-card p-3.5">
             <div className="flex items-center justify-between gap-2">
               <p className="break-all rounded-md bg-secondary/60 px-2.5 py-1.5 text-[12px] leading-relaxed text-foreground/80">
-                {status?.resourcePath ?? "Unknown"}
+                {status?.resourcePath ?? t("notFoundBadge")}
               </p>
               {status && !status.reaperFound && (
                 <Badge

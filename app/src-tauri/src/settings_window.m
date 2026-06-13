@@ -290,9 +290,9 @@ static ReaMeshSettingsController *gController = nil;
     y += 40;
 
     NSTextField *help = [self
-        labelWithString:L(@"REAPER loads the extension at startup. Restart it "
+        labelWithString:L(@"REAPER loads the extension at startup, so restart it "
                           @"after installing or updating.",
-                          @"REAPER lädt die Erweiterung beim Start. Starte es "
+                          @"REAPER lädt die Erweiterung beim Start, also starte es "
                           @"nach Installation oder Update neu.")
                   frame:NSMakeRect(kMargin, y, w, 40)];
     help.textColor = [NSColor secondaryLabelColor];

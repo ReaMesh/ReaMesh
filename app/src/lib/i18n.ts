@@ -35,7 +35,7 @@ const en = {
   trustBody:
     "Joining {name} downloads and opens the host's project. Its effects and plugins run as code on your computer.",
   cancel: "Cancel",
-  joinAnyway: "Join anyway",
+  joinAnyway: "Join",
 
   // Session
   sessionFallback: "Session",
@@ -48,9 +48,9 @@ const en = {
   youBadge: "you",
   sessionHost: "Session host",
   stopHostingTitle: "Stop hosting?",
-  stopHostingBodyOne: "One other person is connected; stopping the session disconnects them.",
+  stopHostingBodyOne: "One other person is connected. Stopping the session disconnects them.",
   stopHostingBodyMany:
-    "{count} other people are connected; stopping the session disconnects them all.",
+    "{count} other people are connected. Stopping the session disconnects them all.",
 
   // Downloading
   joiningLabel: "Joining",
@@ -61,7 +61,7 @@ const en = {
   tagline: "Real-time collaboration for REAPER",
   reaperNotFound: "REAPER not found",
   reaperNotFoundBody:
-    "REAPER may not be installed, or it keeps its data somewhere else (portable install).",
+    "REAPER may not be installed, or it keeps its data somewhere else (a portable install).",
   change: "Change…",
   downloadReaper: "Download REAPER",
   checkAgain: "Check again",
@@ -91,7 +91,7 @@ const en = {
   updateAvailable: "Update available",
   reinstallExtension: "Reinstall extension",
   updateExtension: "Update extension",
-  restartNote: "REAPER loads the extension at startup; restart it after installing or updating.",
+  restartNote: "REAPER loads the extension at startup, so restart it after installing or updating.",
   extInstalledToast: "Extension installed. Restart REAPER to load it.",
   language: "Language",
   languageSystem: "System",
@@ -114,24 +114,24 @@ const en = {
   wrongPassword: "Wrong password.",
   logBrowsing: "Searching for sessions on the network",
   logHosting: "Hosting “{name}”",
-  logJoining: "Joining “{name}”, downloading the project",
-  logJoinUnavailable: "Couldn’t join “{name}”. It may have just closed. Try again.",
+  logJoining: "Joining “{name}”. Downloading the project…",
+  logJoinUnavailable: "Couldn’t join “{name}”. It may have just closed, so try again.",
   logJoinFailed: "Join failed: {reason}",
-  logDownloadComplete: "Download complete, opening the project",
-  logConnected: "Connected: the session host wins conflicts",
+  logDownloadComplete: "Download complete. Opening the project…",
+  logConnected: "Connected. You can edit together live now.",
   logPeerJoined: "Someone joined the session",
   logPeerLeft: "Someone left the session",
   logLeft: "Left the session",
-  logProjectChanged: "Project changed, session ended",
+  logProjectChanged: "Project changed, so the session ended.",
   logSaveFirst: "Save the project first, then host again.",
   logHostFailed: "Could not start hosting.",
   logBrowseFailed: "Could not start session discovery.",
   logWaitingMedia: "Waiting for media of an incoming item…",
   logMediaApplied: "Applied {count} item(s) after media arrived",
-  logMediaCopied: "Copied {file} into the project folder so peers get it",
+  logMediaCopied: "Copied {file} into the project folder so everyone has it",
   logMediaCopyFailed: "Couldn’t copy {file} into the project",
   logMediaTimeout: "Gave up waiting for media: {file}",
-  logReconnecting: "Lost the host, reconnecting to “{name}”…",
+  logReconnecting: "Lost the host. Reconnecting to “{name}”…",
   reconnectFailed: "Couldn’t reconnect to “{name}”.",
   editOverridden: "The host overrode your change.",
   editOverriddenTrack: "The host overrode your change to “{track}”.",
@@ -143,7 +143,7 @@ const en = {
   peerMarkersChanged: "Markers / regions changed",
   peerTitleChanged: "Project info changed",
   peerNotesChanged: "Project notes changed",
-  reconnectingBanner: "Connection to the host lost, reconnecting…",
+  reconnectingBanner: "Connection to the host lost. Reconnecting…",
 } as const;
 
 export type MsgKey = keyof typeof en;
@@ -167,7 +167,7 @@ const de: Record<MsgKey, string> = {
   trustBody:
     "Beim Beitritt zu {name} wird das Projekt des Hosts heruntergeladen und geöffnet. Seine Effekte und Plugins laufen als Code auf deinem Computer.",
   cancel: "Abbrechen",
-  joinAnyway: "Trotzdem beitreten",
+  joinAnyway: "Beitreten",
 
   sessionFallback: "Session",
   hostingBadge: "Hosting",
@@ -199,12 +199,12 @@ const de: Record<MsgKey, string> = {
   installExtBody:
     "ReaMesh fügt REAPER eine kleine Erweiterung hinzu, damit diese App mit ihm sprechen kann. Sie wird installiert nach",
   notReaperDirWarning:
-    "Dieser Ordner sieht noch nicht nach einem REAPER-Datenordner aus (keine reaper.ini). Die Installation ist unbedenklich, prüfe aber den Ort in den Einstellungen, falls REAPER sie nicht lädt.",
+    "Dieser Ordner sieht noch nicht nach einem REAPER-Datenordner aus (keine reaper.ini). Die Installation ist unbedenklich. Prüfe aber den Ort in den Einstellungen, falls REAPER sie nicht lädt.",
   installing: "Installiere…",
   installExtension: "Erweiterung installieren",
   allSet: "Alles bereit",
   allSetBody:
-    "Die Erweiterung ist installiert. Starte REAPER (oder starte es neu, falls es bereits läuft). ReaMesh verbindet sich automatisch.",
+    "Die Erweiterung ist installiert. Starte REAPER (oder starte es neu, falls es bereits läuft). ReaMesh verbindet sich dann automatisch.",
   finish: "Fertig",
   locateReaperFolder: "Wähle deinen REAPER-Ordner",
 
@@ -221,7 +221,7 @@ const de: Record<MsgKey, string> = {
   reinstallExtension: "Erweiterung neu installieren",
   updateExtension: "Erweiterung aktualisieren",
   restartNote:
-    "REAPER lädt die Erweiterung beim Start. Starte es nach Installation oder Update neu.",
+    "REAPER lädt die Erweiterung beim Start, also starte es nach einer Installation oder einem Update neu.",
   extInstalledToast: "Erweiterung installiert. Starte REAPER neu, um sie zu laden.",
   language: "Sprache",
   languageSystem: "System",
@@ -240,16 +240,16 @@ const de: Record<MsgKey, string> = {
   wrongPassword: "Falsches Passwort.",
   logBrowsing: "Suche nach Sessions im Netzwerk",
   logHosting: "Hoste „{name}“",
-  logJoining: "Trete „{name}“ bei, Projekt wird heruntergeladen",
+  logJoining: "Trete „{name}“ bei. Projekt wird heruntergeladen…",
   logJoinUnavailable:
-    "„{name}“ konnte nicht beigetreten werden. Die Session wurde evtl. gerade geschlossen. Versuch es erneut.",
+    "„{name}“ ließ sich nicht beitreten. Die Session wurde vielleicht gerade geschlossen, versuch es erneut.",
   logJoinFailed: "Beitritt fehlgeschlagen: {reason}",
-  logDownloadComplete: "Download abgeschlossen, Projekt wird geöffnet",
-  logConnected: "Verbunden. Bei Konflikten gewinnt der Session-Host",
+  logDownloadComplete: "Download abgeschlossen. Projekt wird geöffnet…",
+  logConnected: "Verbunden. Ihr könnt jetzt gemeinsam live bearbeiten.",
   logPeerJoined: "Jemand ist der Session beigetreten",
   logPeerLeft: "Jemand hat die Session verlassen",
   logLeft: "Session verlassen",
-  logProjectChanged: "Projekt gewechselt, Session beendet",
+  logProjectChanged: "Projekt gewechselt, Session beendet.",
   logSaveFirst: "Speichere zuerst das Projekt und hoste dann erneut.",
   logHostFailed: "Hosting konnte nicht gestartet werden.",
   logBrowseFailed: "Session-Suche konnte nicht gestartet werden.",
@@ -258,7 +258,7 @@ const de: Record<MsgKey, string> = {
   logMediaCopied: "{file} in den Projektordner kopiert, damit andere sie bekommen",
   logMediaCopyFailed: "{file} konnte nicht ins Projekt kopiert werden",
   logMediaTimeout: "Warten auf Medien aufgegeben: {file}",
-  logReconnecting: "Host verloren, verbinde erneut mit „{name}“…",
+  logReconnecting: "Host verloren. Verbinde erneut mit „{name}“…",
   reconnectFailed: "Erneutes Verbinden mit „{name}“ ist fehlgeschlagen.",
   editOverridden: "Der Host hat deine Änderung überschrieben.",
   editOverriddenTrack: "Der Host hat deine Änderung an „{track}“ überschrieben.",
@@ -270,7 +270,7 @@ const de: Record<MsgKey, string> = {
   peerMarkersChanged: "Marker / Regionen geändert",
   peerTitleChanged: "Projektinfo geändert",
   peerNotesChanged: "Projektnotizen geändert",
-  reconnectingBanner: "Verbindung zum Host verloren, verbinde erneut…",
+  reconnectingBanner: "Verbindung zum Host verloren. Verbinde erneut…",
 };
 
 function readStoredPref(): LangPref {
