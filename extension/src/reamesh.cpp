@@ -92,6 +92,7 @@
 #define REAPERAPI_WANT_GetPlayState
 #define REAPERAPI_WANT_GetPlayPosition
 #define REAPERAPI_WANT_GetCursorPosition
+#define REAPERAPI_WANT_GetSet_LoopTimeRange
 #define REAPERAPI_WANT_GetSet_ArrangeView2
 
 #include "reaper_plugin.h"
@@ -229,6 +230,14 @@ static std::chrono::steady_clock::time_point g_lastFullScan{};
 // Client only: cumulative count of own proposals the owner overrode, as
 // reported by reamesh_status ("reverts"); deltas become activity-log events.
 static long g_lastReverts = 0;
+// True once it is safe to propose local edits: always for the owner, and for a
+// client only after the owner's first authoritative state has been applied and
+// re-baselined. Until then a client must stay silent: opening the .rpp and
+// REAPER's own load side effects must never be diffed against a not-yet-synced
+// baseline and shipped as a burst of phantom proposals the owner rejects (the
+// old "everything snapped back the moment I joined" bug).
+static bool g_bootstrapSynced = false;
+static std::chrono::steady_clock::time_point g_clientActiveSince{};
 
 // In-flight automatic rejoin after the host vanished without a farewell
 // (network blip / crash). While set, the Browsing tick watches the lobby for
@@ -280,6 +289,11 @@ static void muteActivity(std::chrono::seconds d) {
 static void activityEvent(const char* code, json params, const std::string& text) {
   const auto now = std::chrono::steady_clock::now();
   if (now < g_activityMuteUntil) return;
+  // The owner's whole project lands as one big changeset right after a client
+  // connects; never narrate that settle as a flurry of "a track was added"
+  // notices. The time mute above covers the burst's tail; this covers a slow
+  // apply that outruns it (bootstrap flips true on the first applied state).
+  if (g_mode == Mode::ClientActive && !g_bootstrapSynced) return;
   const std::string key = std::string(code) + '|' + text;
   for (const auto& [k, when] : g_recentActivity)
     if (k == key && now - when < std::chrono::seconds(3)) return;
@@ -1102,6 +1116,15 @@ static void internalizeExternalMedia() {
 }
 
 static void captureLocalChanges() {
+  // Client: stay silent until the owner's first authoritative state has landed
+  // and re-baselined us (see g_bootstrapSynced). A short grace opens the gate
+  // even if that state never arrives (the download already equalled the doc),
+  // so a client is never muted forever.
+  if (g_mode == Mode::ClientActive && !g_bootstrapSynced) {
+    if (std::chrono::steady_clock::now() - g_clientActiveSince < std::chrono::seconds(3)) return;
+    g_bootstrapSynced = true;
+  }
+
   const int cc = GetProjectStateChangeCount(nullptr);
   const auto now = std::chrono::steady_clock::now();
   // Fast path: the project change counter moved (any undoable edit). Safety
@@ -1120,9 +1143,56 @@ static void captureLocalChanges() {
 
   internalizeExternalMedia();
   Snapshot snap = snapshotProject();
+
+  // Opaque chunk fields (FX chains, input FX, envelope blocks, receives) carry
+  // plugin state that re-serializes differently on every read even when nobody
+  // touched it: a meter or analyzer plugin bakes its live display buffer into
+  // its state chunk. On the bare 2s rescan (the change counter did NOT move, so
+  // REAPER itself considers nothing undoable to have happened) we therefore pin
+  // those fields back to the baseline, so that churn never becomes a phantom
+  // edit that the owner rejects ("change overridden") or admits (re-broadcast
+  // noise). A real FX edit bumps the counter and rides the fast path below,
+  // where the fresh value is kept. This is the core of the spurious-override
+  // fix; only scalar/structural changes (which can defer their undo point) need
+  // the rescan, and they are never pinned.
+  if (!counterMoved) {
+    for (auto& [guid, ts] : snap.tracks) {
+      auto b = g_snapshot.tracks.find(guid);
+      if (b == g_snapshot.tracks.end()) continue;  // a brand-new track: keep it whole
+      ts.fxchain = b->second.fxchain;
+      ts.recfx = b->second.recfx;
+      ts.env = b->second.env;
+      ts.recv = b->second.recv;
+    }
+    for (auto& [guid, is] : snap.items) {
+      auto b = g_snapshot.items.find(guid);
+      if (b != g_snapshot.items.end()) is.chunk = b->second.chunk;
+    }
+  }
+
   std::string changeset = diffSnapshots(g_snapshot, snap);
   g_snapshot = std::move(snap);
   if (changeset.empty()) return;  // change count moved for something we don't sync
+
+  // Opt-in diagnostic (launch REAPER with REAMESH_DEBUG_CAPTURE=1): name every
+  // (section / id / field) a capture is about to propose and whether the change
+  // counter moved. A field that streams here forever on RESCAN with no user
+  // action is a frame-instability leak to strip.
+  if (getenv("REAMESH_DEBUG_CAPTURE")) {
+    json cs = json::parse(changeset, nullptr, false);
+    std::string summary;
+    if (cs.is_object())
+      for (auto& sec : cs.items())
+        if (sec.value().is_object())
+          for (auto& ent : sec.value().items()) {
+            summary += sec.key() + "/" + ent.key().substr(0, 8) + "[";
+            if (ent.value().is_object())
+              for (auto& f : ent.value().items()) summary += f.key() + ",";
+            summary += "] ";
+          }
+    fprintf(stderr, "[reamesh] capture %s -> %s\n", counterMoved ? "COUNTER" : "RESCAN",
+            summary.c_str());
+  }
 
   reamesh_push_local(g_handle, changeset.c_str());
 }
@@ -1463,6 +1533,9 @@ static void applyRemoteChanges() {
 
   g_snapshot = snapshotProject();
   g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+  // The owner's authoritative state has landed and is now our baseline; a
+  // client may start proposing its own edits from here (see captureLocalChanges).
+  if (g_mode == Mode::ClientActive) g_bootstrapSynced = true;
   g_applyingRemote = false;
 }
 
@@ -1539,6 +1612,7 @@ static void leaveSession(const char* code, json params, const std::string& text)
   g_lastChangeCount = -1;
   g_lastPeerCount = 0;
   g_lastReverts = 0;
+  g_bootstrapSynced = false;
   if (!text.empty()) g_lastError = logEvent(code, std::move(params), text);
 }
 
@@ -1646,7 +1720,8 @@ static void onHost(const std::string& passphrase) {
     return;
   }
   g_mode = Mode::Hosting;
-  muteActivity(std::chrono::seconds(4));
+  g_bootstrapSynced = true;  // The owner is already the source of truth.
+  muteActivity(std::chrono::seconds(6));
   g_lastError = json();
   g_sessionProjectPath = path;
   g_snapshot = Snapshot{};
@@ -1994,7 +2069,16 @@ static void pushLocalPresence() {
 
   const int ps = GetPlayState();  // bit 0: playing, bit 2: recording
   const bool playing = (ps & 1) != 0;
-  const double play = playing ? GetPlayPosition() : GetCursorPosition();
+  // The edit cursor is "where I am"; the play cursor is "where the music is".
+  // Both ride the beacon so the overlay can draw a static caret for the edit
+  // cursor and a separate sweeping playhead while the peer is rolling.
+  const double cursor = GetCursorPosition();
+  const double play = playing ? GetPlayPosition() : cursor;
+
+  // Time selection / loop range: drawn as a translucent band across the tracks
+  // (REAPER's own selection, but colored per peer). Zero-length = no selection.
+  double tsa = 0, tsb = 0;
+  GetSet_LoopTimeRange(false, false, &tsa, &tsb, false);
 
   json seltr = json::array();
   for (int i = 0, n = CountSelectedTracks(nullptr); i < n && (int)seltr.size() < 128; ++i)
@@ -2004,7 +2088,8 @@ static void pushLocalPresence() {
   for (int i = 0, n = CountSelectedMediaItems(nullptr); i < n && (int)seli.size() < 128; ++i)
     if (MediaItem* it = GetSelectedMediaItem(nullptr, i)) seli.push_back(itemGuid(it));
 
-  json p = {{"focus", focus},   {"play", play},          {"playing", playing},
+  json p = {{"focus", focus}, {"play", play},       {"playing", playing},
+            {"cursor", cursor}, {"tsa", tsa},       {"tsb", tsb},
             {"seltr", std::move(seltr)}, {"seli", std::move(seli)}};
   static std::string last;
   std::string s = p.dump();
@@ -2033,9 +2118,12 @@ static void pollDownload() {
     g_lastChangeCount = GetProjectStateChangeCount(nullptr);
     g_applyingRemote = false;
     g_mode = Mode::ClientActive;
-    // The owner's full state lands as one big changeset right after this;
-    // don't narrate every track of it as an "added" event.
-    muteActivity(std::chrono::seconds(4));
+    // Don't propose anything until the owner's authoritative state has applied
+    // and re-baselined us; and don't narrate that settle (the whole project
+    // arriving as one changeset) as a flurry of "a track was added" events.
+    g_bootstrapSynced = false;
+    g_clientActiveSince = std::chrono::steady_clock::now();
+    muteActivity(std::chrono::seconds(6));
     g_sessionProjectPath = currentProjectPath();
     logEvent("connected", json::object(),
              "connected: your edits are proposals; the session owner wins conflicts");
