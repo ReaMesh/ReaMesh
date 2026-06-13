@@ -146,8 +146,10 @@ fn store_lang_pref(app: &AppHandle, pref: &str) {
 
 // Overlay visibility toggles, persisted backend-side as a small bitmask so the
 // native settings window AND the overlay webview share one source of truth.
-// Bits: roster=1, activity=2, playheads=4, ghosts=8 (must match
-// settings_window.h's kReaMeshOverlay* and overlaySettings.ts).
+// Bits: roster=1, tint=2, playheads=4, ghosts=8 (must match
+// settings_window.h's kReaMeshOverlay* and overlaySettings.ts). Bit 2 was the
+// retired "activity feed" toggle, reused for the locked-item tint so existing
+// installs keep it on without a migration.
 const OVERLAY_ALL: u8 = 0b1111;
 
 fn overlay_file(app: &AppHandle) -> Option<PathBuf> {
@@ -321,7 +323,7 @@ fn open_overlay(app: AppHandle, port: u16) -> Result<(), String> {
     Ok(())
 }
 
-/// The top-right HUD window (roster + activity + click-to-follow).
+/// The top-right HUD window (roster + click-to-follow).
 fn ensure_hud_overlay(app: &AppHandle, port: u16) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("overlay") {
         let _ = win.show();
@@ -770,7 +772,7 @@ mod native_settings {
         apply_language(app, pref);
     }
 
-    // Overlay toggles as a bitmask (roster=1, activity=2, playheads=4,
+    // Overlay toggles as a bitmask (roster=1, tint=2, playheads=4,
     // ghosts=8; see kReaMeshOverlay* in settings_window.h).
     extern "C" fn get_overlay(ctx: *mut c_void) -> i32 {
         load_overlay(handle(ctx)) as i32

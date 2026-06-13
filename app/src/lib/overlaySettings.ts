@@ -10,11 +10,17 @@ import { listen } from "@tauri-apps/api/event";
 export interface OverlaySettings {
   /** The participant roster (avatars + names + track numbers). */
   roster: boolean;
-  /** The one-line activity feed. */
-  activity: boolean;
+  /**
+   * The dark-grey tint painted on media items another peer is editing (their
+   * editing lock is live). Rendered by the REAPER extension, so flipping this
+   * is pushed to it over the control server (see connection.ts). Bit 2: reused
+   * from the retired "activity feed" toggle, so existing installs (where the
+   * activity bit was on by default) keep the tint on without a migration.
+   */
+  tint: boolean;
   /** Peer playheads drawn over the arrange view. */
   playheads: boolean;
-  /** Peer selection "ghosts" (tinted item/track outlines). */
+  /** Peer time-selection bands drawn over the arrange view. */
   ghosts: boolean;
 }
 
@@ -22,7 +28,7 @@ const KEY = "reamesh.overlay";
 const EVENT = "reamesh:overlay-settings";
 const DEFAULTS: OverlaySettings = {
   roster: true,
-  activity: true,
+  tint: true,
   playheads: true,
   ghosts: true,
 };
@@ -31,7 +37,7 @@ const DEFAULTS: OverlaySettings = {
 // `OVERLAY_ALL` mask.
 const BITS: Record<keyof OverlaySettings, number> = {
   roster: 1,
-  activity: 2,
+  tint: 2,
   playheads: 4,
   ghosts: 8,
 };
@@ -39,7 +45,7 @@ const BITS: Record<keyof OverlaySettings, number> = {
 function maskToSettings(mask: number): OverlaySettings {
   return {
     roster: !!(mask & BITS.roster),
-    activity: !!(mask & BITS.activity),
+    tint: !!(mask & BITS.tint),
     playheads: !!(mask & BITS.playheads),
     ghosts: !!(mask & BITS.ghosts),
   };
@@ -110,6 +116,16 @@ window.addEventListener("storage", (e) => {
   if (e.key === KEY) set(read());
 });
 window.addEventListener(EVENT, () => set(read()));
+
+/**
+ * Subscribe to overlay-settings changes outside React (e.g. the connection
+ * manager, which forwards the tint toggle to the extension). Returns an
+ * unsubscribe function.
+ */
+export function subscribeOverlaySettings(cb: () => void): () => void {
+  listeners.add(cb);
+  return () => listeners.delete(cb);
+}
 
 /** Subscribe a component to overlay-settings changes. */
 export function useOverlaySettings(): OverlaySettings {

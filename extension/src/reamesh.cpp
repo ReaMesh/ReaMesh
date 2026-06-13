@@ -230,6 +230,12 @@ static unsigned g_lastPeerCount = 0;
 // tinted state after every change) and so is never captured, proposed, or
 // written into anyone's .rpp. See reconcileItemTints / restoreAllItemTints.
 static std::map<std::string, int> g_itemTints;
+// Whether the dark-grey lock tint is painted at all. Toggled from the companion
+// app's overlay settings via the `set_tint` control command. The editing lock
+// itself (and the instant local snap-back of edits to a peer-locked item) is
+// unaffected: this only governs the *visual* tint, so "off" still means
+// gelockt = gelockt, just without the grey overlay.
+static bool g_tintEnabled = true;
 // Last session-ending event, shown by the app as an error toast. Structured
 // like a log entry ({code, params, text}); JSON null when there is none.
 static json g_lastError;
@@ -1124,6 +1130,9 @@ static void internalizeExternalMedia() {
   }
 }
 
+// Defined below, near the tint helpers (needs applyItem / lockedItemsByOthers).
+static void revertLockedItemEdits(Snapshot& snap);
+
 static void captureLocalChanges() {
   // Client: stay silent until the owner's first authoritative state has landed
   // and re-baselined us (see g_bootstrapSynced). A short grace opens the gate
@@ -1178,6 +1187,13 @@ static void captureLocalChanges() {
       if (b != g_snapshot.items.end()) is.chunk = b->second.chunk;
     }
   }
+
+  // Items another peer holds the editing lock on are read-only here: snap them
+  // back to the synced state at once (locally, no owner round-trip) and never
+  // propose the edit. This is the "gelockt = gelockt" guard: it also stops the
+  // grey lock tint from ever being captured/synced, since the reverted item
+  // keeps the authoritative baseline.
+  revertLockedItemEdits(snap);
 
   std::string changeset = diffSnapshots(g_snapshot, snap);
   g_snapshot = std::move(snap);
@@ -1694,7 +1710,10 @@ static void restoreAllItemTints() {
 // restore color therefore tracks the live synced color, never a stale snapshot.
 static void reconcileItemTints() {
   if (g_mode != Mode::Hosting && g_mode != Mode::ClientActive) return;
-  const std::set<std::string> desired = lockedItemsByOthers();
+  // When the tint is switched off in the app, paint nothing (the empty desired
+  // set restores every item to its real colour); the lock still binds: only
+  // the visual cue is gone.
+  const std::set<std::string> desired = g_tintEnabled ? lockedItemsByOthers() : std::set<std::string>{};
   const int tint = lockTintNative();
   bool changed = false;
 
@@ -1726,6 +1745,72 @@ static void reconcileItemTints() {
     // Re-baseline so the color writes are folded into the baseline and the next
     // capture diffs to nothing for these items. Mirrors applyRemoteChanges.
     g_snapshot = snapshotProject();
+    g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+  }
+  g_applyingRemote = false;
+}
+
+// Keep locked and tinted items out of the capture diff.
+//
+// Items another peer holds are restored to their last synced state locally,
+// without proposing an edit. Items in g_itemTints stay pinned to the baseline
+// even after their lock expires, until the tint is removed. This closes the
+// one-tick gap where an expired lock could let the grey color enter the diff.
+//
+// The local restore is echo-suppressed and re-baselines the change counter
+// without an undo point. Keep g_itemTints intact so the real color remains
+// available when the lock releases. Restore the owning track separately:
+// the item chunk does not encode it, and a drag may have changed tracks.
+static void revertLockedItemEdits(Snapshot& snap) {
+  const std::set<std::string> locked = lockedItemsByOthers();
+  if (locked.empty() && g_itemTints.empty()) return;
+
+  // Everything to keep out of the diff: items a peer actively locks (snapped
+  // back in REAPER too) plus anything we are currently tinting.
+  std::set<std::string> pinned = locked;
+  for (const auto& [guid, _] : g_itemTints) pinned.insert(guid);
+
+  bool reverted = false;
+  g_applyingRemote = true;
+  for (const std::string& guid : pinned) {
+    auto base = g_snapshot.items.find(guid);
+    if (base == g_snapshot.items.end()) continue;  // not a synced item we baseline
+    auto cur = snap.items.find(guid);
+    const bool deleted = cur == snap.items.end();
+    const bool moved = !deleted && cur->second.track != base->second.track;
+    const bool edited = !deleted && cur->second.chunk != base->second.chunk;
+    if (!deleted && !moved && !edited) continue;  // untouched this tick
+
+    // Only an item a peer ACTIVELY locks gets its REAPER edit snapped back; a
+    // merely-tinted (e.g. just-released) item is only pinned out of the diff so
+    // its grey colour can't leak: the user's edit is theirs to keep.
+    if (locked.count(guid)) {
+      if (MediaItem* it = findItemByGuid(guid)) {
+        // Put it back on its synced track first (setObjectStateChunk rebuilds the
+        // item but never moves it across tracks), then restore the chunk. This
+        // does NOT go through applyItem, so the tint record (real colour) survives.
+        if (moved)
+          if (MediaTrack* dst = findTrackByGuid(base->second.track))
+            if (GetMediaItem_Track(it) != dst) MoveMediaItemToTrack(it, dst);
+        if (MediaItem* it2 = findItemByGuid(guid))
+          setObjectStateChunk(it2, base->second.chunk);
+      } else {
+        // The user deleted a locked item: re-create it from the synced state.
+        // applyItem drops the tint record, so restore it afterward (same real
+        // colour): the re-created item already carries the tint colour from the
+        // baseline chunk, so reconcileItemTints then leaves it tinted.
+        const int real = g_itemTints.count(guid) ? g_itemTints[guid] : -1;
+        applyItem(guid, json{{"present", true},
+                             {"track", base->second.track},
+                             {"chunk", base->second.chunk}});
+        if (real != -1 && g_tintEnabled) g_itemTints[guid] = real;
+      }
+      reverted = true;
+    }
+    snap.items[guid] = base->second;  // pin: the capture diff proposes nothing for it
+  }
+  if (reverted) {
+    UpdateArrange();
     g_lastChangeCount = GetProjectStateChangeCount(nullptr);
   }
   g_applyingRemote = false;
@@ -1986,6 +2071,16 @@ static void ctlDispatch(const json& cmd) {
     onLeave();
   } else if (c == "reveal_peer") {
     revealPeer(jsonStr(cmd, "peer_id"));
+  } else if (c == "set_tint") {
+    // Companion app overlay setting: whether to paint the dark-grey lock tint.
+    const bool on = cmd.contains("on") && cmd["on"].is_boolean() ? cmd["on"].get<bool>() : true;
+    if (on != g_tintEnabled) {
+      g_tintEnabled = on;
+      // Turning it off: drop the grey at once (reconcileItemTints would catch up
+      // next tick anyway, but this is immediate). Turning it on: the next tick's
+      // reconcile re-applies whatever is still locked.
+      if (!on) restoreAllItemTints();
+    }
   }
 }
 

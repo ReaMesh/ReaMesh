@@ -1,11 +1,7 @@
 // Frameless presence HUD for peer names, colors, and focused tracks. Session
 // controls remain in the main companion window.
 //
-// Two states, one window:
-//   • expanded:  just a chevron in the header, the full roster + activity below
-//   • collapsed: the roster folds away, leaving the overlapping avatar stack
-//                 (the session title lives in REAPER's own title bar, so we
-//                 don't repeat it here)
+// Expanded shows the full roster. Collapsed shows the avatar stack.
 //
 // The OS window is sized to hug the card exactly (see the ResizeObserver
 // below) so its transparent area never swallows clicks meant for REAPER.
@@ -17,7 +13,6 @@ import { SlotText } from "slot-text/react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { t, useLang } from "@/lib/i18n";
-import { localizeLogEntry } from "@/lib/log";
 import { displayName, type Peer } from "@/lib/types";
 import { useOverlaySettings } from "@/lib/overlaySettings";
 import { useOverlayState } from "./useOverlayState";
@@ -35,17 +30,6 @@ function TrackNumber({ track }: { track?: number | null }) {
     />
   );
 }
-
-// Pure lifecycle/status codes: the overlay's one-line feed is for collaboration
-// activity (who did what), not connection chatter, so these never take the slot.
-const SKIP_LOG_CODES = new Set([
-  "browsing",
-  "hosting",
-  "joining",
-  "connected",
-  "download_complete",
-  "left",
-]);
 
 function PeerRow({
   peer,
@@ -153,11 +137,6 @@ export function Overlay({ port }: { port: number | null }) {
   }, []);
 
   const peers = state?.peers ?? [];
-  const log = state?.log ?? [];
-  // One line only: the single newest piece of collaboration activity, rolled
-  // smoothly with slot-text as it changes. Status chatter is filtered out.
-  const newest = [...log].reverse().find((e) => !SKIP_LOG_CODES.has(e.code));
-  const newestText = newest ? localizeLogEntry(newest) : "";
   const reveal = (peer: Peer) => send({ cmd: "reveal_peer", peer_id: peer.id });
 
   return (
@@ -230,16 +209,6 @@ export function Overlay({ port }: { port: number | null }) {
               </div>
             )}
 
-            {settings.activity && newestText && (
-              <div className="flex items-center gap-2 border-t border-white/10 px-2.5 py-2">
-                <span className="size-1.5 shrink-0 rounded-full bg-muted-foreground/60" />
-                <SlotText
-                  text={newestText}
-                  options={{ duration: 260, skipUnchanged: false }}
-                  className="block min-w-0 flex-1 overflow-hidden whitespace-nowrap text-[11px] text-muted-foreground"
-                />
-              </div>
-            )}
           </motion.div>
         )}
       </AnimatePresence>

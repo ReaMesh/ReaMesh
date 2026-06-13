@@ -28,7 +28,7 @@ if (params.get("overlay") === "1") {
   });
 } else if (params.get("arrange") === "1") {
   // The full-window, click-through overlay that draws peer playheads and
-  // selection ghosts over REAPER's arrange view.
+  // time-selection bands over REAPER's arrange view.
   document.documentElement.classList.add("arrange-window");
   const port = Number(params.get("port")) || null;
   import("./overlay/ArrangeOverlay").then(({ ArrangeOverlay }) => {

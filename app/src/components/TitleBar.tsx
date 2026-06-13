@@ -11,7 +11,7 @@ export function TitleBar() {
   return (
     <header
       data-tauri-drag-region
-      className="relative flex h-11 shrink-0 items-center border-b border-border bg-background/80 pl-[76px] pr-3"
+      className="relative flex h-11 shrink-0 items-center bg-background/80 pl-[76px] pr-3"
     >
       {instances.length > 1 && (
         <nav className="ml-auto flex items-center gap-1">

@@ -9,6 +9,7 @@
 import { useSyncExternalStore } from "react";
 import type { ExtState, Instance } from "./types";
 import { getProfile } from "./profile";
+import { getOverlaySettings, subscribeOverlaySettings } from "./overlaySettings";
 
 const PORTS = [47415, 47416, 47417, 47418];
 const RETRY_MS = 2000;
@@ -54,6 +55,7 @@ function connect(port: number) {
     live.set(port, { port });
     ensureActive();
     sendProfile(port);
+    sendTint(port);
     emit();
   };
   ws.onmessage = (ev) => {
@@ -89,6 +91,26 @@ export function startScanning() {
   const scan = () => PORTS.forEach(connect);
   scan();
   setInterval(scan, RETRY_MS);
+  // The lock tint is painted by the extension, so push the toggle to every
+  // connected instance whenever it changes (the initial value rides ws.onopen).
+  subscribeOverlaySettings(() => {
+    const tint = getOverlaySettings().tint;
+    if (tint === lastTintSent) return;
+    lastTintSent = tint;
+    for (const p of sockets.keys()) sendTint(p);
+  });
+}
+
+let lastTintSent: boolean | null = null;
+
+/** Tell the extension whether to paint the dark-grey lock tint. */
+export function sendTint(port?: number) {
+  const cmd = { cmd: "set_tint", on: getOverlaySettings().tint };
+  if (port !== undefined) {
+    send(cmd, port);
+  } else {
+    for (const p of sockets.keys()) send(cmd, p);
+  }
 }
 
 export function send(cmd: Record<string, unknown>, port?: number) {

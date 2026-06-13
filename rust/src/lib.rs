@@ -1919,6 +1919,13 @@ async fn run_network(
     // Session messages that failed to publish (nobody connected yet); retried
     // on the tick. Bounded so a long-dead session can't grow without limit.
     let mut retry_pubs: Vec<Vec<u8>> = Vec::new();
+    // Lock-table heartbeat (owner): the lock broadcast is normally edge-driven
+    // (only on change), so a single dropped "lock released" packet would strand
+    // a stale lock on a client, and its grey item tint with it. To self-heal,
+    // re-broadcast every tick while any lock is live, and for a short tail after
+    // the set empties (covers a dropped clear). Counts down to 0 when idle, so a
+    // session with nobody editing stays silent.
+    let mut lock_resend: i32 = 0;
 
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2173,6 +2180,7 @@ async fn run_network(
                         live_locks(&mut ds.locks, Instant::now())
                     };
                     let current: HashMap<FieldKey, String> = live.iter().cloned().collect();
+                    let current_empty = current.is_empty();
                     let changed = {
                         let mut last = shared.peer_locks.lock().unwrap();
                         if *last != current {
@@ -2182,7 +2190,16 @@ async fn run_network(
                             false
                         }
                     };
-                    if changed {
+                    // Heartbeat: keep resending while locks are live (refreshes
+                    // clients every tick so a dropped packet self-heals), and for
+                    // a few ticks after the set empties (so a dropped "released"
+                    // can't leave a tint stuck). Idle (no locks) goes quiet.
+                    if !current_empty {
+                        lock_resend = 4;
+                    } else {
+                        lock_resend = lock_resend.saturating_sub(1);
+                    }
+                    if changed || lock_resend > 0 {
                         let mut data = vec![TAG_LOCKS];
                         data.extend_from_slice(&lock_table_json(&live));
                         let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), data);

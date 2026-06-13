@@ -1,19 +1,15 @@
 #import "settings_window.h"
 #import <Cocoa/Cocoa.h>
 
-// Native macOS settings window: a real NSWindow with an NSToolbar in the
-// centered "preference" style (the System-Settings / Finder-Settings look),
-// switching between a General pane (REAPER folder) and an Extension pane
-// (install / update). All REAPER logic lives in Rust and is reached through
-// the SettingsCallbacks function pointers.
+// Native macOS Settings window with General and Overlay panes.
+// REAPER access goes through the Rust SettingsCallbacks interface.
 
 static NSString *const kTabGeneral = @"general";
-static NSString *const kTabExtension = @"extension";
 static NSString *const kTabOverlay = @"overlay";
 static NSString *const kReaperDownloadURL = @"https://www.reaper.fm/download.php";
 
 static const CGFloat kWindowWidth = 480;
-static const CGFloat kWindowHeight = 300;
+static const CGFloat kWindowHeight = 380;
 static const CGFloat kMargin = 24;
 
 // The window is bilingual (English/German), driven by the same stored
@@ -100,13 +96,13 @@ static ReaMeshSettingsController *gController = nil;
 #pragma mark - NSToolbarDelegate
 
 - (NSArray<NSToolbarItemIdentifier> *)toolbarDefaultItemIdentifiers:(NSToolbar *)t {
-    return @[ kTabGeneral, kTabExtension, kTabOverlay ];
+    return @[ kTabGeneral, kTabOverlay ];
 }
 - (NSArray<NSToolbarItemIdentifier> *)toolbarAllowedItemIdentifiers:(NSToolbar *)t {
-    return @[ kTabGeneral, kTabExtension, kTabOverlay ];
+    return @[ kTabGeneral, kTabOverlay ];
 }
 - (NSArray<NSToolbarItemIdentifier> *)toolbarSelectableItemIdentifiers:(NSToolbar *)t {
-    return @[ kTabGeneral, kTabExtension, kTabOverlay ];
+    return @[ kTabGeneral, kTabOverlay ];
 }
 
 - (NSToolbarItem *)toolbar:(NSToolbar *)toolbar
@@ -115,22 +111,16 @@ static ReaMeshSettingsController *gController = nil;
     NSToolbarItem *item = [[NSToolbarItem alloc] initWithItemIdentifier:identifier];
     item.target = self;
     item.action = @selector(tabSelected:);
-    if ([identifier isEqualToString:kTabGeneral]) {
-        item.label = L(@"General", @"Allgemein");
-        if (@available(macOS 11.0, *)) {
-            item.image = [NSImage imageWithSystemSymbolName:@"folder"
-                                   accessibilityDescription:item.label];
-        }
-    } else if ([identifier isEqualToString:kTabOverlay]) {
+    if ([identifier isEqualToString:kTabOverlay]) {
         item.label = L(@"Overlay", @"Overlay");
         if (@available(macOS 11.0, *)) {
             item.image = [NSImage imageWithSystemSymbolName:@"rectangle.on.rectangle"
                                    accessibilityDescription:item.label];
         }
     } else {
-        item.label = L(@"Extension", @"Erweiterung");
+        item.label = L(@"General", @"Allgemein");
         if (@available(macOS 11.0, *)) {
-            item.image = [NSImage imageWithSystemSymbolName:@"puzzlepiece.extension"
+            item.image = [NSImage imageWithSystemSymbolName:@"folder"
                                    accessibilityDescription:item.label];
         }
     }
@@ -168,9 +158,7 @@ static ReaMeshSettingsController *gController = nil;
     resolveUILanguage(self.cb.get_language(self.cb.ctx));
     self.window.title = L(@"ReaMesh Settings", @"ReaMesh-Einstellungen");
     ReaperStatusC st = self.cb.get_status(self.cb.ctx);
-    if ([identifier isEqualToString:kTabExtension]) {
-        [self buildExtensionPane:st];
-    } else if ([identifier isEqualToString:kTabOverlay]) {
+    if ([identifier isEqualToString:kTabOverlay]) {
         [self buildOverlayPane];
     } else {
         [self buildGeneralPane:st];
@@ -203,9 +191,9 @@ static ReaMeshSettingsController *gController = nil;
     int32_t mask = self.cb.get_overlay(self.cb.ctx);
     NSArray *rows = @[
         @[ @(kReaMeshOverlayRoster), L(@"Participants", @"Teilnehmer") ],
-        @[ @(kReaMeshOverlayActivity), L(@"Activity feed", @"Aktivität") ],
         @[ @(kReaMeshOverlayPlayheads), L(@"Peer playheads", @"Abspielpositionen") ],
-        @[ @(kReaMeshOverlayGhosts), L(@"Selection highlights", @"Auswahlen") ],
+        @[ @(kReaMeshOverlayGhosts), L(@"Time selection", @"Zeitauswahl") ],
+        @[ @(kReaMeshOverlayTint), L(@"Locked-item tint", @"Sperrtönung für Items") ],
     ];
     for (NSArray *row in rows) {
         int32_t bit = (int32_t)[row[0] integerValue];
@@ -306,13 +294,11 @@ static ReaMeshSettingsController *gController = nil;
         dl.frame = NSMakeRect(kMargin - 2, y, w, 20);
         dl.alignment = NSTextAlignmentLeft;
         [self.container addSubview:dl];
+        y += 28;
     }
-}
 
-- (void)buildExtensionPane:(ReaperStatusC)st {
-    CGFloat w = kWindowWidth - 2 * kMargin;
-    CGFloat y = kMargin;
-
+    // Extension status and install controls, followed by the restart reminder.
+    y += 12;
     [self.container addSubview:[self headerWithString:L(@"REAPER extension",
                                                         @"REAPER-Erweiterung")
                                                     y:y]];
@@ -321,36 +307,38 @@ static ReaMeshSettingsController *gController = nil;
     NSString *statusText;
     NSColor *statusColor;
     if (!st.installed) {
-        statusText = L(@"reaper_reamesh: Not installed", @"reaper_reamesh: Nicht installiert");
+        statusText = L(@"● Not installed", @"● Nicht installiert");
         statusColor = [NSColor secondaryLabelColor];
     } else if (st.up_to_date) {
-        statusText = L(@"reaper_reamesh: Installed", @"reaper_reamesh: Installiert");
+        statusText = L(@"● Installed", @"● Installiert");
         statusColor = [NSColor systemGreenColor];
     } else {
-        statusText = L(@"reaper_reamesh: Update available",
-                       @"reaper_reamesh: Update verfügbar");
+        statusText = L(@"● Update available", @"● Update verfügbar");
         statusColor = [NSColor systemOrangeColor];
     }
-    NSTextField *statusLabel =
-        [self labelWithString:statusText frame:NSMakeRect(kMargin, y, w, 18)];
-    statusLabel.textColor = statusColor;
-    statusLabel.font = [NSFont systemFontOfSize:13];
-    [self.container addSubview:statusLabel];
-    y += 34;
 
-    NSString *title = !st.installed
+    NSString *btnTitle = !st.installed
         ? L(@"Install extension", @"Erweiterung installieren")
         : st.up_to_date ? L(@"Reinstall extension", @"Erweiterung neu installieren")
                         : L(@"Update extension", @"Erweiterung aktualisieren");
-    NSButton *installBtn = [NSButton buttonWithTitle:title
+    CGFloat btnW = 230;
+    NSButton *installBtn = [NSButton buttonWithTitle:btnTitle
                                               target:self
                                               action:@selector(install:)];
-    installBtn.frame = NSMakeRect(kMargin, y, 230, 28);
+    installBtn.frame = NSMakeRect(kMargin + w - btnW, y, btnW, 28);
     installBtn.bezelStyle = NSBezelStyleRounded;
     installBtn.keyEquivalent = @"\r";
     installBtn.enabled = st.reaper_found ? YES : NO;
     [self.container addSubview:installBtn];
-    y += 40;
+
+    NSTextField *statusLabel =
+        [self labelWithString:statusText
+                        frame:NSMakeRect(kMargin, y + 4, w - btnW - 12, 18)];
+    statusLabel.textColor = statusColor;
+    statusLabel.font = [NSFont systemFontOfSize:13];
+    statusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.container addSubview:statusLabel];
+    y += 38;
 
     NSTextField *help = [self
         labelWithString:L(@"REAPER loads the extension at startup, so restart it "

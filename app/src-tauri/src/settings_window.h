@@ -24,9 +24,11 @@ enum {
 };
 
 // Overlay toggle bits (a bitmask shared with Rust + overlaySettings.ts).
+// Bit 2 was the retired "activity feed" toggle; it now drives the locked-item
+// tint, so existing installs (activity default-on) keep the tint on.
 enum {
     kReaMeshOverlayRoster = 1,
-    kReaMeshOverlayActivity = 2,
+    kReaMeshOverlayTint = 2,
     kReaMeshOverlayPlayheads = 4,
     kReaMeshOverlayGhosts = 8,
 };
