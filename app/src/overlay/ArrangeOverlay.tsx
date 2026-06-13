@@ -1,22 +1,23 @@
 // The full-window, click-through overlay that paints, directly over REAPER's
-// arrange view, where everyone else is: a thin colored playhead per peer and a
-// tinted "ghost" around the items they have selected ("Alice is holding these
-// three items"). It maps each peer's project-time / track GUID onto YOUR local
-// view using geometry the extension measures every tick (see computeArrangeView
-// in reamesh.cpp), so it stays correct whatever your layout or scroll position.
+// arrange view, where everyone else is: a live presence layer in the spirit of
+// Word/Figma cursors:
+//   • a labeled caret at each peer's edit cursor ("Alice is here"),
+//   • a separate sweeping playhead while they're rolling,
+//   • a translucent band over their time selection,
+//   • a tinted "ghost" around the items they hold, and a subtle accent on the
+//     tracks they have selected.
+// It maps each peer's project-time / track GUID onto YOUR local view using
+// geometry the extension measures every tick (computeArrangeView in
+// reamesh.cpp), so it stays correct whatever your layout or scroll position.
 //
 // Coordinate model: the extension reports geometry in REAPER SCREEN coordinates
-// (logical points, top-left origin; the extension already flips REAPER's
-// native bottom-left rects). The native layer sizes THIS window to cover
-// REAPER's whole window, so a screen point becomes window-relative by
-// subtracting the window's own screen origin, the single conversion below
-// (`relX`/`relY`). If alignment is ever off on a given machine, that origin (or
-// a constant) is the one knob.
-//
-// Two deliberate restraints keep it from being distracting: only the *items*
-// peers hold are outlined (never whole tracks), and everything is drawn muted
-// and semi-transparent. Peer playheads are interpolated between the ~1 Hz
-// presence beacons so a rolling playhead sweeps smoothly instead of stepping.
+// (logical points, top-left origin; it already flips REAPER's native
+// bottom-left rects). The native layer sizes THIS window to cover REAPER's whole
+// window, so a screen point becomes window-relative by subtracting the window's
+// own screen origin (`relX`/`relY`). That origin is tracked EVENT-DRIVEN (the
+// window moves/resizes exactly when REAPER does), not on a lazy poll; a stale
+// origin was the old "playhead in the wrong place / flickers when REAPER moves"
+// bug. If alignment is ever off on a given machine, that origin is the one knob.
 
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -25,26 +26,60 @@ import { displayName } from "@/lib/types";
 import { useOverlaySettings } from "@/lib/overlaySettings";
 import { useOverlayState } from "./useOverlayState";
 
-/** This window's top-left in logical screen points (it covers REAPER's window,
- *  so this is REAPER's window origin). Polled from Tauri as REAPER moves. */
+/** This window's top-left in logical screen points. The native layer pins this
+ *  window onto REAPER's frame, so this IS REAPER's window origin, and because
+ *  the window moves/resizes precisely when REAPER does, we learn the new origin
+ *  from Tauri's move/resize events (carrying the new position) instead of
+ *  polling, which used to lag ~90ms behind and misplace everything mid-move.
+ *  `null` until the first read, so we never paint at a bogus {0,0}. */
 function useWindowOrigin() {
-  const [origin, setOrigin] = useState({ x: 0, y: 0 });
+  const [origin, setOrigin] = useState<{ x: number; y: number } | null>(null);
   useEffect(() => {
     const win = getCurrentWindow();
     let alive = true;
-    const poll = async () => {
+    let scale = 1;
+    let lastX = Number.NaN;
+    let lastY = Number.NaN;
+    const cleanups: Array<() => void> = [];
+    const apply = (px: number, py: number) => {
+      const x = px / scale;
+      const y = py / scale;
+      if (!alive || (x === lastX && y === lastY)) return; // skip redundant renders
+      lastX = x;
+      lastY = y;
+      setOrigin({ x, y });
+    };
+    const readPos = async () => {
       try {
-        const [pos, scale] = await Promise.all([win.outerPosition(), win.scaleFactor()]);
-        if (alive) setOrigin({ x: pos.x / scale, y: pos.y / scale });
+        const pos = await win.outerPosition();
+        apply(pos.x, pos.y);
       } catch {
         /* plain-browser dev: no Tauri window APIs */
       }
     };
-    poll();
-    const id = window.setInterval(poll, 90);
+    (async () => {
+      try {
+        scale = await win.scaleFactor();
+        await readPos();
+        cleanups.push(await win.onMoved((e) => apply(e.payload.x, e.payload.y)));
+        cleanups.push(await win.onResized(() => void readPos()));
+        cleanups.push(
+          await win.onScaleChanged((e) => {
+            scale = e.payload.scaleFactor;
+            void readPos();
+          }),
+        );
+      } catch {
+        /* plain-browser dev */
+      }
+    })();
+    // Safety net for the rare change that emits no event (e.g. a display
+    // reconfiguration the window doesn't move through).
+    const id = window.setInterval(() => void readPos(), 500);
     return () => {
       alive = false;
       window.clearInterval(id);
+      for (const c of cleanups) c();
     };
   }, []);
   return origin;
@@ -52,9 +87,8 @@ function useWindowOrigin() {
 
 /** Per-peer baseline for playhead interpolation: the last play position we
  *  received and when it landed. While a peer is rolling, beacons arrive only
- *  ~1 Hz, so we extrapolate forward at 1x between them (REAPER's edit/play rate
- *  isn't beaconed; the next beacon corrects any drift). When the peer isn't
- *  playing, `play` is a static edit cursor and we show it as-is. */
+ *  ~1 Hz, so we extrapolate forward at 1x between them (REAPER's play rate
+ *  isn't beaconed; the next beacon corrects any drift). */
 interface PlayBase {
   play: number;
   at: number;
@@ -101,7 +135,7 @@ function useInterpolatedPlay(peers: Peer[]): (peer: Peer) => number | undefined 
   };
 }
 
-interface PlayheadDraw {
+interface CaretDraw {
   id: string;
   x: number;
   top: number;
@@ -109,11 +143,33 @@ interface PlayheadDraw {
   color: string;
   name: string;
 }
+interface HeadDraw {
+  id: string;
+  x: number;
+  top: number;
+  bottom: number;
+  color: string;
+}
+interface BandDraw {
+  id: string;
+  x: number;
+  w: number;
+  top: number;
+  bottom: number;
+  color: string;
+}
 interface GhostDraw {
   id: string;
   x: number;
   y: number;
   w: number;
+  h: number;
+  color: string;
+}
+interface TintDraw {
+  id: string;
+  x: number;
+  y: number;
   h: number;
   color: string;
 }
@@ -128,54 +184,85 @@ export function ArrangeOverlay({ port }: { port: number | null }) {
   const tracks = view?.tracks;
   const playAt = useInterpolatedPlay(peers);
 
-  // Nothing measurable (not in a session, or geometry unresolved) -> paint air.
-  if (!view || !tracks || view.spp <= 0) return null;
+  // Nothing measurable (origin not read yet, not in a session, or geometry
+  // unresolved) -> paint air.
+  if (!origin || !view || !tracks || view.spp <= 0) return null;
 
   const relX = (screenX: number) => screenX - origin.x;
   const relY = (screenY: number) => screenY - origin.y;
   const timeToX = (t: number) => relX(view.ax + (t - view.t0) / view.spp);
   const arrangeLeft = relX(view.ax);
+  const top = relY(view.top);
+  const bottom = relY(view.bottom);
   const winW = window.innerWidth;
+  const visibleX = (x: number) => x >= arrangeLeft - 1 && x <= winW + 1;
+  const clampX = (x: number) => Math.max(arrangeLeft, Math.min(x, winW));
 
-  const playheads: PlayheadDraw[] = [];
+  const carets: CaretDraw[] = [];
+  const heads: HeadDraw[] = [];
+  const bands: BandDraw[] = [];
   const ghosts: GhostDraw[] = [];
+  const tints: TintDraw[] = [];
 
+  let peerIndex = 0;
   for (const peer of peers) {
     if (peer.is_self) continue;
     const color = peer.color || "#888";
+    const idx = peerIndex++;
 
     if (settings.playheads) {
-      const play = playAt(peer);
-      if (typeof play === "number") {
-        const x = timeToX(play);
-        if (x >= arrangeLeft - 1 && x <= winW + 1) {
-          playheads.push({
-            id: peer.id,
-            x,
-            top: relY(view.top),
-            bottom: relY(view.bottom),
-            color,
-            name: displayName(peer),
-          });
+      // Edit-cursor caret: the "Alice is here" marker, always shown. Falls
+      // back to the play field for an older extension that doesn't beacon a
+      // separate edit cursor.
+      const caretPos = typeof peer.cursor === "number" ? peer.cursor : peer.play;
+      if (typeof caretPos === "number") {
+        const x = timeToX(caretPos);
+        if (visibleX(x)) {
+          carets.push({ id: peer.id, x, top, bottom, color, name: displayName(peer) });
+        }
+      }
+      // Sweeping playhead: only while they're actually rolling, so a stopped
+      // peer is just a calm caret, not a redundant second line.
+      if (peer.playing) {
+        const play = playAt(peer);
+        if (typeof play === "number") {
+          const x = timeToX(play);
+          if (visibleX(x)) heads.push({ id: peer.id, x, top, bottom, color });
         }
       }
     }
 
-    // Selection ghosts: only the *items* a peer is holding (never whole tracks
-    // because that lit up the entire row and was far too loud).
     if (settings.ghosts) {
+      // Time selection: a translucent band across the tracks (their loop /
+      // time range, colored as them).
+      if (typeof peer.tsa === "number" && typeof peer.tsb === "number" && peer.tsb > peer.tsa) {
+        const x1 = clampX(timeToX(peer.tsa));
+        const x2 = clampX(timeToX(peer.tsb));
+        if (x2 - x1 >= 1) bands.push({ id: peer.id, x: x1, w: x2 - x1, top, bottom, color });
+      }
+      // Item ghosts: outline the items the peer holds.
       for (const guid of peer.seli ?? []) {
         const it = view.items?.[guid];
         const tr = it && tracks[it.tr];
         if (!it || !tr) continue;
+        const x = timeToX(it.pos);
+        if (!visibleX(x) && !visibleX(x + it.len / view.spp)) continue;
         ghosts.push({
           id: `${peer.id}:it:${guid}`,
-          x: timeToX(it.pos),
+          x,
           y: relY(tr.y),
           w: Math.max(2, it.len / view.spp),
           h: tr.h,
           color,
         });
+      }
+      // Track selection: a subtle per-peer accent bar at the left edge of each
+      // selected row (never a full-row flood; that was far too loud). Peers
+      // stack side by side so two people on one track both read.
+      for (const guid of peer.seltr ?? []) {
+        const tr = tracks[guid];
+        if (!tr) continue;
+        tints.push({ id: `${peer.id}:tr:${guid}`, x: arrangeLeft + idx * 4, y: relY(tr.y), h: tr.h, color });
       }
     }
   }
@@ -184,6 +271,25 @@ export function ArrangeOverlay({ port }: { port: number | null }) {
     <svg
       style={{ position: "fixed", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}
     >
+      {/* Track accents and selection bands sit behind everything else. */}
+      {tints.map((s) => (
+        <rect key={s.id} x={s.x} y={s.y} width={3} height={s.h} fill={s.color} fillOpacity={0.5} />
+      ))}
+      {bands.map((b) => (
+        <g key={b.id}>
+          <rect x={b.x} y={b.top} width={b.w} height={b.bottom - b.top} fill={b.color} fillOpacity={0.07} />
+          <line x1={b.x} y1={b.top} x2={b.x} y2={b.bottom} stroke={b.color} strokeOpacity={0.35} strokeWidth={1} />
+          <line
+            x1={b.x + b.w}
+            y1={b.top}
+            x2={b.x + b.w}
+            y2={b.bottom}
+            stroke={b.color}
+            strokeOpacity={0.35}
+            strokeWidth={1}
+          />
+        </g>
+      ))}
       {ghosts.map((g) => (
         <rect
           key={g.id}
@@ -199,18 +305,18 @@ export function ArrangeOverlay({ port }: { port: number | null }) {
           strokeWidth={1}
         />
       ))}
-      {playheads.map((p) => (
-        <g key={p.id}>
-          <line
-            x1={p.x}
-            y1={p.top}
-            x2={p.x}
-            y2={p.bottom}
-            stroke={p.color}
-            strokeWidth={1.5}
-            strokeOpacity={0.5}
-          />
-          {/* Small, low-key name tab at the top of the line. */}
+      {/* Sweeping playheads: brighter line + a small ▶ at the top. */}
+      {heads.map((p) => (
+        <g key={`h:${p.id}`}>
+          <line x1={p.x} y1={p.top} x2={p.x} y2={p.bottom} stroke={p.color} strokeWidth={1.5} strokeOpacity={0.6} />
+          <path d={`M ${p.x} ${p.top} l 7 0 l -3.5 6 z`} fill={p.color} fillOpacity={0.85} />
+        </g>
+      ))}
+      {/* Edit-cursor carets: thin line + a low-key name tab. Drawn last so the
+          labels sit on top of bands/ghosts. */}
+      {carets.map((p) => (
+        <g key={`c:${p.id}`}>
+          <line x1={p.x} y1={p.top} x2={p.x} y2={p.bottom} stroke={p.color} strokeWidth={1} strokeOpacity={0.7} />
           <rect
             x={p.x}
             y={p.top}
@@ -218,7 +324,7 @@ export function ArrangeOverlay({ port }: { port: number | null }) {
             height={13}
             rx={2}
             fill={p.color}
-            fillOpacity={0.75}
+            fillOpacity={0.8}
           />
           <text x={p.x + 4} y={p.top + 9.5} fontSize={9} fontWeight={600} fill="#fff" fillOpacity={0.95}>
             {p.name}

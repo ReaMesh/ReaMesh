@@ -91,17 +91,24 @@ function useErrorToasts(state: ExtState | undefined) {
  *  Fires in either role, since the lock binds the host too. Debounced so a quick
  *  back-and-forth can't stack notices. */
 function useOverrideToasts(state: ExtState | undefined) {
-  const prev = useRef<{ mode?: Mode; count: number; lastAt: number }>({ count: 0, lastAt: 0 });
+  const prev = useRef<{ mode?: Mode; count: number; lastAt: number; enteredAt: number }>({
+    count: 0,
+    lastAt: 0,
+    enteredAt: 0,
+  });
   useEffect(() => {
     const count = state?.overridden ?? 0;
     const sameSession = prev.current.mode === state?.mode;
     const inSession = state?.mode === "client" || state?.mode === "hosting";
     const now = Date.now();
+    if (inSession && !sameSession) prev.current.enteredAt = now; // just joined/started
     if (
       inSession &&
       sameSession &&
       count > prev.current.count &&
-      now - prev.current.lastAt > 4000
+      now - prev.current.lastAt > 4000 &&
+      // Suppress conflict notices during the initial synchronization grace period.
+      now - prev.current.enteredAt > 3000
     ) {
       // The most recent lock event carries the track and who's editing it; fall
       // back to the generic notice when the extension couldn't resolve them.

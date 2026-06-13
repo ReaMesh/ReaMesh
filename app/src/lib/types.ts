@@ -17,11 +17,18 @@ export interface Peer {
    *  locally from their broadcast track GUID. Absent/0 when they're not on a
    *  track (or an older extension that doesn't report focus). */
   track?: number | null;
-  /** Peer's playhead in project seconds (edit cursor, or play position while
-   *  rolling). For peer playheads in the arrange overlay. */
+  /** Peer's play cursor in project seconds (sweeps while `playing`). Drawn as a
+   *  sweeping playhead in the arrange overlay. */
   play?: number;
   /** True while the peer's transport is rolling (their playhead is sweeping). */
   playing?: boolean;
+  /** Peer's edit cursor in project seconds, drawn as a static caret, distinct
+   *  from the play cursor. */
+  cursor?: number;
+  /** Peer's time selection / loop range in project seconds, drawn as a
+   *  translucent band across the tracks. Equal values = no selection. */
+  tsa?: number;
+  tsb?: number;
   /** GUIDs of the tracks / items the peer has selected, drawn as tinted
    *  "ghosts" in the arrange overlay. */
   seltr?: string[];
