@@ -88,4 +88,20 @@
   html.overlay-window ::-webkit-scrollbar {
     display: none;
   }
+  /* The arrange overlay fills REAPER's whole window: transparent, no scrollbars,
+     and pointer-events:none so clicks always fall through to REAPER even if the
+     native click-through bit ever lapsed. */
+  html.arrange-window,
+  html.arrange-window body,
+  html.arrange-window #root {
+    height: 100%;
+    width: 100%;
+    margin: 0;
+    background: transparent;
+    overflow: hidden;
+    pointer-events: none;
+  }
+  html.arrange-window ::-webkit-scrollbar {
+    display: none;
+  }
 }

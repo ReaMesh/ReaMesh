@@ -105,7 +105,12 @@ const en = {
   connecting: "Connecting…",
   expand: "Expand",
   collapse: "Collapse",
-  revealPeerTrack: "Jump to {name}’s track",
+  revealPeerTrack: "Jump to {name}",
+  overlaySettingsTitle: "Overlay",
+  olRoster: "Roster",
+  olActivity: "Activity",
+  olPlayheads: "Playheads",
+  olSelections: "Selections",
 
   // Activity-log / error events from the extension, rendered by code (see
   // lib/log.ts). `text` on the wire is the English fallback for unknown codes.
@@ -233,7 +238,12 @@ const de: Record<MsgKey, string> = {
   connecting: "Verbinde…",
   expand: "Ausklappen",
   collapse: "Einklappen",
-  revealPeerTrack: "Zu {name}s Spur springen",
+  revealPeerTrack: "Zu {name} springen",
+  overlaySettingsTitle: "Overlay",
+  olRoster: "Teilnehmer",
+  olActivity: "Aktivität",
+  olPlayheads: "Abspielpositionen",
+  olSelections: "Auswahlen",
 
   hostEndedSession: "Der Host hat die Session beendet.",
   hostLost: "Verbindung zum Host verloren.",

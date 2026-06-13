@@ -46,6 +46,25 @@ export interface LogEntry {
   text: string;
 }
 
+/** Live arrange-view geometry for the peer-playhead / selection-ghost overlay,
+ *  in REAPER SCREEN coordinates (logical points). The arrange overlay window
+ *  covers REAPER's whole window, so it converts these to window-relative by
+ *  subtracting its own screen origin. `{}` (no `tracks`) means nothing to draw. */
+export interface ArrangeView {
+  /** Screen x of the arrange's left edge (right edge of the track panels). */
+  ax: number;
+  /** Project time at the arrange's left edge, and seconds per horizontal pixel. */
+  t0: number;
+  spp: number;
+  /** Screen y of the top / bottom of the visible track stack (playhead span). */
+  top: number;
+  bottom: number;
+  /** Per-track screen rect (reflects vertical scroll), keyed by track GUID. */
+  tracks?: Record<string, { y: number; h: number }>;
+  /** Geometry of every item some peer has selected, keyed by item GUID. */
+  items?: Record<string, { tr: string; pos: number; len: number }>;
+}
+
 export interface ExtState {
   mode: Mode;
   /** Rust-side session state: hosting|browsing|connecting|downloading|ready|failed|ended */
@@ -63,6 +82,8 @@ export interface ExtState {
   reconnecting?: boolean;
   sessions: SessionAd[];
   peers: Peer[];
+  /** Local arrange-view geometry for the playhead/ghost overlay (may be `{}`). */
+  view?: ArrangeView;
 }
 
 /** One running REAPER instance (= one control server port). */

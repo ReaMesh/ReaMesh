@@ -12,13 +12,18 @@
 
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { ChevronUp, Crown } from "lucide-react";
+import { Check, ChevronUp, Crown, SlidersHorizontal } from "lucide-react";
 import { SlotText } from "slot-text/react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { t, useLang } from "@/lib/i18n";
 import { localizeLogEntry } from "@/lib/log";
 import { displayName, type Peer } from "@/lib/types";
+import {
+  type OverlaySettings,
+  setOverlaySetting,
+  useOverlaySettings,
+} from "@/lib/overlaySettings";
 import { useOverlayState } from "./useOverlayState";
 
 const WIDTH = 232;
@@ -120,9 +125,48 @@ function AvatarStack({ peers }: { peers: Peer[] }) {
   );
 }
 
+const TOGGLES: { key: keyof OverlaySettings; label: () => string }[] = [
+  { key: "roster", label: () => t("olRoster") },
+  { key: "activity", label: () => t("olActivity") },
+  { key: "playheads", label: () => t("olPlayheads") },
+  { key: "ghosts", label: () => t("olSelections") },
+];
+
+/** The overlay's own settings: which pieces to show. */
+function SettingsPanel({ settings }: { settings: OverlaySettings }) {
+  return (
+    <div className="flex flex-col gap-0.5 border-t border-white/10 px-1.5 py-1.5">
+      {TOGGLES.map((row) => {
+        const on = settings[row.key];
+        return (
+          <button
+            key={row.key}
+            type="button"
+            onClick={() => setOverlaySetting(row.key, !on)}
+            className="flex items-center gap-2 rounded-md px-1.5 py-1 text-left text-[12px] transition-colors hover:bg-white/5"
+          >
+            <span
+              className={`grid size-3.5 shrink-0 place-items-center rounded-[4px] border ${
+                on
+                  ? "border-white/30 bg-white/80 text-background"
+                  : "border-white/20 text-transparent"
+              }`}
+            >
+              <Check className="size-2.5" strokeWidth={3} />
+            </span>
+            <span className="flex-1 text-foreground/80">{row.label()}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 export function Overlay({ port }: { port: number | null }) {
   const { state, send } = useOverlayState(port);
   const [collapsed, setCollapsed] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const settings = useOverlaySettings();
   const cardRef = useRef<HTMLDivElement>(null);
   useLang(); // re-render on language change
 
@@ -173,7 +217,7 @@ export function Overlay({ port }: { port: number | null }) {
           className="flex min-w-0 flex-1 items-center"
         >
           <AnimatePresence initial={false}>
-            {collapsed && peers.length > 0 && (
+            {collapsed && settings.roster && peers.length > 0 && (
               <motion.div
                 key="stack"
                 initial={{ opacity: 0, scale: 0.85, x: -4 }}
@@ -186,6 +230,20 @@ export function Overlay({ port }: { port: number | null }) {
             )}
           </AnimatePresence>
         </div>
+        <button
+          type="button"
+          onClick={() => {
+            setCollapsed(false);
+            setShowSettings((s) => !s);
+          }}
+          aria-label={t("overlaySettingsTitle")}
+          title={t("overlaySettingsTitle")}
+          className={`grid size-6 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/5 hover:text-foreground ${
+            showSettings ? "text-foreground" : "text-muted-foreground"
+          }`}
+        >
+          <SlidersHorizontal className="size-3.5" />
+        </button>
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}
@@ -212,21 +270,25 @@ export function Overlay({ port }: { port: number | null }) {
             transition={{ type: "spring", stiffness: 400, damping: 38 }}
             style={{ overflow: "hidden" }}
           >
-            <div className="border-t border-white/10 px-1.5 py-1.5">
-              {peers.length === 0 ? (
-                <p className="px-1.5 py-1 text-[12px] text-muted-foreground">
-                  {t("connecting")}
-                </p>
-              ) : (
-                <AnimatePresence initial={false} mode="popLayout">
-                  {peers.map((p) => (
-                    <PeerRow key={p.id} peer={p} onReveal={reveal} />
-                  ))}
-                </AnimatePresence>
-              )}
-            </div>
+            {showSettings && <SettingsPanel settings={settings} />}
 
-            {newestText && (
+            {settings.roster && (
+              <div className="border-t border-white/10 px-1.5 py-1.5">
+                {peers.length === 0 ? (
+                  <p className="px-1.5 py-1 text-[12px] text-muted-foreground">
+                    {t("connecting")}
+                  </p>
+                ) : (
+                  <AnimatePresence initial={false} mode="popLayout">
+                    {peers.map((p) => (
+                      <PeerRow key={p.id} peer={p} onReveal={reveal} />
+                    ))}
+                  </AnimatePresence>
+                )}
+              </div>
+            )}
+
+            {settings.activity && newestText && (
               <div className="flex items-center gap-2 border-t border-white/10 px-2.5 py-2">
                 <span className="size-1.5 shrink-0 rounded-full bg-muted-foreground/60" />
                 <SlotText

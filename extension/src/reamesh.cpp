@@ -1744,6 +1744,91 @@ static void ctlDispatch(const json& cmd) {
   }
 }
 
+// Geometry for the arrange overlay (peer playheads + selection ghosts), in
+// REAPER SCREEN coordinates (logical points, top-left origin). The overlay
+// window covers REAPER's whole main window, so the webview converts to
+// window-relative by subtracting its own screen origin, which is why we never
+// need the arrange VIEWPORT rect (REAPER doesn't expose it through the stable
+// API). Per-track `P_UI_RECT:tcp.size` already reflects vertical scroll, and the
+// time axis comes from GetSet_ArrangeView2; together they're enough.
+//
+// The exact P_UI_RECT string format and screen-coordinate space want a one-time
+// on-device check, so the first raw rect is logged to stderr. Returns {} when
+// there's nothing to draw (not in a session, or no resolvable geometry).
+static json computeArrangeView(const json& peers) {
+  if (g_mode != Mode::Hosting && g_mode != Mode::ClientActive) return json::object();
+
+  // Time axis: t0 = project time at the arrange's left edge; spp = seconds per
+  // horizontal pixel (from the time at two x offsets, 0 and 1000).
+  double t0 = 0, t1 = 0, a = 0, b = 0;
+  GetSet_ArrangeView2(nullptr, false, 0, 0, &t0, &t1);
+  GetSet_ArrangeView2(nullptr, false, 0, 1000, &a, &b);
+  const double spp = (b - a) / 1000.0;
+  if (!(spp > 0.0)) return json::object();
+
+  // Per-track screen rects. P_UI_RECT reflects the live vertical scroll, so a
+  // track's y is correct right now; the arrange's left x is the right edge of
+  // the (uniform-width) TCP.
+  json tracks = json::object();
+  double ax = 0;
+  bool haveAx = false;
+  double top = 0, bottom = 0;
+  bool haveSpan = false;
+  static bool loggedRect = false;
+  const int n = CountTracks(nullptr);
+  for (int i = 0; i < n; ++i) {
+    MediaTrack* tr = GetTrack(nullptr, i);
+    if (!tr) continue;
+    char buf[128] = {0};
+    if (!GetSetMediaTrackInfo_String(tr, "P_UI_RECT:tcp.size", buf, false)) continue;
+    if (!loggedRect) {
+      fprintf(stderr, "[reamesh] P_UI_RECT:tcp.size = \"%s\"\n", buf);
+      loggedRect = true;
+    }
+    double rx = 0, ry = 0, rw = 0, rh = 0;
+    if (sscanf(buf, "%lf %lf %lf %lf", &rx, &ry, &rw, &rh) != 4) continue;
+    if (rh <= 0) continue;  // collapsed / hidden
+    if (!haveAx) {
+      ax = rx + rw;
+      haveAx = true;
+    }
+    if (!haveSpan) {
+      top = ry;
+      bottom = ry + rh;
+      haveSpan = true;
+    } else {
+      if (ry < top) top = ry;
+      if (ry + rh > bottom) bottom = ry + rh;
+    }
+    tracks[trackGuid(tr)] = {{"y", ry}, {"h", rh}};
+  }
+  if (!haveAx) return json::object();
+
+  // Items any peer has selected -> their owning track + position/length, so the
+  // overlay can outline what each person is "holding".
+  json items = json::object();
+  if (peers.is_array()) {
+    for (const auto& p : peers) {
+      if (!p.is_object() || !p.contains("seli") || !p["seli"].is_array()) continue;
+      for (const auto& g : p["seli"]) {
+        if (!g.is_string()) continue;
+        const std::string ig = g.get<std::string>();
+        if (items.contains(ig)) continue;
+        MediaItem* it = findItemByGuid(ig);
+        if (!it) continue;
+        MediaTrack* itr = GetMediaItem_Track(it);
+        items[ig] = {{"tr", itr ? trackGuid(itr) : std::string()},
+                     {"pos", GetMediaItemInfo_Value(it, "D_POSITION")},
+                     {"len", GetMediaItemInfo_Value(it, "D_LENGTH")}};
+      }
+    }
+  }
+
+  return json{{"ax", ax},   {"t0", t0},         {"spp", spp},
+              {"top", top}, {"bottom", bottom}, {"tracks", std::move(tracks)},
+              {"items", std::move(items)}};
+}
+
 static void ctlTick() {
   for (;;) {
     char* raw = reamesh_ctl_poll();
@@ -1830,6 +1915,7 @@ static void ctlTick() {
   if (session.empty() && !g_sessionProjectPath.empty()) session = fileStem(g_sessionProjectPath);
   state["session"] = session;
   state["sessions"] = handleJson(reamesh_sessions, json::array());
+  state["view"] = computeArrangeView(peers);
   state["peers"] = std::move(peers);
 
   static std::string lastPublished;

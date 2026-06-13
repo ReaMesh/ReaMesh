@@ -17,4 +17,14 @@ void reamesh_overlay_attach(void *ns_window, double width);
 // Called from close_overlay before the window is closed.
 void reamesh_overlay_detach(void);
 
+// Register a second Tauri NSWindow as the full-window, click-through arrange
+// overlay. It follows REAPER's main window and shares the HUD's
+// show-only-when-REAPER-frontmost visibility; the webview paints peer
+// playheads/ghosts into it. Attach the HUD first. Idempotent.
+void reamesh_overlay_attach_arrange(void *ns_window);
+
+// Forget the arrange overlay window (orders it out). Called from close_overlay
+// before that window is closed.
+void reamesh_overlay_detach_arrange(void);
+
 #endif

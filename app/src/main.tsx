@@ -26,6 +26,18 @@ if (params.get("overlay") === "1") {
       </React.StrictMode>,
     );
   });
+} else if (params.get("arrange") === "1") {
+  // The full-window, click-through overlay that draws peer playheads and
+  // selection ghosts over REAPER's arrange view.
+  document.documentElement.classList.add("arrange-window");
+  const port = Number(params.get("port")) || null;
+  import("./overlay/ArrangeOverlay").then(({ ArrangeOverlay }) => {
+    root.render(
+      <React.StrictMode>
+        <ArrangeOverlay port={port} />
+      </React.StrictMode>,
+    );
+  });
 } else {
   import("./App").then(({ default: App }) => {
     root.render(

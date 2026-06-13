@@ -50,6 +50,7 @@ static const NSTimeInterval kDragPause = 0.25; // suspend follow during a drag
 @property (assign) CGWindowID cachedWindowID; // REAPER's main window, re-resolved when stale
 @property (assign) NSTimeInterval nextWindowScan; // throttle for failed full scans
 @property (strong) NSTimer *visibilityTimer; // always-running show/hide supervisor (followLink suspends while hidden)
+@property (strong) NSWindow *arrangeWindow;  // full-REAPER-window, click-through overlay for peer playheads/ghosts
 @end
 
 static ReaMeshOverlayController *gOverlay = nil;
@@ -176,6 +177,16 @@ static ReaMeshOverlayController *gOverlay = nil;
     CGFloat h = NSHeight(frame); // Read again because the webview resizes it.
     CGFloat H = [self primaryScreenHeight];
 
+    // Arrange overlay (if present): cover REAPER's whole window so its webview
+    // can paint peer playheads/ghosts in window-relative coordinates. CG
+    // top-left rect -> AppKit bottom-left frame.
+    if (self.arrangeWindow) {
+        NSRect af = NSMakeRect(r.origin.x, H - r.origin.y - r.size.height,
+                               r.size.width, r.size.height);
+        if (!NSEqualRects(af, self.arrangeWindow.frame))
+            [self.arrangeWindow setFrame:af display:YES];
+    }
+
     // Anchor the overlay's top-right corner to REAPER's top-right + offset.
     CGFloat overlayRightX_cg = (r.origin.x + r.size.width) + self.userOffset.x;
     CGFloat overlayTopY_cg = r.origin.y + self.userOffset.y;
@@ -215,13 +226,21 @@ static ReaMeshOverlayController *gOverlay = nil;
     if (want == self.visible) return;
     self.visible = want;
     if (want) {
-        [self reposition]; // place before it's seen
+        [self reposition]; // place before it's seen (positions both windows)
         [self.panel setAlphaValue:0.0];
         [self.panel orderFront:nil];
         [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
             ctx.duration = 0.18;
             [self.panel.animator setAlphaValue:1.0];
         }];
+        if (self.arrangeWindow) {
+            [self.arrangeWindow setAlphaValue:0.0];
+            [self.arrangeWindow orderFront:nil];
+            [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
+                ctx.duration = 0.18;
+                [self.arrangeWindow.animator setAlphaValue:1.0];
+            }];
+        }
     } else {
         [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
             ctx.duration = 0.15;
@@ -230,6 +249,15 @@ static ReaMeshOverlayController *gOverlay = nil;
             };
             [self.panel.animator setAlphaValue:0.0];
         }];
+        if (self.arrangeWindow) {
+            [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
+                ctx.duration = 0.15;
+                ctx.completionHandler = ^{
+                    if (!self.visible) [self.arrangeWindow orderOut:nil];
+                };
+                [self.arrangeWindow.animator setAlphaValue:0.0];
+            }];
+        }
     }
 }
 
@@ -361,6 +389,12 @@ static ReaMeshOverlayController *gOverlay = nil;
     self.followTimer = nil;
     [self.visibilityTimer invalidate];
     self.visibilityTimer = nil;
+    // The arrange window is a plain (un-subclassed) Tauri window; just forget
+    // it here; the Rust side closes it. Order it out so it can't linger.
+    if (self.arrangeWindow) {
+        [self.arrangeWindow orderOut:nil];
+        self.arrangeWindow = nil;
+    }
     [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
     if (self.panel) {
         NSPanel *panel = self.panel;
@@ -379,6 +413,39 @@ static ReaMeshOverlayController *gOverlay = nil;
     }
 }
 
+#pragma mark - Arrange overlay (full-window, click-through)
+
+// A second Tauri window that covers REAPER's whole main window and lets clicks
+// pass straight through (ignoresMouseEvents). It is NOT panel-ized (it never
+// takes input), so there's no class swap to undo. Its frame is driven by
+// `reposition` (fill REAPER's window) and its visibility by the same
+// REAPER-frontmost logic as the HUD; the webview only paints into it.
+- (void)attachArrange:(NSWindow *)window {
+    window.ignoresMouseEvents = YES;
+    window.level = NSFloatingWindowLevel;
+    window.collectionBehavior |= (NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                  NSWindowCollectionBehaviorFullScreenAuxiliary |
+                                  NSWindowCollectionBehaviorStationary);
+    window.hidesOnDeactivate = NO;
+    [window setAlphaValue:0.0];
+    [window orderOut:nil];
+    self.arrangeWindow = window;
+    // If the HUD is already showing (REAPER frontmost), place and reveal it now;
+    // otherwise the next visibility tick brings it in.
+    if (self.visible) {
+        [self reposition];
+        [window setAlphaValue:1.0];
+        [window orderFront:nil];
+    }
+}
+
+- (void)detachArrange {
+    if (self.arrangeWindow) {
+        [self.arrangeWindow orderOut:nil];
+        self.arrangeWindow = nil;
+    }
+}
+
 @end
 
 #pragma mark - C ABI
@@ -393,4 +460,15 @@ void reamesh_overlay_attach(void *ns_window, double width) {
 
 void reamesh_overlay_detach(void) {
     if (gOverlay) [gOverlay detach];
+}
+
+void reamesh_overlay_attach_arrange(void *ns_window) {
+    if (!ns_window) return;
+    NSWindow *window = (__bridge NSWindow *)ns_window;
+    if (!gOverlay) gOverlay = [[ReaMeshOverlayController alloc] init];
+    [gOverlay attachArrange:window];
+}
+
+void reamesh_overlay_detach_arrange(void) {
+    if (gOverlay) [gOverlay detachArrange];
 }
