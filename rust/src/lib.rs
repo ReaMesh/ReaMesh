@@ -286,8 +286,20 @@ struct PeerPresence {
     color: String,
     /// GUID of the track this peer is currently focused on ("" if none).
     focus: String,
+    /// Edit-cursor (or, while playing, play) position in project seconds.
+    play: f64,
+    /// True while this peer's transport is rolling (the playhead is sweeping).
+    playing: bool,
+    /// GUIDs of the tracks and items this peer has selected: the "Alice is
+    /// holding these" set the overlay draws as tinted ghosts.
+    seltracks: Vec<String>,
+    selitems: Vec<String>,
     last_seen: Instant,
 }
+
+/// Selection arrays are capped before they ride the ~1s beacon so a
+/// select-all can't balloon presence traffic.
+const PRESENCE_SEL_CAP: usize = 128;
 
 /// Process-wide display profile (name, color hex), set by the companion app
 /// through the control server (or `reamesh_set_profile`). Global rather than
@@ -301,15 +313,63 @@ pub fn set_profile(name: &str, color: &str) {
     p.1 = color.chars().take(16).collect();
 }
 
-/// The local user's currently-focused track GUID (empty when none), set by the
-/// extension each tick. Like PROFILE it's process-global: it describes where
-/// the user is, not the session, and rides the presence beacon so peers can
-/// show which track each person is on. Peers resolve the GUID to their own
-/// local track number (identity is the GUID, never the index).
-static FOCUS: Mutex<String> = Mutex::new(String::new());
+/// The local user's live "where am I" state, set by the extension each tick and
+/// gossiped on the presence beacon so peers can show where each person is:
+/// which track they're focused on, where their playhead sits, and what they
+/// have selected. Like PROFILE it's process-global: it describes the user, not
+/// the session. GUIDs (never indices) are the shared identity; peers resolve
+/// them against their own project.
+#[derive(Clone)]
+struct LivePresence {
+    focus: String,
+    play: f64,
+    playing: bool,
+    seltracks: Vec<String>,
+    selitems: Vec<String>,
+}
+
+static LIVE: Mutex<LivePresence> = Mutex::new(LivePresence {
+    focus: String::new(),
+    play: 0.0,
+    playing: false,
+    seltracks: Vec::new(),
+    selitems: Vec::new(),
+});
 
 pub fn set_focus(guid: &str) {
-    *FOCUS.lock().unwrap() = guid.chars().take(64).collect();
+    LIVE.lock().unwrap().focus = guid.chars().take(64).collect();
+}
+
+/// Replace the live presence from a JSON blob the extension composes each tick:
+/// `{"focus","play","playing","seltr":[guid…],"seli":[guid…]}`. Any missing
+/// field resets to its empty/zero default; selection arrays are capped.
+pub fn set_presence(json: &str) {
+    let Ok(v) = serde_json::from_str::<JsonValue>(json) else {
+        return;
+    };
+    let guids = |key: &str| -> Vec<String> {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|g| g.as_str().map(|s| s.chars().take(64).collect()))
+                    .take(PRESENCE_SEL_CAP)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut p = LIVE.lock().unwrap();
+    p.focus = v
+        .get("focus")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(64)
+        .collect();
+    p.play = v.get("play").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    p.playing = v.get("playing").and_then(|x| x.as_bool()).unwrap_or(false);
+    p.seltracks = guids("seltr");
+    p.selitems = guids("seli");
 }
 
 /// Stable fallback identity color for a peer that never told us one: a
@@ -896,25 +956,58 @@ impl Reamesh {
     pub fn peers_json(&self) -> String {
         let owner = self.shared.owner_peer.lock().unwrap().clone();
         let (my_name, my_color) = PROFILE.lock().unwrap().clone();
-        let my_focus = FOCUS.lock().unwrap().clone();
-        let entry = |id: &str, name: &str, color: &str, focus: &str, is_self: bool| {
+        let me = LIVE.lock().unwrap().clone();
+        #[allow(clippy::too_many_arguments)]
+        let entry = |id: &str,
+                     name: &str,
+                     color: &str,
+                     focus: &str,
+                     play: f64,
+                     playing: bool,
+                     seltracks: &[String],
+                     selitems: &[String],
+                     is_self: bool| {
             json!({
                 "id": id,
                 "name": name,
                 "color": if color.is_empty() { default_color(id) } else { color.to_string() },
                 "focus": focus,
+                "play": play,
+                "playing": playing,
+                "seltr": seltracks,
+                "seli": selitems,
                 "is_self": is_self,
                 "is_owner": id == owner,
             })
         };
-        let mut arr = vec![entry(&self.local_peer_id, &my_name, &my_color, &my_focus, true)];
+        let mut arr = vec![entry(
+            &self.local_peer_id,
+            &my_name,
+            &my_color,
+            &me.focus,
+            me.play,
+            me.playing,
+            &me.seltracks,
+            &me.selitems,
+            true,
+        )];
         let mut infos = self.shared.peers_info.lock().unwrap();
         let now = Instant::now();
         infos.retain(|_, p| now.duration_since(p.last_seen) < PRESENCE_STALE);
         for p in self.shared.session_peers.lock().unwrap().iter() {
             let id = p.to_string();
             if let Some(info) = infos.get(&id) {
-                arr.push(entry(&id, &info.name, &info.color, &info.focus, false));
+                arr.push(entry(
+                    &id,
+                    &info.name,
+                    &info.color,
+                    &info.focus,
+                    info.play,
+                    info.playing,
+                    &info.seltracks,
+                    &info.selitems,
+                    false,
+                ));
             }
         }
         json!(arr).to_string()
@@ -1798,10 +1891,11 @@ async fn run_network(
                     let _ = swarm.behaviour_mut().gossipsub.publish(lobby.clone(), bytes.clone());
                 }
                 // Everyone: presence beacon on the session topic every ~1s so
-                // peers can show who is here, by name and color.
+                // peers can show who is here: name, color, focused track,
+                // playhead and selection.
                 if tick_count % 2 == 0 && let Some(t) = &sess_topic {
                     let (name, color) = PROFILE.lock().unwrap().clone();
-                    let focus = FOCUS.lock().unwrap().clone();
+                    let live = LIVE.lock().unwrap().clone();
                     // The MAC proves token possession; peers only roster
                     // beacons that verify (see presence_mac).
                     let mac = presence_mac(
@@ -1810,9 +1904,18 @@ async fn run_network(
                     );
                     let mut data = vec![TAG_PRESENCE];
                     data.extend_from_slice(
-                        json!({"name": name, "color": color, "focus": focus, "mac": mac})
-                            .to_string()
-                            .as_bytes(),
+                        json!({
+                            "name": name,
+                            "color": color,
+                            "focus": live.focus,
+                            "play": live.play,
+                            "playing": live.playing,
+                            "seltr": live.seltracks,
+                            "seli": live.selitems,
+                            "mac": mac,
+                        })
+                        .to_string()
+                        .as_bytes(),
                     );
                     let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), data);
                 }
@@ -1982,6 +2085,17 @@ async fn run_network(
                                     let get = |k: &str| {
                                         v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
                                     };
+                                    let get_guids = |k: &str| -> Vec<String> {
+                                        v.get(k)
+                                            .and_then(|x| x.as_array())
+                                            .map(|a| {
+                                                a.iter()
+                                                    .filter_map(|g| g.as_str().map(String::from))
+                                                    .take(PRESENCE_SEL_CAP)
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default()
+                                    };
                                     // Only token holders may appear in the
                                     // roster: verify the beacon's MAC against
                                     // the sender's authenticated peer id.
@@ -2001,6 +2115,13 @@ async fn run_network(
                                             name: get("name"),
                                             color: get("color"),
                                             focus: get("focus"),
+                                            play: v.get("play").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                                            playing: v
+                                                .get("playing")
+                                                .and_then(|x| x.as_bool())
+                                                .unwrap_or(false),
+                                            seltracks: get_guids("seltr"),
+                                            selitems: get_guids("seli"),
                                             last_seen: Instant::now(),
                                         },
                                     );
@@ -2822,6 +2943,16 @@ pub extern "C" fn reamesh_set_profile(name: *const c_char, color: *const c_char)
 #[unsafe(no_mangle)]
 pub extern "C" fn reamesh_set_focus(guid: *const c_char) {
     set_focus(&cstr_arg(guid).unwrap_or_default());
+}
+
+/// Set the local user's full live presence from a JSON blob
+/// `{"focus","play","playing","seltr":[guid…],"seli":[guid…]}`, gossiped on the
+/// presence beacon so peers can show where each person is (focused track,
+/// playhead, and selected tracks/items). Supersedes `reamesh_set_focus`; the
+/// extension calls it each tick. Missing fields reset to empty/zero.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_set_presence(json: *const c_char) {
+    set_presence(&cstr_arg(json).unwrap_or_default());
 }
 
 /// Start the localhost control server the companion app connects to

@@ -114,6 +114,15 @@ void reamesh_set_profile(const char *name, const char *color);
 void reamesh_set_focus(const char *guid);
 
 /**
+ * Set the local user's full live presence from a JSON blob
+ * `{"focus","play","playing","seltr":[guid…],"seli":[guid…]}`, gossiped on the
+ * presence beacon so peers can show where each person is (focused track,
+ * playhead, and selected tracks/items). Supersedes `reamesh_set_focus`; the
+ * extension calls it each tick. Missing fields reset to empty/zero.
+ */
+void reamesh_set_presence(const char *json);
+
+/**
  * Start the localhost control server the companion app connects to
  * (idempotent). Returns the bound port, 0 if no port was available.
  */

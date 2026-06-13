@@ -82,6 +82,17 @@
 #define REAPERAPI_WANT_GetTempoTimeSigMarker
 #define REAPERAPI_WANT_SetTempoTimeSigMarker
 #define REAPERAPI_WANT_DeleteTempoTimeSigMarker
+// Live presence (playhead + selection) and arrange-view geometry for the
+// peer-presence overlay. All long-stable APIs, so importing them is safe on
+// older REAPER (REAPERAPI_LoadAPI only aborts on a missing wanted function).
+#define REAPERAPI_WANT_CountSelectedTracks
+#define REAPERAPI_WANT_CountSelectedMediaItems
+#define REAPERAPI_WANT_GetSelectedMediaItem
+#define REAPERAPI_WANT_GetMediaItemInfo_Value
+#define REAPERAPI_WANT_GetPlayState
+#define REAPERAPI_WANT_GetPlayPosition
+#define REAPERAPI_WANT_GetCursorPosition
+#define REAPERAPI_WANT_GetSet_ArrangeView2
 
 #include "reaper_plugin.h"
 #include "reaper_plugin_functions.h"
@@ -1668,28 +1679,48 @@ static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback) {
   return parsed.is_discarded() ? fallback : parsed;
 }
 
-// Click-to-follow from the overlay: jump this REAPER's view to the track the
-// given peer currently has focused. The overlay is otherwise read-only; this is
-// the one command it sends. We re-resolve the peer's focus GUID here (rather
-// than trust a possibly-stale track number from the app) so it always lands on
-// where they are now.
+// Click-to-follow moves this REAPER view to the peer's focused track and
+// playhead position. Resolve presence again here so stale UI state cannot move
+// the view to an old location.
 static void revealPeer(const std::string& peerId) {
   if (peerId.empty()) return;
   json peers = handleJson(reamesh_peers, json::array());
   if (!peers.is_array()) return;
   std::string guid;
+  double play = 0.0;
+  bool havePlay = false;
   for (const auto& p : peers) {
     if (p.is_object() && jsonStr(p, "id") == peerId) {
       guid = jsonStr(p, "focus");
+      if (p.contains("play") && p["play"].is_number()) {
+        play = p["play"].get<double>();
+        havePlay = true;
+      }
       break;
     }
   }
-  MediaTrack* tr = guid.empty() ? nullptr : findTrackByGuid(guid);
-  if (!tr) return;
-  SetOnlyTrackSelected(tr);
-  // "Track: Vertical scroll selected tracks into view": bring it on-screen
-  // without stealing focus from REAPER (the overlay panel is non-activating).
-  Main_OnCommand(40913, 0);
+  // Vertical: bring their focused track on-screen (if we can resolve it).
+  // "Track: Vertical scroll selected tracks into view": non-activating, so it
+  // never steals focus from REAPER (the overlay panel doesn't activate).
+  if (MediaTrack* tr = guid.empty() ? nullptr : findTrackByGuid(guid)) {
+    SetOnlyTrackSelected(tr);
+    Main_OnCommand(40913, 0);
+  }
+  // Horizontal: scroll the arrange so their playhead sits in the middle,
+  // keeping our own zoom and without moving our edit cursor. This is what makes
+  // "jump to their view" actually land somewhere when their track was already
+  // on screen but they're working elsewhere in the timeline.
+  if (havePlay) {
+    double t0 = 0, t1 = 0;
+    GetSet_ArrangeView2(nullptr, false, 0, 0, &t0, &t1);
+    const double span = t1 - t0;
+    if (span > 0) {
+      double ns = play - span / 2.0;
+      if (ns < 0) ns = 0;
+      double ne = ns + span;
+      GetSet_ArrangeView2(nullptr, true, 0, 0, &ns, &ne);
+    }
+  }
   UpdateArrange();
 }
 
@@ -1811,17 +1842,36 @@ static void ctlTick() {
 
 // ---------- timer ----------
 
-// Report which track the user is on so peers can show it in their presence
-// roster. We broadcast the GUID (shared identity); each peer resolves it to
-// their own local track number. Only pushed when it changes: cheap value
-// reads, safe on the main-thread tick.
-static void pushLocalFocus() {
-  MediaTrack* sel = GetSelectedTrack(nullptr, 0);
-  std::string guid = sel ? trackGuid(sel) : std::string();
+// Report the user's live presence so peers can see where each person is: the
+// focused track, the playhead (the edit cursor, or the play position while the
+// transport is rolling), and the selected tracks/items. GUIDs are the shared
+// identity; each peer resolves them to its own project. Cheap value reads on
+// the main-thread tick, pushed only when something changes; while playing,
+// `play` advances every tick, which is exactly what keeps a sweeping playhead
+// live on peers' overlays.
+static void pushLocalPresence() {
+  MediaTrack* focusTr = GetSelectedTrack(nullptr, 0);
+  std::string focus = focusTr ? trackGuid(focusTr) : std::string();
+
+  const int ps = GetPlayState();  // bit 0: playing, bit 2: recording
+  const bool playing = (ps & 1) != 0;
+  const double play = playing ? GetPlayPosition() : GetCursorPosition();
+
+  json seltr = json::array();
+  for (int i = 0, n = CountSelectedTracks(nullptr); i < n && (int)seltr.size() < 128; ++i)
+    if (MediaTrack* tr = GetSelectedTrack(nullptr, i)) seltr.push_back(trackGuid(tr));
+
+  json seli = json::array();
+  for (int i = 0, n = CountSelectedMediaItems(nullptr); i < n && (int)seli.size() < 128; ++i)
+    if (MediaItem* it = GetSelectedMediaItem(nullptr, i)) seli.push_back(itemGuid(it));
+
+  json p = {{"focus", focus},   {"play", play},          {"playing", playing},
+            {"seltr", std::move(seltr)}, {"seli", std::move(seli)}};
   static std::string last;
-  if (guid != last) {
-    last = guid;
-    reamesh_set_focus(guid.c_str());
+  std::string s = p.dump();
+  if (s != last) {
+    last = s;
+    reamesh_set_presence(s.c_str());
   }
 }
 
@@ -1912,7 +1962,7 @@ static void timerTick() {
           logEvent("peer_left", json::object(), "a peer left the session");
         g_lastPeerCount = peers;
       }
-      pushLocalFocus();
+      pushLocalPresence();
       // Capture before apply, so an edit made by the user in this tick
       // interval is diffed against the old baseline before remote
       // application re-baselines.
