@@ -105,6 +105,7 @@ const en = {
   connecting: "Connecting…",
   expand: "Expand",
   collapse: "Collapse",
+  revealPeerTrack: "Jump to {name}’s track",
 
   // Activity-log / error events from the extension, rendered by code (see
   // lib/log.ts). `text` on the wire is the English fallback for unknown codes.
@@ -133,6 +134,15 @@ const en = {
   logReconnecting: "Lost the host, reconnecting to “{name}”…",
   reconnectFailed: "Couldn’t reconnect to “{name}”.",
   editOverridden: "The host overrode your change.",
+  editOverriddenTrack: "The host overrode your change to “{track}”.",
+  peerTrackAdded: "Added track “{name}”",
+  peerTrackAddedUnnamed: "A track was added",
+  peerTrackRemoved: "Removed track “{name}”",
+  peerTrackRemovedUnnamed: "A track was removed",
+  peerTempoChanged: "Tempo map changed",
+  peerMarkersChanged: "Markers / regions changed",
+  peerTitleChanged: "Project info changed",
+  peerNotesChanged: "Project notes changed",
   reconnectingBanner: "Connection to the host lost, reconnecting…",
 } as const;
 
@@ -223,6 +233,7 @@ const de: Record<MsgKey, string> = {
   connecting: "Verbinde…",
   expand: "Ausklappen",
   collapse: "Einklappen",
+  revealPeerTrack: "Zu {name}s Spur springen",
 
   hostEndedSession: "Der Host hat die Session beendet.",
   hostLost: "Verbindung zum Host verloren.",
@@ -250,6 +261,15 @@ const de: Record<MsgKey, string> = {
   logReconnecting: "Host verloren, verbinde erneut mit „{name}“…",
   reconnectFailed: "Erneutes Verbinden mit „{name}“ ist fehlgeschlagen.",
   editOverridden: "Der Host hat deine Änderung überschrieben.",
+  editOverriddenTrack: "Der Host hat deine Änderung an „{track}“ überschrieben.",
+  peerTrackAdded: "Spur „{name}“ hinzugefügt",
+  peerTrackAddedUnnamed: "Eine Spur wurde hinzugefügt",
+  peerTrackRemoved: "Spur „{name}“ entfernt",
+  peerTrackRemovedUnnamed: "Eine Spur wurde entfernt",
+  peerTempoChanged: "Tempo geändert",
+  peerMarkersChanged: "Marker / Regionen geändert",
+  peerTitleChanged: "Projektinfo geändert",
+  peerNotesChanged: "Projektnotizen geändert",
   reconnectingBanner: "Verbindung zum Host verloren, verbinde erneut…",
 };
 

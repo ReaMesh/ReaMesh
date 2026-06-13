@@ -47,6 +47,7 @@
 #define REAPERAPI_WANT_ReorderSelectedTracks
 #define REAPERAPI_WANT_TrackList_AdjustWindows
 #define REAPERAPI_WANT_UpdateArrange
+#define REAPERAPI_WANT_Main_OnCommand
 #define REAPERAPI_WANT_EnumProjects
 #define REAPERAPI_WANT_Main_SaveProject
 #define REAPERAPI_WANT_Main_openProject
@@ -237,6 +238,30 @@ static json logEvent(const char* code, json params, const std::string& text) {
   g_log.push_back(e);
   while (g_log.size() > 80) g_log.pop_front();
   return e;
+}
+
+// Structural activity events ("a track was added", "tempo changed", …) shown as
+// the overlay's short feed. Two guards keep it signal, not noise: a mute window
+// swallows the burst when a session first opens (the whole project arrives as
+// one changeset), and identical events de-duplicate within a few seconds (one
+// drag re-emits its field repeatedly). Join/leave and override notices call
+// logEvent directly: those are never muted.
+static std::chrono::steady_clock::time_point g_activityMuteUntil;
+static std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> g_recentActivity;
+
+static void muteActivity(std::chrono::seconds d) {
+  g_activityMuteUntil = std::chrono::steady_clock::now() + d;
+}
+
+static void activityEvent(const char* code, json params, const std::string& text) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now < g_activityMuteUntil) return;
+  const std::string key = std::string(code) + '|' + text;
+  for (const auto& [k, when] : g_recentActivity)
+    if (k == key && now - when < std::chrono::seconds(3)) return;
+  g_recentActivity.push_back({key, now});
+  while (g_recentActivity.size() > 16) g_recentActivity.pop_front();
+  logEvent(code, std::move(params), text);
 }
 
 // ---------- state-chunk utilities ----------
@@ -563,6 +588,17 @@ static MediaTrack* findTrackByGuid(const std::string& guid) {
     if (trackGuid(tr) == guid) return tr;
   }
   return nullptr;
+}
+
+// Human-readable name for a track GUID, or "" if it's unknown or unnamed. Used
+// by the override notice and activity feed so the app can say *which* track,
+// not just that something changed.
+static std::string trackNameByGuid(const std::string& guid) {
+  MediaTrack* tr = findTrackByGuid(guid);
+  if (!tr) return "";
+  char buf[512] = "";
+  if (GetSetMediaTrackInfo_String(tr, "P_NAME", buf, false) && buf[0]) return buf;
+  return "";
 }
 
 static std::string itemGuid(MediaItem* item) {
@@ -1239,7 +1275,14 @@ static void applyChangeset(const json& changeset) {
     for (auto it = tracks.begin(); it != tracks.end(); ++it) {
       const json& fields = it.value();
       if (fields.is_object() && fields.value("present", true) == false) {
-        if (MediaTrack* tr = findTrackByGuid(it.key())) DeleteTrack(tr);
+        if (MediaTrack* tr = findTrackByGuid(it.key())) {
+          std::string nm = trackNameByGuid(it.key());  // name before it's gone
+          DeleteTrack(tr);
+          if (nm.empty())
+            activityEvent("peer_track_removed", json::object(), "a track was removed");
+          else
+            activityEvent("peer_track_removed", {{"name", nm}}, "removed track " + nm);
+        }
       }
     }
 
@@ -1251,6 +1294,7 @@ static void applyChangeset(const json& changeset) {
       if (!fields.is_object() || fields.value("present", true) == false) continue;
 
       MediaTrack* tr = findTrackByGuid(guid);
+      bool created = false;
       if (!tr) {
         int idx = (int)fields.value("index", (double)CountTracks(nullptr));
         idx = std::clamp(idx, 0, CountTracks(nullptr));
@@ -1262,8 +1306,16 @@ static void applyChangeset(const json& changeset) {
         std::vector<char> gbuf(guid.begin(), guid.end());
         gbuf.push_back('\0');
         GetSetMediaTrackInfo_String(tr, "GUID", gbuf.data(), true);
+        created = true;
       }
       applyTrackFields(tr, fields);
+      if (created) {
+        std::string nm = fields.value("name", std::string());
+        if (nm.empty())
+          activityEvent("peer_track_added", json::object(), "a track was added");
+        else
+          activityEvent("peer_track_added", {{"name", nm}}, "added track " + nm);
+      }
       if (fields.contains("recv") && fields["recv"].is_string())
         pendingRecv.emplace_back(guid, fields["recv"].get<std::string>());
       if (fields.contains("index") && fields["index"].is_number())
@@ -1322,16 +1374,26 @@ static void applyChangeset(const json& changeset) {
     auto it = changeset["project"].find("project");
     if (it != changeset["project"].end() && it->is_object()) {
       const json& f = *it;
-      if (f.contains("tempo") && f["tempo"].is_string())
+      if (f.contains("tempo") && f["tempo"].is_string()) {
         applyTempo(f["tempo"].get<std::string>());
-      if (f.contains("markers") && f["markers"].is_string())
+        activityEvent("peer_tempo_changed", json::object(), "the tempo map changed");
+      }
+      if (f.contains("markers") && f["markers"].is_string()) {
         applyMarkers(f["markers"].get<std::string>());
-      if (f.contains("notes") && f["notes"].is_string())
+        activityEvent("peer_markers_changed", json::object(), "markers/regions changed");
+      }
+      if (f.contains("notes") && f["notes"].is_string()) {
         applyProjectNotes(f["notes"].get<std::string>());
-      if (f.contains("title") && f["title"].is_string())
+        activityEvent("peer_notes_changed", json::object(), "project notes changed");
+      }
+      if (f.contains("title") && f["title"].is_string()) {
         applyProjectString("PROJECT_TITLE", f["title"].get<std::string>());
-      if (f.contains("author") && f["author"].is_string())
+        activityEvent("peer_title_changed", json::object(), "project info changed");
+      }
+      if (f.contains("author") && f["author"].is_string()) {
         applyProjectString("PROJECT_AUTHOR", f["author"].get<std::string>());
+        activityEvent("peer_title_changed", json::object(), "project info changed");
+      }
       if (f.contains("groupnames") && f["groupnames"].is_string())
         applyGroupNames(f["groupnames"].get<std::string>());
       if (f.contains("timebase") && f["timebase"].is_string())
@@ -1546,6 +1608,7 @@ static void onHost(const std::string& passphrase) {
     return;
   }
   g_mode = Mode::Hosting;
+  muteActivity(std::chrono::seconds(4));
   g_lastError = json();
   g_sessionProjectPath = path;
   g_snapshot = Snapshot{};
@@ -1601,6 +1664,31 @@ static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback) {
   return parsed.is_discarded() ? fallback : parsed;
 }
 
+// Click-to-follow from the overlay: jump this REAPER's view to the track the
+// given peer currently has focused. The overlay is otherwise read-only; this is
+// the one command it sends. We re-resolve the peer's focus GUID here (rather
+// than trust a possibly-stale track number from the app) so it always lands on
+// where they are now.
+static void revealPeer(const std::string& peerId) {
+  if (peerId.empty()) return;
+  json peers = handleJson(reamesh_peers, json::array());
+  if (!peers.is_array()) return;
+  std::string guid;
+  for (const auto& p : peers) {
+    if (p.is_object() && jsonStr(p, "id") == peerId) {
+      guid = jsonStr(p, "focus");
+      break;
+    }
+  }
+  MediaTrack* tr = guid.empty() ? nullptr : findTrackByGuid(guid);
+  if (!tr) return;
+  SetOnlyTrackSelected(tr);
+  // "Track: Vertical scroll selected tracks into view": bring it on-screen
+  // without stealing focus from REAPER (the overlay panel is non-activating).
+  Main_OnCommand(40913, 0);
+  UpdateArrange();
+}
+
 static void ctlDispatch(const json& cmd) {
   const std::string c = jsonStr(cmd, "cmd");
   // Any explicit user action supersedes a pending auto-rejoin.
@@ -1616,6 +1704,8 @@ static void ctlDispatch(const json& cmd) {
                     jsonStr(cmd, "passphrase"));
   } else if (c == "leave") {
     onLeave();
+  } else if (c == "reveal_peer") {
+    revealPeer(jsonStr(cmd, "peer_id"));
   }
 }
 
@@ -1656,8 +1746,32 @@ static void ctlTick() {
                      : 0;
   if (g_mode == Mode::ClientActive) {
     if (reverts > g_lastReverts) {
-      logEvent("edit_overridden", {{"count", reverts - g_lastReverts}},
-               "the host overrode your change");
+      const long delta = reverts - g_lastReverts;
+      // The status carries a tail of recently-overridden (section,id) pairs; the
+      // last `delta` are new. Name the tracks among them so the app can say
+      // *what* the host overrode, not just that something snapped back.
+      std::vector<std::string> names;
+      std::vector<std::string> seenIds;
+      if (st.contains("reverted") && st["reverted"].is_array()) {
+        const json& rv = st["reverted"];
+        const long start = std::max<long>(0, static_cast<long>(rv.size()) - delta);
+        for (long i = start; i < static_cast<long>(rv.size()); ++i) {
+          const json& e = rv[i];
+          if (!e.is_object() || jsonStr(e, "section") != "tracks") continue;
+          std::string id = jsonStr(e, "id");
+          if (std::find(seenIds.begin(), seenIds.end(), id) != seenIds.end()) continue;
+          seenIds.push_back(id);
+          std::string nm = trackNameByGuid(id);
+          if (!nm.empty()) names.push_back(nm);
+        }
+      }
+      if (names.empty()) {
+        logEvent("edit_overridden", {{"count", delta}}, "the host overrode your change");
+      } else {
+        for (const std::string& nm : names)
+          logEvent("edit_overridden", {{"track", nm}},
+                   "the host overrode your change to " + nm);
+      }
       g_lastReverts = reverts;
     }
   } else {
@@ -1722,6 +1836,9 @@ static void pollDownload() {
     g_lastChangeCount = GetProjectStateChangeCount(nullptr);
     g_applyingRemote = false;
     g_mode = Mode::ClientActive;
+    // The owner's full state lands as one big changeset right after this;
+    // don't narrate every track of it as an "added" event.
+    muteActivity(std::chrono::seconds(4));
     g_sessionProjectPath = currentProjectPath();
     logEvent("connected", json::object(),
              "connected: your edits are proposals; the session owner wins conflicts");

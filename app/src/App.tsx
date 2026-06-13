@@ -95,7 +95,11 @@ function useOverrideToasts(state: ExtState | undefined) {
     const count = state?.overridden ?? 0;
     const sameSession = prev.current.mode === state?.mode;
     if (state?.mode === "client" && sameSession && count > prev.current.count) {
-      toast(t("editOverridden"));
+      // Name the track when the extension could resolve it (the most recent
+      // override event carries it); otherwise fall back to the generic notice.
+      const last = [...(state?.log ?? [])].reverse().find((e) => e.code === "edit_overridden");
+      const track = last?.params?.track;
+      toast(track ? t("editOverriddenTrack", { track }) : t("editOverridden"));
     }
     prev.current = { mode: state?.mode, count };
   }, [state?.overridden, state?.mode]);

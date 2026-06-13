@@ -1,11 +1,7 @@
-// The overlay is a second, read-only consumer of one REAPER instance's
-// control server. Unlike the main app's connection manager (which scans every
-// port), the overlay is told exactly which port to ride (the same instance
-// the main window is in a session on), so it never drifts onto a different
-// REAPER. It only listens; it never sends commands or a profile (the main
-// window owns that).
+// Read state from the exact REAPER instance selected by the main window. The
+// overlay only sends `reveal_peer`; session controls stay in the main window.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ExtState } from "@/lib/types";
 
 const RETRY_MS = 1500;
@@ -13,9 +9,11 @@ const RETRY_MS = 1500;
 export function useOverlayState(port: number | null): {
   state: ExtState | null;
   connected: boolean;
+  send: (cmd: Record<string, unknown>) => void;
 } {
   const [state, setState] = useState<ExtState | null>(null);
   const [connected, setConnected] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
     if (!port) return;
@@ -34,6 +32,7 @@ export function useOverlayState(port: number | null): {
         schedule();
         return;
       }
+      wsRef.current = ws;
       ws.onopen = () => setConnected(true);
       ws.onmessage = (ev) => {
         try {
@@ -45,6 +44,7 @@ export function useOverlayState(port: number | null): {
       };
       ws.onclose = () => {
         setConnected(false);
+        if (wsRef.current === ws) wsRef.current = null;
         if (!closed) schedule();
       };
       ws.onerror = () => ws?.close();
@@ -54,9 +54,15 @@ export function useOverlayState(port: number | null): {
     return () => {
       closed = true;
       if (retry) clearTimeout(retry);
+      wsRef.current = null;
       ws?.close();
     };
   }, [port]);
 
-  return { state, connected };
+  const send = useCallback((cmd: Record<string, unknown>) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(cmd));
+  }, []);
+
+  return { state, connected, send };
 }

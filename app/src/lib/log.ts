@@ -32,10 +32,31 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   reconnecting: "logReconnecting",
   reconnect_failed: "reconnectFailed",
   edit_overridden: "editOverridden",
+  peer_tempo_changed: "peerTempoChanged",
+  peer_markers_changed: "peerMarkersChanged",
+  peer_title_changed: "peerTitleChanged",
+  peer_notes_changed: "peerNotesChanged",
 };
 
 export function localizeLogEntry(entry: LogEntry | string): string {
   if (typeof entry === "string") return entry; // older extension: raw text
+  // A few codes pick a different string depending on whether the extension
+  // could name the thing (track names can be empty; the override notice is
+  // generic when the overridden field isn't a track).
+  switch (entry.code) {
+    case "edit_overridden": {
+      const track = entry.params?.track;
+      return track ? t("editOverriddenTrack", { track }) : t("editOverridden", entry.params);
+    }
+    case "peer_track_added": {
+      const name = entry.params?.name;
+      return name ? t("peerTrackAdded", { name }) : t("peerTrackAddedUnnamed");
+    }
+    case "peer_track_removed": {
+      const name = entry.params?.name;
+      return name ? t("peerTrackRemoved", { name }) : t("peerTrackRemovedUnnamed");
+    }
+  }
   const key = entry.code ? CODE_KEYS[entry.code] : undefined;
   return key ? t(key, entry.params) : entry.text;
 }

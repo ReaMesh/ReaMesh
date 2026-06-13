@@ -195,7 +195,7 @@ struct StatusState {
 }
 
 impl StatusState {
-    fn to_json(&self, reverts: usize) -> String {
+    fn to_json(&self, reverts: usize, reverted: Vec<JsonValue>) -> String {
         json!({
             "state": self.state,
             "progress": self.progress,
@@ -205,6 +205,10 @@ impl StatusState {
             "message": self.message,
             "end_reason": self.end_reason,
             "reverts": reverts,
+            // Tail of recently-overridden (section,id) pairs, most recent last.
+            // The cumulative `reverts` counter tells the consumer how many of
+            // these are new, so it can name *what* the owner overrode.
+            "reverted": reverted,
         })
         .to_string()
     }
@@ -256,6 +260,10 @@ struct Shared {
     /// owner's value (cumulative). Surfaced via status so the UI can tell the
     /// user their edit was overridden instead of letting it silently snap back.
     reverts: AtomicUsize,
+    /// Client only: (section, id) of recently overridden fields, most recent
+    /// last, bounded. Pairs with `reverts` so the UI can name *what* was
+    /// overridden (e.g. the track), not just count it.
+    reverts_detail: Mutex<VecDeque<(String, String)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -543,6 +551,7 @@ impl Reamesh {
             peers_info: Mutex::new(HashMap::new()),
             owner_peer: Mutex::new(String::new()),
             reverts: AtomicUsize::new(0),
+            reverts_detail: Mutex::new(VecDeque::new()),
         });
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (init_tx, init_rx) = std_mpsc::channel();
@@ -717,6 +726,13 @@ impl Reamesh {
                 // otherwise).
                 if let Some(dv) = doc_val {
                     self.shared.reverts.fetch_add(1, Ordering::Relaxed);
+                    {
+                        let mut d = self.shared.reverts_detail.lock().unwrap();
+                        d.push_back((section.clone(), id.clone()));
+                        while d.len() > 32 {
+                            d.pop_front();
+                        }
+                    }
                     diff.entry(section.clone())
                         .or_insert_with(|| JsonValue::Object(JsonMap::new()))
                         .as_object_mut()
@@ -803,10 +819,22 @@ impl Reamesh {
 
     /// Current session status as JSON:
     /// `{"state","progress","project_path","session_id","session_name",
-    ///   "message","end_reason","reverts"}`.
+    ///   "message","end_reason","reverts","reverted"}`.
     pub fn status_json(&self) -> String {
         let reverts = self.shared.reverts.load(Ordering::Relaxed);
-        self.shared.status.lock().unwrap().to_json(reverts)
+        let reverted: Vec<JsonValue> = self
+            .shared
+            .reverts_detail
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, i)| json!({ "section": s, "id": i }))
+            .collect();
+        self.shared
+            .status
+            .lock()
+            .unwrap()
+            .to_json(reverts, reverted)
     }
 
     /// Full current doc state in changeset shape. For tests and debugging.
@@ -1626,6 +1654,7 @@ async fn run_network(
                         s.end_reason = None;
                     });
                     shared.reverts.store(0, Ordering::Relaxed);
+                    shared.reverts_detail.lock().unwrap().clear();
                     let req = swarm
                         .behaviour_mut()
                         .xfer
