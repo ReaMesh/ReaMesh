@@ -49,6 +49,7 @@ static const NSTimeInterval kDragPause = 0.25; // suspend follow during a drag
 @property (assign) pid_t cachedReaperPID;
 @property (assign) CGWindowID cachedWindowID; // REAPER's main window, re-resolved when stale
 @property (assign) NSTimeInterval nextWindowScan; // throttle for failed full scans
+@property (strong) NSTimer *visibilityTimer; // always-running show/hide supervisor (followLink suspends while hidden)
 @end
 
 static ReaMeshOverlayController *gOverlay = nil;
@@ -192,10 +193,25 @@ static ReaMeshOverlayController *gOverlay = nil;
     [self reposition];
 }
 
+- (void)visibilityTick:(NSTimer *)t {
+    [self updateVisibility];
+}
+
 #pragma mark - Visibility / fade
 
 - (void)updateVisibility {
-    BOOL want = [self reaperFrontmost];
+    // Show only while REAPER is frontmost AND its window is actually on screen.
+    // The on-screen half is what handles minimize: a minimized REAPER stays
+    // "frontmost" (it still owns the menu bar) but its window reports
+    // !kCGWindowIsOnscreen, so we must hide, and re-show on restore. The
+    // reaperWindowBounds query is the cheap cached-window path; skip it entirely
+    // when REAPER isn't frontmost so an idle background poll never triggers a
+    // full window scan.
+    BOOL want = NO;
+    if ([self reaperFrontmost]) {
+        CGRect r;
+        want = [self reaperWindowBounds:&r];
+    }
     if (want == self.visible) return;
     self.visible = want;
     if (want) {
@@ -317,6 +333,21 @@ static ReaMeshOverlayController *gOverlay = nil;
         [[NSRunLoop mainRunLoop] addTimer:self.followTimer forMode:NSRunLoopCommonModes];
     }
 
+    // Decide show/hide on a steady cadence that runs even while the overlay is
+    // hidden. The follow link above auto-suspends once the panel is ordered out,
+    // and macOS posts no app-activation notification when REAPER's own window
+    // minimizes/restores while REAPER stays frontmost, so without this poll the
+    // overlay would stay gone after an un-minimize until REAPER lost and regained
+    // focus. 10 Hz: imperceptible against the deminiaturize animation, and each
+    // tick is just a frontmost check plus (only when frontmost) one cached-window
+    // query.
+    self.visibilityTimer = [NSTimer timerWithTimeInterval:0.1
+                                                   target:self
+                                                 selector:@selector(visibilityTick:)
+                                                 userInfo:nil
+                                                  repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:self.visibilityTimer forMode:NSRunLoopCommonModes];
+
     self.visible = NO;
     [panel setAlphaValue:0.0];
     [panel orderOut:nil];
@@ -328,6 +359,8 @@ static ReaMeshOverlayController *gOverlay = nil;
     self.followLink = nil;
     [self.followTimer invalidate];
     self.followTimer = nil;
+    [self.visibilityTimer invalidate];
+    self.visibilityTimer = nil;
     [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
     if (self.panel) {
         NSPanel *panel = self.panel;
