@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "arrange",
+  "description": "Capability for the click-through arrange overlay window: it reads its own screen origin and scale factor (and follows move/resize events) to map peer playheads onto REAPER's arrange view.",
+  "windows": ["arrange"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-outer-position",
+    "core:window:allow-scale-factor"
+  ]
+}

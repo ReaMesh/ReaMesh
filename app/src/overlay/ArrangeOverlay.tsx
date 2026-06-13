@@ -31,7 +31,14 @@ import { useOverlayState } from "./useOverlayState";
  *  the window moves/resizes precisely when REAPER does, we learn the new origin
  *  from Tauri's move/resize events (carrying the new position) instead of
  *  polling, which used to lag ~90ms behind and misplace everything mid-move.
- *  `null` until the first read, so we never paint at a bogus {0,0}. */
+ *  `null` until the first read, so we never paint at a bogus {0,0}.
+ *
+ *  NOTE: `outerPosition`/`scaleFactor`/move-resize events are silently caught,
+ *  so they fail invisibly if the "arrange" window lacks the matching Tauri
+ *  capability: origin then stays `null` forever and the whole layer paints
+ *  nothing. The grant lives in `src-tauri/capabilities/arrange.json`
+ *  (`core:window:allow-outer-position` + `allow-scale-factor`); keep that window
+ *  label listed there. */
 function useWindowOrigin() {
   const [origin, setOrigin] = useState<{ x: number; y: number } | null>(null);
   useEffect(() => {
