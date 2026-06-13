@@ -225,16 +225,26 @@ static unsigned g_lastPeerCount = 0;
 // Media items locally tinted dark grey to signal "another peer is editing this"
 // (their editing lock is live, per reamesh_locked_entities). Maps each tinted
 // item's GUID -> the REAL native I_CUSTOMCOLOR to restore once the lock
-// releases. The tint is a PURE LOCAL VIEW TRANSFORM: it recolors the item in
+// releases, plus when the tint was (re)applied and whether the safety cap has
+// fired. The tint is a PURE LOCAL VIEW TRANSFORM: it recolors the item in
 // REAPER but must never enter the sync diff (the snapshot is re-baselined to the
 // tinted state after every change) and so is never captured, proposed, or
 // written into anyone's .rpp. See reconcileItemTints / restoreAllItemTints.
-static std::map<std::string, int> g_itemTints;
-// Whether the dark-grey lock tint is painted at all. Toggled from the companion
-// app's overlay settings via the `set_tint` control command. The editing lock
-// itself (and the instant local snap-back of edits to a peer-locked item) is
-// unaffected: this only governs the *visual* tint, so "off" still means
-// gelockt = gelockt, just without the grey overlay.
+struct ItemTint {
+  int real;                                     // the real I_CUSTOMCOLOR to restore
+  std::chrono::steady_clock::time_point since;  // when this tint was (re)applied
+  bool expired = false;  // safety cap tripped: shown in real colour, won't re-grey
+};
+static std::map<std::string, ItemTint> g_itemTints;
+// Safety net: a lock tint must never persist longer than this. A live edit keeps
+// refreshing the record (applyItem drops it on every remote item update, so the
+// next reconcile re-stamps `since`), so this only ever trips on a tint that's
+// stuck with no incoming updates: at which point we restore the real colour
+// locally. Well clear of a legitimate lock (LOCK_HOLD is 2s; an active editor
+// pushes updates ~every second) so it never clears a tint that's genuinely live.
+static constexpr std::chrono::seconds TINT_MAX_AGE{8};
+// Whether to paint the local lock tint, controlled by the app's set_tint
+// command. Disabling the tint leaves editing locks and local snap-back active.
 static bool g_tintEnabled = true;
 // Last session-ending event, shown by the app as an error toast. Structured
 // like a log entry ({code, params, text}); JSON null when there is none.
@@ -1638,17 +1648,20 @@ static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback);
 // are never tinted (reamesh_locked_entities filters our own holds out).
 //
 // The one place the tint could leak to disk is a project SAVE, which serializes
-// the live (grey) item color. Protection: dispatchCommand intercepts the
-// deliberate-save actions (Ctrl+S / menu Save / Save As) and calls
-// restoreAllItemTints() first, so REAPER writes the REAL colors; the next tick
-// re-applies the tints. leaveSession does the same on every session exit.
-// RESIDUAL RISK (best effort, documented): auto-save and REAPER's quit-time
-// "save changes?" prompt do NOT route through the command hooks, so a save on
-// one of those paths while an item is tinted can persist grey into the .rpp.
-// This is bounded (only items a peer is editing at that instant) and a manual
-// save afterwards (which IS hooked) re-cleans it. A crash writes nothing, so the
-// last on-disk file stays clean. There is no per-item sentinel to auto-undo a
-// persisted tint on the next load; that would itself be project pollution.
+// the live (grey) item color. It is guarded on every path we can hook:
+//   • Ctrl+S / menu Save / Save As: dispatchCommand intercepts the action and
+//     calls restoreAllItemTints() first, so REAPER writes the REAL colors; the
+//     next tick re-applies the tints.
+//   • Quit: the "atexit" hook restores the real colors (restoreAllItemTints)
+//     before REAPER tears down, so a quit-time "save changes?" serializes clean.
+//   • Session exit: leaveSession restores them too.
+//   • Crash: REAPER writes nothing, so the last on-disk file stays clean.
+// The one path REAPER exposes no pre-save hook for is the periodic AUTO-SAVE; it
+// is bounded two ways so the exposure is tiny and self-healing: a tint lives at
+// most TINT_MAX_AGE (the safety cap in reconcileItemTints), and any later
+// hooked save (Ctrl+S / quit) re-cleans the file. Auto-save also defaults to
+// timestamped backups, not the live .rpp. There is no per-item sentinel to
+// auto-undo a persisted tint on load: that would itself be project pollution.
 
 // The dark grey a locked item is tinted with. Computed LOCALLY: never
 // colorToWire, since this color never rides the wire; the high 0x1000000 bit is
@@ -1687,9 +1700,9 @@ static void restoreAllItemTints() {
   if (g_itemTints.empty()) return;
   const bool inSession = g_mode == Mode::Hosting || g_mode == Mode::ClientActive;
   g_applyingRemote = true;
-  for (const auto& [guid, real] : g_itemTints)
+  for (const auto& [guid, rec] : g_itemTints)
     if (MediaItem* it = findItemByGuid(guid))
-      SetMediaItemInfo_Value(it, "I_CUSTOMCOLOR", static_cast<double>(real));
+      SetMediaItemInfo_Value(it, "I_CUSTOMCOLOR", static_cast<double>(rec.real));
   g_itemTints.clear();
   UpdateArrange();
   if (inSession) {
@@ -1715,27 +1728,42 @@ static void reconcileItemTints() {
   // the visual cue is gone.
   const std::set<std::string> desired = g_tintEnabled ? lockedItemsByOthers() : std::set<std::string>{};
   const int tint = lockTintNative();
+  const auto now = std::chrono::steady_clock::now();
   bool changed = false;
 
   g_applyingRemote = true;
   // Tint items newly locked by a peer (or freshly un-tinted by a remote apply,
-  // which dropped their record so we re-stash the current real color).
+  // which dropped their record so we re-stash the current real color), and
+  // enforce the safety cap on a tint that has lingered too long.
   for (const std::string& guid : desired) {
-    if (g_itemTints.count(guid)) continue;
-    MediaItem* it = findItemByGuid(guid);
-    if (!it) continue;  // not local yet (e.g. its media is still downloading)
-    g_itemTints[guid] = static_cast<int>(GetMediaItemInfo_Value(it, "I_CUSTOMCOLOR"));
-    SetMediaItemInfo_Value(it, "I_CUSTOMCOLOR", static_cast<double>(tint));
-    changed = true;
+    auto rec = g_itemTints.find(guid);
+    if (rec == g_itemTints.end()) {
+      MediaItem* it = findItemByGuid(guid);
+      if (!it) continue;  // not local yet (e.g. its media is still downloading)
+      g_itemTints[guid] = {static_cast<int>(GetMediaItemInfo_Value(it, "I_CUSTOMCOLOR")), now, false};
+      SetMediaItemInfo_Value(it, "I_CUSTOMCOLOR", static_cast<double>(tint));
+      changed = true;
+    } else if (!rec->second.expired && now - rec->second.since > TINT_MAX_AGE) {
+      // Safety net: this tint has been up too long with no refreshing update, so
+      // it is almost certainly stuck. Restore the real colour and mark it expired
+      // so we don't immediately re-grey it; a genuine resume re-tints because the
+      // remote update drops the record (see applyItem) and we re-stash fresh.
+      if (MediaItem* it = findItemByGuid(guid))
+        SetMediaItemInfo_Value(it, "I_CUSTOMCOLOR", static_cast<double>(rec->second.real));
+      rec->second.expired = true;
+      changed = true;
+    }
   }
-  // Restore items whose lock has released.
+  // Restore items whose lock has released (an expired one already shows its real
+  // colour, so just drop the record).
   for (auto it = g_itemTints.begin(); it != g_itemTints.end();) {
     if (desired.count(it->first)) {
       ++it;
       continue;
     }
-    if (MediaItem* item = findItemByGuid(it->first))
-      SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", static_cast<double>(it->second));
+    if (!it->second.expired)
+      if (MediaItem* item = findItemByGuid(it->first))
+        SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", static_cast<double>(it->second.real));
     it = g_itemTints.erase(it);
     changed = true;
   }
@@ -1799,11 +1827,12 @@ static void revertLockedItemEdits(Snapshot& snap) {
         // applyItem drops the tint record, so restore it afterward (same real
         // colour): the re-created item already carries the tint colour from the
         // baseline chunk, so reconcileItemTints then leaves it tinted.
-        const int real = g_itemTints.count(guid) ? g_itemTints[guid] : -1;
+        const int real = g_itemTints.count(guid) ? g_itemTints[guid].real : -1;
         applyItem(guid, json{{"present", true},
                              {"track", base->second.track},
                              {"chunk", base->second.chunk}});
-        if (real != -1 && g_tintEnabled) g_itemTints[guid] = real;
+        if (real != -1 && g_tintEnabled)
+          g_itemTints[guid] = {real, std::chrono::steady_clock::now(), false};
       }
       reverted = true;
     }
@@ -2449,6 +2478,7 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
       g_rec->Register("-timer", (void*)timerTick);
       g_rec->Register("-hookcommand", (void*)hookCommand);
       g_rec->Register("-hookcommand2", (void*)hookCommand2);
+      g_rec->Register("-atexit", (void*)restoreAllItemTints);
       g_rec->Register("-custom_action", &g_caHost);
       g_rec->Register("-custom_action", &g_caLeave);
     }
@@ -2465,6 +2495,10 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
   rec->Register("hookcommand", (void*)hookCommand);
   rec->Register("hookcommand2", (void*)hookCommand2);
   rec->Register("timer", (void*)timerTick);
+  // Restore real item colours before REAPER quits, so a quit-time save prompt
+  // serializes the real colours, never our grey lock tint (the deliberate-save
+  // actions are covered separately in dispatchCommand).
+  rec->Register("atexit", (void*)restoreAllItemTints);
   reamesh_ctl_start();
   return 1;
 }
