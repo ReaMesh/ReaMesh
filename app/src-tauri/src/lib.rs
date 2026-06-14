@@ -146,11 +146,11 @@ fn store_lang_pref(app: &AppHandle, pref: &str) {
 
 // Overlay visibility toggles, persisted backend-side as a small bitmask so the
 // native settings window AND the overlay webview share one source of truth.
-// Bits: roster=1, tint=2, playheads=4, ghosts=8 (must match
-// settings_window.h's kReaMeshOverlay* and overlaySettings.ts). Bit 2 was the
-// retired "activity feed" toggle, reused for the locked-item tint so existing
-// installs keep it on without a migration.
-const OVERLAY_ALL: u8 = 0b1111;
+// Bits: roster=1, tint=2 (must match settings_window.h's kReaMeshOverlay* and
+// overlaySettings.ts). Bit 2 was the retired "activity feed" toggle, reused for
+// the locked-item tint so existing installs keep it on without a migration.
+// Bits 4/8 (peer playheads / time-selection) are retired and masked off.
+const OVERLAY_ALL: u8 = 0b11;
 
 fn overlay_file(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_config_dir().ok().map(|d| d.join("overlay"))
@@ -310,16 +310,11 @@ fn set_reaper_path(app: AppHandle, path: Option<String>) -> Result<(), String> {
 /// so the right edge stays put as the roster grows and shrinks.
 const OVERLAY_WIDTH: f64 = 232.0;
 
-/// Open (or reveal) the presence overlays for one REAPER instance: the
-/// top-right HUD window, and a full-window, click-through "arrange" window that
-/// draws peer playheads + selection ghosts over REAPER's arrange view. Both are
-/// frameless, transparent, always-on-top, and never take focus: opening them
-/// must never steal keys from REAPER mid-take. The `port` pins them to the same
-/// control server the main window is in a session on.
+/// Open the frameless presence HUD without stealing focus from REAPER. `port`
+/// selects the same control server as the main window.
 #[tauri::command]
 fn open_overlay(app: AppHandle, port: u16) -> Result<(), String> {
     ensure_hud_overlay(&app, port)?;
-    ensure_arrange_overlay(&app, port)?;
     Ok(())
 }
 
@@ -360,58 +355,16 @@ fn ensure_hud_overlay(app: &AppHandle, port: u16) -> Result<(), String> {
     Ok(())
 }
 
-/// The full-window, click-through arrange overlay (peer playheads + ghosts).
-/// The native layer sizes it to REAPER's window and shares the HUD's
-/// frontmost-only visibility; the webview paints into it and lets every click
-/// fall through to REAPER (`set_ignore_cursor_events`).
-fn ensure_arrange_overlay(app: &AppHandle, port: u16) -> Result<(), String> {
-    if let Some(win) = app.get_webview_window("arrange") {
-        let _ = win.show();
-        return Ok(());
-    }
-    let url = format!("index.html?arrange=1&port={port}");
-    let win = tauri::WebviewWindowBuilder::new(app, "arrange", tauri::WebviewUrl::App(url.into()))
-        .title("ReaMesh arrange overlay")
-        .inner_size(800.0, 600.0)
-        .resizable(false)
-        .decorations(false)
-        .transparent(true)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .focused(false)
-        .shadow(false)
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let _ = win.set_ignore_cursor_events(true);
-    let _ = win.set_visible_on_all_workspaces(true);
-
-    #[cfg(target_os = "macos")]
-    {
-        let _ = app.run_on_main_thread(move || native_overlay::attach_arrange(&win));
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = &win;
-    }
-    Ok(())
-}
-
-/// Close both presence overlays (on leaving/stopping a session).
+/// Close the presence overlay (on leaving/stopping a session).
 #[tauri::command]
 fn close_overlay(app: AppHandle) -> Result<(), String> {
     let hud = app.get_webview_window("overlay");
-    let arrange = app.get_webview_window("arrange");
-    // Stop the follow timer / observers before the windows go away, in the same
+    // Stop the follow timer / observers before the window goes away, in the same
     // main-thread hop so detach always precedes close.
     #[cfg(target_os = "macos")]
     {
         let _ = app.run_on_main_thread(move || {
-            native_overlay::detach_arrange();
             native_overlay::detach();
-            if let Some(w) = arrange {
-                let _ = w.close();
-            }
             if let Some(w) = hud {
                 let _ = w.close();
             }
@@ -419,9 +372,6 @@ fn close_overlay(app: AppHandle) -> Result<(), String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        if let Some(w) = arrange {
-            let _ = w.close();
-        }
         if let Some(w) = hud {
             let _ = w.close();
         }
@@ -772,8 +722,8 @@ mod native_settings {
         apply_language(app, pref);
     }
 
-    // Overlay toggles as a bitmask (roster=1, tint=2, playheads=4,
-    // ghosts=8; see kReaMeshOverlay* in settings_window.h).
+    // Overlay toggles as a bitmask (roster=1, tint=2: kReaMeshOverlay* in
+    // settings_window.h).
     extern "C" fn get_overlay(ctx: *mut c_void) -> i32 {
         load_overlay(handle(ctx)) as i32
     }
@@ -814,8 +764,6 @@ mod native_overlay {
     extern "C" {
         fn reamesh_overlay_attach(ns_window: *mut c_void, width: f64);
         fn reamesh_overlay_detach();
-        fn reamesh_overlay_attach_arrange(ns_window: *mut c_void);
-        fn reamesh_overlay_detach_arrange();
     }
 
     pub fn attach(win: &WebviewWindow) {
@@ -826,15 +774,5 @@ mod native_overlay {
 
     pub fn detach() {
         unsafe { reamesh_overlay_detach() };
-    }
-
-    pub fn attach_arrange(win: &WebviewWindow) {
-        if let Ok(ns) = win.ns_window() {
-            unsafe { reamesh_overlay_attach_arrange(ns) };
-        }
-    }
-
-    pub fn detach_arrange() {
-        unsafe { reamesh_overlay_detach_arrange() };
     }
 }

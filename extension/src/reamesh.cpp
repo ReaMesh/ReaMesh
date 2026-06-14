@@ -82,17 +82,17 @@
 #define REAPERAPI_WANT_GetTempoTimeSigMarker
 #define REAPERAPI_WANT_SetTempoTimeSigMarker
 #define REAPERAPI_WANT_DeleteTempoTimeSigMarker
-// Live presence (playhead + time selection) and arrange-view geometry for the
-// peer-presence overlay, plus the local dark-grey item tint that marks media
-// items another peer is editing (SetMediaItemInfo_Value writes I_CUSTOMCOLOR).
-// All long-stable APIs, so importing them is safe on older REAPER
-// (REAPERAPI_LoadAPI only aborts on a missing wanted function).
+// Live presence (the focused track + timeline position, for the roster and
+// click-to-follow), the click-to-follow arrange scroll (GetSet_ArrangeView2),
+// plus the local dark-grey item tint that marks media items another peer is
+// editing (SetMediaItemInfo_Value writes I_CUSTOMCOLOR). All long-stable APIs,
+// so importing them is safe on older REAPER (REAPERAPI_LoadAPI only aborts on a
+// missing wanted function).
 #define REAPERAPI_WANT_GetMediaItemInfo_Value
 #define REAPERAPI_WANT_SetMediaItemInfo_Value
 #define REAPERAPI_WANT_GetPlayState
 #define REAPERAPI_WANT_GetPlayPosition
 #define REAPERAPI_WANT_GetCursorPosition
-#define REAPERAPI_WANT_GetSet_LoopTimeRange
 #define REAPERAPI_WANT_GetSet_ArrangeView2
 
 #include "reaper_plugin.h"
@@ -117,19 +117,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
-#ifdef __APPLE__
-#include <CoreGraphics/CoreGraphics.h>
-// Height of the main (menu-bar) display in logical points. REAPER's
-// `P_UI_RECT` reports macOS-native *bottom-left*-origin screen coordinates, but
-// the overlay (Tauri/winit, top-left origin) wants top-left, so a screen y is
-// flipped through this height (see computeArrangeView). The global Cocoa origin
-// is always the main display's bottom-left, even for windows on other monitors,
-// so the main display height is the correct (and only) flip constant.
-static double mainDisplayHeightPoints() {
-  return CGDisplayBounds(CGMainDisplayID()).size.height;
-}
-#endif
 
 using nlohmann::json;
 namespace fs = std::filesystem;
@@ -2113,82 +2100,6 @@ static void ctlDispatch(const json& cmd) {
   }
 }
 
-// Geometry for the arrange overlay (peer playheads / carets + time-selection
-// bands), in REAPER SCREEN coordinates (logical points, TOP-LEFT origin). The
-// overlay window covers REAPER's whole main window, so the webview converts to
-// window-relative by subtracting its own screen origin, which is why we never
-// need the arrange VIEWPORT rect (REAPER doesn't expose it through the stable
-// API). Per-track `P_UI_RECT:tcp.size` already reflects vertical scroll, and the
-// time axis comes from GetSet_ArrangeView2; together they're enough.
-//
-// IMPORTANT (coordinate space): on macOS `P_UI_RECT` returns *bottom-left*-origin
-// screen points (y grows upward, the topmost track has the LARGEST y), verified
-// on device. The overlay is top-left origin, so each y is flipped here through
-// the main display height. The playhead spans only the visible track stack
-// (top of the first track to the bottom of the last), so it stops above a
-// docked mixer / bottom dock instead of running off the window. Returns {} when
-// there's nothing to draw (not in a session, or no resolvable geometry).
-static json computeArrangeView() {
-  if (g_mode != Mode::Hosting && g_mode != Mode::ClientActive) return json::object();
-
-  // Time axis: t0 = project time at the arrange's left edge; spp = seconds per
-  // horizontal pixel (from the time at two x offsets, 0 and 1000).
-  double t0 = 0, t1 = 0, a = 0, b = 0;
-  GetSet_ArrangeView2(nullptr, false, 0, 0, &t0, &t1);
-  GetSet_ArrangeView2(nullptr, false, 0, 1000, &a, &b);
-  const double spp = (b - a) / 1000.0;
-  if (!(spp > 0.0)) return json::object();
-
-#ifdef __APPLE__
-  // On macOS, `P_UI_RECT` y is the track's TOP edge measured UP from the screen
-  // bottom (so the topmost track has the LARGEST y; the track extends DOWNWARD).
-  // Verified on device by checking adjacent tracks' edges against the gaps left
-  // by envelope lanes. Top-left top edge is therefore just H - y.
-  const double H = mainDisplayHeightPoints();
-  const auto topEdge = [H](double ry) { return H - ry; };
-#else
-  // Windows/Linux: P_UI_RECT is already top-left origin; ry is the top edge.
-  const auto topEdge = [](double ry) { return ry; };
-#endif
-
-  // Per-track screen rects. P_UI_RECT reflects the live vertical scroll, so a
-  // track's y is correct right now; the arrange's left x is the right edge of
-  // the (uniform-width) TCP.
-  json tracks = json::object();
-  double ax = 0;
-  bool haveAx = false;
-  double top = 0, bottom = 0;
-  bool haveSpan = false;
-  const int n = CountTracks(nullptr);
-  for (int i = 0; i < n; ++i) {
-    MediaTrack* tr = GetTrack(nullptr, i);
-    if (!tr) continue;
-    char buf[128] = {0};
-    if (!GetSetMediaTrackInfo_String(tr, "P_UI_RECT:tcp.size", buf, false)) continue;
-    double rx = 0, ry = 0, rw = 0, rh = 0;
-    if (sscanf(buf, "%lf %lf %lf %lf", &rx, &ry, &rw, &rh) != 4) continue;
-    if (rh <= 0) continue;  // collapsed / hidden
-    const double y = topEdge(ry);  // top-left y of the track's top edge
-    if (!haveAx) {
-      ax = rx + rw;
-      haveAx = true;
-    }
-    if (!haveSpan) {
-      top = y;
-      bottom = y + rh;
-      haveSpan = true;
-    } else {
-      if (y < top) top = y;
-      if (y + rh > bottom) bottom = y + rh;
-    }
-    tracks[trackGuid(tr)] = {{"y", y}, {"h", rh}};
-  }
-  if (!haveAx) return json::object();
-
-  return json{{"ax", ax},   {"t0", t0},         {"spp", spp},
-              {"top", top}, {"bottom", bottom}, {"tracks", std::move(tracks)}};
-}
-
 static void ctlTick() {
   for (;;) {
     char* raw = reamesh_ctl_poll();
@@ -2285,7 +2196,6 @@ static void ctlTick() {
   if (session.empty() && !g_sessionProjectPath.empty()) session = fileStem(g_sessionProjectPath);
   state["session"] = session;
   state["sessions"] = handleJson(reamesh_sessions, json::array());
-  state["view"] = computeArrangeView();
   state["peers"] = std::move(peers);
 
   static std::string lastPublished;
@@ -2298,35 +2208,19 @@ static void ctlTick() {
 
 // ---------- timer ----------
 
-// Report the user's live presence so peers can see where each person is: the
-// focused track, the playhead (the edit cursor, or the play position while the
-// transport is rolling), and the time selection. GUIDs are the shared identity;
-// each peer resolves them to its own project. Cheap value reads on the
-// main-thread tick, pushed only when something changes; while playing, `play`
-// advances every tick, which is exactly what keeps a sweeping playhead live on
-// peers' overlays. (Per-object selection, which tracks/items a peer has
-// selected, is deliberately NOT beaconed: peer item selection is no longer
-// drawn in the overlay; a peer's *editing lock* on an item shows up instead as
-// a local dark-grey item tint, computed from reamesh_locked_entities.)
+// Publish the focused track GUID and current timeline position with the user's
+// presence. Peers resolve the GUID against their own project. Track and item
+// selections stay local; item locks are shown with the local grey tint instead.
 static void pushLocalPresence() {
   MediaTrack* focusTr = GetSelectedTrack(nullptr, 0);
   std::string focus = focusTr ? trackGuid(focusTr) : std::string();
 
-  const int ps = GetPlayState();  // bit 0: playing, bit 2: recording
-  const bool playing = (ps & 1) != 0;
-  // The edit cursor is "where I am"; the play cursor is "where the music is".
-  // Both ride the beacon so the overlay can draw a static caret for the edit
-  // cursor and a separate sweeping playhead while the peer is rolling.
-  const double cursor = GetCursorPosition();
-  const double play = playing ? GetPlayPosition() : cursor;
+  // "Where they are" on the timeline: the play cursor while the transport rolls,
+  // otherwise the edit cursor.
+  const bool playing = (GetPlayState() & 1) != 0;  // bit 0: playing
+  const double play = playing ? GetPlayPosition() : GetCursorPosition();
 
-  // Time selection / loop range: drawn as a translucent band across the tracks
-  // (REAPER's own selection, but colored per peer). Zero-length = no selection.
-  double tsa = 0, tsb = 0;
-  GetSet_LoopTimeRange(false, false, &tsa, &tsb, false);
-
-  json p = {{"focus", focus},   {"play", play}, {"playing", playing},
-            {"cursor", cursor}, {"tsa", tsa},   {"tsb", tsb}};
+  json p = {{"focus", focus}, {"play", play}};
   static std::string last;
   std::string s = p.dump();
   if (s != last) {

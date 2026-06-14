@@ -17,18 +17,6 @@ export interface Peer {
    *  locally from their broadcast track GUID. Absent/0 when they're not on a
    *  track (or an older extension that doesn't report focus). */
   track?: number | null;
-  /** Peer's play cursor in project seconds (sweeps while `playing`). Drawn as a
-   *  sweeping playhead in the arrange overlay. */
-  play?: number;
-  /** True while the peer's transport is rolling (their playhead is sweeping). */
-  playing?: boolean;
-  /** Peer's edit cursor in project seconds, drawn as a static caret, distinct
-   *  from the play cursor. */
-  cursor?: number;
-  /** Peer's time selection / loop range in project seconds, drawn as a
-   *  translucent band across the tracks. Equal values = no selection. */
-  tsa?: number;
-  tsb?: number;
 }
 
 export interface SessionAd {
@@ -49,23 +37,6 @@ export interface LogEntry {
   text: string;
 }
 
-/** Live arrange-view geometry for the peer-playhead / time-selection overlay,
- *  in REAPER SCREEN coordinates (logical points). The arrange overlay window
- *  covers REAPER's whole window, so it converts these to window-relative by
- *  subtracting its own screen origin. `{}` (no `tracks`) means nothing to draw. */
-export interface ArrangeView {
-  /** Screen x of the arrange's left edge (right edge of the track panels). */
-  ax: number;
-  /** Project time at the arrange's left edge, and seconds per horizontal pixel. */
-  t0: number;
-  spp: number;
-  /** Screen y of the top / bottom of the visible track stack (playhead span). */
-  top: number;
-  bottom: number;
-  /** Per-track screen rect (reflects vertical scroll), keyed by track GUID. */
-  tracks?: Record<string, { y: number; h: number }>;
-}
-
 export interface ExtState {
   mode: Mode;
   /** Rust-side session state: hosting|browsing|connecting|downloading|ready|failed|ended */
@@ -84,8 +55,6 @@ export interface ExtState {
   reconnecting?: boolean;
   sessions: SessionAd[];
   peers: Peer[];
-  /** Local arrange-view geometry for the playhead/ghost overlay (may be `{}`). */
-  view?: ArrangeView;
   /** Result of a passphrase pre-check: `ok` is null while in flight, then a
    *  boolean. `null` (the whole field) when no check is active. */
   probe?: { session_id: string; ok: boolean | null } | null;

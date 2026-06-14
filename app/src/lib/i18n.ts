@@ -108,8 +108,6 @@ const en = {
   revealPeerTrack: "Jump to {name}",
   overlaySettingsTitle: "Overlay",
   olRoster: "Participants",
-  olPlayheads: "Peer playheads",
-  olTimeSelection: "Time selection",
   olItemTint: "Locked-item tint",
 
   // Activity-log / error events from the extension, rendered by code (see
@@ -243,8 +241,6 @@ const de: Record<MsgKey, string> = {
   revealPeerTrack: "Zu {name} springen",
   overlaySettingsTitle: "Overlay",
   olRoster: "Teilnehmer",
-  olPlayheads: "Abspielpositionen",
-  olTimeSelection: "Zeitauswahl",
   olItemTint: "Sperrtönung für Items",
 
   hostEndedSession: "Der Host hat die Session beendet.",

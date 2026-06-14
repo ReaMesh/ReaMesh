@@ -4,9 +4,9 @@ import "./index.css";
 import "slot-text/style.css";
 import { initLanguage } from "./lib/i18n";
 
-// Two entry points share this bundle. The floating presence overlay is opened
-// as a separate Tauri window pointed at `index.html?overlay=1&port=<n>`; every
-// other window is the main companion app. We branch with dynamic imports so the
+// Two entry points share this bundle. The floating presence HUD is opened as a
+// separate Tauri window pointed at `index.html?overlay=1&port=<n>`; every other
+// window is the main companion app. We branch with dynamic imports so the
 // overlay window never pulls in App.tsx's module-level scanning side effects
 // (and vice versa).
 const params = new URLSearchParams(window.location.search);
@@ -23,18 +23,6 @@ if (params.get("overlay") === "1") {
     root.render(
       <React.StrictMode>
         <Overlay port={port} />
-      </React.StrictMode>,
-    );
-  });
-} else if (params.get("arrange") === "1") {
-  // The full-window, click-through overlay that draws peer playheads and
-  // time-selection bands over REAPER's arrange view.
-  document.documentElement.classList.add("arrange-window");
-  const port = Number(params.get("port")) || null;
-  import("./overlay/ArrangeOverlay").then(({ ArrangeOverlay }) => {
-    root.render(
-      <React.StrictMode>
-        <ArrangeOverlay port={port} />
       </React.StrictMode>,
     );
   });

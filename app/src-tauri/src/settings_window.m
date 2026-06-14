@@ -191,8 +191,6 @@ static ReaMeshSettingsController *gController = nil;
     int32_t mask = self.cb.get_overlay(self.cb.ctx);
     NSArray *rows = @[
         @[ @(kReaMeshOverlayRoster), L(@"Participants", @"Teilnehmer") ],
-        @[ @(kReaMeshOverlayPlayheads), L(@"Peer playheads", @"Abspielpositionen") ],
-        @[ @(kReaMeshOverlayGhosts), L(@"Time selection", @"Zeitauswahl") ],
         @[ @(kReaMeshOverlayTint), L(@"Locked-item tint", @"Sperrtönung für Items") ],
     ];
     for (NSArray *row in rows) {

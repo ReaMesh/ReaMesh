@@ -22,8 +22,6 @@ import { cn } from "@/lib/utils";
 
 const OVERLAY_TOGGLES: { key: keyof OverlaySettings; label: () => string }[] = [
   { key: "roster", label: () => t("olRoster") },
-  { key: "playheads", label: () => t("olPlayheads") },
-  { key: "ghosts", label: () => t("olTimeSelection") },
   { key: "tint", label: () => t("olItemTint") },
 ];
 

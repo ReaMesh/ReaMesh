@@ -376,15 +376,10 @@ struct PeerPresence {
     color: String,
     /// GUID of the track this peer is currently focused on ("" if none).
     focus: String,
-    /// Play-cursor position in project seconds (sweeps while `playing`).
+    /// Where this peer is in the timeline (project seconds): play cursor while
+    /// rolling, else edit cursor. Used by the roster's click-to-follow to centre
+    /// the view on them; not drawn as a live playhead.
     play: f64,
-    /// True while this peer's transport is rolling (the playhead is sweeping).
-    playing: bool,
-    /// Edit-cursor position in project seconds, drawn as a static caret.
-    cursor: f64,
-    /// Time selection / loop range (project seconds); `tsa == tsb` means none.
-    tsa: f64,
-    tsb: f64,
     last_seen: Instant,
 }
 
@@ -401,31 +396,23 @@ pub fn set_profile(name: &str, color: &str) {
 }
 
 /// The local user's live "where am I" state, set by the extension each tick and
-/// gossiped on the presence beacon so peers can show where each person is:
-/// which track they're focused on and where their playhead / time selection
-/// sits. Like PROFILE it's process-global: it describes the user, not the
-/// session. GUIDs (never indices) are the shared identity; peers resolve them
-/// against their own project.
+/// gossiped on the presence beacon so peers can show where each person is: which
+/// track they're focused on (the roster track number) and where they sit in the
+/// timeline (so click-to-follow can centre the view on them). Like PROFILE it's
+/// process-global: it describes the user, not the session. GUIDs (never
+/// indices) are the shared identity; peers resolve them against their own
+/// project.
 #[derive(Clone)]
 struct LivePresence {
     focus: String,
+    /// Timeline position (project seconds): play cursor while rolling, else edit
+    /// cursor. Drives the roster's click-to-follow, not a live playhead.
     play: f64,
-    playing: bool,
-    /// Edit-cursor position (project seconds), distinct from `play`, which is
-    /// the play cursor while rolling. Drawn as a static caret.
-    cursor: f64,
-    /// Time selection / loop range (project seconds); `tsa == tsb` means none.
-    tsa: f64,
-    tsb: f64,
 }
 
 static LIVE: Mutex<LivePresence> = Mutex::new(LivePresence {
     focus: String::new(),
     play: 0.0,
-    playing: false,
-    cursor: 0.0,
-    tsa: 0.0,
-    tsb: 0.0,
 });
 
 pub fn set_focus(guid: &str) {
@@ -433,8 +420,7 @@ pub fn set_focus(guid: &str) {
 }
 
 /// Replace the live presence from a JSON blob the extension composes each tick:
-/// `{"focus","play","playing","cursor","tsa","tsb"}`. Any missing field resets
-/// to its empty/zero default.
+/// `{"focus","play"}`. Any missing field resets to its empty/zero default.
 pub fn set_presence(json: &str) {
     let Ok(v) = serde_json::from_str::<JsonValue>(json) else {
         return;
@@ -448,10 +434,6 @@ pub fn set_presence(json: &str) {
         .take(64)
         .collect();
     p.play = v.get("play").and_then(|x| x.as_f64()).unwrap_or(0.0);
-    p.playing = v.get("playing").and_then(|x| x.as_bool()).unwrap_or(false);
-    p.cursor = v.get("cursor").and_then(|x| x.as_f64()).unwrap_or(0.0);
-    p.tsa = v.get("tsa").and_then(|x| x.as_f64()).unwrap_or(0.0);
-    p.tsb = v.get("tsb").and_then(|x| x.as_f64()).unwrap_or(0.0);
 }
 
 /// Stable fallback identity color for a peer that never told us one: a
@@ -1136,27 +1118,13 @@ impl Reamesh {
         let owner = self.shared.owner_peer.lock().unwrap().clone();
         let (my_name, my_color) = PROFILE.lock().unwrap().clone();
         let me = LIVE.lock().unwrap().clone();
-        #[allow(clippy::too_many_arguments)]
-        let entry = |id: &str,
-                     name: &str,
-                     color: &str,
-                     focus: &str,
-                     play: f64,
-                     playing: bool,
-                     cursor: f64,
-                     tsa: f64,
-                     tsb: f64,
-                     is_self: bool| {
+        let entry = |id: &str, name: &str, color: &str, focus: &str, play: f64, is_self: bool| {
             json!({
                 "id": id,
                 "name": name,
                 "color": if color.is_empty() { default_color(id) } else { color.to_string() },
                 "focus": focus,
                 "play": play,
-                "playing": playing,
-                "cursor": cursor,
-                "tsa": tsa,
-                "tsb": tsb,
                 "is_self": is_self,
                 "is_owner": id == owner,
             })
@@ -1167,10 +1135,6 @@ impl Reamesh {
             &my_color,
             &me.focus,
             me.play,
-            me.playing,
-            me.cursor,
-            me.tsa,
-            me.tsb,
             true,
         )];
         let mut infos = self.shared.peers_info.lock().unwrap();
@@ -1185,10 +1149,6 @@ impl Reamesh {
                     &info.color,
                     &info.focus,
                     info.play,
-                    info.playing,
-                    info.cursor,
-                    info.tsa,
-                    info.tsb,
                     false,
                 ));
             }
@@ -2158,10 +2118,6 @@ async fn run_network(
                             "color": color,
                             "focus": live.focus,
                             "play": live.play,
-                            "playing": live.playing,
-                            "cursor": live.cursor,
-                            "tsa": live.tsa,
-                            "tsb": live.tsb,
                             "mac": mac,
                         })
                         .to_string()
@@ -2391,13 +2347,6 @@ async fn run_network(
                                             color: get("color"),
                                             focus: get("focus"),
                                             play: v.get("play").and_then(|x| x.as_f64()).unwrap_or(0.0),
-                                            playing: v
-                                                .get("playing")
-                                                .and_then(|x| x.as_bool())
-                                                .unwrap_or(false),
-                                            cursor: v.get("cursor").and_then(|x| x.as_f64()).unwrap_or(0.0),
-                                            tsa: v.get("tsa").and_then(|x| x.as_f64()).unwrap_or(0.0),
-                                            tsb: v.get("tsb").and_then(|x| x.as_f64()).unwrap_or(0.0),
                                             last_seen: Instant::now(),
                                         },
                                     );
@@ -3286,11 +3235,11 @@ pub extern "C" fn reamesh_set_focus(guid: *const c_char) {
     set_focus(&cstr_arg(guid).unwrap_or_default());
 }
 
-/// Set the local user's full live presence from a JSON blob
-/// `{"focus","play","playing","cursor","tsa","tsb"}`, gossiped on the presence
-/// beacon so peers can show where each person is (focused track, playhead /
-/// edit cursor, and time selection). Supersedes `reamesh_set_focus`; the
-/// extension calls it each tick. Missing fields reset to empty/zero.
+/// Set the local user's live presence from a JSON blob `{"focus","play"}`,
+/// gossiped on the presence beacon so peers can show where each person is (their
+/// focused track for the roster, and timeline position for click-to-follow).
+/// Supersedes `reamesh_set_focus`; the extension calls it each tick. Missing
+/// fields reset to empty/zero.
 #[unsafe(no_mangle)]
 pub extern "C" fn reamesh_set_presence(json: *const c_char) {
     set_presence(&cstr_arg(json).unwrap_or_default());

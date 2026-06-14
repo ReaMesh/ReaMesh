@@ -134,11 +134,11 @@ void reamesh_set_profile(const char *name, const char *color);
 void reamesh_set_focus(const char *guid);
 
 /**
- * Set the local user's full live presence from a JSON blob
- * `{"focus","play","playing","cursor","tsa","tsb"}`, gossiped on the presence
- * beacon so peers can show where each person is (focused track, playhead /
- * edit cursor, and time selection). Supersedes `reamesh_set_focus`; the
- * extension calls it each tick. Missing fields reset to empty/zero.
+ * Set the local user's live presence from a JSON blob `{"focus","play"}`,
+ * gossiped on the presence beacon so peers can show where each person is (their
+ * focused track for the roster, and timeline position for click-to-follow).
+ * Supersedes `reamesh_set_focus`; the extension calls it each tick. Missing
+ * fields reset to empty/zero.
  */
 void reamesh_set_presence(const char *json);
 

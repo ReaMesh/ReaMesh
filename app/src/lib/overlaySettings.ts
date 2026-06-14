@@ -18,10 +18,6 @@ export interface OverlaySettings {
    * activity bit was on by default) keep the tint on without a migration.
    */
   tint: boolean;
-  /** Peer playheads drawn over the arrange view. */
-  playheads: boolean;
-  /** Peer time-selection bands drawn over the arrange view. */
-  ghosts: boolean;
 }
 
 const KEY = "reamesh.overlay";
@@ -29,25 +25,19 @@ const EVENT = "reamesh:overlay-settings";
 const DEFAULTS: OverlaySettings = {
   roster: true,
   tint: true,
-  playheads: true,
-  ghosts: true,
 };
 
 // Bit layout: must match settings_window.h (kReaMeshOverlay*) and the Rust
-// `OVERLAY_ALL` mask.
+// `OVERLAY_ALL` mask. Bits 4/8 (peer playheads / time-selection) are retired.
 const BITS: Record<keyof OverlaySettings, number> = {
   roster: 1,
   tint: 2,
-  playheads: 4,
-  ghosts: 8,
 };
 
 function maskToSettings(mask: number): OverlaySettings {
   return {
     roster: !!(mask & BITS.roster),
     tint: !!(mask & BITS.tint),
-    playheads: !!(mask & BITS.playheads),
-    ghosts: !!(mask & BITS.ghosts),
   };
 }
 
