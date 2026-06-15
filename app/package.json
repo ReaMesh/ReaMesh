@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "dmg": "bash scripts/make-dmg.sh"
+    "dmg": "bash scripts/make-dmg.sh",
+    "dmg:full": "bash scripts/build-dmg.sh"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.16",
