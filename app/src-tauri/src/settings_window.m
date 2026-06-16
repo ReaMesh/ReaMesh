@@ -9,7 +9,7 @@ static NSString *const kTabOverlay = @"overlay";
 static NSString *const kReaperDownloadURL = @"https://www.reaper.fm/download.php";
 
 static const CGFloat kWindowWidth = 480;
-static const CGFloat kWindowHeight = 380;
+static const CGFloat kWindowHeight = 416;
 static const CGFloat kMargin = 24;
 
 // The window is bilingual (English/German), driven by the same stored
@@ -206,6 +206,13 @@ static ReaMeshSettingsController *gController = nil;
     }
 }
 
+- (void)autoInstallToggled:(NSButton *)sender {
+    self.cb.set_auto_install(self.cb.ctx,
+                             sender.state == NSControlStateValueOn ? 1 : 0);
+    // Turning it on may have just installed/updated: rebuild to refresh status.
+    [self showTab:self.selectedTab];
+}
+
 - (void)overlayToggled:(NSButton *)sender {
     int32_t mask = self.cb.get_overlay(self.cb.ctx);
     int32_t bit = (int32_t)sender.tag;
@@ -336,7 +343,21 @@ static ReaMeshSettingsController *gController = nil;
     statusLabel.font = [NSFont systemFontOfSize:13];
     statusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     [self.container addSubview:statusLabel];
-    y += 38;
+    y += 36;
+
+    // Auto-install toggle. On (the default), the extension is installed and kept
+    // up to date automatically: on launch, after a folder change, and the
+    // moment this is switched on. Off restores the manual install button above.
+    NSButton *autoBox =
+        [NSButton checkboxWithTitle:L(@"Install and update automatically",
+                                      @"Automatisch installieren und aktualisieren")
+                             target:self
+                             action:@selector(autoInstallToggled:)];
+    autoBox.state =
+        self.cb.get_auto_install(self.cb.ctx) ? NSControlStateValueOn : NSControlStateValueOff;
+    autoBox.frame = NSMakeRect(kMargin, y, w, 22);
+    [self.container addSubview:autoBox];
+    y += 30;
 
     NSTextField *help = [self
         labelWithString:L(@"REAPER loads the extension at startup, so restart it "

@@ -43,6 +43,8 @@ typedef struct {
     void (*set_language)(void *ctx, int32_t pref);
     int32_t (*get_overlay)(void *ctx);        // kReaMeshOverlay* bitmask
     void (*set_overlay)(void *ctx, int32_t mask);
+    int32_t (*get_auto_install)(void *ctx);   // 1 = auto-install/update on
+    void (*set_auto_install)(void *ctx, int32_t enabled);
 } SettingsCallbacks;
 
 // Opens (or re-focuses) the native settings window. Must be called on the

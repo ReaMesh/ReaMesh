@@ -192,6 +192,82 @@ fn set_overlay_settings(app: AppHandle, mask: u8) {
     apply_overlay(&app, mask);
 }
 
+// ---------- auto-install ----------
+//
+// When enabled (the default), the bundled extension is installed into REAPER's
+// UserPlugins automatically: on app launch, after the REAPER folder changes,
+// and the moment the toggle is switched on. Because "up to date" is a byte
+// comparison against the bundled copy, this also silently *updates* the
+// installed extension whenever a newer app build ships a newer dylib. Turning
+// it off restores the old manual install/update-button workflow. Persisted
+// backend-side (like the language/overlay prefs) so the webview Settings screen
+// and the native macOS settings window share one source of truth.
+fn auto_install_file(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|d| d.join("auto_install"))
+}
+
+/// Default on: absent file (fresh install) or anything but an explicit off flag.
+fn load_auto_install(app: &AppHandle) -> bool {
+    auto_install_file(app)
+        .and_then(|p| fs::read_to_string(p).ok())
+        .map(|s| !matches!(s.trim(), "0" | "false"))
+        .unwrap_or(true)
+}
+
+fn store_auto_install(app: &AppHandle, enabled: bool) {
+    let Some(p) = auto_install_file(app) else {
+        return;
+    };
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(p, if enabled { "1" } else { "0" });
+}
+
+/// Install/update the bundled extension when auto-install is on and the
+/// installed copy is missing or stale. Best-effort and silent: onboarding and
+/// the manual install button still cover the case where REAPER can't be written
+/// (e.g. a folder that isn't there yet, or permissions).
+fn maybe_auto_install(app: &AppHandle) {
+    if !load_auto_install(app) {
+        return;
+    }
+    let custom = load_custom_path(app);
+    let Ok(st) = compute_status(app, &custom) else {
+        return;
+    };
+    if st.reaper_found && (!st.installed || !st.up_to_date) {
+        let _ = do_install(app, &custom);
+    }
+}
+
+/// Persist the auto-install preference, install right away when turning it on,
+/// and tell the webview(s) so the toggle and the install status re-render.
+/// Shared by the webview command and the native settings window callback.
+fn apply_auto_install(app: &AppHandle, enabled: bool) {
+    store_auto_install(app, enabled);
+    if enabled {
+        maybe_auto_install(app);
+    }
+    use tauri::Emitter;
+    let _ = app.emit("auto-install-changed", enabled);
+    // Nudge the main window to re-read status (an enable may have just installed).
+    let _ = app.emit("menu:settings-changed", ());
+}
+
+#[tauri::command]
+fn get_auto_install(app: AppHandle) -> bool {
+    load_auto_install(&app)
+}
+
+#[tauri::command]
+fn set_auto_install(app: AppHandle, enabled: bool) {
+    apply_auto_install(&app, enabled);
+}
+
 fn device_lang() -> Lang {
     match sys_locale::get_locale() {
         Some(l) if l.to_lowercase().starts_with("de") => Lang::De,
@@ -302,7 +378,11 @@ fn get_reaper_path(app: AppHandle) -> Option<String> {
 
 #[tauri::command]
 fn set_reaper_path(app: AppHandle, path: Option<String>) -> Result<(), String> {
-    store_custom_path(&app, path)
+    store_custom_path(&app, path)?;
+    // A freshly located REAPER folder should pick up the extension on its own
+    // when auto-install is on (no-op in manual mode).
+    maybe_auto_install(&app);
+    Ok(())
 }
 
 /// Width of the floating presence overlay, in logical pixels. The webview
@@ -549,11 +629,16 @@ pub fn run() {
             set_language,
             get_overlay_settings,
             set_overlay_settings,
+            get_auto_install,
+            set_auto_install,
             set_session_state
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             build_menu(app.handle())?;
+            // Keep the bundled extension installed/updated automatically unless
+            // the user opted into the manual workflow.
+            maybe_auto_install(app.handle());
             Ok(())
         })
         .on_menu_event(|app, event| {
@@ -616,8 +701,9 @@ pub fn run() {
 #[cfg(target_os = "macos")]
 mod native_settings {
     use super::{
-        apply_language, apply_overlay, compute_status, do_install, load_custom_path,
-        load_lang_pref, load_overlay, store_custom_path, ReaperStatus,
+        apply_auto_install, apply_language, apply_overlay, compute_status, do_install,
+        load_auto_install, load_custom_path, load_lang_pref, load_overlay, maybe_auto_install,
+        store_custom_path, ReaperStatus,
     };
     use std::cell::RefCell;
     use std::ffi::{c_char, c_void, CStr, CString};
@@ -644,6 +730,8 @@ mod native_settings {
         set_language: extern "C" fn(*mut c_void, i32),
         get_overlay: extern "C" fn(*mut c_void) -> i32,
         set_overlay: extern "C" fn(*mut c_void, i32),
+        get_auto_install: extern "C" fn(*mut c_void) -> i32,
+        set_auto_install: extern "C" fn(*mut c_void, i32),
     }
 
     extern "C" {
@@ -699,6 +787,7 @@ mod native_settings {
             Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
         };
         let _ = store_custom_path(app, path);
+        maybe_auto_install(app);
         let _ = app.emit("menu:settings-changed", ());
     }
 
@@ -732,6 +821,15 @@ mod native_settings {
         apply_overlay(handle(ctx), mask as u8);
     }
 
+    // Auto-install toggle (1 = keep the extension installed/updated automatically).
+    extern "C" fn get_auto_install(ctx: *mut c_void) -> i32 {
+        load_auto_install(handle(ctx)) as i32
+    }
+
+    extern "C" fn set_auto_install(ctx: *mut c_void, enabled: i32) {
+        apply_auto_install(handle(ctx), enabled != 0);
+    }
+
     // The AppHandle is leaked once so the pointer stays valid for the lifetime
     // of the (long-lived) native window.
     static APP_PTR: OnceLock<usize> = OnceLock::new();
@@ -747,6 +845,8 @@ mod native_settings {
             set_language,
             get_overlay,
             set_overlay,
+            get_auto_install,
+            set_auto_install,
         };
         unsafe { reamesh_settings_open(cb) };
     }

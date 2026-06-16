@@ -91,6 +91,7 @@ const en = {
   updateAvailable: "Update available",
   reinstallExtension: "Reinstall extension",
   updateExtension: "Update extension",
+  autoInstallExt: "Install and update automatically",
   restartNote: "REAPER loads the extension at startup, so restart it after installing or updating.",
   extInstalledToast: "Extension installed. Restart REAPER to load it.",
   language: "Language",
@@ -225,6 +226,7 @@ const de: Record<MsgKey, string> = {
   updateAvailable: "Update verfügbar",
   reinstallExtension: "Erweiterung neu installieren",
   updateExtension: "Erweiterung aktualisieren",
+  autoInstallExt: "Automatisch installieren und aktualisieren",
   restartNote:
     "REAPER lädt die Erweiterung beim Start, also starte es nach einer Installation oder einem Update neu.",
   extInstalledToast: "Erweiterung installiert. Starte REAPER neu, um sie zu laden.",

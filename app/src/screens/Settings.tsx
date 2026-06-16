@@ -13,6 +13,7 @@ import {
   setReaperPath,
   useReaperStatus,
 } from "@/lib/install";
+import { setAutoInstall, useAutoInstall } from "@/lib/autoInstall";
 import {
   type OverlaySettings,
   setOverlaySetting,
@@ -34,7 +35,14 @@ export function Settings({ onBack }: { onBack: () => void }) {
   const status = useReaperStatus();
   const hasCustom = !!getReaperPath();
   const overlay = useOverlaySettings();
+  const autoInstall = useAutoInstall() ?? true;
   useLang(); // re-render when the language changes
+
+  const toggleAuto = async (next: boolean) => {
+    await setAutoInstall(next);
+    // Enabling may have just installed/updated; reflect the new status.
+    await refreshStatus();
+  };
 
   const pickFolder = async () => {
     const dir = await open({
@@ -189,6 +197,23 @@ export function Settings({ onBack }: { onBack: () => void }) {
               <span className="text-[13px]">reaper_reamesh</span>
               {extBadge}
             </div>
+            <button
+              type="button"
+              onClick={() => toggleAuto(!autoInstall)}
+              className="flex w-full items-center gap-2.5 rounded-lg px-1 py-0.5 text-left text-[13px] transition-colors hover:bg-secondary/40"
+            >
+              <span
+                className={cn(
+                  "grid size-4 shrink-0 place-items-center rounded-[5px] border transition-colors",
+                  autoInstall
+                    ? "border-foreground/30 bg-foreground/85 text-background"
+                    : "border-border text-transparent",
+                )}
+              >
+                <Check className="size-3" strokeWidth={3} />
+              </span>
+              <span className="flex-1 text-foreground/90">{t("autoInstallExt")}</span>
+            </button>
             <Button
               size="sm"
               className="h-7 w-full text-[12px]"
