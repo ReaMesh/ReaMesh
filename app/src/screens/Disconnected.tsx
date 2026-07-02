@@ -55,10 +55,22 @@ function BreathingBeacon({ found }: { found: boolean }) {
             initial={{ scale: 1, opacity: 0.55 }}
             animate={{ scale: 4.2, opacity: 0 }}
             transition={{
-              duration: 2,
-              repeat: Infinity,
-              ease: [0, 0.2, 0.8, 1],
-              delay: i,
+              scale: {
+                duration: 2,
+                repeat: Infinity,
+                ease: [0, 0.2, 0.8, 1],
+                delay: i,
+              },
+              // Fade out ahead of the scale (easeOut = fast initial drop) so the
+              // ring is fully transparent well before it reaches the outer edge;
+              // otherwise the largest ring lingers faint and reads as a flash
+              // right before it vanishes.
+              opacity: {
+                duration: 2,
+                repeat: Infinity,
+                ease: "easeOut",
+                delay: i,
+              },
             }}
           />
         ))}
