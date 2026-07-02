@@ -4,36 +4,71 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { t } from "@/lib/i18n";
 
-// Shown until a REAPER instance with the ReaMesh extension answers on
-// localhost. A slim indeterminate sweep reads as "scanning" without the
-// busy pulsing rings.
-export function Disconnected() {
-  const openReaper = async () => {
-    try {
-      await openPath("/Applications/REAPER.app");
-    } catch {
-      toast.error(t("couldntOpenReaper"));
-    }
-  };
+async function launchReaper() {
+  try {
+    await openPath("/Applications/REAPER.app");
+  } catch {
+    toast.error(t("couldntOpenReaper"));
+  }
+}
 
+// Shown until a REAPER instance with the ReaMesh extension answers on
+// localhost. A calm "breathing" beacon reads as "listening on the network"
+// without the busy spin of a progress wheel; it flashes to a found-blue the
+// instant REAPER answers (`found`), just before the screen hands off.
+export function Disconnected({ found = false }: { found?: boolean }) {
   return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-7 px-10 text-center">
-      <div className="h-px w-32 overflow-hidden rounded-full bg-border">
-        <motion.div
-          className="h-full w-1/3 rounded-full bg-foreground/50"
-          animate={{ x: ["-120%", "320%"] }}
-          transition={{ duration: 1.6, repeat: Infinity, ease: "easeInOut" }}
-        />
-      </div>
+    <div className="flex flex-1 flex-col items-center justify-center gap-6 px-10 text-center">
+      <BreathingBeacon found={found} />
+
       <div className="space-y-1.5">
-        <h2 className="text-[15px] font-semibold">{t("waitingForReaper")}</h2>
+        <h2 className="text-[15px] font-semibold">
+          {found ? t("reaperFound") : t("waitingForReaper")}
+        </h2>
         <p className="text-[13px] leading-relaxed text-muted-foreground">
-          {t("startReaperToConnect")}
+          {found ? t("connecting") : t("startReaperToConnect")}
         </p>
       </div>
-      <Button size="sm" onClick={openReaper}>
-        {t("openReaper")}
-      </Button>
+
+      <div className="flex w-full max-w-[240px] flex-col items-center gap-3">
+        <Button className="w-full" onClick={launchReaper} disabled={found}>
+          {t("openReaper")}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+// A center dot with two rings that expand and fade outward on a stagger:
+// a heartbeat, not a spinner. Muted grey while scanning; the whole beacon
+// switches to found-blue for the brief handoff beat.
+function BreathingBeacon({ found }: { found: boolean }) {
+  const color = found ? "var(--found)" : "var(--muted-foreground)";
+  return (
+    <div className="flex h-11 w-11 items-center justify-center">
+      <div className="relative flex items-center justify-center">
+        {[0, 1].map((i) => (
+          <motion.span
+            key={i}
+            className="absolute size-[9px] rounded-full border-[1.5px]"
+            style={{ borderColor: color }}
+            initial={{ scale: 1, opacity: 0.55 }}
+            animate={{ scale: 4.2, opacity: 0 }}
+            transition={{
+              duration: 2,
+              repeat: Infinity,
+              ease: [0, 0.2, 0.8, 1],
+              delay: i,
+            }}
+          />
+        ))}
+        <motion.span
+          className="size-[9px] rounded-full"
+          style={{ backgroundColor: color }}
+          animate={found ? { scale: [1, 1.35, 1] } : { scale: 1 }}
+          transition={{ duration: 0.5, ease: "easeOut" }}
+        />
+      </div>
     </div>
   );
 }

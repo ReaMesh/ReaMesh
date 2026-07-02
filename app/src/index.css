@@ -19,6 +19,8 @@
   --muted-foreground: #8b8b94;
   --accent: #232329;
   --accent-foreground: #e7e7ea;
+  /* Accent used when the REAPER scan succeeds. */
+  --found: #6aa6f0;
   --destructive: #ff5d5d;
   --destructive-foreground: #fff;
   --border: rgba(255, 255, 255, 0.08);
@@ -42,6 +44,7 @@
   --color-muted-foreground: var(--muted-foreground);
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
+  --color-found: var(--found);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
   --color-border: var(--border);

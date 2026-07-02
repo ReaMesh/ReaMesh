@@ -20,6 +20,7 @@ const en = {
   startReaperToConnect: "Start REAPER to connect.",
   openReaper: "Open REAPER",
   couldntOpenReaper: "Couldn't open REAPER. Launch it manually.",
+  reaperFound: "REAPER found",
 
   // Lobby
   yourName: "Your name",
@@ -159,6 +160,7 @@ const de: Record<MsgKey, string> = {
   startReaperToConnect: "Starte REAPER, um dich zu verbinden.",
   openReaper: "REAPER öffnen",
   couldntOpenReaper: "REAPER konnte nicht geöffnet werden. Starte es manuell.",
+  reaperFound: "REAPER gefunden",
 
   yourName: "Dein Name",
   sessionsOnNetwork: "Sessions in diesem Netzwerk",

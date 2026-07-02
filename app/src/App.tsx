@@ -131,6 +131,25 @@ export default function App() {
   useErrorToasts(state);
   useOverrideToasts(state);
 
+  // Hold the Disconnected screen briefly after REAPER answers so its
+  // success animation finishes before the lobby appears. `waiting` matches
+  // the render condition below.
+  const hasState = !!state;
+  const waiting =
+    !settingsOpen && reaper !== undefined && !state && !(reaper && !reaper.installed);
+  const [foundBeat, setFoundBeat] = useState(false);
+  const wasWaiting = useRef(false);
+  useEffect(() => {
+    if (hasState && wasWaiting.current) {
+      setFoundBeat(true);
+      const id = setTimeout(() => setFoundBeat(false), 850);
+      return () => clearTimeout(id);
+    }
+  }, [hasState]);
+  useEffect(() => {
+    wasWaiting.current = waiting;
+  });
+
   // Settings is opened from the native menu (ReaMesh → Settings…, Cmd+,). On
   // macOS the backend opens a native AppKit window instead and emits
   // `menu:settings-changed` after edits so we can re-read status; the
@@ -181,6 +200,8 @@ export default function App() {
     };
   } else if (reaper === undefined) {
     screen = { key: "checking", node: null };
+  } else if (foundBeat) {
+    screen = { key: "disconnected", node: <Disconnected found /> };
   } else if (reaper && !reaper.installed && !state) {
     screen = { key: "onboarding", node: <Onboarding status={reaper} /> };
   } else if (!state) {
