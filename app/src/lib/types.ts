@@ -42,6 +42,9 @@ export interface ExtState {
   /** Rust-side session state: hosting|browsing|connecting|downloading|ready|failed|ended */
   state: string;
   progress: number;
+  /** Byte counters behind `progress` while downloading (0 or absent otherwise). */
+  done_bytes?: number;
+  total_bytes?: number;
   session: string;
   /** Name (stem) of the project currently open in this REAPER instance. */
   project: string;
