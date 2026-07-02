@@ -112,10 +112,12 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using nlohmann::json;
@@ -1092,10 +1094,78 @@ static std::string diffSnapshots(const Snapshot& prev, const Snapshot& now) {
 // (only project-relative paths cross the wire). Copy such sources into the
 // project folder and repoint the take, like REAPER's own "copy media into
 // project" option. Runs during capture, so the path change is published.
+// Background media-internalization plumbing. Copying an out-of-project source
+// (a 500 MB WAV from another disk) used to run synchronously in the capture,
+// freezing REAPER's main thread for the whole copy. Copies now run on detached
+// worker threads writing to a hidden ".reamesh-copy-*" temp (dotfiles are
+// excluded from the transfer manifest, so a half-copied file is never served)
+// renamed into place when whole; results are drained, and takes repointed:
+// on the next capture, on the main thread. While a source is still copying,
+// its items are pinned out of the capture diff (see captureLocalChanges), so
+// an absolute external path never reaches the wire.
+struct CopyResult {
+  std::string src, dest, err;
+  bool ok;
+};
+static std::mutex g_copyMx;
+static std::vector<CopyResult> g_copyDone;      // filled by worker threads
+static std::set<std::string> g_copyInFlight;    // source paths, main thread only
+static std::set<std::string> g_copyFailed;      // gave up (logged once)
+// item GUID -> external source path, rebuilt each capture: which items must
+// stay out of the diff because their media is still on its way in.
+static std::map<std::string, std::string> g_itemsAwaitingCopy;
+
+// Repoint every take still reading `srcPath` to the in-project copy at `dest`.
+static bool repointTakes(const std::string& srcPath, const std::string& dest) {
+  bool repointed = false;
+  const int n = CountMediaItems(nullptr);
+  for (int i = 0; i < n; ++i) {
+    MediaItem* item = GetMediaItem(nullptr, i);
+    MediaItem_Take* take = GetActiveTake(item);
+    if (!take) continue;
+    PCM_source* src = GetMediaItemTake_Source(take);
+    if (!src) continue;
+    char fn[4096] = "";
+    GetMediaSourceFileName(src, fn, sizeof(fn));
+    if (srcPath != fn) continue;
+    PCM_source* ns = PCM_Source_CreateFromFile(dest.c_str());
+    if (!ns) continue;
+    SetMediaItemTake_Source(take, ns);
+    PCM_Source_Destroy(src);
+    UpdateItemInProject(item);
+    repointed = true;
+  }
+  return repointed;
+}
+
 static void internalizeExternalMedia() {
   const fs::path projDir = projectDir();
   if (projDir.empty()) return;
   bool repointed = false;
+
+  // Drain finished background copies first: repoint their takes so this very
+  // capture picks the in-project path up as a normal local edit.
+  std::vector<CopyResult> done;
+  {
+    std::lock_guard<std::mutex> lk(g_copyMx);
+    done.swap(g_copyDone);
+  }
+  for (const CopyResult& r : done) {
+    g_copyInFlight.erase(r.src);
+    const std::string name = fs::path(r.src).filename().string();
+    if (!r.ok) {
+      g_copyFailed.insert(r.src);  // don't retry (and re-log) every capture
+      logEvent("media_copy_failed", {{"file", name}},
+               "could not copy " + name + " into the project: " + r.err);
+      continue;
+    }
+    repointed |= repointTakes(r.src, r.dest);
+    logEvent("media_copied", {{"file", name}},
+             "copied " + name + " into the project folder so peers get it");
+  }
+
+  // Scan for external sources and kick off copies for new ones.
+  g_itemsAwaitingCopy.clear();
   const int n = CountMediaItems(nullptr);
   for (int i = 0; i < n; ++i) {
     MediaItem* item = GetMediaItem(nullptr, i);
@@ -1110,30 +1180,43 @@ static void internalizeExternalMedia() {
     fs::path source = fs::path(fn);
     fs::path rel = fs::relative(source, projDir, ec);
     if (!ec && !rel.empty() && rel.native().rfind("..", 0) != 0) continue;  // already inside
+    if (g_copyFailed.count(fn)) continue;
+    if (g_copyInFlight.count(fn)) {
+      g_itemsAwaitingCopy[itemGuid(item)] = fn;  // still copying: keep it off the wire
+      continue;
+    }
 
     fs::path dest = projDir / source.filename();
     for (int k = 2; fs::exists(dest, ec) && fs::file_size(dest, ec) != fs::file_size(source, ec);
          ++k)
       dest = projDir / (source.stem().string() + " (" + std::to_string(k) + ")" +
                         source.extension().string());
-    if (!fs::exists(dest, ec)) {
-      fs::copy_file(source, dest, ec);
-      if (ec) {
-        logEvent("media_copy_failed", {{"file", source.filename().string()}},
-                 "could not copy " + source.filename().string() + " into the project: " +
-                     ec.message());
-        continue;
-      }
+    if (fs::exists(dest, ec)) {
+      // Identical-size copy already in the project (a prior run): repoint now.
+      repointed |= repointTakes(fn, dest.string());
+      continue;
     }
-    PCM_source* ns = PCM_Source_CreateFromFile(dest.string().c_str());
-    if (!ns) continue;
-    SetMediaItemTake_Source(take, ns);
-    PCM_Source_Destroy(src);
-    UpdateItemInProject(item);
-    repointed = true;
-    logEvent("media_copied", {{"file", source.filename().string()}},
-             "copied " + source.filename().string() + " into the project folder so peers get it");
+
+    g_copyInFlight.insert(fn);
+    g_itemsAwaitingCopy[itemGuid(item)] = fn;
+    std::thread([srcPath = source.string(), destPath = dest.string()] {
+      std::error_code tec;
+      fs::path tmp = fs::path(destPath).parent_path() /
+                     (".reamesh-copy-" + fs::path(destPath).filename().string());
+      fs::copy_file(srcPath, tmp, fs::copy_options::overwrite_existing, tec);
+      bool ok = !tec;
+      std::string err = tec ? tec.message() : "";
+      if (ok) {
+        fs::rename(tmp, destPath, tec);
+        ok = !tec;
+        if (!ok) err = tec.message();
+      }
+      if (!ok) fs::remove(tmp, tec);
+      std::lock_guard<std::mutex> lk(g_copyMx);
+      g_copyDone.push_back({srcPath, destPath, err, ok});
+    }).detach();
   }
+
   // Peaks are keyed by source path; a repointed take starts without them.
   if (repointed) Main_OnCommand(40047, 0);  // Peaks: Build any missing peaks
 }
@@ -1207,11 +1290,24 @@ static void captureLocalChanges() {
     }
   }
 
-  // Items another peer holds the editing lock on are read-only here: snap them
-  // back to the synced state at once (locally, no owner round-trip) and never
-  // propose the edit. This is the "gelockt = gelockt" guard: it also stops the
-  // grey lock tint from ever being captured/synced, since the reverted item
-  // keeps the authoritative baseline.
+  // Items whose media is still being copied into the project folder stay off
+  // the wire: their chunk still references the external ABSOLUTE path, which
+  // no peer could ever fetch. An already-known item keeps its baseline chunk
+  // (no phantom edit), a brand-new one stays invisible until the copy lands
+  // and its take is repointed: never a tombstone, since it was never synced.
+  for (const auto& [guid, srcPath] : g_itemsAwaitingCopy) {
+    auto it = snap.items.find(guid);
+    if (it == snap.items.end()) continue;
+    auto b = g_snapshot.items.find(guid);
+    if (b != g_snapshot.items.end())
+      it->second.chunk = b->second.chunk;
+    else
+      snap.items.erase(it);
+  }
+
+  // Items locked by another peer are read-only locally. Restore their synced
+  // state without proposing the edit. Keeping the authoritative baseline
+  // also prevents the local lock tint from entering the diff.
   revertLockedItemEdits(snap);
 
   std::string changeset = diffSnapshots(g_snapshot, snap);
@@ -1999,6 +2095,10 @@ static void onHost(const std::string& passphrase) {
   g_lastCapture = {};
   g_lastFullScan = {};
   g_captureCost = {};  // new project: re-learn what a capture costs
+  // Copies from a previous session may still finish (drained harmlessly by
+  // path match); only the per-session verdicts reset.
+  g_copyFailed.clear();
+  g_itemsAwaitingCopy.clear();
   g_lastPeerCount = 0;
   logEvent("hosting", {{"name", name}},
            passphrase.empty()
@@ -2315,6 +2415,8 @@ static void pollDownload() {
     g_lastChangeCount = GetProjectStateChangeCount(nullptr);
     g_itemTints.clear();  // fresh download: start with no lock tints
     g_captureCost = {};   // new project: re-learn what a capture costs
+    g_copyFailed.clear();
+    g_itemsAwaitingCopy.clear();
     g_applyingRemote = false;
     g_openingProject = false;
     // Peak caches (.reapeaks) are deliberately not transferred, and REAPER
