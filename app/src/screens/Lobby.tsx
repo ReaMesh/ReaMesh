@@ -214,8 +214,27 @@ function SessionCard({
   );
 }
 
-function HostCard({ project }: { project: string }) {
+function HostCard({ project, error }: { project: string; error: ExtState["error"] }) {
   const [pass, setPass] = useState("");
+  // Keep the host button pending until hosting starts or an error arrives.
+  // Saving a large project may take time; block duplicate commands meanwhile.
+  const [pending, setPending] = useState(false);
+  const errKey = error ? JSON.stringify(error) : "";
+  const lastErr = useRef(errKey);
+  useEffect(() => {
+    if (pending && errKey !== lastErr.current) setPending(false);
+    lastErr.current = errKey;
+  }, [errKey, pending]);
+  useEffect(() => {
+    if (!pending) return;
+    const id = setTimeout(() => setPending(false), 10000); // safety net
+    return () => clearTimeout(id);
+  }, [pending]);
+  const host = () => {
+    if (pending) return;
+    setPending(true);
+    send({ cmd: "host", passphrase: pass });
+  };
   return (
     <div className="space-y-2 rounded-xl bg-card p-3">
       <div className="flex items-center gap-3">
@@ -228,9 +247,10 @@ function HostCard({ project }: { project: string }) {
         <Button
           size="sm"
           className="h-7 px-4 text-[12px]"
-          onClick={() => send({ cmd: "host", passphrase: pass })}
+          disabled={pending}
+          onClick={host}
         >
-          {t("hostAction")}
+          {pending ? <LoaderCircle className="size-3.5 animate-spin" /> : t("hostAction")}
         </Button>
       </div>
       <Input
@@ -285,7 +305,7 @@ export function Lobby({ state }: { state: ExtState }) {
         </ScrollArea>
       </div>
 
-      <HostCard project={state.project} />
+      <HostCard project={state.project} error={state.error} />
     </div>
   );
 }
