@@ -552,6 +552,11 @@ enum Command {
     ProbeAuth { session_id: String, passphrase: String },
     FetchFile(String),
     Dial(Multiaddr),
+    /// Owner-side: the background hashing pass over the project finished;
+    /// replace the served manifest with this hash-complete one. Hosting starts
+    /// with an unhashed manifest so `host()` returns instantly (hashing a
+    /// multi-GB project would otherwise freeze REAPER's main thread).
+    ManifestReady(Vec<FileMeta>),
     Shutdown,
 }
 
@@ -599,7 +604,14 @@ impl Reamesh {
         if !dir.is_dir() {
             anyhow::bail!("project directory not found: {project_dir}");
         }
+        // Walk only: no hashes yet. This runs on REAPER's main thread (the
+        // user just clicked "Host"), and blake3 over a multi-GB project takes
+        // long enough to look like a hang. Hashes are filled in by a background
+        // thread below; a client that requests the manifest before that
+        // finishes simply downloads without resume-dedup/verify (empty hashes
+        // are legal throughout the transfer path).
         let files = build_manifest(&dir)?;
+        let files_for_hash = files.clone();
         let session_id = new_session_id();
         let salt = random_hex(16); // fresh CSPRNG public salt, distinct from the id
         let token = auth_token(&salt, passphrase);
@@ -629,9 +641,20 @@ impl Reamesh {
             },
             status,
         )?;
-        *r.shared.serve_dir.lock().unwrap() = Some(dir);
+        *r.shared.serve_dir.lock().unwrap() = Some(dir.clone());
         *r.shared.auth_token.lock().unwrap() = token;
         *r.shared.owner_peer.lock().unwrap() = r.local_peer_id.clone();
+        {
+            let files = files_for_hash;
+            let cmd_tx = r.cmd_tx.clone();
+            std::thread::Builder::new()
+                .name("reamesh-hash".into())
+                .spawn(move || {
+                    let hashed = hash_manifest(&dir, files);
+                    let _ = cmd_tx.send(Command::ManifestReady(hashed));
+                })
+                .ok();
+        }
         Ok(r)
     }
 
@@ -1286,13 +1309,28 @@ fn build_manifest(dir: &Path) -> anyhow::Result<Vec<FileMeta>> {
                     .map(|c| c.as_os_str().to_string_lossy())
                     .collect::<Vec<_>>()
                     .join("/");
-                let hash = blake3_file(&dir.join(&rel_child)).unwrap_or_default();
-                out.push(FileMeta { path, size: meta.len(), hash });
+                // Hash deliberately left empty: see `hash_manifest`.
+                out.push(FileMeta { path, size: meta.len(), hash: String::new() });
             }
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// Fill in the blake3 hash of every manifest entry. Runs on a background
+/// thread at host start (never on the REAPER main thread); the result replaces
+/// the served manifest via `Command::ManifestReady`. A file that changed size
+/// since the walk (the user is still editing) keeps an empty hash; the
+/// transfer path treats that as "download unconditionally, skip verify".
+fn hash_manifest(dir: &Path, mut files: Vec<FileMeta>) -> Vec<FileMeta> {
+    for meta in &mut files {
+        let full = dir.join(&meta.path);
+        if fs::metadata(&full).map(|m| m.len()).ok() == Some(meta.size) {
+            meta.hash = blake3_file(&full).unwrap_or_default();
+        }
+    }
+    files
 }
 
 /// blake3 of a file's contents as a hex string, streamed so large media never
@@ -1835,7 +1873,7 @@ async fn run_network(
         std::collections::HashSet::new();
 
     let lobby = gossipsub::IdentTopic::new(LOBBY_TOPIC);
-    let hosting = cfg.hosting;
+    let mut hosting = cfg.hosting;
 
     // The session topic this node is currently active on. Owners have one
     // from the start; clients get one when they join.
@@ -2015,6 +2053,12 @@ async fn run_network(
                 }
                 Some(Command::FetchFile(rel)) => {
                     start_fetch(&mut swarm, &shared, &mut fetches, &mut fetch_reqs, rel);
+                }
+                Some(Command::ManifestReady(files)) => {
+                    if let Some(h) = hosting.as_mut() {
+                        eprintln!("[reamesh] manifest hashing done ({} files)", files.len());
+                        h.files = files;
+                    }
                 }
                 Some(Command::Dial(addr)) => {
                     if let Err(e) = swarm.dial(addr) {
