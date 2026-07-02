@@ -207,6 +207,10 @@ static Mode g_mode = Mode::Idle;
 static std::string g_sessionProjectPath;  // path the session is bound to
 static Snapshot g_snapshot;               // last known state, by GUID
 static int g_lastChangeCount = -1;
+// EMA of what one capture (serialize every track+item chunk + diff) costs on
+// this project; drives the adaptive capture/rescan throttle so huge projects
+// trade sync latency for a smooth REAPER UI instead of a choppy one.
+static std::chrono::milliseconds g_captureCost{0};
 static bool g_applyingRemote = false;  // echo-suppression / reentrancy guard
 // True only while Main_openProject runs on a finished download; published to
 // the app so its download stepper can show the "opening in REAPER" phase.
@@ -1152,16 +1156,27 @@ static void captureLocalChanges() {
   // Fast path: the project change counter moved (any undoable edit). Safety
   // net: some edits reach the chunks without promptly bumping the counter
   // (FX-parameter gestures get batched undo points, some toggles defer
-  // theirs), so a full re-diff also runs unconditionally every 2s; the gate
-  // is a latency optimization, never a correctness dependency.
+  // theirs), so a full re-diff also runs unconditionally on a rescan cadence:
+  // the gate is a latency optimization, never a correctness dependency.
+  //
+  // Both cadences adapt to what a capture actually costs here (EMA over the
+  // measured serialize+diff time): a small project keeps the snappy 250ms /
+  // 2s floors, a huge one stretches toward the ceilings so capture stays a
+  // bounded slice (~1/8th) of main-thread time instead of making REAPER's UI
+  // choppy. Latency degrades gracefully; correctness never depends on it.
+  // ((std::max)) defeats SWELL's max/min macros.
+  const auto minGap = (std::max)(std::chrono::milliseconds(250), g_captureCost * 8);
+  const auto rescanGap = (std::clamp)(g_captureCost * 20, std::chrono::milliseconds(2000),
+                                      std::chrono::milliseconds(10000));
   const bool counterMoved = cc != g_lastChangeCount;
-  const bool rescanDue = now - g_lastFullScan >= std::chrono::seconds(2);
+  const bool rescanDue = now - g_lastFullScan >= rescanGap;
   if (!counterMoved && !rescanDue) return;
   // Chunk serialization isn't free; cap capture rate (sync target is ~1s).
-  if (!rescanDue && now - g_lastCapture < std::chrono::milliseconds(250)) return;
+  if (!rescanDue && now - g_lastCapture < minGap) return;
   g_lastCapture = now;
   g_lastFullScan = now;
   g_lastChangeCount = cc;
+  const auto captureStart = std::chrono::steady_clock::now();
 
   internalizeExternalMedia();
   Snapshot snap = snapshotProject();
@@ -1201,6 +1216,11 @@ static void captureLocalChanges() {
 
   std::string changeset = diffSnapshots(g_snapshot, snap);
   g_snapshot = std::move(snap);
+  // Feed the adaptive throttle (EMA, 30% weight on the fresh sample) with what
+  // this capture actually cost.
+  const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - captureStart);
+  g_captureCost = (g_captureCost.count() == 0) ? spent : (g_captureCost * 7 + spent * 3) / 10;
   if (changeset.empty()) return;  // change count moved for something we don't sync
 
   // Opt-in diagnostic (launch REAPER with REAMESH_DEBUG_CAPTURE=1): name every
@@ -1978,6 +1998,7 @@ static void onHost(const std::string& passphrase) {
   g_lastChangeCount = -1;  // force a full capture; this seeds the shared doc
   g_lastCapture = {};
   g_lastFullScan = {};
+  g_captureCost = {};  // new project: re-learn what a capture costs
   g_lastPeerCount = 0;
   logEvent("hosting", {{"name", name}},
            passphrase.empty()
@@ -2293,6 +2314,7 @@ static void pollDownload() {
     g_snapshot = snapshotProject();
     g_lastChangeCount = GetProjectStateChangeCount(nullptr);
     g_itemTints.clear();  // fresh download: start with no lock tints
+    g_captureCost = {};   // new project: re-learn what a capture costs
     g_applyingRemote = false;
     g_openingProject = false;
     // Peak caches (.reapeaks) are deliberately not transferred, and REAPER
