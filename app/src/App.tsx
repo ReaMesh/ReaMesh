@@ -141,7 +141,15 @@ export default function App() {
   const [foundBeat, setFoundBeat] = useState(false);
   const wasWaiting = useRef(false);
   useEffect(() => {
-    if (hasState && wasWaiting.current) {
+    // REAPER gone → no found beat, ever. This also clears the beat if the
+    // connection drops mid-handoff (e.g. REAPER closing right after it briefly
+    // answered): otherwise the 850ms timeout is cancelled by this effect's
+    // cleanup before it fires and the beat sticks on "found" forever.
+    if (!hasState) {
+      setFoundBeat(false);
+      return;
+    }
+    if (wasWaiting.current) {
       setFoundBeat(true);
       const id = setTimeout(() => setFoundBeat(false), 850);
       return () => clearTimeout(id);
