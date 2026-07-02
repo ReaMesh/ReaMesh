@@ -2128,6 +2128,10 @@ static void ctlTick() {
       if (!p.is_object()) continue;
       std::string guid = jsonStr(p, "focus");
       p.erase("focus");
+      // The app never shows timeline positions; keeping `play` would republish
+      // the whole state on every presence beacon while someone's cursor moves
+      // (click-to-follow asks the extension directly via `reveal_peer`).
+      p.erase("play");
       if (guid.empty()) continue;
       if (MediaTrack* tr = findTrackByGuid(guid)) {
         int n = static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"));

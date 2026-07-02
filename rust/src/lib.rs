@@ -1177,8 +1177,21 @@ impl Reamesh {
         let mut infos = self.shared.peers_info.lock().unwrap();
         let now = Instant::now();
         infos.retain(|_, p| now.duration_since(p.last_seen) < PRESENCE_STALE);
-        for p in self.shared.session_peers.lock().unwrap().iter() {
-            let id = p.to_string();
+        // Deterministic roster order: session_peers comes from gossipsub's
+        // internal hash map each tick, so its order can differ from tick to
+        // tick, without the sort the composed app state "changes" every tick
+        // and roster rows shuffle.
+        let mut others: Vec<String> = self
+            .shared
+            .session_peers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        others.sort();
+        others.dedup();
+        for id in others {
             if let Some(info) = infos.get(&id) {
                 arr.push(entry(
                     &id,
