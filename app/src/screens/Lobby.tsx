@@ -11,8 +11,10 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { PasswordInput } from "@/components/PasswordInput";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { send, sendProfile } from "@/lib/connection";
+import { getActivePort, send, sendProfile } from "@/lib/connection";
+import { rememberHostPass } from "@/lib/hostPass";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
 import { getProfile, saveProfile, PALETTE, type Profile } from "@/lib/profile";
@@ -167,8 +169,7 @@ function SessionCard({
       </div>
       {session.auth && (
         <>
-          <Input
-            type="password"
+          <PasswordInput
             value={pass}
             placeholder={t("password")}
             className={cn(
@@ -239,6 +240,9 @@ function HostCard({ project, error }: { project: string; error: ExtState["error"
   const host = () => {
     if (pending) return;
     setPending(true);
+    // Keep our own passphrase so the Session screen can re-reveal it if the
+    // host forgets it; the extension never echoes it back.
+    rememberHostPass(getActivePort(), pass);
     send({ cmd: "host", passphrase: pass });
   };
   return (
@@ -259,8 +263,7 @@ function HostCard({ project, error }: { project: string; error: ExtState["error"
           {pending ? <LoaderCircle className="size-3.5 animate-spin" /> : t("hostAction")}
         </Button>
       </div>
-      <Input
-        type="password"
+      <PasswordInput
         value={pass}
         placeholder={t("passwordOptional")}
         className="h-8 border-0 bg-secondary text-[13px]"

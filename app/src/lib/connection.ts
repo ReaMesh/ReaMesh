@@ -134,6 +134,10 @@ export function sendProfile(port?: number) {
   }
 }
 
+export function getActivePort(): number | null {
+  return activePort;
+}
+
 export function setActivePort(port: number) {
   if (live.has(port)) {
     activePort = port;

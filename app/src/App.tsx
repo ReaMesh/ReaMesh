@@ -218,7 +218,7 @@ export default function App() {
   } else if (mode === "downloading") {
     screen = { key: "downloading", node: <Downloading state={state} /> };
   } else if (mode === "hosting" || mode === "client") {
-    screen = { key: "session", node: <Session state={state} /> };
+    screen = { key: "session", node: <Session state={state} port={port ?? null} /> };
   } else {
     screen = { key: "lobby", node: <Lobby state={state} /> };
   }

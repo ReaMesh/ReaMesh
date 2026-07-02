@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { Crown, TriangleAlert } from "lucide-react";
+import { Crown, Eye, EyeOff, TriangleAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,6 +14,7 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { send } from "@/lib/connection";
+import { forgetHostPass, getHostPass } from "@/lib/hostPass";
 import { t } from "@/lib/i18n";
 import { displayName, type ExtState, type Peer } from "@/lib/types";
 
@@ -45,12 +46,43 @@ function PeerRow({ peer }: { peer: Peer }) {
   );
 }
 
-export function Session({ state }: { state: ExtState }) {
+// Reveal the host's session passphrase temporarily, then mask it again.
+function HostPassword({ pass }: { pass: string }) {
+  const [shown, setShown] = useState(false);
+  useEffect(() => {
+    if (!shown) return;
+    const id = setTimeout(() => setShown(false), 6000);
+    return () => clearTimeout(id);
+  }, [shown]);
+  return (
+    <button
+      onClick={() => setShown((v) => !v)}
+      className="flex shrink-0 items-center gap-1.5 self-start px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+    >
+      {shown ? <EyeOff className="size-3" /> : <Eye className="size-3" />}
+      {shown ? (
+        <span className="font-mono">{pass}</span>
+      ) : (
+        <span>{t("showPassword")}</span>
+      )}
+    </button>
+  );
+}
+
+export function Session({
+  state,
+  port,
+}: {
+  state: ExtState;
+  port: number | null;
+}) {
   const hosting = state.mode === "hosting";
   const [confirmStop, setConfirmStop] = useState(false);
   const others = state.peers.length - 1;
+  const hostPass = hosting ? getHostPass(port) : "";
   const leave = () => {
     setConfirmStop(false);
+    forgetHostPass(port);
     send({ cmd: "leave" });
   };
   // Confirm only when stopping the session would disconnect other people.
@@ -91,6 +123,8 @@ export function Session({ state }: { state: ExtState }) {
       {/* Absorbs slack so the peer card hugs its content and the Leave
           button stays pinned to the bottom. */}
       <div className="min-h-0 flex-1" />
+
+      {hostPass && <HostPassword pass={hostPass} />}
 
       <Button variant="secondary" className="shrink-0" onClick={requestLeave}>
         {hosting ? t("stopHosting") : t("leaveSession")}
