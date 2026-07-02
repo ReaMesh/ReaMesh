@@ -70,6 +70,10 @@ function connect(port: number) {
       inst.pid = Number(msg.pid) || undefined;
     } else if (msg.type === "state") {
       inst.state = msg as unknown as ExtState;
+    } else if (msg.type === "busy") {
+      // Watchdog from the control server: REAPER's main thread stopped
+      // ticking (usually a modal dialog waiting for an answer over there).
+      inst.busy = Boolean(msg.busy);
     }
     live.set(port, inst);
     ensureActive();

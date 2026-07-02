@@ -69,6 +69,7 @@ const en = {
   oneFileRemaining: "1 file left",
   etaSeconds: "~{s}s left",
   etaMinutes: "~{m} min left",
+  reaperBusyBanner: "REAPER isn't responding; a dialog there is likely waiting for an answer.",
 
   // Onboarding
   welcome: "Welcome to ReaMesh",
@@ -220,6 +221,7 @@ const de: Record<MsgKey, string> = {
   oneFileRemaining: "1 Datei übrig",
   etaSeconds: "~{s} s übrig",
   etaMinutes: "~{m} Min. übrig",
+  reaperBusyBanner: "REAPER reagiert nicht, vermutlich wartet dort ein Dialog auf eine Antwort.",
 
   welcome: "Willkommen bei ReaMesh",
   tagline: "Echtzeit-Kollaboration für REAPER",

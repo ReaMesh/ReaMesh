@@ -163,6 +163,13 @@ char *reamesh_ctl_poll(void);
 void reamesh_ctl_publish(const char *state_json);
 
 /**
+ * Mark the extension's main-thread timer alive. Call once per timer tick;
+ * when the beats stop (a modal REAPER dialog, a long blocking call) the
+ * control server tells connected apps the instance is busy.
+ */
+void reamesh_ctl_heartbeat(void);
+
+/**
  * Free a string returned by any reamesh_* function.
  */
 void reamesh_free_string(char *s);

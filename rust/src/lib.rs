@@ -3486,6 +3486,14 @@ pub extern "C" fn reamesh_ctl_publish(state_json: *const c_char) {
     let _ = std::panic::catch_unwind(|| ctl::publish(&s));
 }
 
+/// Mark the extension's main-thread timer alive. Call once per timer tick;
+/// when the beats stop (a modal REAPER dialog, a long blocking call) the
+/// control server tells connected apps the instance is busy.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_ctl_heartbeat() {
+    let _ = std::panic::catch_unwind(ctl::heartbeat);
+}
+
 /// Free a string returned by any reamesh_* function.
 #[unsafe(no_mangle)]
 pub extern "C" fn reamesh_free_string(s: *mut c_char) {

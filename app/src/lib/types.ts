@@ -76,6 +76,8 @@ export interface Instance {
   port: number;
   pid?: number;
   state?: ExtState;
+  /** True while REAPER's main thread isn't ticking (modal dialog open there). */
+  busy?: boolean;
 }
 
 export function displayName(p: Peer): string {

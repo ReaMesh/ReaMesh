@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
+import { TriangleAlert } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
@@ -217,6 +218,27 @@ export default function App() {
   return (
     <div className="flex h-full flex-col">
       <TitleBar />
+      {/* REAPER's main thread stopped ticking, usually a modal dialog waiting
+          over there. Without this, a frozen Downloading/Lobby just looks hung
+          (and Cancel etc. silently do nothing until the dialog is answered).
+          Suppressed while a finished download is being opened: that block is
+          expected and the stepper already narrates it. */}
+      <AnimatePresence>
+        {instance?.busy && !state?.opening && (
+          <motion.div
+            key="busy"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="overflow-hidden"
+          >
+            <div className="mx-4 mt-2 flex items-center gap-2.5 rounded-xl bg-amber-500/10 px-3 py-2.5 text-amber-500">
+              <TriangleAlert className="size-4 shrink-0" />
+              <span className="text-[12px] font-medium">{t("reaperBusyBanner")}</span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       <AnimatePresence mode="wait">
         <motion.main
           key={screen.key + (port ?? "")}

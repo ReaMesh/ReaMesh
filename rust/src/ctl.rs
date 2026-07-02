@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libp2p::futures::{SinkExt, StreamExt};
 use serde_json::{Value as JsonValue, json};
@@ -59,6 +59,11 @@ struct CtlShared {
     /// Last state published by the extension; replayed to newly-connected
     /// apps so they render immediately instead of waiting for the next tick.
     last_state: Mutex<String>,
+    /// Last time the extension's timer tick beat (`heartbeat`). REAPER's main
+    /// thread stops ticking while a modal dialog waits for an answer (or a
+    /// long blocking call runs); this server thread keeps running, so it can
+    /// tell the app "REAPER isn't responding": see the monitor task.
+    last_beat: Mutex<Option<Instant>>,
     port: AtomicU16,
 }
 
@@ -73,6 +78,7 @@ pub fn start() -> u16 {
         inbound: Mutex::new(VecDeque::new()),
         clients: Mutex::new(Vec::new()),
         last_state: Mutex::new(String::new()),
+        last_beat: Mutex::new(None),
         port: AtomicU16::new(0),
     });
     let (port_tx, port_rx) = std_mpsc::channel();
@@ -111,6 +117,36 @@ pub fn start() -> u16 {
                     shared.port.store(port, Ordering::Relaxed);
                     let _ = port_tx.send(port);
                     eprintln!("[reamesh] ctl server on 127.0.0.1:{port}");
+                    // Main-thread watchdog: while the extension's timer beats,
+                    // stay silent; once it goes quiet (a modal REAPER dialog,
+                    // a long blocking call) tell every app, and repeat each
+                    // second while it lasts so late-connecting apps hear it
+                    // too. One `busy:false` marks recovery.
+                    {
+                        let shared = shared.clone();
+                        tokio::spawn(async move {
+                            let mut busy = false;
+                            let mut iv = tokio::time::interval(Duration::from_secs(1));
+                            loop {
+                                iv.tick().await;
+                                let stale = shared
+                                    .last_beat
+                                    .lock()
+                                    .unwrap()
+                                    .is_some_and(|t| t.elapsed() > Duration::from_secs(3));
+                                if stale || busy != stale {
+                                    busy = stale;
+                                    let msg =
+                                        json!({"type": "busy", "busy": busy}).to_string();
+                                    shared
+                                        .clients
+                                        .lock()
+                                        .unwrap()
+                                        .retain(|tx| tx.send(msg.clone()).is_ok());
+                                }
+                            }
+                        });
+                    }
                     accept_loop(listener, shared).await;
                 });
             });
@@ -128,6 +164,14 @@ pub fn start() -> u16 {
 /// Next queued command from a connected app as JSON, or None.
 pub fn poll() -> Option<String> {
     CTL.get()?.inbound.lock().unwrap().pop_front()
+}
+
+/// Mark the extension's timer tick alive. Called every tick from REAPER's
+/// main thread; the watchdog task reports "busy" to the apps when this stops.
+pub fn heartbeat() {
+    if let Some(ctl) = CTL.get() {
+        *ctl.last_beat.lock().unwrap() = Some(Instant::now());
+    }
 }
 
 /// Broadcast the extension's state JSON to every connected app and remember

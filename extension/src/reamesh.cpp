@@ -2241,6 +2241,11 @@ static void ctlDispatch(const json& cmd) {
 }
 
 static void ctlTick() {
+  // Alive beacon for the control server's watchdog: when this stops beating
+  // (a modal REAPER dialog blocks the main thread), the server tells the app
+  // "REAPER isn't responding" so a stuck Downloading/Lobby screen explains
+  // itself instead of looking hung.
+  reamesh_ctl_heartbeat();
   for (;;) {
     char* raw = reamesh_ctl_poll();
     if (!raw) break;
