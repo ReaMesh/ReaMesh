@@ -201,6 +201,10 @@ struct SessionInfo {
     /// client mixes with the passphrase to reproduce the access token.
     auth: bool,
     salt: String,
+    /// Project size as announced (shareable file count + total bytes), so the
+    /// lobby can show what a join would download before anyone commits.
+    files: u64,
+    bytes: u64,
     last_seen: Instant,
 }
 
@@ -214,6 +218,9 @@ struct StatusState {
     /// companion app shows "412 MB / 1.3 GB" and a transfer rate from these.
     done_bytes: u64,
     total_bytes: u64,
+    /// File counters for the same download ("busy with file 3 of 41").
+    files_done: u64,
+    files_total: u64,
     project_path: Option<String>,
     session_id: Option<String>,
     session_name: Option<String>,
@@ -230,6 +237,8 @@ impl StatusState {
             "progress": self.progress,
             "done_bytes": self.done_bytes,
             "total_bytes": self.total_bytes,
+            "files_done": self.files_done,
+            "files_total": self.files_total,
             "project_path": self.project_path,
             "session_id": self.session_id,
             "session_name": self.session_name,
@@ -390,6 +399,10 @@ struct PeerPresence {
     /// rolling, else edit cursor. Used by the roster's click-to-follow to centre
     /// the view on them; not drawn as a live playhead.
     play: f64,
+    /// This peer's arrange-view span (project seconds); click-to-follow adopts
+    /// it so the follower lands with the same zoom + scroll. 0/0 = unknown.
+    v0: f64,
+    v1: f64,
     last_seen: Instant,
 }
 
@@ -418,11 +431,17 @@ struct LivePresence {
     /// Timeline position (project seconds): play cursor while rolling, else edit
     /// cursor. Drives the roster's click-to-follow, not a live playhead.
     play: f64,
+    /// Arrange-view span (project seconds, start/end) so click-to-follow can
+    /// reproduce this peer's zoom + scroll, not just centre on their cursor.
+    v0: f64,
+    v1: f64,
 }
 
 static LIVE: Mutex<LivePresence> = Mutex::new(LivePresence {
     focus: String::new(),
     play: 0.0,
+    v0: 0.0,
+    v1: 0.0,
 });
 
 pub fn set_focus(guid: &str) {
@@ -444,6 +463,8 @@ pub fn set_presence(json: &str) {
         .take(64)
         .collect();
     p.play = v.get("play").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    p.v0 = v.get("v0").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    p.v1 = v.get("v1").and_then(|x| x.as_f64()).unwrap_or(0.0);
 }
 
 /// Stable fallback identity color for a peer that never told us one: a
@@ -638,6 +659,8 @@ impl Reamesh {
             progress: 1.0,
             done_bytes: 0,
             total_bytes: 0,
+            files_done: 0,
+            files_total: 0,
             project_path: None,
             session_id: Some(session_id),
             session_name: Some(session_name.to_string()),
@@ -679,6 +702,8 @@ impl Reamesh {
             progress: 0.0,
             done_bytes: 0,
             total_bytes: 0,
+            files_done: 0,
+            files_total: 0,
             project_path: None,
             session_id: None,
             session_name: None,
@@ -1039,6 +1064,8 @@ impl Reamesh {
                     "project_file": s.project_file,
                     "owner": s.owner,
                     "auth": s.auth,
+                    "files": s.files,
+                    "bytes": s.bytes,
                 })
             })
             .collect();
@@ -1155,23 +1182,27 @@ impl Reamesh {
         let owner = self.shared.owner_peer.lock().unwrap().clone();
         let (my_name, my_color) = PROFILE.lock().unwrap().clone();
         let me = LIVE.lock().unwrap().clone();
-        let entry = |id: &str, name: &str, color: &str, focus: &str, play: f64, is_self: bool| {
-            json!({
-                "id": id,
-                "name": name,
-                "color": if color.is_empty() { default_color(id) } else { color.to_string() },
-                "focus": focus,
-                "play": play,
-                "is_self": is_self,
-                "is_owner": id == owner,
-            })
-        };
+        let entry =
+            |id: &str, name: &str, color: &str, focus: &str, play: f64, view: (f64, f64), is_self: bool| {
+                json!({
+                    "id": id,
+                    "name": name,
+                    "color": if color.is_empty() { default_color(id) } else { color.to_string() },
+                    "focus": focus,
+                    "play": play,
+                    "v0": view.0,
+                    "v1": view.1,
+                    "is_self": is_self,
+                    "is_owner": id == owner,
+                })
+            };
         let mut arr = vec![entry(
             &self.local_peer_id,
             &my_name,
             &my_color,
             &me.focus,
             me.play,
+            (me.v0, me.v1),
             true,
         )];
         let mut infos = self.shared.peers_info.lock().unwrap();
@@ -1199,6 +1230,7 @@ impl Reamesh {
                     &info.color,
                     &info.focus,
                     info.play,
+                    (info.v0, info.v1),
                     false,
                 ));
             }
@@ -1924,6 +1956,10 @@ async fn run_network(
             "owner": swarm.local_peer_id().to_string(),
             "auth": h.auth,
             "salt": h.salt,
+            // Sizes come from the initial walk and the manifest is static for
+            // the session, so this precomputed announce never goes stale.
+            "files": h.files.len() as u64,
+            "bytes": h.files.iter().map(|f| f.size).sum::<u64>(),
         })
         .to_string()
         .into_bytes()
@@ -2192,6 +2228,8 @@ async fn run_network(
                             "color": color,
                             "focus": live.focus,
                             "play": live.play,
+                            "v0": live.v0,
+                            "v1": live.v1,
                             "mac": mac,
                         })
                         .to_string()
@@ -2385,6 +2423,8 @@ async fn run_network(
                                 owner,
                                 auth: v.get("auth").and_then(|x| x.as_bool()).unwrap_or(false),
                                 salt: get("salt"),
+                                files: v.get("files").and_then(|x| x.as_u64()).unwrap_or(0),
+                                bytes: v.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0),
                                 last_seen: Instant::now(),
                             };
                             if signer_is_owner && !info.session_id.is_empty() {
@@ -2421,6 +2461,8 @@ async fn run_network(
                                             color: get("color"),
                                             focus: get("focus"),
                                             play: v.get("play").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                                            v0: v.get("v0").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                                            v1: v.get("v1").and_then(|x| x.as_f64()).unwrap_or(0.0),
                                             last_seen: Instant::now(),
                                         },
                                     );
@@ -2617,6 +2659,11 @@ fn build_reuse_index(root: &Path) -> HashMap<u64, Vec<PathBuf>> {
     idx
 }
 
+/// Files of this download already fully on disk (reused or completed).
+fn files_done(dl: &Download) -> u64 {
+    dl.files.iter().filter(|f| f.remaining == 0).count() as u64
+}
+
 /// Whether `path` already holds exactly the file `meta` describes.
 fn file_matches(path: &Path, meta: &FileMeta) -> bool {
     match fs::metadata(path) {
@@ -2740,11 +2787,14 @@ fn download_finalize(shared: &Shared, download: &mut Option<Download>) {
     // This copy is now what we serve to (and fetch from) other peers.
     *shared.serve_dir.lock().unwrap() = Some(dl.dir.clone());
     let total = dl.total;
+    let files = dl.files.len() as u64;
     set_status(shared, |s| {
         s.state = "ready".into();
         s.progress = 1.0;
         s.done_bytes = total;
         s.total_bytes = total;
+        s.files_done = files;
+        s.files_total = files;
         s.project_path = Some(path.to_string_lossy().into_owned());
     });
     *download = None;
@@ -2838,11 +2888,14 @@ fn handle_download_manifest(
                 );
                 let progress = if dl.total == 0 { 1.0 } else { dl.done as f64 / dl.total as f64 };
                 let (done, total) = (dl.done, dl.total);
+                let (fdone, ftotal) = (files_done(dl), dl.files.len() as u64);
                 set_status(shared, |s| {
                     s.state = "downloading".into();
                     s.progress = progress;
                     s.done_bytes = done;
                     s.total_bytes = total;
+                    s.files_done = fdone;
+                    s.files_total = ftotal;
                 });
                 download_pump(swarm, dl);
             }
@@ -2918,10 +2971,13 @@ fn handle_download_piece(
     dl.last_progress = Instant::now();
     let progress = if dl.total == 0 { 1.0 } else { dl.done as f64 / dl.total as f64 };
     let (done, total) = (dl.done, dl.total);
+    let (fdone, ftotal) = (files_done(dl), dl.files.len() as u64);
     set_status(shared, |s| {
         s.progress = progress;
         s.done_bytes = done;
         s.total_bytes = total;
+        s.files_done = fdone;
+        s.files_total = ftotal;
     });
 
     if dl.files[piece.file].remaining == 0 {

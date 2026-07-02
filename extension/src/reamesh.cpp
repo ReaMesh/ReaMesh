@@ -2032,7 +2032,7 @@ static void revealPeer(const std::string& peerId) {
   json peers = handleJson(reamesh_peers, json::array());
   if (!peers.is_array()) return;
   std::string guid;
-  double play = 0.0;
+  double play = 0.0, pv0 = 0.0, pv1 = 0.0;
   bool havePlay = false;
   for (const auto& p : peers) {
     if (p.is_object() && jsonStr(p, "id") == peerId) {
@@ -2041,6 +2041,8 @@ static void revealPeer(const std::string& peerId) {
         play = p["play"].get<double>();
         havePlay = true;
       }
+      if (p.contains("v0") && p["v0"].is_number()) pv0 = p["v0"].get<double>();
+      if (p.contains("v1") && p["v1"].is_number()) pv1 = p["v1"].get<double>();
       break;
     }
   }
@@ -2051,11 +2053,13 @@ static void revealPeer(const std::string& peerId) {
     SetOnlyTrackSelected(tr);
     Main_OnCommand(40913, 0);
   }
-  // Horizontal: scroll the arrange so their playhead sits in the middle,
-  // keeping our own zoom and without moving our edit cursor. This is what makes
-  // "jump to their view" actually land somewhere when their track was already
-  // on screen but they're working elsewhere in the timeline.
-  if (havePlay) {
+  // Horizontal: adopt the peer's own arrange-view span when their beacon
+  // carries one: the follower lands with the same zoom and scroll they see.
+  // Fallback (older peer, no view yet): keep our zoom and centre their cursor.
+  if (pv1 > pv0) {
+    double ns = pv0, ne = pv1;
+    GetSet_ArrangeView2(nullptr, true, 0, 0, &ns, &ne);
+  } else if (havePlay) {
     double t0 = 0, t1 = 0;
     GetSet_ArrangeView2(nullptr, false, 0, 0, &t0, &t1);
     const double span = t1 - t0;
@@ -2128,10 +2132,12 @@ static void ctlTick() {
       if (!p.is_object()) continue;
       std::string guid = jsonStr(p, "focus");
       p.erase("focus");
-      // The app never shows timeline positions; keeping `play` would republish
-      // the whole state on every presence beacon while someone's cursor moves
-      // (click-to-follow asks the extension directly via `reveal_peer`).
+      // The app never shows timeline positions or view spans; keeping them
+      // would republish the whole state on every presence beacon while someone
+      // scrolls (click-to-follow asks the extension directly via `reveal_peer`).
       p.erase("play");
+      p.erase("v0");
+      p.erase("v1");
       if (guid.empty()) continue;
       if (MediaTrack* tr = findTrackByGuid(guid)) {
         int n = static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"));
@@ -2211,6 +2217,12 @@ static void ctlTick() {
   state["total_bytes"] = (st.contains("total_bytes") && st["total_bytes"].is_number())
                              ? st["total_bytes"].get<uint64_t>()
                              : 0;
+  state["files_done"] = (st.contains("files_done") && st["files_done"].is_number())
+                            ? st["files_done"].get<uint64_t>()
+                            : 0;
+  state["files_total"] = (st.contains("files_total") && st["files_total"].is_number())
+                             ? st["files_total"].get<uint64_t>()
+                             : 0;
   std::string session = jsonStr(st, "session_name");
   if (session.empty() && !g_sessionProjectPath.empty()) session = fileStem(g_sessionProjectPath);
   state["session"] = session;
@@ -2239,7 +2251,12 @@ static void pushLocalPresence() {
   const bool playing = (GetPlayState() & 1) != 0;  // bit 0: playing
   const double play = playing ? GetPlayPosition() : GetCursorPosition();
 
-  json p = {{"focus", focus}, {"play", play}};
+  // The arrange-view span rides along so click-to-follow on a peer can adopt
+  // this user's zoom + scroll, not just centre on their cursor.
+  double v0 = 0, v1 = 0;
+  GetSet_ArrangeView2(nullptr, false, 0, 0, &v0, &v1);
+
+  json p = {{"focus", focus}, {"play", play}, {"v0", v0}, {"v1", v1}};
   static std::string last;
   std::string s = p.dump();
   if (s != last) {
