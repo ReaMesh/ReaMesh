@@ -1580,6 +1580,10 @@ struct Download {
     /// Last time a new byte actually landed (or the manifest arrived):
     /// bounds how long pieces are requeued without any forward progress.
     last_progress: Instant,
+    /// Completed files whose blake3 verification is still running on a
+    /// blocking task (hashing a GB file would stall the event loop). The
+    /// download only finalizes once this drops to zero.
+    verifying: usize,
 }
 
 /// Chunk offsets for a file of `size` bytes.
@@ -1991,6 +1995,10 @@ async fn run_network(
     // session with nobody editing stays silent.
     let mut lock_resend: i32 = 0;
 
+    // Results of off-loop blake3 verification of completed download files.
+    let (verify_tx, mut verify_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(PathBuf, bool)>();
+
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tick_count: u64 = 0;
@@ -2000,6 +2008,9 @@ async fn run_network(
 
     loop {
         tokio::select! {
+            Some((tmp, ok)) = verify_rx.recv() => {
+                handle_verify_result(&mut swarm, &shared, &mut download, tmp, ok);
+            }
             cmd = cmd_rx.recv() => match cmd {
                 Some(Command::PublishAuthoritative(update)) => {
                     let mut data = vec![TAG_AUTHORITATIVE];
@@ -2115,6 +2126,7 @@ async fn run_network(
                         last_activity: Instant::now(),
                         started: Instant::now(),
                         last_progress: Instant::now(),
+                        verifying: 0,
                     });
                 }
                 Some(Command::FetchFile(rel)) => {
@@ -2590,7 +2602,7 @@ async fn run_network(
                                 }
                                 handle_download_manifest(&mut swarm, &shared, &mut download, response);
                             } else if download.as_ref().is_some_and(|dl| dl.inflight.contains_key(&request_id)) {
-                                handle_download_piece(&mut swarm, &shared, &mut download, request_id, Some(response));
+                                handle_download_piece(&mut swarm, &shared, &mut download, &verify_tx, request_id, Some(response));
                             } else if let Some(rel) = fetch_reqs.remove(&request_id) {
                                 handle_fetch_response(&mut swarm, &mut fetches, &mut fetch_reqs, &rel, Some(response));
                             }
@@ -2610,7 +2622,7 @@ async fn run_network(
                             dl.last_activity = Instant::now() - Duration::from_secs(10);
                         }
                     } else if download.as_ref().is_some_and(|dl| dl.inflight.contains_key(&request_id)) {
-                        handle_download_piece(&mut swarm, &shared, &mut download, request_id, None);
+                        handle_download_piece(&mut swarm, &shared, &mut download, &verify_tx, request_id, None);
                     } else if let Some(rel) = fetch_reqs.remove(&request_id) {
                         handle_fetch_response(&mut swarm, &mut fetches, &mut fetch_reqs, &rel, None);
                     }
@@ -2918,6 +2930,7 @@ fn handle_download_piece(
     swarm: &mut Swarm<Behaviour>,
     shared: &Shared,
     download: &mut Option<Download>,
+    verify_tx: &VerifyTx,
     request_id: request_response::OutboundRequestId,
     response: Option<XferResponse>,
 ) {
@@ -2983,41 +2996,101 @@ fn handle_download_piece(
     if dl.files[piece.file].remaining == 0 {
         let fd = &mut dl.files[piece.file];
         fd.file = None; // close before verifying/renaming
-        let ok = fd.meta.hash.is_empty()
-            || blake3_file(&fd.tmp).ok().as_deref() == Some(fd.meta.hash.as_str());
-        if ok {
+        if fd.meta.hash.is_empty() {
+            // No hash to check (host was still hashing when we joined).
             if let Err(e) = fs::rename(&fd.tmp, &fd.dest) {
                 let dest = fd.dest.display().to_string();
                 return download_fail(download, shared, format!("finalize {dest}: {e}"));
             }
         } else {
-            fd.tries += 1;
-            if fd.tries > 3 {
-                let p = fd.meta.path.clone();
-                return download_fail(download, shared, format!("checksum mismatch for {p}"));
-            }
-            eprintln!("[reamesh] checksum mismatch for {}, re-downloading", fd.meta.path);
-            match fs::OpenOptions::new().read(true).write(true).truncate(true).open(&fd.tmp) {
-                Ok(f) => {
-                    let _ = f.set_len(fd.meta.size);
-                    fd.file = Some(f);
-                }
-                Err(e) => {
-                    let tmp = fd.tmp.display().to_string();
-                    return download_fail(download, shared, format!("reopen {tmp}: {e}"));
-                }
-            }
-            let size = fd.meta.size;
-            let pieces = file_pieces(piece.file, size);
-            fd.remaining = pieces.len() as u64;
-            dl.done = dl.done.saturating_sub(size);
-            for p in pieces {
-                dl.queue.push_back(p);
-            }
+            // Hash on a blocking task: a multi-GB file would otherwise stall
+            // every in-flight response while the event loop grinds blake3.
+            // The result comes back through verify_rx (handle_verify_result).
+            dl.verifying += 1;
+            let tmp = fd.tmp.clone();
+            let hash = fd.meta.hash.clone();
+            let tx = verify_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let ok = blake3_file(&tmp).ok().as_deref() == Some(hash.as_str());
+                let _ = tx.send((tmp, ok));
+            });
         }
     }
 
-    if dl.queue.is_empty() && dl.inflight.is_empty() {
+    if dl.queue.is_empty() && dl.inflight.is_empty() && dl.verifying == 0 {
+        return download_finalize(shared, download);
+    }
+    download_pump(swarm, dl);
+}
+
+/// Sender half of the download-verification channel: (temp path, hash ok).
+type VerifyTx = tokio::sync::mpsc::UnboundedSender<(PathBuf, bool)>;
+
+/// Handle a completed client-side blake3 check. Match by temporary path so a
+/// result from an earlier download cannot finalize a file after auto-rejoin.
+/// Stale failures may only requeue data that would be downloaded again anyway.
+fn handle_verify_result(
+    swarm: &mut Swarm<Behaviour>,
+    shared: &Shared,
+    download: &mut Option<Download>,
+    tmp: PathBuf,
+    ok: bool,
+) {
+    let Some(dl) = download.as_mut() else { return };
+    if dl.verifying == 0 {
+        return;
+    }
+    let Some(idx) = dl
+        .files
+        .iter()
+        .position(|f| f.tmp == tmp && f.tmp != f.dest && f.remaining == 0 && f.file.is_none())
+    else {
+        return;
+    };
+    dl.verifying -= 1;
+    let fd = &mut dl.files[idx];
+    if ok {
+        if let Err(e) = fs::rename(&fd.tmp, &fd.dest) {
+            let dest = fd.dest.display().to_string();
+            return download_fail(download, shared, format!("finalize {dest}: {e}"));
+        }
+    } else {
+        fd.tries += 1;
+        if fd.tries > 3 {
+            let p = fd.meta.path.clone();
+            return download_fail(download, shared, format!("checksum mismatch for {p}"));
+        }
+        eprintln!("[reamesh] checksum mismatch for {}, re-downloading", fd.meta.path);
+        match fs::OpenOptions::new().read(true).write(true).truncate(true).open(&fd.tmp) {
+            Ok(f) => {
+                let _ = f.set_len(fd.meta.size);
+                fd.file = Some(f);
+            }
+            Err(e) => {
+                let t = fd.tmp.display().to_string();
+                return download_fail(download, shared, format!("reopen {t}: {e}"));
+            }
+        }
+        let size = fd.meta.size;
+        let pieces = file_pieces(idx, size);
+        fd.remaining = pieces.len() as u64;
+        dl.done = dl.done.saturating_sub(size);
+        for p in pieces {
+            dl.queue.push_back(p);
+        }
+        let progress = if dl.total == 0 { 1.0 } else { dl.done as f64 / dl.total as f64 };
+        let (done, total) = (dl.done, dl.total);
+        let (fdone, ftotal) = (files_done(dl), dl.files.len() as u64);
+        set_status(shared, |s| {
+            s.progress = progress;
+            s.done_bytes = done;
+            s.total_bytes = total;
+            s.files_done = fdone;
+            s.files_total = ftotal;
+        });
+    }
+
+    if dl.queue.is_empty() && dl.inflight.is_empty() && dl.verifying == 0 {
         return download_finalize(shared, download);
     }
     download_pump(swarm, dl);
