@@ -2192,6 +2192,14 @@ static void ctlTick() {
   state["state"] = jsonStr(st, "state");
   state["progress"] =
       (st.contains("progress") && st["progress"].is_number()) ? st["progress"].get<double>() : 0.0;
+  // Byte counters behind the download progress; the app renders "412 MB /
+  // 1.3 GB" plus a transfer rate from consecutive states.
+  state["done_bytes"] = (st.contains("done_bytes") && st["done_bytes"].is_number())
+                            ? st["done_bytes"].get<uint64_t>()
+                            : 0;
+  state["total_bytes"] = (st.contains("total_bytes") && st["total_bytes"].is_number())
+                             ? st["total_bytes"].get<uint64_t>()
+                             : 0;
   std::string session = jsonStr(st, "session_name");
   if (session.empty() && !g_sessionProjectPath.empty()) session = fileStem(g_sessionProjectPath);
   state["session"] = session;

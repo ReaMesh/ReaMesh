@@ -64,11 +64,15 @@ const PROJECT_ROOT: &str = "project";
 const SECTIONS: [&str; 3] = [TRACKS_ROOT, ITEMS_ROOT, PROJECT_ROOT];
 const LOBBY_TOPIC: &str = "reamesh/v2/lobby";
 const XFER_PROTOCOL: &str = "/reamesh/xfer/1";
-/// Max payload per file chunk over the transfer protocol.
-const CHUNK_SIZE: u64 = 1024 * 1024;
+/// Max payload per file chunk over the transfer protocol. Each chunk is one
+/// request-response round trip on its own substream, so bigger chunks mean
+/// fewer per-request stalls (stream setup, CBOR framing, scheduling); the
+/// libp2p CBOR codec caps responses at 10 MiB, so 4 MiB + framing fits.
+const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 /// How many chunk requests a downloader keeps in flight at once. Pipelining:
-/// the link stays full instead of idling one round-trip per chunk.
-const DOWNLOAD_WINDOW: usize = 12;
+/// the link stays full instead of idling one round-trip per chunk. With 4 MiB
+/// chunks this bounds in-flight buffers at 64 MiB.
+const DOWNLOAD_WINDOW: usize = 16;
 /// Soft editing lock (Word/Docs style): whoever edits a field holds it
 /// exclusively for this long after their LAST touch. While a field is held,
 /// edits to it from anyone else are rejected and snap back with a "X is editing
@@ -206,6 +210,10 @@ struct StatusState {
     /// "failed" | "ended" (the owner stopped the session)
     state: String,
     progress: f64,
+    /// Byte counters behind `progress` while downloading (0 otherwise): the
+    /// companion app shows "412 MB / 1.3 GB" and a transfer rate from these.
+    done_bytes: u64,
+    total_bytes: u64,
     project_path: Option<String>,
     session_id: Option<String>,
     session_name: Option<String>,
@@ -220,6 +228,8 @@ impl StatusState {
         json!({
             "state": self.state,
             "progress": self.progress,
+            "done_bytes": self.done_bytes,
+            "total_bytes": self.total_bytes,
             "project_path": self.project_path,
             "session_id": self.session_id,
             "session_name": self.session_name,
@@ -626,6 +636,8 @@ impl Reamesh {
         let status = StatusState {
             state: "hosting".into(),
             progress: 1.0,
+            done_bytes: 0,
+            total_bytes: 0,
             project_path: None,
             session_id: Some(session_id),
             session_name: Some(session_name.to_string()),
@@ -665,6 +677,8 @@ impl Reamesh {
         let status = StatusState {
             state: "browsing".into(),
             progress: 0.0,
+            done_bytes: 0,
+            total_bytes: 0,
             project_path: None,
             session_id: None,
             session_name: None,
@@ -1769,7 +1783,10 @@ fn serve_xfer(
                 let mut buf = vec![0u8; want];
                 f.read_exact(&mut buf)?;
                 if compress {
-                    if let Ok(z) = zstd::encode_all(&buf[..], 3) {
+                    // Level 1: this runs synchronously in the serving peer's
+                    // network event loop, once per chunk: throughput over
+                    // ratio (.rpp text still shrinks ~8x).
+                    if let Ok(z) = zstd::encode_all(&buf[..], 1) {
                         return Ok((size, true, z));
                     }
                 }
@@ -2709,9 +2726,12 @@ fn download_finalize(shared: &Shared, download: &mut Option<Download>) {
     eprintln!("[reamesh] download complete: {}", path.display());
     // This copy is now what we serve to (and fetch from) other peers.
     *shared.serve_dir.lock().unwrap() = Some(dl.dir.clone());
+    let total = dl.total;
     set_status(shared, |s| {
         s.state = "ready".into();
         s.progress = 1.0;
+        s.done_bytes = total;
+        s.total_bytes = total;
         s.project_path = Some(path.to_string_lossy().into_owned());
     });
     *download = None;
@@ -2804,9 +2824,12 @@ fn handle_download_manifest(
                     dl.total
                 );
                 let progress = if dl.total == 0 { 1.0 } else { dl.done as f64 / dl.total as f64 };
+                let (done, total) = (dl.done, dl.total);
                 set_status(shared, |s| {
                     s.state = "downloading".into();
                     s.progress = progress;
+                    s.done_bytes = done;
+                    s.total_bytes = total;
                 });
                 download_pump(swarm, dl);
             }
@@ -2881,7 +2904,12 @@ fn handle_download_piece(
     dl.done += chunk.len() as u64;
     dl.last_progress = Instant::now();
     let progress = if dl.total == 0 { 1.0 } else { dl.done as f64 / dl.total as f64 };
-    set_status(shared, |s| s.progress = progress);
+    let (done, total) = (dl.done, dl.total);
+    set_status(shared, |s| {
+        s.progress = progress;
+        s.done_bytes = done;
+        s.total_bytes = total;
+    });
 
     if dl.files[piece.file].remaining == 0 {
         let fd = &mut dl.files[piece.file];
