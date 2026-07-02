@@ -94,6 +94,7 @@
 #define REAPERAPI_WANT_GetPlayPosition
 #define REAPERAPI_WANT_GetCursorPosition
 #define REAPERAPI_WANT_GetSet_ArrangeView2
+#define REAPERAPI_WANT_SetEditCurPos
 
 #include "reaper_plugin.h"
 #include "reaper_plugin_functions.h"
@@ -2177,6 +2178,10 @@ static void revealPeer(const std::string& peerId) {
     SetOnlyTrackSelected(tr);
     Main_OnCommand(40913, 0);
   }
+  // Jump the edit cursor to where they are (their play cursor while rolling,
+  // else their edit cursor); seekplay=true carries a rolling transport along,
+  // so "follow" means follow, not just glance.
+  if (havePlay) SetEditCurPos(play, false, true);
   // Horizontal: adopt the peer's own arrange-view span when their beacon
   // carries one: the follower lands with the same zoom and scroll they see.
   // Fallback (older peer, no view yet): keep our zoom and centre their cursor.
