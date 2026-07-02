@@ -25,6 +25,9 @@ export interface SessionAd {
   project_file: string;
   owner: string;
   auth: boolean;
+  /** Shareable file count + total bytes, from the announce (0 = unknown/old host). */
+  files?: number;
+  bytes?: number;
 }
 
 /** Structured activity-log entry / error from the extension. `code` (plus
@@ -45,6 +48,11 @@ export interface ExtState {
   /** Byte counters behind `progress` while downloading (0 or absent otherwise). */
   done_bytes?: number;
   total_bytes?: number;
+  /** File counters for the same download. */
+  files_done?: number;
+  files_total?: number;
+  /** True while REAPER is blocking in Main_openProject on the finished download. */
+  opening?: boolean;
   session: string;
   /** Name (stem) of the project currently open in this REAPER instance. */
   project: string;

@@ -56,6 +56,15 @@ const en = {
   // Downloading
   joiningLabel: "Joining",
   downloadingProject: "Downloading the project…",
+  phaseConnect: "Connect",
+  phaseDownload: "Download",
+  phaseOpen: "Open in REAPER",
+  connectingToHost: "Contacting the host…",
+  openingInReaper: "Opening the project in REAPER…",
+  filesRemaining: "{count} files left",
+  oneFileRemaining: "1 file left",
+  etaSeconds: "~{s}s left",
+  etaMinutes: "~{m} min left",
 
   // Onboarding
   welcome: "Welcome to ReaMesh",
@@ -194,6 +203,15 @@ const de: Record<MsgKey, string> = {
 
   joiningLabel: "Trete bei",
   downloadingProject: "Projekt wird heruntergeladen…",
+  phaseConnect: "Verbinden",
+  phaseDownload: "Download",
+  phaseOpen: "In REAPER öffnen",
+  connectingToHost: "Host wird kontaktiert…",
+  openingInReaper: "Projekt wird in REAPER geöffnet…",
+  filesRemaining: "{count} Dateien übrig",
+  oneFileRemaining: "1 Datei übrig",
+  etaSeconds: "~{s} s übrig",
+  etaMinutes: "~{m} Min. übrig",
 
   welcome: "Willkommen bei ReaMesh",
   tagline: "Echtzeit-Kollaboration für REAPER",

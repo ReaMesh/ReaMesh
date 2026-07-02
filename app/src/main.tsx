@@ -10,6 +10,14 @@ import { initLanguage } from "./lib/i18n";
 // overlay window never pulls in App.tsx's module-level scanning side effects
 // (and vice versa).
 const params = new URLSearchParams(window.location.search);
+
+// Hidden tabs may pause requestAnimationFrame and block Motion transitions.
+// In development, ?raf=shim uses timers so automated previews can finish.
+if (import.meta.env.DEV && params.get("raf") === "shim") {
+  window.requestAnimationFrame = (cb) =>
+    window.setTimeout(() => cb(performance.now()), 16) as unknown as number;
+  window.cancelAnimationFrame = (id) => clearTimeout(id);
+}
 const root = ReactDOM.createRoot(document.getElementById("root") as HTMLElement);
 
 // Both windows render localized strings; sync the language preference with the

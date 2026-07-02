@@ -208,6 +208,9 @@ static std::string g_sessionProjectPath;  // path the session is bound to
 static Snapshot g_snapshot;               // last known state, by GUID
 static int g_lastChangeCount = -1;
 static bool g_applyingRemote = false;  // echo-suppression / reentrancy guard
+// True only while Main_openProject runs on a finished download; published to
+// the app so its download stepper can show the "opening in REAPER" phase.
+static bool g_openingProject = false;
 static unsigned g_lastPeerCount = 0;
 // Media items locally tinted dark grey to signal "another peer is editing this"
 // (their editing lock is live, per reamesh_locked_entities). Maps each tinted
@@ -2223,6 +2226,7 @@ static void ctlTick() {
   state["files_total"] = (st.contains("files_total") && st["files_total"].is_number())
                              ? st["files_total"].get<uint64_t>()
                              : 0;
+  state["opening"] = g_openingProject;
   std::string session = jsonStr(st, "session_name");
   if (session.empty() && !g_sessionProjectPath.empty()) session = fileStem(g_sessionProjectPath);
   state["session"] = session;
@@ -2276,6 +2280,12 @@ static void pollDownload() {
   if (state == "ready") {
     std::string path = st.value("project_path", "");
     logEvent("download_complete", json::object(), "download complete, opening " + path);
+    // Main_openProject blocks the main thread for seconds on a big project and
+    // the next state publish only happens afterwards (mode=client); publish
+    // the "opening" phase first so the app's stepper doesn't sit frozen on the
+    // download bar meanwhile.
+    g_openingProject = true;
+    ctlTick();
     g_applyingRemote = true;
     Main_openProject(path.c_str());
     // The loaded project IS the owner's state; baseline it so the load is
@@ -2284,6 +2294,7 @@ static void pollDownload() {
     g_lastChangeCount = GetProjectStateChangeCount(nullptr);
     g_itemTints.clear();  // fresh download: start with no lock tints
     g_applyingRemote = false;
+    g_openingProject = false;
     // Peak caches (.reapeaks) are deliberately not transferred, and REAPER
     // does not always rebuild them on its own (e.g. with a central peaks
     // folder, or "build peaks on the fly" off); items then render as flat
