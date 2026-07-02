@@ -1088,6 +1088,7 @@ static std::string diffSnapshots(const Snapshot& prev, const Snapshot& now) {
 static void internalizeExternalMedia() {
   const fs::path projDir = projectDir();
   if (projDir.empty()) return;
+  bool repointed = false;
   const int n = CountMediaItems(nullptr);
   for (int i = 0; i < n; ++i) {
     MediaItem* item = GetMediaItem(nullptr, i);
@@ -1122,9 +1123,12 @@ static void internalizeExternalMedia() {
     SetMediaItemTake_Source(take, ns);
     PCM_Source_Destroy(src);
     UpdateItemInProject(item);
+    repointed = true;
     logEvent("media_copied", {{"file", source.filename().string()}},
              "copied " + source.filename().string() + " into the project folder so peers get it");
   }
+  // Peaks are keyed by source path; a repointed take starts without them.
+  if (repointed) Main_OnCommand(40047, 0);  // Peaks: Build any missing peaks
 }
 
 // Defined below, near the tint helpers (needs applyItem / lockedItemsByOthers).
@@ -1600,6 +1604,9 @@ static void processDeferredItems() {
   g_snapshot = snapshotProject();
   g_lastChangeCount = GetProjectStateChangeCount(nullptr);
   g_applyingRemote = false;
+  // The media behind these items was just fetched, so it has no local peaks
+  // yet; queue a background build so the items don't render as flat blocks.
+  Main_OnCommand(40047, 0);  // Peaks: Build any missing peaks
   logEvent("media_applied", {{"count", ready.size()}},
            "applied " + std::to_string(ready.size()) + " item(s) after media arrived");
 }
@@ -2256,6 +2263,11 @@ static void pollDownload() {
     g_lastChangeCount = GetProjectStateChangeCount(nullptr);
     g_itemTints.clear();  // fresh download: start with no lock tints
     g_applyingRemote = false;
+    // Peak caches (.reapeaks) are deliberately not transferred, and REAPER
+    // does not always rebuild them on its own (e.g. with a central peaks
+    // folder, or "build peaks on the fly" off); items then render as flat
+    // blocks. Queue the missing ones now; the build runs in the background.
+    Main_OnCommand(40047, 0);  // Peaks: Build any missing peaks
     g_mode = Mode::ClientActive;
     // Don't propose anything until the owner's authoritative state has applied
     // and re-baselined us; and don't narrate that settle (the whole project
