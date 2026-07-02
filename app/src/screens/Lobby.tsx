@@ -13,6 +13,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { send, sendProfile } from "@/lib/connection";
+import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
 import { getProfile, saveProfile, PALETTE, type Profile } from "@/lib/profile";
 import { initials, type ExtState, type SessionAd } from "@/lib/types";
@@ -148,6 +149,11 @@ function SessionCard({
           </div>
           <p className="truncate text-[12px] text-muted-foreground">
             {session.project_file}
+            {(session.bytes ?? 0) > 0 &&
+              ` · ${t("filesAndSize", {
+                count: session.files ?? 0,
+                size: formatBytes(session.bytes ?? 0),
+              })}`}
           </p>
         </div>
         <Button
@@ -289,20 +295,27 @@ export function Lobby({ state }: { state: ExtState }) {
         <h3 className="px-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
           {t("sessionsOnNetwork")}
         </h3>
-        <ScrollArea className="min-h-0 flex-1 -mx-1 px-1">
-          <div className="space-y-2">
-            <AnimatePresence mode="popLayout">
-              {state.sessions.map((s) => (
-                <SessionCard key={s.session_id} session={s} probe={state.probe} />
-              ))}
-            </AnimatePresence>
-            {state.sessions.length === 0 && (
-              <div className="flex items-center justify-center rounded-xl border border-dashed border-border p-5 text-muted-foreground">
-                <span className="text-[13px]">{t("noSessionsYet")}</span>
-              </div>
-            )}
+        {state.sessions.length > 0 ? (
+          <ScrollArea className="min-h-0 flex-1 -mx-1 px-1">
+            <div className="space-y-2">
+              <AnimatePresence mode="popLayout">
+                {state.sessions.map((s) => (
+                  <SessionCard key={s.session_id} session={s} probe={state.probe} />
+                ))}
+              </AnimatePresence>
+            </div>
+          </ScrollArea>
+        ) : (
+          /* Fill the empty lobby without a permanent discovery spinner. */
+          <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 pb-4 text-center">
+            <div className="space-y-1">
+              <p className="text-[13px] font-medium">{t("noSessionsYet")}</p>
+              <p className="mx-auto max-w-[250px] text-[12px] leading-relaxed text-muted-foreground">
+                {t("noSessionsHint")}
+              </p>
+            </div>
           </div>
-        </ScrollArea>
+        )}
       </div>
 
       <HostCard project={state.project} error={state.error} />
