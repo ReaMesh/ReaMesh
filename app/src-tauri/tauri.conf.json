@@ -46,7 +46,10 @@
     "macOS": {
       "files": {
         "Resources/Assets.car": "resources/Assets.car"
-      }
+      },
+      "signingIdentity": "-",
+      "hardenedRuntime": true,
+      "entitlements": "entitlements.plist"
     }
   }
 }

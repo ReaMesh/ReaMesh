@@ -11,6 +11,15 @@ cd "$(dirname "$0")/.."
 APP_BUNDLE="src-tauri/target/release/bundle/macos/ReaMesh.app"
 [ -d "$APP_BUNDLE" ] || { echo "error: $APP_BUNDLE not found; run 'bun run tauri build' first" >&2; exit 1; }
 
+# Codesigning identity for the DMG container: APPLE_SIGNING_IDENTITY, i.e. a
+# "Developer ID Application" cert. Without one the image stays unsigned on
+# purpose: Gatekeeper assesses a signed disk image when it is opened and
+# rejects any signature that is not a notarized Developer ID, so a
+# development or ad-hoc signature would add a second "Open Anyway" prompt in
+# front of the app's own. An unsigned image just mounts.
+SIGN_ID="${APPLE_SIGNING_IDENTITY:-}"
+[ "$SIGN_ID" = "-" ] && SIGN_ID=""
+
 VERSION=$(bun -e 'console.log(JSON.parse(await Bun.file("src-tauri/tauri.conf.json").text()).version)')
 VOL="ReaMesh"
 OUT_DIR="src-tauri/target/release/bundle/dmg"
@@ -113,5 +122,13 @@ for i in 1 2 3 4 5; do
 done
 DEV=""
 hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -ov -o "$OUT" >/dev/null
+
+# 6. Sign the DMG container (the .app inside was already signed by
+#    `tauri build`). Skipped when SIGN_ID is empty.
+if [ -n "$SIGN_ID" ]; then
+  codesign --force --sign "$SIGN_ID" --timestamp "$OUT"
+  codesign --verify --verbose=2 "$OUT"
+  echo "signed $OUT with: $SIGN_ID"
+fi
 
 echo "built $OUT"
