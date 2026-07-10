@@ -2,97 +2,161 @@ import { Check } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { Button } from "@/components/ui/button";
 import { Rolling } from "@/components/Rolling";
-import { FOUND_COLOR } from "@/lib/colors";
+import { FG_COLOR, FOUND_COLOR, SCAN_COLOR } from "@/lib/colors";
 import { send } from "@/lib/connection";
 import { formatBytes, useRate } from "@/lib/format";
 import { resolveLang, t } from "@/lib/i18n";
 import type { ExtState } from "@/lib/types";
-import { cn } from "@/lib/utils";
 
-// Joining is three distinct waits (reach the host → transfer the project →
-// REAPER opens it); showing them as steps makes each one feel shorter than a
-// single bar that crawls, stalls at 100%, then sits there.
-const PHASES = ["phaseConnect", "phaseDownload", "phaseOpen"] as const;
-
+// The beacon covers three stages: connecting, downloading, and opening the
+// project in REAPER. Phase 3 is the brief completion state owned by App.
 function phaseIndex(state: ExtState): number {
   if (state.opening || state.state === "ready") return 2;
   if (state.state === "downloading") return 1;
   return 0; // connecting: join sent, waiting for the host's manifest
 }
 
-function StepDot({ status }: { status: "done" | "active" | "pending" }) {
+const R = 30; // ring radius inside the 76px beacon box
+const CIRC = 2 * Math.PI * R;
+
+/** One expanding-and-fading breath ring: the Disconnected beacon's pulse.
+ *  Opacity is 0 at both ends so the loop boundary never snap-flashes, and hits
+ *  full transparency at 80% so the ring doesn't linger at its outer edge. */
+function Breath({
+  className,
+  toScale,
+  delay = 0,
+}: {
+  className: string;
+  toScale: number;
+  delay?: number;
+}) {
   return (
-    <span
-      className={cn(
-        "grid size-4 shrink-0 place-items-center rounded-full transition-colors duration-300",
-        status === "done" && "bg-foreground text-background",
-        status === "active" && "bg-foreground/15",
-        status === "pending" && "bg-secondary",
-      )}
-    >
-      {status === "done" ? (
-        // Pop, don't appear: a step checking off is a small win worth a beat.
-        <motion.span
-          initial={{ scale: 0 }}
-          animate={{ scale: 1 }}
-          transition={{ type: "spring", stiffness: 500, damping: 22 }}
-          className="grid place-items-center"
-        >
-          <Check className="size-2.5" strokeWidth={3} />
-        </motion.span>
-      ) : (
-        <span
-          className={cn(
-            "size-1.5 rounded-full",
-            status === "active" ? "animate-pulse bg-foreground" : "bg-muted-foreground/40",
-          )}
-        />
-      )}
-    </span>
+    <motion.span
+      className={className}
+      style={{ borderColor: SCAN_COLOR }}
+      initial={{ scale: 1, opacity: 0 }}
+      animate={{ scale: toScale, opacity: [0, 0.5, 0] }}
+      exit={{ opacity: 0, transition: { duration: 0.2 } }}
+      transition={{
+        scale: { duration: 2, repeat: Infinity, ease: [0, 0.2, 0.8, 1], delay },
+        opacity: { duration: 2, repeat: Infinity, ease: "easeOut", times: [0, 0.2, 0.8], delay },
+      }}
+    />
   );
 }
 
-function Steps({ current }: { current: number }) {
-  return (
-    <div className="flex w-full items-center">
-      {PHASES.map((key, i) => (
-        <div key={key} className={cn("flex items-center", i > 0 && "flex-1")}>
-          {i > 0 && (
-            <div className="relative mx-2 h-px flex-1 overflow-hidden rounded bg-border">
-              <motion.div
-                className="absolute inset-y-0 left-0 bg-foreground/60"
-                initial={false}
-                animate={{ width: current >= i ? "100%" : "0%" }}
-                transition={{ duration: 0.4, ease: "easeOut" }}
-              />
-            </div>
-          )}
-          <div className="flex items-center gap-1.5">
-            <StepDot status={i < current ? "done" : i === current ? "active" : "pending"} />
-            <span
-              className={cn(
-                "text-[11px] font-medium transition-colors duration-300",
-                i === current ? "text-foreground" : "text-muted-foreground",
-              )}
-            >
-              {t(key)}
-            </span>
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
+/** Join progress indicator: pulsing dot while connecting, progress ring during
+ *  transfer, full ring while opening, and a checkmark when done. */
+function ProgressBeacon({ phase, progress }: { phase: number; progress: number }) {
+  const done = phase >= 3;
+  // The opening phase holds the ring visually full even if the last progress
+  // report landed a hair short of 1.
+  const p = phase >= 2 ? 1 : Math.min(1, Math.max(0, progress));
+  const pct = Math.round(p * 100);
 
-/** Slim indeterminate sweep for the phases that have no measurable progress. */
-function SweepBar() {
   return (
-    <div className="h-1.5 w-full overflow-hidden rounded-full bg-secondary">
-      <motion.div
-        className="h-full w-1/3 rounded-full bg-foreground/50"
-        animate={{ x: ["-120%", "320%"] }}
-        transition={{ duration: 1.6, repeat: Infinity, ease: "easeInOut" }}
-      />
+    <div className="relative grid size-[76px] place-items-center">
+      <AnimatePresence>
+        {phase === 0 && (
+          <>
+            {/* Match the pulse used on the disconnected screen. */}
+            <Breath
+              key="b0"
+              className="absolute size-[9px] rounded-full border-[1.5px]"
+              toScale={4.2}
+            />
+            <Breath
+              key="b1"
+              className="absolute size-[9px] rounded-full border-[1.5px]"
+              toScale={4.2}
+              delay={1}
+            />
+          </>
+        )}
+        {/* Pulse the full ring while REAPER opens the project. */}
+        {phase === 2 && (
+          <Breath
+            key="ring-breath"
+            className="absolute inset-1 rounded-full border-[1.5px]"
+            toScale={1.3}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence initial={false}>
+        {phase >= 1 && (
+          <motion.svg
+            key="ring"
+            viewBox="0 0 76 76"
+            className="absolute inset-0 -rotate-90"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.35, ease: "easeOut" }}
+          >
+            <circle
+              cx="38"
+              cy="38"
+              r={R}
+              fill="none"
+              strokeWidth="3"
+              className="stroke-secondary"
+            />
+            <motion.circle
+              cx="38"
+              cy="38"
+              r={R}
+              fill="none"
+              strokeWidth="3"
+              strokeLinecap="round"
+              strokeDasharray={CIRC}
+              initial={{ strokeDashoffset: CIRC, stroke: FG_COLOR }}
+              animate={{
+                strokeDashoffset: CIRC * (1 - p),
+                stroke: done ? FOUND_COLOR : FG_COLOR,
+              }}
+              transition={{
+                strokeDashoffset: { type: "spring", stiffness: 80, damping: 20 },
+                stroke: { duration: 0.45, ease: "easeOut" },
+              }}
+            />
+          </motion.svg>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence mode="wait" initial={false}>
+        {phase === 0 ? (
+          <motion.span
+            key="dot"
+            className="size-[9px] rounded-full"
+            style={{ backgroundColor: SCAN_COLOR }}
+            exit={{ scale: 0.5, opacity: 0 }}
+            transition={{ duration: 0.15, ease: "easeOut" }}
+          />
+        ) : done ? (
+          <motion.span
+            key="check"
+            initial={{ scale: 0 }}
+            animate={{ scale: 1 }}
+            transition={{ type: "spring", stiffness: 500, damping: 22 }}
+            className="grid place-items-center"
+            style={{ color: FOUND_COLOR }}
+          >
+            <Check className="size-5" strokeWidth={2.5} />
+          </motion.span>
+        ) : (
+          <motion.span
+            key="pct"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.15, ease: "easeOut" }}
+            className="text-[13px] font-semibold tabular-nums"
+          >
+            <Rolling text={`${pct}%`} />
+          </motion.span>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -128,93 +192,62 @@ function eta(remaining: number, rate: number): string | null {
 }
 
 // `done` is App's completion beat: the project just opened (mode is already
-// client) and this screen is held for a moment so all three steps can check
-// off and the bar can sweep to the found-blue before handing off to Session.
+// client) and this screen is held for a moment so the ring can sweep to the
+// found-blue and the checkmark can pop before handing off to Session.
 export function Downloading({ state, done = false }: { state: ExtState; done?: boolean }) {
-  const phase = done ? PHASES.length : phaseIndex(state);
+  const phase = done ? 3 : phaseIndex(state);
   const lang = resolveLang();
-  const pct = Math.round((state.progress || 0) * 100);
   const doneBytes = state.done_bytes || 0;
   const total = state.total_bytes || 0;
-  const filesLeft = Math.max(0, (state.files_total || 0) - (state.files_done || 0));
   const rate = useRate(doneBytes);
   const remainingTime = eta(total - doneBytes, rate);
 
+  // While downloading, the narration line *is* the numbers: one quiet line,
+  // not a scatter of stat corners.
+  const stats = [
+    total > 0 ? `${formatBytes(doneBytes, lang)} / ${formatBytes(total, lang)}` : null,
+    rate > 0 ? `${formatBytes(rate, lang)}/s` : null,
+    remainingTime,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const line =
+    phase >= 3
+      ? t("downloadReady")
+      : phase === 2
+        ? t("openingInReaper")
+        : phase === 1
+          ? stats || t("downloadingProject")
+          : t("connectingToHost");
+
   return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-8 px-8">
-      <div className="w-full space-y-3 text-center">
-        <p className="text-[13px] text-muted-foreground">{t("joiningLabel")}</p>
-        <h2 className="truncate text-lg font-semibold tracking-tight">
+    <div className="flex flex-1 flex-col items-center justify-center gap-6 px-10 text-center">
+      <ProgressBeacon phase={phase} progress={state.progress || 0} />
+
+      <div className="w-full space-y-1.5">
+        <h2 className="truncate text-[15px] font-semibold tracking-tight">
           {state.session || t("sessionFallback")}
         </h2>
-      </div>
-
-      <div className="w-full space-y-4">
-        <Steps current={phase} />
-
-        {done ? (
-          /* The payoff: a found-blue sweep filling the bar while the third
-             step's checkmark pops above it. */
-          <div className="space-y-2">
-            <div className="h-1.5 w-full overflow-hidden rounded-full bg-secondary">
-              <motion.div
-                className="h-full rounded-full"
-                style={{ backgroundColor: FOUND_COLOR }}
-                initial={{ width: "0%" }}
-                animate={{ width: "100%" }}
-                transition={{ duration: 0.45, ease: "easeOut" }}
-              />
-            </div>
+        {/* One narration line per wait, crossfading on phase changes; the
+            stats update in place without re-animating. Fixed-height so the
+            swap never shifts the beacon above. */}
+        <div className="relative h-[18px]">
+          <AnimatePresence initial={false}>
             <motion.p
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ duration: 0.3, delay: 0.15 }}
-              className="text-center text-[12px] font-medium"
-              style={{ color: FOUND_COLOR }}
+              key={phase}
+              initial={{ y: 6, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              exit={{ y: -6, opacity: 0 }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
+              className="absolute inset-0 truncate text-[13px] tabular-nums text-muted-foreground"
+              style={phase >= 3 ? { color: FOUND_COLOR } : undefined}
             >
-              {t("downloadReady")}
+              {line}
             </motion.p>
-          </div>
-        ) : phase === 1 ? (
-          <div className="space-y-2">
-            <div className="h-1.5 w-full overflow-hidden rounded-full bg-secondary">
-              <motion.div
-                className="h-full rounded-full bg-foreground"
-                initial={{ width: 0 }}
-                animate={{ width: `${pct}%` }}
-                transition={{ type: "spring", stiffness: 80, damping: 20 }}
-              />
-            </div>
-            <div className="flex justify-between text-[12px] text-muted-foreground">
-              <span className="tabular-nums">
-                {total > 0
-                  ? `${formatBytes(doneBytes, lang)} / ${formatBytes(total, lang)}`
-                  : t("downloadingProject")}
-              </span>
-              <span className="tabular-nums">
-                {rate > 0 && `${formatBytes(rate, lang)}/s · `}
-                <Rolling text={`${pct}%`} className="tabular-nums" />
-              </span>
-            </div>
-            <div className="flex justify-between text-[12px] text-muted-foreground/70">
-              <span className="tabular-nums">
-                {filesLeft > 0 &&
-                  (filesLeft === 1
-                    ? t("oneFileRemaining")
-                    : t("filesRemaining", { count: filesLeft }))}
-              </span>
-              <span className="tabular-nums">{remainingTime}</span>
-            </div>
-            <CurrentFile path={state.current_file} />
-          </div>
-        ) : (
-          <div className="space-y-2">
-            <SweepBar />
-            <p className="text-center text-[12px] text-muted-foreground">
-              {phase === 0 ? t("connectingToHost") : t("openingInReaper")}
-            </p>
-          </div>
-        )}
+          </AnimatePresence>
+        </div>
+        <CurrentFile path={phase === 1 ? state.current_file : undefined} />
       </div>
 
       <Button

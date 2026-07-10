@@ -71,16 +71,10 @@ const en = {
     "Send this code to someone outside this network. They paste it in their lobby to join (works over VPNs like Tailscale). It is valid while this session is hosted.",
 
   // Downloading
-  joiningLabel: "Joining",
   downloadingProject: "Downloading the project…",
-  phaseConnect: "Connect",
-  phaseDownload: "Download",
-  phaseOpen: "Open in REAPER",
   connectingToHost: "Contacting the host…",
   openingInReaper: "Opening the project in REAPER…",
   downloadReady: "Ready",
-  filesRemaining: "{count} files left",
-  oneFileRemaining: "1 file left",
   etaSeconds: "~{s}s left",
   etaMinutes: "~{m} min left",
   reaperBusyBanner: "REAPER isn't responding; a dialog there is likely waiting for an answer.",
@@ -239,16 +233,10 @@ const de: Record<MsgKey, string> = {
   inviteTicketHint:
     "Schick diesen Code jemandem außerhalb dieses Netzwerks. Er fügt ihn in seiner Lobby ein, um beizutreten (funktioniert über VPNs wie Tailscale). Er gilt, solange diese Session gehostet wird.",
 
-  joiningLabel: "Trete bei",
   downloadingProject: "Projekt wird heruntergeladen…",
-  phaseConnect: "Verbinden",
-  phaseDownload: "Download",
-  phaseOpen: "In REAPER öffnen",
   connectingToHost: "Host wird kontaktiert…",
   openingInReaper: "Projekt wird in REAPER geöffnet…",
   downloadReady: "Bereit",
-  filesRemaining: "{count} Dateien übrig",
-  oneFileRemaining: "1 Datei übrig",
   etaSeconds: "~{s} s übrig",
   etaMinutes: "~{m} Min. übrig",
   reaperBusyBanner: "REAPER reagiert nicht, vermutlich wartet dort ein Dialog auf eine Antwort.",
