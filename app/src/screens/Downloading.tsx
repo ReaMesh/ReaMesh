@@ -1,7 +1,13 @@
+import { useEffect } from "react";
 import { Check } from "lucide-react";
-import { AnimatePresence, motion } from "motion/react";
+import {
+  AnimatePresence,
+  motion,
+  useReducedMotion,
+  useSpring,
+  useTransform,
+} from "motion/react";
 import { Button } from "@/components/ui/button";
-import { Rolling } from "@/components/Rolling";
 import { FG_COLOR, FOUND_COLOR, SCAN_COLOR } from "@/lib/colors";
 import { send } from "@/lib/connection";
 import { formatBytes, useRate } from "@/lib/format";
@@ -19,9 +25,24 @@ function phaseIndex(state: ExtState): number {
 const R = 30; // ring radius inside the 76px beacon box
 const CIRC = 2 * Math.PI * R;
 
-/** One expanding-and-fading breath ring: the Disconnected beacon's pulse.
- *  Opacity is 0 at both ends so the loop boundary never snap-flashes, and hits
- *  full transparency at 80% so the ring doesn't linger at its outer edge. */
+/** Keep the percentage and ring on the same spring. Rolling digits are too
+ *  distracting at the transfer update rate. */
+function GlidingPercent({ progress }: { progress: number }) {
+  const reduce = useReducedMotion();
+  const spring = useSpring(0, { stiffness: 80, damping: 20 });
+  useEffect(() => {
+    spring.set(progress);
+  }, [spring, progress]);
+  const text = useTransform(
+    spring,
+    (v) => `${Math.round(Math.max(0, Math.min(1, v)) * 100)}%`,
+  );
+  if (reduce) return <>{`${Math.round(progress * 100)}%`}</>;
+  return <motion.span>{text}</motion.span>;
+}
+
+/** Expanding pulse shared with the disconnected screen. The ring is transparent
+ *  at both ends of the loop to avoid a visible restart. */
 function Breath({
   className,
   toScale,
@@ -53,7 +74,6 @@ function ProgressBeacon({ phase, progress }: { phase: number; progress: number }
   // The opening phase holds the ring visually full even if the last progress
   // report landed a hair short of 1.
   const p = phase >= 2 ? 1 : Math.min(1, Math.max(0, progress));
-  const pct = Math.round(p * 100);
 
   return (
     <div className="relative grid size-[76px] place-items-center">
@@ -153,7 +173,7 @@ function ProgressBeacon({ phase, progress }: { phase: number; progress: number }
             transition={{ duration: 0.15, ease: "easeOut" }}
             className="text-[13px] font-semibold tabular-nums"
           >
-            <Rolling text={`${pct}%`} />
+            <GlidingPercent progress={p} />
           </motion.span>
         )}
       </AnimatePresence>
@@ -184,11 +204,12 @@ function CurrentFile({ path }: { path?: string }) {
   );
 }
 
+/** Format the estimated time remaining for the status line. */
 function eta(remaining: number, rate: number): string | null {
   if (rate <= 0 || remaining <= 0) return null;
   const s = remaining / rate;
-  if (s < 90) return t("etaSeconds", { s: Math.max(1, Math.round(s)) });
-  return t("etaMinutes", { m: Math.round(s / 60) });
+  if (s < 90) return t("etaAboutSeconds", { s: Math.max(1, Math.round(s)) });
+  return t("etaAboutMinutes", { m: Math.round(s / 60) });
 }
 
 // `done` is App's completion beat: the project just opened (mode is already
@@ -202,12 +223,12 @@ export function Downloading({ state, done = false }: { state: ExtState; done?: b
   const rate = useRate(doneBytes);
   const remainingTime = eta(total - doneBytes, rate);
 
-  // While downloading, the narration line *is* the numbers: one quiet line,
-  // not a scatter of stat corners.
-  const stats = [
+  // While downloading, the narration line answers the one question that
+  // matters (how long) in the same voice as the other phases. The raw
+  // numbers (bytes, rate) recede into a quiet detail line below it.
+  const detail = [
     total > 0 ? `${formatBytes(doneBytes, lang)} / ${formatBytes(total, lang)}` : null,
     rate > 0 ? `${formatBytes(rate, lang)}/s` : null,
-    remainingTime,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -218,8 +239,12 @@ export function Downloading({ state, done = false }: { state: ExtState; done?: b
       : phase === 2
         ? t("openingInReaper")
         : phase === 1
-          ? stats || t("downloadingProject")
+          ? remainingTime || t("downloadingProject")
           : t("connectingToHost");
+  // Crossfade the narration only when its *kind* changes (phase, or the
+  // one-time hop from "Downloading…" to a real ETA); the ETA number itself
+  // updates in place, so it never re-animates on every tick.
+  const lineKey = phase === 1 ? (remainingTime ? "eta" : "dl") : String(phase);
 
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-6 px-10 text-center">
@@ -235,7 +260,7 @@ export function Downloading({ state, done = false }: { state: ExtState; done?: b
         <div className="relative h-[18px]">
           <AnimatePresence initial={false}>
             <motion.p
-              key={phase}
+              key={lineKey}
               initial={{ y: 6, opacity: 0 }}
               animate={{ y: 0, opacity: 1 }}
               exit={{ y: -6, opacity: 0 }}
@@ -245,6 +270,23 @@ export function Downloading({ state, done = false }: { state: ExtState; done?: b
             >
               {line}
             </motion.p>
+          </AnimatePresence>
+        </div>
+        {/* Reserve the stats row's height even in phases with no transfer data. */}
+        <div className="h-4">
+          <AnimatePresence initial={false}>
+            {phase === 1 && detail && (
+              <motion.p
+                key="detail"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.2, ease: "easeOut" }}
+                className="truncate text-[11px] tabular-nums text-muted-foreground/60"
+              >
+                {detail}
+              </motion.p>
+            )}
           </AnimatePresence>
         </div>
         <CurrentFile path={phase === 1 ? state.current_file : undefined} />

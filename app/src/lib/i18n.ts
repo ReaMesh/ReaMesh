@@ -75,8 +75,8 @@ const en = {
   connectingToHost: "Contacting the host…",
   openingInReaper: "Opening the project in REAPER…",
   downloadReady: "Ready",
-  etaSeconds: "~{s}s left",
-  etaMinutes: "~{m} min left",
+  etaAboutSeconds: "About {s}s to go",
+  etaAboutMinutes: "About {m} min to go",
   reaperBusyBanner: "REAPER isn't responding; a dialog there is likely waiting for an answer.",
 
   // Onboarding
@@ -237,8 +237,8 @@ const de: Record<MsgKey, string> = {
   connectingToHost: "Host wird kontaktiert…",
   openingInReaper: "Projekt wird in REAPER geöffnet…",
   downloadReady: "Bereit",
-  etaSeconds: "~{s} s übrig",
-  etaMinutes: "~{m} Min. übrig",
+  etaAboutSeconds: "Noch etwa {s} s",
+  etaAboutMinutes: "Noch etwa {m} Min.",
   reaperBusyBanner: "REAPER reagiert nicht, vermutlich wartet dort ein Dialog auf eine Antwort.",
 
   welcome: "Willkommen bei ReaMesh",
