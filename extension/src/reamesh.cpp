@@ -2410,6 +2410,8 @@ static void ctlTick() {
   state["files_total"] = (st.contains("files_total") && st["files_total"].is_number())
                              ? st["files_total"].get<uint64_t>()
                              : 0;
+  // Relative path of the file currently being fetched, or "" outside a download.
+  state["current_file"] = jsonStr(st, "current_file");
   state["opening"] = g_openingProject;
   std::string session = jsonStr(st, "session_name");
   if (session.empty() && !g_sessionProjectPath.empty()) session = fileStem(g_sessionProjectPath);

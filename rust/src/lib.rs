@@ -234,6 +234,9 @@ struct StatusState {
     /// File counters for the same download ("busy with file 3 of 41").
     files_done: u64,
     files_total: u64,
+    /// Relative path of the file whose chunk arrived most recently ("" outside
+    /// a download): the companion app's download screen shows its name.
+    current_file: String,
     project_path: Option<String>,
     session_id: Option<String>,
     session_name: Option<String>,
@@ -252,6 +255,7 @@ impl StatusState {
             "total_bytes": self.total_bytes,
             "files_done": self.files_done,
             "files_total": self.files_total,
+            "current_file": self.current_file,
             "project_path": self.project_path,
             "session_id": self.session_id,
             "session_name": self.session_name,
@@ -862,6 +866,7 @@ impl Reamesh {
             total_bytes: 0,
             files_done: 0,
             files_total: 0,
+            current_file: String::new(),
             project_path: None,
             session_id: Some(session_id),
             session_name: Some(session_name.to_string()),
@@ -905,6 +910,7 @@ impl Reamesh {
             total_bytes: 0,
             files_done: 0,
             files_total: 0,
+            current_file: String::new(),
             project_path: None,
             session_id: None,
             session_name: None,
@@ -3317,6 +3323,7 @@ fn download_fail(download: &mut Option<Download>, shared: &Shared, msg: String) 
     set_status(shared, |s| {
         s.state = "failed".into();
         s.message = Some(msg);
+        s.current_file = String::new();
     });
 }
 
@@ -3335,6 +3342,7 @@ fn download_finalize(shared: &Shared, download: &mut Option<Download>) {
         s.total_bytes = total;
         s.files_done = files;
         s.files_total = files;
+        s.current_file = String::new();
         s.project_path = Some(path.to_string_lossy().into_owned());
     });
     *download = None;
@@ -3508,6 +3516,7 @@ fn handle_download_piece(
         }
     }
     fd.remaining -= 1;
+    let current = fd.meta.path.clone();
     dl.done += chunk.len() as u64;
     dl.last_progress = Instant::now();
     let progress = if dl.total == 0 { 1.0 } else { dl.done as f64 / dl.total as f64 };
@@ -3519,6 +3528,7 @@ fn handle_download_piece(
         s.total_bytes = total;
         s.files_done = fdone;
         s.files_total = ftotal;
+        s.current_file = current;
     });
 
     if dl.files[piece.file].remaining == 0 {

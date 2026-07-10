@@ -51,6 +51,8 @@ export interface ExtState {
   /** File counters for the same download. */
   files_done?: number;
   files_total?: number;
+  /** Relative path of the file currently being fetched ("" outside a download). */
+  current_file?: string;
   /** True while REAPER is blocking in Main_openProject on the finished download. */
   opening?: boolean;
   session: string;

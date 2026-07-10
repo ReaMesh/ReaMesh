@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, motion, useAnimate } from "motion/react";
 import { Check, Crown, Eye, EyeOff, Ticket, TriangleAlert } from "lucide-react";
-import { SlotText } from "slot-text/react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,30 +13,33 @@ import {
 } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { PeerAvatar } from "@/components/PeerAvatar";
+import { Rolling, TrackNumber } from "@/components/Rolling";
 import { send } from "@/lib/connection";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
 import { t } from "@/lib/i18n";
 import { displayName, type ExtState, type Peer } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-/** The peer's current track number, right-aligned and rolling on change:
- *  the same readout the overlay HUD shows. */
-function TrackNumber({ track }: { track?: number | null }) {
-  if (track == null || track <= 0) return <span className="w-4" />;
-  return (
-    <SlotText
-      text={String(track)}
-      options={{ direction: "up", duration: 260 }}
-      className="w-4 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground"
-    />
-  );
-}
-
-function PeerRow({ peer }: { peer: Peer }) {
+function PeerRow({ peer, flash }: { peer: Peer; flash?: boolean }) {
   // Click-to-follow, same as the overlay HUD: only meaningful for someone
   // else who's actually on a track.
   const clickable = !peer.is_self && peer.track != null && peer.track > 0;
   const reveal = () => send({ cmd: "reveal_peer", peer_id: peer.id });
+  // "While you were away": this peer joined while the window was unfocused;
+  // wash the row in their color once, fading out, so a returning user's eye
+  // lands on who's new.
+  const [flashScope, animateFlash] = useAnimate();
+  useEffect(() => {
+    if (!flash || !flashScope.current) return;
+    const tint = /^#[0-9a-fA-F]{6}$/.test(peer.color)
+      ? [`${peer.color}40`, `${peer.color}00`]
+      : ["rgba(255,255,255,0.12)", "rgba(255,255,255,0)"];
+    animateFlash(
+      flashScope.current,
+      { backgroundColor: tint },
+      { duration: 2, ease: "easeOut" },
+    );
+  }, [flash, peer.color, flashScope, animateFlash]);
   return (
     <motion.div
       layout
@@ -60,10 +62,15 @@ function PeerRow({ peer }: { peer: Peer }) {
       tabIndex={clickable ? 0 : undefined}
       title={clickable ? t("revealPeerTrack", { name: displayName(peer) }) : undefined}
       className={cn(
-        "flex items-center gap-3 rounded-lg px-2 py-1.5",
+        "relative flex items-center gap-3 rounded-lg px-2 py-1.5",
         clickable && "cursor-pointer transition-colors hover:bg-secondary/60",
       )}
     >
+      <span
+        ref={flashScope}
+        aria-hidden
+        className="pointer-events-none absolute inset-0 rounded-lg"
+      />
       <PeerAvatar peer={peer} />
       <span className="min-w-0 flex-1 truncate text-[13px] font-medium">
         {displayName(peer)}
@@ -170,9 +177,12 @@ function HostPassword({ pass }: { pass: string }) {
 export function Session({
   state,
   port,
+  flashPeers = [],
 }: {
   state: ExtState;
   port: number | null;
+  /** Peers to highlight once after the user returns to the window. */
+  flashPeers?: string[];
 }) {
   const hosting = state.mode === "hosting";
   const [confirmStop, setConfirmStop] = useState(false);
@@ -203,13 +213,12 @@ export function Session({
       <div className="flex min-h-0 flex-col gap-2">
         <h3 className="px-1 text-[12px] font-medium text-muted-foreground">
           {/* The count rolls slot-machine style when someone joins/leaves. */}
-          <SlotText
+          <Rolling
             text={
               state.peers.length === 1
                 ? t("justYou")
                 : t("peopleInSession", { count: state.peers.length })
             }
-            options={{ direction: "up", duration: 260 }}
           />
         </h3>
         <ScrollArea className="min-h-0 rounded-xl bg-card p-2">
@@ -218,7 +227,7 @@ export function Session({
               whole screen), while later join/leave still animate. */}
           <AnimatePresence mode="popLayout" initial={false}>
             {state.peers.map((p) => (
-              <PeerRow key={p.id} peer={p} />
+              <PeerRow key={p.id} peer={p} flash={flashPeers.includes(p.id)} />
             ))}
           </AnimatePresence>
         </ScrollArea>

@@ -1,7 +1,7 @@
 import { Check } from "lucide-react";
-import { motion } from "motion/react";
-import { SlotText } from "slot-text/react";
+import { AnimatePresence, motion } from "motion/react";
 import { Button } from "@/components/ui/button";
+import { Rolling } from "@/components/Rolling";
 import { FOUND_COLOR } from "@/lib/colors";
 import { send } from "@/lib/connection";
 import { formatBytes, useRate } from "@/lib/format";
@@ -97,6 +97,29 @@ function SweepBar() {
   );
 }
 
+/** Show the active filename without moving the rows above it. */
+function CurrentFile({ path }: { path?: string }) {
+  const name = path ? (path.split(/[/\\]/).pop() ?? path) : "";
+  return (
+    <div className="relative h-4 overflow-hidden">
+      <AnimatePresence initial={false}>
+        {name && (
+          <motion.p
+            key={name}
+            initial={{ y: 10, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: -10, opacity: 0 }}
+            transition={{ duration: 0.2, ease: "easeOut" }}
+            className="absolute inset-0 truncate text-center text-[11px] text-muted-foreground/60"
+          >
+            {name}
+          </motion.p>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
 function eta(remaining: number, rate: number): string | null {
   if (rate <= 0 || remaining <= 0) return null;
   const s = remaining / rate;
@@ -170,11 +193,7 @@ export function Downloading({ state, done = false }: { state: ExtState; done?: b
               </span>
               <span className="tabular-nums">
                 {rate > 0 && `${formatBytes(rate, lang)}/s · `}
-                <SlotText
-                  text={`${pct}%`}
-                  options={{ direction: "up", duration: 260 }}
-                  className="tabular-nums"
-                />
+                <Rolling text={`${pct}%`} className="tabular-nums" />
               </span>
             </div>
             <div className="flex justify-between text-[12px] text-muted-foreground/70">
@@ -186,6 +205,7 @@ export function Downloading({ state, done = false }: { state: ExtState; done?: b
               </span>
               <span className="tabular-nums">{remainingTime}</span>
             </div>
+            <CurrentFile path={state.current_file} />
           </div>
         ) : (
           <div className="space-y-2">

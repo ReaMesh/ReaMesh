@@ -9,27 +9,15 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
 import { ChevronUp, Crown } from "lucide-react";
-import { SlotText } from "slot-text/react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { PeerAvatar } from "@/components/PeerAvatar";
+import { TrackNumber } from "@/components/Rolling";
 import { t, useLang } from "@/lib/i18n";
 import { displayName, type Peer } from "@/lib/types";
 import { useOverlaySettings } from "@/lib/overlaySettings";
 import { useOverlayState } from "./useOverlayState";
 
 const WIDTH = 232;
-
-/** The peer's current track number, right-aligned and rolling on change. */
-function TrackNumber({ track }: { track?: number | null }) {
-  if (track == null || track <= 0) return <span className="w-4" />;
-  return (
-    <SlotText
-      text={String(track)}
-      options={{ direction: "up", duration: 260 }}
-      className="w-4 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground"
-    />
-  );
-}
 
 function PeerRow({
   peer,

@@ -394,3 +394,11 @@ void reamesh_overlay_attach(void *ns_window, double width) {
 void reamesh_overlay_detach(void) {
     if (gOverlay) [gOverlay detach];
 }
+
+// Whether REAPER is the frontmost app right now. The Rust side asks before
+// badging the dock on a session join: while the user is in REAPER the overlay
+// roster is visible and already showed them the join.
+int reamesh_frontmost_is_reaper(void) {
+    NSRunningApplication *front = [[NSWorkspace sharedWorkspace] frontmostApplication];
+    return [front.bundleIdentifier isEqualToString:kReaperBundleId] ? 1 : 0;
+}

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { TriangleAlert } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
@@ -23,11 +24,19 @@ loadReaperPath().then(refreshStatus);
 
 /** Toast people joining/leaving by diffing the peers list between states.
  *  Suppressed across mode changes so entering a session doesn't announce
- *  everyone already there as "joined". */
-function usePresenceToasts(state: ExtState | undefined) {
+ *  everyone already there as "joined".
+ *
+ *  Joins that happen while the user is *away* (this window unfocused and
+ *  (checked backend-side) REAPER not frontmost either, so neither this list
+ *  nor the overlay roster was visible) additionally badge the dock icon.
+ *  Returns the ids of those peers once the user is back: the Session screen
+ *  flashes their rows so the returning eye lands on who's new. */
+function usePresenceToasts(state: ExtState | undefined): string[] {
   const prev = useRef<
     { mode: Mode; ids: Map<string, { name: string; color: string }> } | undefined
   >(undefined);
+  const unseen = useRef<Set<string>>(new Set());
+  const [flash, setFlash] = useState<string[]>([]);
 
   useEffect(() => {
     if (!state) {
@@ -35,6 +44,11 @@ function usePresenceToasts(state: ExtState | undefined) {
       return;
     }
     const inSession = state.mode === "hosting" || state.mode === "client";
+    // Session over: whatever the badge was announcing no longer exists.
+    if (!inSession && unseen.current.size) {
+      unseen.current.clear();
+      invoke("clear_join_badge").catch(() => {});
+    }
     const ids = new Map(
       state.peers
         .filter((p) => !p.is_self)
@@ -60,6 +74,14 @@ function usePresenceToasts(state: ExtState | undefined) {
             </span>
           </span>,
         );
+        if (!document.hasFocus()) {
+          // Highlight the peer only if the backend actually badged the app.
+          invoke<boolean>("notify_join")
+            .then((badged) => {
+              if (badged) unseen.current.add(id);
+            })
+            .catch(() => {});
+        }
       }
     }
     for (const [id, info] of before.ids) {
@@ -75,6 +97,27 @@ function usePresenceToasts(state: ExtState | undefined) {
       }
     }
   }, [state]);
+
+  // The user is back: drop the badge and hand the missed joins to the Session
+  // screen for their one-shot row flash.
+  useEffect(() => {
+    const onFocus = () => {
+      invoke("clear_join_badge").catch(() => {});
+      if (unseen.current.size) {
+        setFlash([...unseen.current]);
+        unseen.current.clear();
+      }
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
+  useEffect(() => {
+    if (!flash.length) return;
+    const id = setTimeout(() => setFlash([]), 2400);
+    return () => clearTimeout(id);
+  }, [flash]);
+
+  return flash;
 }
 
 function useErrorToasts(state: ExtState | undefined) {
@@ -128,7 +171,7 @@ export default function App() {
   const reaper = useReaperStatus();
   const [settingsOpen, setSettingsOpen] = useState(false);
   useLang(); // re-render the whole tree when the language changes
-  usePresenceToasts(state);
+  const flashPeers = usePresenceToasts(state);
   useErrorToasts(state);
   useOverrideToasts(state);
 
@@ -247,7 +290,10 @@ export default function App() {
     // switches to its done state in place.
     screen = { key: "downloading", node: <Downloading state={state} done /> };
   } else if (mode === "hosting" || mode === "client") {
-    screen = { key: "session", node: <Session state={state} port={port ?? null} /> };
+    screen = {
+      key: "session",
+      node: <Session state={state} port={port ?? null} flashPeers={flashPeers} />,
+    };
   } else {
     screen = { key: "lobby", node: <Lobby state={state} /> };
   }

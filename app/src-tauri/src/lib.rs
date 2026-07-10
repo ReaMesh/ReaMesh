@@ -459,6 +459,59 @@ fn close_overlay(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// ---------- join attention ----------
+//
+// When someone joins the session while the user is neither in this app nor in
+// REAPER (where the overlay roster already shows the join), the dock icon gets
+// a badge counting the joins missed plus one polite attention bounce. The
+// webview decides "window unfocused" (document.hasFocus()); the REAPER half of
+// the check lives here because only the native side knows the frontmost app.
+
+static UNSEEN_JOINS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+#[cfg(target_os = "macos")]
+fn frontmost_is_reaper() -> bool {
+    extern "C" {
+        fn reamesh_frontmost_is_reaper() -> i32;
+    }
+    unsafe { reamesh_frontmost_is_reaper() != 0 }
+}
+
+/// Without a native frontmost check, only the webview's focus gate applies.
+#[cfg(not(target_os = "macos"))]
+fn frontmost_is_reaper() -> bool {
+    false
+}
+
+/// A peer joined while the main window was unfocused. Returns whether the user
+/// was really away (badge set): only then does the webview queue the "who's
+/// new" row flash for when they come back.
+#[tauri::command]
+fn notify_join(app: AppHandle) -> bool {
+    use std::sync::atomic::Ordering;
+    if frontmost_is_reaper() {
+        return false;
+    }
+    let n = UNSEEN_JOINS.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.set_badge_count(Some(n));
+        let _ = win.request_user_attention(Some(tauri::UserAttentionType::Informational));
+    }
+    true
+}
+
+/// The user is back (window focused, or the session ended): clear the badge.
+#[tauri::command]
+fn clear_join_badge(app: AppHandle) {
+    use std::sync::atomic::Ordering;
+    if UNSEEN_JOINS.swap(0, Ordering::SeqCst) == 0 {
+        return; // Preserve badges not created by this feature.
+    }
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.set_badge_count(None);
+    }
+}
+
 /// Whether this app is hosting (vs merely a client) and the control port it's
 /// in a session on: pushed by the webview whenever the session mode changes.
 /// Read by the quit handler to leave the session (and confirm, if hosting)
@@ -631,7 +684,9 @@ pub fn run() {
             set_overlay_settings,
             get_auto_install,
             set_auto_install,
-            set_session_state
+            set_session_state,
+            notify_join,
+            clear_join_badge
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
