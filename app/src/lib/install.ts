@@ -60,11 +60,14 @@ export async function refreshStatus(): Promise<ReaperStatus | null> {
   return status;
 }
 
+// Copies the bundled dylib into UserPlugins and returns the fresh status, but
+// deliberately does NOT publish it into the shared store: during onboarding the
+// App-level gate keys off `installed`, and flipping it here would unmount the
+// Onboarding screen before its "All set" step could show. Callers refresh the
+// shared status themselves when they're ready to move on (Onboarding on Finish,
+// Settings right after, to refresh the badge).
 export async function installExtension(): Promise<ReaperStatus> {
-  const s = await invoke<ReaperStatus>("install_extension");
-  status = s;
-  emit();
-  return s;
+  return invoke<ReaperStatus>("install_extension");
 }
 
 export function useReaperStatus(): ReaperStatus | null | undefined {

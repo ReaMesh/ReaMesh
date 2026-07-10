@@ -64,6 +64,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
     setBusy(true);
     try {
       await installExtension();
+      await refreshStatus(); // installExtension no longer publishes; refresh the badge
       toast.success(t("extInstalledToast"));
     } catch (e) {
       toast.error(String(e));
