@@ -225,8 +225,13 @@ function DoneStep() {
 
 export function Onboarding({ status }: { status: ReaperStatus }) {
   // Local "installed just now" flag so the success step stays visible until
-  // Finish refreshes the status and the App-level gate moves on.
-  const [done, setDone] = useState(false);
+  // Finish refreshes the status and the App-level gate moves on. Dev-only:
+  // ?step=done jumps straight to the "All set" step for preview (see the
+  // ?mock=onboarding harness in main.tsx).
+  const [done, setDone] = useState(
+    import.meta.env.DEV &&
+      new URLSearchParams(window.location.search).get("step") === "done",
+  );
   const step = done ? "done" : status.reaperFound ? "install" : "locate";
 
   return (

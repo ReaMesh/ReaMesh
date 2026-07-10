@@ -19,6 +19,42 @@ if (import.meta.env.DEV && params.get("raf") === "shim") {
     window.setTimeout(() => cb(performance.now()), 16) as unknown as number;
   window.cancelAnimationFrame = (id) => clearTimeout(id);
 }
+
+// Mock enough of Tauri to preview onboarding in a plain browser. The flag flips
+// after installation so the complete flow can be tested without REAPER.
+if (import.meta.env.DEV && params.get("mock") === "onboarding") {
+  let installed = false;
+  const status = () => ({
+    reaperFound: params.get("step") !== "locate",
+    isReaperDir: true,
+    resourcePath: "/Users/you/Library/Application Support/REAPER",
+    userPlugins: "/Users/you/Library/Application Support/REAPER/UserPlugins",
+    installed,
+    upToDate: installed,
+  });
+  let cbId = 0;
+  // deno-lint-ignore no-explicit-any
+  (window as unknown as { __TAURI_INTERNALS__: any }).__TAURI_INTERNALS__ = {
+    transformCallback: () => ++cbId,
+    unregisterCallback: () => {},
+    convertFileSrc: (p: string) => p,
+    invoke: async (cmd: string) => {
+      switch (cmd) {
+        case "reaper_status":
+          return status();
+        case "install_extension":
+          installed = true;
+          return status();
+        case "get_reaper_path":
+          return null;
+        case "get_language":
+          return "system";
+        default:
+          return undefined; // Event listeners and setters are no-ops in the mock.
+      }
+    },
+  };
+}
 const root = ReactDOM.createRoot(document.getElementById("root") as HTMLElement);
 
 // Both windows render localized strings; sync the language preference with the
