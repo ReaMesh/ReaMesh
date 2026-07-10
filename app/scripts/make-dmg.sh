@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Builds the styled ReaMesh installer DMG: app-themed background with a
-# drag-to-Applications layout, volume icon, compressed UDZO image.
+# drag-to-Applications layout, compressed UDZO image.
 #
 # Run from app/ (or anywhere): bun run dmg
-# Needs a prior `bun run tauri build` (the .app bundle), a GUI session
-# (Finder is scripted to set icon positions), and Xcode CLT for SetFile.
+# Needs a prior `bun run tauri build` (the .app bundle) and a GUI session
+# (Finder is scripted to set icon positions).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -21,7 +21,9 @@ SIGN_ID="${APPLE_SIGNING_IDENTITY:-}"
 [ "$SIGN_ID" = "-" ] && SIGN_ID=""
 
 VERSION=$(bun -e 'console.log(JSON.parse(await Bun.file("src-tauri/tauri.conf.json").text()).version)')
-VOL="ReaMesh"
+# Volume label shown when the installer image is mounted.
+VOL="ReaMesh Installer"
+# Use the standard macOS disk-image icon by omitting a custom volume icon.
 OUT_DIR="src-tauri/target/release/bundle/dmg"
 OUT="$OUT_DIR/ReaMesh_${VERSION}.dmg"
 mkdir -p "$OUT_DIR"
@@ -43,10 +45,6 @@ cp -R "$APP_BUNDLE" "$STAGE/ReaMesh.app"
 ln -s /Applications "$STAGE/Applications"
 mkdir "$STAGE/.background"
 cp scripts/.build/dmg-background.png "$STAGE/.background/background.png"
-# Placeholder so the styling pass below can record a parked position for
-# ".VolumeIcon.icns" in the .DS_Store (records are keyed by name and outlive
-# the file); the real icon replaces it after styling and inherits the spot.
-touch "$STAGE/.VolumeIcon.icns"
 
 # 3. Writable image; mount it for Finder styling.
 if [ -d "/Volumes/$VOL" ]; then hdiutil detach "/Volumes/$VOL" -force >/dev/null || true; fi
@@ -77,7 +75,7 @@ tell application "Finder"
       set extension hidden of item "ReaMesh.app" to true
     end try
     -- park dotfiles outside the visible area for people who show hidden files
-    repeat with h in {".background", ".fseventsd", ".DS_Store", ".VolumeIcon.icns"}
+    repeat with h in {".background", ".fseventsd", ".DS_Store"}
       try
         set position of item (h as text) of container window to {990, 205}
       end try
@@ -91,23 +89,14 @@ EOF
 sync
 sleep 1
 
-# Volume icon LAST: the macOS 26+ Finder strips .VolumeIcon.icns (and the
-# custom-icon flag) from volumes it opens, so it must land after the
-# scripted styling above, right before detach. SetFile ships with the
-# Xcode command line tools.
-cp src-tauri/icons/icon.icns "/Volumes/$VOL/.VolumeIcon.icns"
-xcrun SetFile -a C "/Volumes/$VOL" 2>/dev/null || SetFile -a C "/Volumes/$VOL" || true
-# These two only exist now, so they couldn't be parked above. The window
-# stays closed here: reopening it makes Finder strip the volume icon again.
-# Finder ejects the disk itself so the position edits flush to .DS_Store
-# (a plain hdiutil detach races Finder's lazy write and loses them).
+# Finder ejects the disk itself so the layout edits flush to .DS_Store (a plain
+# hdiutil detach races Finder's lazy write and loses the icon positions). Park
+# .DS_Store first; the window stays closed so the layout isn't re-touched.
 osascript -e 'tell application "Finder"
   tell disk "'"$VOL"'"
-    repeat with h in {".VolumeIcon.icns", ".DS_Store"}
-      try
-        set position of item (h as text) of container window to {990, 205}
-      end try
-    end repeat
+    try
+      set position of item ".DS_Store" of container window to {990, 205}
+    end try
   end tell
   eject disk "'"$VOL"'"
 end tell' || true
