@@ -133,9 +133,8 @@ function SessionCard({
   // only act once we've seen the fresh "in flight" (ok === null) for our check.
   const sawPending = useRef(false);
   const { scope: shakeScope, shake } = useShake();
-  // A session discovered while the lobby was already up gets a one-shot
-  // found-blue glow so the eye catches it. Cards present when the lobby
-  // mounts (or arriving in its first moments) just enter normally.
+  // Highlight sessions discovered after the initial lobby render.
+  // Skip the highlight for sessions present on mount or shortly afterward.
   const fresh = useRef(Date.now() - lobbyMountedAt > 1500).current;
 
   const join = () => {
@@ -193,15 +192,13 @@ function SessionCard({
       className="relative flex flex-col gap-2 rounded-xl bg-card p-3"
     >
       {fresh && (
+        // Briefly tint sessions discovered after the lobby opened.
         <motion.span
           aria-hidden
           className="pointer-events-none absolute inset-0 rounded-xl"
-          style={{
-            boxShadow: `0 0 0 1px ${FOUND_COLOR}80, 0 0 14px ${FOUND_COLOR}40`,
-          }}
-          initial={{ opacity: 1 }}
-          animate={{ opacity: 0 }}
-          transition={{ duration: 2.2, ease: "easeOut", delay: 0.2 }}
+          initial={{ backgroundColor: `${FOUND_COLOR}33` }}
+          animate={{ backgroundColor: `${FOUND_COLOR}00` }}
+          transition={{ duration: 0.9, ease: "easeOut", delay: 0.15 }}
         />
       )}
       <div className="flex items-center gap-3">
