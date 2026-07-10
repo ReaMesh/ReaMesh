@@ -45,6 +45,7 @@ const en = {
   joinAnyway: "Join",
   haveInviteCode: "Have an invite code?",
   ticketPlaceholder: "Paste the invite code…",
+  pasteInvite: "Paste",
   invalidTicket: "This doesn't look like a ReaMesh invite code.",
   ticketJoinHint:
     "An invite code reaches a host beyond this network, for example over a VPN like Tailscale.",
@@ -164,6 +165,7 @@ const en = {
   logReconnecting: "Lost the host. Reconnecting to “{name}”…",
   reconnectFailed: "Couldn’t reconnect to “{name}”.",
   logBadTicket: "That invite code doesn’t look valid. Copy it again from the host.",
+  ticketUnreachable: "Couldn’t reach that host. Check they’re still hosting and you share a network (or VPN).",
   editLocked: "Your edit snapped back: someone else is editing it.",
   editLockedTrack: "Your edit to “{track}” snapped back: someone else is editing it.",
   editLockedBy: "{by} is editing this right now.",
@@ -210,6 +212,7 @@ const de: Record<MsgKey, string> = {
   joinAnyway: "Beitreten",
   haveInviteCode: "Hast du einen Einladungscode?",
   ticketPlaceholder: "Einladungscode einfügen…",
+  pasteInvite: "Einfügen",
   invalidTicket: "Das sieht nicht nach einem ReaMesh-Einladungscode aus.",
   ticketJoinHint:
     "Ein Einladungscode erreicht einen Host auch außerhalb dieses Netzwerks, zum Beispiel über ein VPN wie Tailscale.",
@@ -324,6 +327,7 @@ const de: Record<MsgKey, string> = {
   logReconnecting: "Host verloren. Verbinde erneut mit „{name}“…",
   reconnectFailed: "Erneutes Verbinden mit „{name}“ ist fehlgeschlagen.",
   logBadTicket: "Dieser Einladungscode scheint ungültig zu sein. Kopiere ihn beim Host erneut.",
+  ticketUnreachable: "Host nicht erreichbar. Prüfe, ob er noch hostet und ihr ein Netzwerk (oder VPN) teilt.",
   editLocked: "Deine Änderung wurde zurückgesetzt. Jemand anderes bearbeitet sie gerade.",
   editLockedTrack: "Deine Änderung an „{track}“ wurde zurückgesetzt. Jemand anderes bearbeitet sie gerade.",
   editLockedBy: "{by} bearbeitet das gerade.",

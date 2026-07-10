@@ -175,8 +175,14 @@ export function Session({
           button stays pinned to the bottom. */}
       <div className="min-h-0 flex-1" />
 
-      {hosting && !!state.ticket && <InviteTicket ticket={state.ticket} />}
-      {hostPass && <HostPassword pass={hostPass} />}
+      {/* Invite code + password reminder: two quiet host-only lines, kept
+          tight together (and away from the Leave button) as one group. */}
+      {(hostPass || (hosting && !!state.ticket)) && (
+        <div className="flex flex-col gap-1">
+          {hosting && !!state.ticket && <InviteTicket ticket={state.ticket} />}
+          {hostPass && <HostPassword pass={hostPass} />}
+        </div>
+      )}
 
       <Button variant="secondary" className="shrink-0" onClick={requestLeave}>
         {hosting ? t("stopHosting") : t("leaveSession")}

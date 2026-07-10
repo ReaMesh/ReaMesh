@@ -226,6 +226,54 @@ fn ticket_join_works_without_lan_discovery() {
 }
 
 #[test]
+fn ticket_join_against_dead_host_fails_instead_of_hanging() {
+    // Joining with a ticket from a stopped host must fail within the timeout.
+    let project = temp_dir("proj-deadticket");
+    let staging = temp_dir("staging-deadticket");
+    make_project(&project);
+
+    let owner = Reamesh::host("dead-ticket", project.to_str().unwrap(), "Song.rpp", "hunter2")
+        .expect("host failed");
+    let mut ticket = String::new();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            ticket = owner.session_ticket();
+            !ticket.is_empty()
+        }),
+        "host never produced a ticket"
+    );
+    // Stop hosting: the ticket's addresses are now dead.
+    drop(owner);
+
+    let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
+    assert!(client.join_ticket(&ticket, "hunter2"), "join_ticket refused");
+    // It must resolve to "failed" within the ticket-join timeout (+ margin),
+    // not sit on "connecting" forever.
+    let failed = wait_until(Duration::from_secs(40), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        s["state"] == "failed"
+    });
+    assert!(
+        failed,
+        "join against a dead ticket never failed: {}",
+        client.status_json()
+    );
+
+    // The passphrase pre-check against a dead ticket must likewise resolve
+    // (to ok:false), not hang.
+    assert!(client.check_ticket(&ticket, "hunter2"));
+    let resolved = wait_until(Duration::from_secs(40), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        s["probe"]["ok"] == false
+    });
+    assert!(resolved, "check against a dead ticket never resolved");
+
+    drop(client);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
 fn owner_edit_propagates_to_client() {
     let project = temp_dir("proj-owneredit");
     let staging = temp_dir("staging-owneredit");

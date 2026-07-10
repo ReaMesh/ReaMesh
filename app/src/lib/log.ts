@@ -32,6 +32,7 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   reconnecting: "logReconnecting",
   reconnect_failed: "reconnectFailed",
   bad_ticket: "logBadTicket",
+  ticket_unreachable: "ticketUnreachable",
   edit_locked: "editLocked",
   peer_tempo_changed: "peerTempoChanged",
   peer_markers_changed: "peerMarkersChanged",

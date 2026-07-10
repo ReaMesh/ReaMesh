@@ -668,6 +668,13 @@ const TICKET_MAX_ADDRS: usize = 16;
 /// before it fails. Longer than MANIFEST_TIMEOUT: this leg spans WAN/VPN
 /// connection setup, not just one request round-trip.
 const TICKET_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Fast-fail for a ticket whose host is unreachable: if we never even
+/// established a connection to the pinned peer within this window, the host is
+/// gone (stopped hosting, wrong network): fail now instead of making the user
+/// stare at "contacting the host" for the full TICKET_JOIN_TIMEOUT. A reachable
+/// host completes the transport handshake in well under this even over a VPN,
+/// so a slow-but-alive host still gets the full window to send its announce.
+const TICKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 
 const B64URL_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -2244,6 +2251,11 @@ struct PendingJoin {
     probe_only: bool,
     started: Instant,
     last_dial: Instant,
+    /// Set once the transport handshake to the pinned host completes. Until it
+    /// does, TICKET_CONNECT_TIMEOUT fast-fails an unreachable host; after it
+    /// does, the host is alive and gets the full TICKET_JOIN_TIMEOUT to
+    /// announce.
+    connected: bool,
 }
 
 /// Dial a ticket's host: remember its addresses (request-response dials by
@@ -2536,6 +2548,7 @@ async fn run_network(
                         probe_only,
                         started: Instant::now(),
                         last_dial: Instant::now(),
+                        connected: false,
                     });
                 }
                 Some(Command::FetchFile(rel)) => {
@@ -2627,9 +2640,19 @@ async fn run_network(
                         ) {
                             download = Some(dl);
                         }
-                    } else if pj.started.elapsed() > TICKET_JOIN_TIMEOUT {
+                    } else if (!pj.connected && pj.started.elapsed() > TICKET_CONNECT_TIMEOUT)
+                        || pj.started.elapsed() > TICKET_JOIN_TIMEOUT
+                    {
+                        // Two ways to give up: never reached the host at all
+                        // (fast-fail: it's dead/on another network), or reached
+                        // it but it never announced within the full window.
                         let pj = pending_join.take().unwrap();
-                        eprintln!("[reamesh] ticket join timed out ({})", pj.info.peer);
+                        eprintln!(
+                            "[reamesh] ticket {} gave up ({}, connected={})",
+                            if pj.probe_only { "check" } else { "join" },
+                            pj.info.peer,
+                            pj.connected
+                        );
                         if pj.probe_only {
                             // Unreachable reports false, like an unanswered
                             // probe: a definite answer beats a hang.
@@ -2638,8 +2661,9 @@ async fn run_network(
                         } else {
                             set_status(&shared, |s| {
                                 s.state = "failed".into();
-                                s.message =
-                                    Some("could not reach the host from the ticket".into());
+                                // Distinct message so the extension can localize
+                                // "the invited host isn't reachable" cleanly.
+                                s.message = Some("ticket host unreachable".into());
                             });
                         }
                     } else if pj.last_dial.elapsed() >= Duration::from_secs(3) {
@@ -2828,6 +2852,12 @@ async fn run_network(
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     eprintln!("[reamesh] connection established with {peer_id} via {endpoint:?}");
+                    // A reachable ticket host: stop the fast-fail clock and let
+                    // it have the full window to send its announce.
+                    if let Some(pj) = &mut pending_join
+                        && peer_id == pj.info.peer {
+                        pj.connected = true;
+                    }
                 }
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     eprintln!("[reamesh] outgoing connection error (peer {peer_id:?}): {error}");

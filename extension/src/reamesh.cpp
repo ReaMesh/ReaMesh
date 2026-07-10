@@ -2509,10 +2509,13 @@ static void pollDownload() {
              "connected: your edits are proposals; the session owner wins conflicts");
   } else if (state == "failed") {
     std::string msg = st.value("message", std::string("unknown error"));
-    // The wrong-passphrase refusal is the one failure a user routinely hits;
-    // give it a stable code so the app can translate it.
+    // Give the two routine failures stable codes so the app can translate them:
+    // a wrong passphrase, and an invite-code host that couldn't be reached.
     if (msg.find("passphrase") != std::string::npos)
       leaveSession("wrong_password", json::object(), "join failed: " + msg);
+    else if (msg.find("ticket host unreachable") != std::string::npos)
+      leaveSession("ticket_unreachable", json::object(),
+                   "couldn't reach the host from that invite code");
     else
       leaveSession("join_failed", {{"reason", msg}}, "join failed: " + msg);
   } else if (state == "ended") {

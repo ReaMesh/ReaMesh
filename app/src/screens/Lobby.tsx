@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { LoaderCircle, LockKeyhole, ShieldAlert, Ticket } from "lucide-react";
+import { ClipboardPaste, LoaderCircle, LockKeyhole, ShieldAlert, Ticket } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -25,6 +25,16 @@ import { cn } from "@/lib/utils";
 // first join after launch gets it, later joins in the same run don't. Module
 // state (not localStorage) is exactly that lifetime: a restart shows it again.
 let trustWarningAccepted = false;
+
+// Read the clipboard for the Paste button. Returns "" if the webview denies
+// clipboard read (the user can still paste with the keyboard).
+async function readClipboard(): Promise<string> {
+  try {
+    return (await navigator.clipboard.readText()) ?? "";
+  } catch {
+    return "";
+  }
+}
 
 function ProfileRow({
   profile,
@@ -314,21 +324,39 @@ function TicketJoin({ probe }: { probe?: ExtState["probe"] }) {
 
   return (
     <div className="space-y-2 rounded-xl bg-card p-3">
-      <div className="flex items-center gap-3">
-        <Input
-          value={raw}
-          placeholder={t("ticketPlaceholder")}
-          autoFocus
-          className="h-8 min-w-0 flex-1 border-0 bg-secondary font-mono text-[12px]"
-          onChange={(e) => {
-            setRaw(e.target.value);
-            setPwError(false);
-          }}
-          onKeyDown={(e) => e.key === "Enter" && ticket && (!ticket.auth || pass) && beginJoin()}
-        />
+      <div className="flex items-center gap-2">
+        <div className="relative min-w-0 flex-1">
+          <Input
+            value={raw}
+            placeholder={t("ticketPlaceholder")}
+            autoFocus
+            className="h-8 border-0 bg-secondary pr-8 text-[13px]"
+            onChange={(e) => {
+              setRaw(e.target.value);
+              setPwError(false);
+            }}
+            onKeyDown={(e) => e.key === "Enter" && ticket && (!ticket.auth || pass) && beginJoin()}
+          />
+          {/* Paste from clipboard: the common gesture for a copied code. */}
+          <button
+            type="button"
+            title={t("pasteInvite")}
+            aria-label={t("pasteInvite")}
+            className="absolute right-1 top-1/2 grid size-6 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:bg-background/60 hover:text-foreground"
+            onClick={async () => {
+              const text = await readClipboard();
+              if (text) {
+                setRaw(text.trim());
+                setPwError(false);
+              }
+            }}
+          >
+            <ClipboardPaste className="size-3.5" />
+          </button>
+        </div>
         <Button
           size="sm"
-          className="h-7 w-16 shrink-0 px-3 text-[12px]"
+          className="h-8 w-16 shrink-0 px-3 text-[12px]"
           disabled={!ticket || (ticket.auth && !pass) || checking}
           onClick={beginJoin}
         >
