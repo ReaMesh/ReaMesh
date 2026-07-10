@@ -1,6 +1,8 @@
 import { Check } from "lucide-react";
 import { motion } from "motion/react";
+import { SlotText } from "slot-text/react";
 import { Button } from "@/components/ui/button";
+import { FOUND_COLOR } from "@/lib/colors";
 import { send } from "@/lib/connection";
 import { formatBytes, useRate } from "@/lib/format";
 import { resolveLang, t } from "@/lib/i18n";
@@ -29,7 +31,15 @@ function StepDot({ status }: { status: "done" | "active" | "pending" }) {
       )}
     >
       {status === "done" ? (
-        <Check className="size-2.5" strokeWidth={3} />
+        // Pop, don't appear: a step checking off is a small win worth a beat.
+        <motion.span
+          initial={{ scale: 0 }}
+          animate={{ scale: 1 }}
+          transition={{ type: "spring", stiffness: 500, damping: 22 }}
+          className="grid place-items-center"
+        >
+          <Check className="size-2.5" strokeWidth={3} />
+        </motion.span>
       ) : (
         <span
           className={cn(
@@ -94,15 +104,18 @@ function eta(remaining: number, rate: number): string | null {
   return t("etaMinutes", { m: Math.round(s / 60) });
 }
 
-export function Downloading({ state }: { state: ExtState }) {
-  const phase = phaseIndex(state);
+// `done` is App's completion beat: the project just opened (mode is already
+// client) and this screen is held for a moment so all three steps can check
+// off and the bar can sweep to the found-blue before handing off to Session.
+export function Downloading({ state, done = false }: { state: ExtState; done?: boolean }) {
+  const phase = done ? PHASES.length : phaseIndex(state);
   const lang = resolveLang();
   const pct = Math.round((state.progress || 0) * 100);
-  const done = state.done_bytes || 0;
+  const doneBytes = state.done_bytes || 0;
   const total = state.total_bytes || 0;
   const filesLeft = Math.max(0, (state.files_total || 0) - (state.files_done || 0));
-  const rate = useRate(done);
-  const remainingTime = eta(total - done, rate);
+  const rate = useRate(doneBytes);
+  const remainingTime = eta(total - doneBytes, rate);
 
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-8 px-8">
@@ -116,7 +129,30 @@ export function Downloading({ state }: { state: ExtState }) {
       <div className="w-full space-y-4">
         <Steps current={phase} />
 
-        {phase === 1 ? (
+        {done ? (
+          /* The payoff: a found-blue sweep filling the bar while the third
+             step's checkmark pops above it. */
+          <div className="space-y-2">
+            <div className="h-1.5 w-full overflow-hidden rounded-full bg-secondary">
+              <motion.div
+                className="h-full rounded-full"
+                style={{ backgroundColor: FOUND_COLOR }}
+                initial={{ width: "0%" }}
+                animate={{ width: "100%" }}
+                transition={{ duration: 0.45, ease: "easeOut" }}
+              />
+            </div>
+            <motion.p
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ duration: 0.3, delay: 0.15 }}
+              className="text-center text-[12px] font-medium"
+              style={{ color: FOUND_COLOR }}
+            >
+              {t("downloadReady")}
+            </motion.p>
+          </div>
+        ) : phase === 1 ? (
           <div className="space-y-2">
             <div className="h-1.5 w-full overflow-hidden rounded-full bg-secondary">
               <motion.div
@@ -129,12 +165,16 @@ export function Downloading({ state }: { state: ExtState }) {
             <div className="flex justify-between text-[12px] text-muted-foreground">
               <span className="tabular-nums">
                 {total > 0
-                  ? `${formatBytes(done, lang)} / ${formatBytes(total, lang)}`
+                  ? `${formatBytes(doneBytes, lang)} / ${formatBytes(total, lang)}`
                   : t("downloadingProject")}
               </span>
               <span className="tabular-nums">
                 {rate > 0 && `${formatBytes(rate, lang)}/s · `}
-                {pct}%
+                <SlotText
+                  text={`${pct}%`}
+                  options={{ direction: "up", duration: 260 }}
+                  className="tabular-nums"
+                />
               </span>
             </div>
             <div className="flex justify-between text-[12px] text-muted-foreground/70">
@@ -162,7 +202,7 @@ export function Downloading({ state }: { state: ExtState }) {
         size="sm"
         className="text-muted-foreground"
         onClick={() => send({ cmd: "leave" })}
-        disabled={phase === 2}
+        disabled={phase >= 2}
       >
         {t("cancel")}
       </Button>

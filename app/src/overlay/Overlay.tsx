@@ -7,7 +7,7 @@
 // below) so its transparent area never swallows clicks meant for REAPER.
 
 import { useEffect, useRef, useState } from "react";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, motion, useAnimate } from "motion/react";
 import { ChevronUp, Crown } from "lucide-react";
 import { SlotText } from "slot-text/react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
@@ -42,6 +42,21 @@ function PeerRow({
   // track. Tapping your own row, or a peer not on any track, does nothing.
   const clickable =
     !!onReveal && !peer.is_self && peer.track != null && peer.track > 0;
+  // The scroll this triggers happens over in REAPER, outside this window;
+  // flash the row in the peer's color so the click is acknowledged in place.
+  const [flashScope, animateFlash] = useAnimate();
+  const activate = () => {
+    onReveal!(peer);
+    if (!flashScope.current) return;
+    const tint = /^#[0-9a-fA-F]{6}$/.test(peer.color)
+      ? [`${peer.color}4d`, `${peer.color}00`]
+      : ["rgba(255,255,255,0.14)", "rgba(255,255,255,0)"];
+    animateFlash(
+      flashScope.current,
+      { backgroundColor: tint },
+      { duration: 0.5, ease: "easeOut" },
+    );
+  };
   return (
     <motion.div
       layout
@@ -49,13 +64,13 @@ function PeerRow({
       animate={{ opacity: 1, x: 0 }}
       exit={{ opacity: 0, x: 8 }}
       transition={{ type: "spring", stiffness: 350, damping: 28 }}
-      onClick={clickable ? () => onReveal!(peer) : undefined}
+      onClick={clickable ? activate : undefined}
       onKeyDown={
         clickable
           ? (e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
-                onReveal!(peer);
+                activate();
               }
             }
           : undefined
@@ -63,12 +78,19 @@ function PeerRow({
       role={clickable ? "button" : undefined}
       tabIndex={clickable ? 0 : undefined}
       title={clickable ? t("revealPeerTrack", { name: displayName(peer) }) : undefined}
-      className={`flex items-center gap-2 rounded-md px-1.5 py-1 ${
+      className={`relative flex items-center gap-2 rounded-md px-1.5 py-1 ${
         clickable
           ? "cursor-pointer transition-colors hover:bg-white/5"
           : ""
       }`}
     >
+      {clickable && (
+        <span
+          ref={flashScope}
+          aria-hidden
+          className="pointer-events-none absolute inset-0 rounded-md"
+        />
+      )}
       <PeerAvatar peer={peer} size="sm" />
       <span className="min-w-0 flex-1 truncate text-[12px] font-medium">
         {displayName(peer)}

@@ -1,3 +1,4 @@
+import { MotionConfig } from "motion/react";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import "./index.css";
@@ -30,7 +31,10 @@ if (params.get("overlay") === "1") {
   import("./overlay/Overlay").then(({ Overlay }) => {
     root.render(
       <React.StrictMode>
-        <Overlay port={port} />
+        {/* Honor the OS "reduce motion" setting for every Motion animation. */}
+        <MotionConfig reducedMotion="user">
+          <Overlay port={port} />
+        </MotionConfig>
       </React.StrictMode>,
     );
   });
@@ -38,7 +42,9 @@ if (params.get("overlay") === "1") {
   import("./App").then(({ default: App }) => {
     root.render(
       <React.StrictMode>
-        <App />
+        <MotionConfig reducedMotion="user">
+          <App />
+        </MotionConfig>
       </React.StrictMode>,
     );
   });

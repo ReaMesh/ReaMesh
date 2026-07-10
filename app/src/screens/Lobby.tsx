@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, motion, useAnimate, useReducedMotion } from "motion/react";
 import { ClipboardPaste, LoaderCircle, LockKeyhole, ShieldAlert, Ticket, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -13,6 +13,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { PasswordInput } from "@/components/PasswordInput";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { FOUND_COLOR } from "@/lib/colors";
 import { getActivePort, send, sendProfile } from "@/lib/connection";
 import { rememberHostPass } from "@/lib/hostPass";
 import { formatBytes } from "@/lib/format";
@@ -34,6 +35,31 @@ async function readClipboard(): Promise<string> {
   } catch {
     return "";
   }
+}
+
+// Shake rejected passphrases without remounting or moving focus.
+function useShake() {
+  const [scope, animate] = useAnimate();
+  const reduce = useReducedMotion();
+  const shake = () => {
+    if (reduce || !scope.current) return;
+    animate(scope.current, { x: [0, -7, 6, -4, 3, 0] }, { duration: 0.4, ease: "easeOut" });
+  };
+  return { scope, shake };
+}
+
+/** Fading slide-in for the small red "wrong password" line. */
+function ErrorLine({ children }: { children: React.ReactNode }) {
+  return (
+    <motion.p
+      initial={{ opacity: 0, y: -3 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.2, ease: "easeOut" }}
+      className="px-0.5 text-[12px] text-red-400"
+    >
+      {children}
+    </motion.p>
+  );
 }
 
 function ProfileRow({
@@ -66,16 +92,23 @@ function ProfileRow({
               aria-label={`color ${c}`}
               onClick={() => onChange({ ...profile, color: c })}
               className={cn(
-                // Always carry a 2px ring (transparent by default) so the
-                // grey hover ring fades both in and out via transition-shadow,
-                // and never shows on the already-selected swatch.
-                "size-4 rounded-full ring-2 ring-transparent ring-offset-2 ring-offset-card transition-shadow duration-200",
-                profile.color === c
-                  ? "ring-foreground/70"
-                  : "hover:ring-muted-foreground/50",
+                // Keep the hover ring allocated so its shadow fades in and out.
+                // The selected swatch uses the shared layout ring below.
+                "relative size-4 rounded-full ring-2 ring-transparent ring-offset-2 ring-offset-card transition-shadow duration-200",
+                profile.color !== c && "hover:ring-muted-foreground/50",
               )}
               style={{ backgroundColor: c }}
-            />
+            >
+              {profile.color === c && (
+                // Animate one selection ring between swatches. Its inset and border
+                // match the hover ring's dimensions.
+                <motion.span
+                  layoutId="profile-color-ring"
+                  className="absolute -inset-1 rounded-full border-2 border-foreground/70"
+                  transition={{ type: "spring", stiffness: 500, damping: 35 }}
+                />
+              )}
+            </button>
           ))}
         </div>
       </div>
@@ -86,9 +119,11 @@ function ProfileRow({
 function SessionCard({
   session,
   probe,
+  lobbyMountedAt,
 }: {
   session: SessionAd;
   probe?: ExtState["probe"];
+  lobbyMountedAt: number;
 }) {
   const [pass, setPass] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -97,6 +132,11 @@ function SessionCard({
   // Guards against an earlier check's stale result resolving the new one: we
   // only act once we've seen the fresh "in flight" (ok === null) for our check.
   const sawPending = useRef(false);
+  const { scope: shakeScope, shake } = useShake();
+  // A session discovered while the lobby was already up gets a one-shot
+  // found-blue glow so the eye catches it. Cards present when the lobby
+  // mounts (or arriving in its first moments) just enter normally.
+  const fresh = useRef(Date.now() - lobbyMountedAt > 1500).current;
 
   const join = () => {
     trustWarningAccepted = true;
@@ -137,7 +177,10 @@ function SessionCard({
     if (!sawPending.current) return; // ignore a stale prior result
     setChecking(false);
     if (probe.ok) proceedJoin();
-    else setPwError(true);
+    else {
+      setPwError(true);
+      shake();
+    }
   }, [probe, checking]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
@@ -147,8 +190,20 @@ function SessionCard({
       animate={{ opacity: 1, y: 0, scale: 1 }}
       exit={{ opacity: 0, scale: 0.97 }}
       transition={{ type: "spring", stiffness: 350, damping: 28 }}
-      className="space-y-2 rounded-xl bg-card p-3"
+      className="relative flex flex-col gap-2 rounded-xl bg-card p-3"
     >
+      {fresh && (
+        <motion.span
+          aria-hidden
+          className="pointer-events-none absolute inset-0 rounded-xl"
+          style={{
+            boxShadow: `0 0 0 1px ${FOUND_COLOR}80, 0 0 14px ${FOUND_COLOR}40`,
+          }}
+          initial={{ opacity: 1 }}
+          animate={{ opacity: 0 }}
+          transition={{ duration: 2.2, ease: "easeOut", delay: 0.2 }}
+        />
+      )}
       <div className="flex items-center gap-3">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5">
@@ -179,22 +234,22 @@ function SessionCard({
       </div>
       {session.auth && (
         <>
-          <PasswordInput
-            value={pass}
-            placeholder={t("password")}
-            className={cn(
-              "h-8 border-0 bg-secondary text-[13px]",
-              pwError && "ring-1 ring-red-500/70",
-            )}
-            onChange={(e) => {
-              setPass(e.target.value);
-              setPwError(false);
-            }}
-            onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
-          />
-          {pwError && (
-            <p className="px-0.5 text-[12px] text-red-400">{t("wrongPassword")}</p>
-          )}
+          <div ref={shakeScope}>
+            <PasswordInput
+              value={pass}
+              placeholder={t("password")}
+              className={cn(
+                "h-8 border-0 bg-secondary text-[13px]",
+                pwError && "ring-1 ring-red-500/70",
+              )}
+              onChange={(e) => {
+                setPass(e.target.value);
+                setPwError(false);
+              }}
+              onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
+            />
+          </div>
+          {pwError && <ErrorLine>{t("wrongPassword")}</ErrorLine>}
         </>
       )}
 
@@ -270,6 +325,7 @@ function TicketJoin({ probe }: { probe?: ExtState["probe"] }) {
   const [checking, setChecking] = useState(false);
   const [pwError, setPwError] = useState(false);
   const sawPending = useRef(false);
+  const { scope: shakeScope, shake } = useShake();
   const ticket = decodeTicket(raw);
   const invalid = raw.trim().length > 0 && !ticket;
   const name = ticket?.name || t("sessionFallback");
@@ -306,21 +362,11 @@ function TicketJoin({ probe }: { probe?: ExtState["probe"] }) {
     if (!sawPending.current) return;
     setChecking(false);
     if (probe.ok) proceedJoin();
-    else setPwError(true);
+    else {
+      setPwError(true);
+      shake();
+    }
   }, [probe, checking]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  if (!open) {
-    return (
-      <button
-        onClick={() => setOpen(true)}
-        title={t("ticketJoinHint")}
-        className="flex shrink-0 items-center gap-1.5 self-start px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
-      >
-        <Ticket className="size-3" />
-        <span>{t("haveInviteCode")}</span>
-      </button>
-    );
-  }
 
   // Collapse back to the one-line link, clearing whatever was typed so it
   // reopens fresh.
@@ -333,86 +379,132 @@ function TicketJoin({ probe }: { probe?: ExtState["probe"] }) {
   };
 
   return (
-    <div className="space-y-2 rounded-xl bg-card p-3">
-      <div className="flex items-center justify-between px-0.5">
-        <span className="text-[11px] font-medium text-muted-foreground">
-          {t("haveInviteCode")}
-        </span>
+    // Keep the invite header mounted while its form expands below it.
+    <div
+      className={cn(
+        "shrink-0 rounded-xl transition-colors duration-300",
+        open && "bg-card",
+      )}
+    >
+      <div
+        className={cn(
+          "flex items-center justify-between transition-[padding] duration-300",
+          open && "p-2 pb-1",
+        )}
+      >
         <button
           type="button"
-          onClick={close}
-          aria-label={t("close")}
-          className="grid size-5 place-items-center rounded text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+          onClick={() => (open ? close() : setOpen(true))}
+          title={open ? undefined : t("ticketJoinHint")}
+          className="flex min-w-0 items-center gap-1.5 px-1 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
         >
-          <X className="size-3.5" />
+          <Ticket className="size-3 shrink-0" />
+          <span className="truncate">{t("haveInviteCode")}</span>
         </button>
-      </div>
-      <div className="flex items-center gap-2">
-        <div className="relative min-w-0 flex-1">
-          <Input
-            value={raw}
-            placeholder={t("ticketPlaceholder")}
-            autoFocus
-            className="h-8 border-0 bg-secondary pr-8 text-[13px]"
-            onChange={(e) => {
-              setRaw(e.target.value);
-              setPwError(false);
-            }}
-            onKeyDown={(e) => e.key === "Enter" && ticket && (!ticket.auth || pass) && beginJoin()}
-          />
-          {/* Paste from clipboard: the common gesture for a copied code. */}
-          <button
-            type="button"
-            title={t("pasteInvite")}
-            aria-label={t("pasteInvite")}
-            className="absolute right-1 top-1/2 grid size-6 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:bg-background/60 hover:text-foreground"
-            onClick={async () => {
-              const text = await readClipboard();
-              if (text) {
-                setRaw(text.trim());
-                setPwError(false);
-              }
-            }}
-          >
-            <ClipboardPaste className="size-3.5" />
-          </button>
-        </div>
-        <Button
-          size="sm"
-          className="h-8 w-16 shrink-0 px-3 text-[12px]"
-          disabled={!ticket || (ticket.auth && !pass) || checking}
-          onClick={beginJoin}
-        >
-          {checking ? <LoaderCircle className="size-3.5 animate-spin" /> : t("join")}
-        </Button>
-      </div>
-      {invalid && <p className="px-0.5 text-[12px] text-red-400">{t("invalidTicket")}</p>}
-      {ticket && (
-        <div className="flex items-center gap-1.5 px-0.5">
-          {ticket.auth && <LockKeyhole className="size-3.5 shrink-0 text-muted-foreground" />}
-          <span className="truncate text-[12px] text-muted-foreground">{name}</span>
-        </div>
-      )}
-      {ticket?.auth && (
-        <>
-          <PasswordInput
-            value={pass}
-            placeholder={t("password")}
-            className={cn(
-              "h-8 border-0 bg-secondary text-[13px]",
-              pwError && "ring-1 ring-red-500/70",
-            )}
-            onChange={(e) => {
-              setPass(e.target.value);
-              setPwError(false);
-            }}
-            onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
-          />
-          {pwError && (
-            <p className="px-0.5 text-[12px] text-red-400">{t("wrongPassword")}</p>
+        <AnimatePresence initial={false}>
+          {open && (
+            <motion.button
+              key="close"
+              type="button"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              onClick={close}
+              aria-label={t("close")}
+              className="grid size-5 shrink-0 place-items-center rounded text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              <X className="size-3.5" />
+            </motion.button>
           )}
-        </>
-      )}
+        </AnimatePresence>
+      </div>
+
+      <AnimatePresence initial={false}>
+        {open && (
+          <motion.div
+            key="body"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ type: "spring", stiffness: 400, damping: 38 }}
+            className="overflow-hidden"
+          >
+            <div className="space-y-2 p-3 pt-1">
+              <div className="flex items-center gap-2">
+                <div className="relative min-w-0 flex-1">
+                  <Input
+                    value={raw}
+                    placeholder={t("ticketPlaceholder")}
+                    autoFocus
+                    className="h-8 border-0 bg-secondary pr-8 text-[13px]"
+                    onChange={(e) => {
+                      setRaw(e.target.value);
+                      setPwError(false);
+                    }}
+                    onKeyDown={(e) =>
+                      e.key === "Enter" && ticket && (!ticket.auth || pass) && beginJoin()
+                    }
+                  />
+                  {/* Paste from clipboard: the common gesture for a copied code. */}
+                  <button
+                    type="button"
+                    title={t("pasteInvite")}
+                    aria-label={t("pasteInvite")}
+                    className="absolute right-1 top-1/2 grid size-6 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:bg-background/60 hover:text-foreground"
+                    onClick={async () => {
+                      const text = await readClipboard();
+                      if (text) {
+                        setRaw(text.trim());
+                        setPwError(false);
+                      }
+                    }}
+                  >
+                    <ClipboardPaste className="size-3.5" />
+                  </button>
+                </div>
+                <Button
+                  size="sm"
+                  className="h-8 w-16 shrink-0 px-3 text-[12px]"
+                  disabled={!ticket || (ticket.auth && !pass) || checking}
+                  onClick={beginJoin}
+                >
+                  {checking ? <LoaderCircle className="size-3.5 animate-spin" /> : t("join")}
+                </Button>
+              </div>
+              {invalid && <ErrorLine>{t("invalidTicket")}</ErrorLine>}
+              {ticket && (
+                <div className="flex items-center gap-1.5 px-0.5">
+                  {ticket.auth && (
+                    <LockKeyhole className="size-3.5 shrink-0 text-muted-foreground" />
+                  )}
+                  <span className="truncate text-[12px] text-muted-foreground">{name}</span>
+                </div>
+              )}
+              {ticket?.auth && (
+                <>
+                  <div ref={shakeScope}>
+                    <PasswordInput
+                      value={pass}
+                      placeholder={t("password")}
+                      className={cn(
+                        "h-8 border-0 bg-secondary text-[13px]",
+                        pwError && "ring-1 ring-red-500/70",
+                      )}
+                      onChange={(e) => {
+                        setPass(e.target.value);
+                        setPwError(false);
+                      }}
+                      onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
+                    />
+                  </div>
+                  {pwError && <ErrorLine>{t("wrongPassword")}</ErrorLine>}
+                </>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* The same explicit trust decision as joining an announced session:
           a pasted code downloads and runs the host's project all the same. */}
@@ -499,6 +591,8 @@ function HostCard({ project, error }: { project: string; error: ExtState["error"
 
 export function Lobby({ state }: { state: ExtState }) {
   const [profile, setProfile] = useState(getProfile);
+  // Sessions discovered after this timestamp get a one-time highlight.
+  const mountedAt = useRef(Date.now()).current;
   const updateProfile = (p: Profile) => {
     setProfile(p);
     saveProfile(p);
@@ -527,7 +621,12 @@ export function Lobby({ state }: { state: ExtState }) {
             <div className="space-y-2">
               <AnimatePresence mode="popLayout">
                 {state.sessions.map((s) => (
-                  <SessionCard key={s.session_id} session={s} probe={state.probe} />
+                  <SessionCard
+                    key={s.session_id}
+                    session={s}
+                    probe={state.probe}
+                    lobbyMountedAt={mountedAt}
+                  />
                 ))}
               </AnimatePresence>
             </div>

@@ -2,6 +2,10 @@ import { motion } from "motion/react";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+// Concrete color values (mirrors of index.css variables) because Motion can
+// only interpolate between real colors: a CSS variable would snap instead of
+// easing grey→blue.
+import { FOUND_COLOR, SCAN_COLOR } from "@/lib/colors";
 import { t } from "@/lib/i18n";
 
 async function launchReaper() {
@@ -39,17 +43,8 @@ export function Disconnected({ found = false }: { found?: boolean }) {
   );
 }
 
-// Concrete color values (mirror --muted-foreground / --found in index.css).
-// Hardcoded rather than `var(...)` because Motion can only interpolate between
-// real colors; a CSS variable would snap instead of easing grey→blue. The
-// theme is always-dark (one value each), so there's no light-mode variant.
-const SCAN_COLOR = "#8b8b94"; // --muted-foreground
-const FOUND_COLOR = "#6aa6f0"; // --found
-
-// A center dot with two rings that expand and fade outward on a stagger:
-// a heartbeat, not a spinner. Muted grey while scanning; when REAPER answers
-// the beacon eases its color to found-blue *in place*; the breathing loop
-// keeps running, so it never replays its entrance, it just tints over.
+// Two staggered rings pulse around the center dot. When REAPER answers, the
+// existing animation changes color instead of restarting.
 function BreathingBeacon({ found }: { found: boolean }) {
   const color = found ? FOUND_COLOR : SCAN_COLOR;
   return (

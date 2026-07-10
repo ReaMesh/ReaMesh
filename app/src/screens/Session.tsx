@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Check, Crown, Eye, EyeOff, Ticket, TriangleAlert } from "lucide-react";
+import { SlotText } from "slot-text/react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -17,8 +18,26 @@ import { send } from "@/lib/connection";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
 import { t } from "@/lib/i18n";
 import { displayName, type ExtState, type Peer } from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+/** The peer's current track number, right-aligned and rolling on change:
+ *  the same readout the overlay HUD shows. */
+function TrackNumber({ track }: { track?: number | null }) {
+  if (track == null || track <= 0) return <span className="w-4" />;
+  return (
+    <SlotText
+      text={String(track)}
+      options={{ direction: "up", duration: 260 }}
+      className="w-4 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground"
+    />
+  );
+}
 
 function PeerRow({ peer }: { peer: Peer }) {
+  // Click-to-follow, same as the overlay HUD: only meaningful for someone
+  // else who's actually on a track.
+  const clickable = !peer.is_self && peer.track != null && peer.track > 0;
+  const reveal = () => send({ cmd: "reveal_peer", peer_id: peer.id });
   return (
     <motion.div
       layout
@@ -26,7 +45,24 @@ function PeerRow({ peer }: { peer: Peer }) {
       animate={{ opacity: 1, x: 0 }}
       exit={{ opacity: 0, x: 10 }}
       transition={{ type: "spring", stiffness: 350, damping: 28 }}
-      className="flex items-center gap-3 rounded-lg px-2 py-1.5"
+      onClick={clickable ? reveal : undefined}
+      onKeyDown={
+        clickable
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                reveal();
+              }
+            }
+          : undefined
+      }
+      role={clickable ? "button" : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      title={clickable ? t("revealPeerTrack", { name: displayName(peer) }) : undefined}
+      className={cn(
+        "flex items-center gap-3 rounded-lg px-2 py-1.5",
+        clickable && "cursor-pointer transition-colors hover:bg-secondary/60",
+      )}
     >
       <PeerAvatar peer={peer} />
       <span className="min-w-0 flex-1 truncate text-[13px] font-medium">
@@ -42,6 +78,7 @@ function PeerRow({ peer }: { peer: Peer }) {
           {t("youBadge")}
         </Badge>
       )}
+      <TrackNumber track={peer.track} />
     </motion.div>
   );
 }
@@ -87,11 +124,21 @@ function InviteTicket({ ticket }: { ticket: string }) {
       title={t("inviteTicketHint")}
       className="flex shrink-0 items-center gap-1.5 self-start px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
     >
-      {copied ? (
-        <Check className="size-3" />
-      ) : (
-        <Ticket className="size-3" />
-      )}
+      {/* Morph, don't cut: the checkmark springs in over the ticket icon. */}
+      <span className="relative size-3 shrink-0">
+        <AnimatePresence initial={false}>
+          <motion.span
+            key={copied ? "check" : "ticket"}
+            className="absolute inset-0 grid place-items-center"
+            initial={{ scale: 0.4, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            exit={{ scale: 0.4, opacity: 0 }}
+            transition={{ type: "spring", stiffness: 500, damping: 30 }}
+          >
+            {copied ? <Check className="size-3" /> : <Ticket className="size-3" />}
+          </motion.span>
+        </AnimatePresence>
+      </span>
       <span>{copied ? t("inviteCopied") : t("copyInvite")}</span>
     </button>
   );
@@ -155,9 +202,15 @@ export function Session({
 
       <div className="flex min-h-0 flex-col gap-2">
         <h3 className="px-1 text-[12px] font-medium text-muted-foreground">
-          {state.peers.length === 1
-            ? t("justYou")
-            : t("peopleInSession", { count: state.peers.length })}
+          {/* The count rolls slot-machine style when someone joins/leaves. */}
+          <SlotText
+            text={
+              state.peers.length === 1
+                ? t("justYou")
+                : t("peopleInSession", { count: state.peers.length })
+            }
+            options={{ direction: "up", duration: 260 }}
+          />
         </h3>
         <ScrollArea className="min-h-0 rounded-xl bg-card p-2">
           {/* initial={false} suppresses entrance animations for people

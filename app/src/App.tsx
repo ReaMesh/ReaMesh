@@ -157,6 +157,33 @@ export default function App() {
     return () => clearTimeout(id);
   }, [foundBeat, hasState]);
 
+  // Keep the completed download screen visible briefly before showing Session.
+  // Detect this during render to keep the same screen mounted, and key it by
+  // port so switching to another client instance cannot trigger the beat.
+  const [doneBeat, setDoneBeat] = useState<number | null>(null);
+  const [prevInst, setPrevInst] = useState({ port: instance?.port, mode: state?.mode });
+  if (prevInst.port !== instance?.port || prevInst.mode !== state?.mode) {
+    if (
+      prevInst.port === instance?.port &&
+      prevInst.mode === "downloading" &&
+      state?.mode === "client" &&
+      instance?.port != null
+    )
+      setDoneBeat(instance.port);
+    setPrevInst({ port: instance?.port, mode: state?.mode });
+  }
+  const beatActive = doneBeat != null && doneBeat === instance?.port;
+  useEffect(() => {
+    if (doneBeat == null) return;
+    // Drop the beat if the session ends or the active instance changes.
+    if (doneBeat !== instance?.port || state?.mode !== "client") {
+      setDoneBeat(null);
+      return;
+    }
+    const id = setTimeout(() => setDoneBeat(null), 1100);
+    return () => clearTimeout(id);
+  }, [doneBeat, instance?.port, state?.mode]);
+
   // Settings is opened from the native menu (ReaMesh → Settings…, Cmd+,). On
   // macOS the backend opens a native AppKit window instead and emits
   // `menu:settings-changed` after edits so we can re-read status; the
@@ -215,6 +242,10 @@ export default function App() {
     screen = { key: "disconnected", node: <Disconnected /> };
   } else if (mode === "downloading") {
     screen = { key: "downloading", node: <Downloading state={state} /> };
+  } else if (beatActive && mode === "client") {
+    // Keep the "downloading" key so the screen isn't torn down; it just
+    // switches to its done state in place.
+    screen = { key: "downloading", node: <Downloading state={state} done /> };
   } else if (mode === "hosting" || mode === "client") {
     screen = { key: "session", node: <Session state={state} port={port ?? null} /> };
   } else {

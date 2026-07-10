@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { AnimatePresence, motion } from "motion/react";
+import { useEffect, useState } from "react";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import {
   CheckCircle2,
   ExternalLink,
@@ -28,6 +28,14 @@ const BAR_COLORS = ["#f0846b", "#e8d35c", "#7bd88f", "#5b8def"];
 const BAR_HEIGHTS = [22, 34, 28, 38];
 
 function Wordmark() {
+  // After the entrance springs land, the bars sway through a few slow,
+  // desynced equalizer passes (this is a DAW tool, after all) and settle.
+  const [settled, setSettled] = useState(false);
+  const reduce = useReducedMotion();
+  useEffect(() => {
+    const id = setTimeout(() => setSettled(true), 1100);
+    return () => clearTimeout(id);
+  }, []);
   return (
     <div className="flex flex-col items-center gap-4">
       <div className="flex h-10 items-end gap-1.5">
@@ -37,13 +45,33 @@ function Wordmark() {
             className="w-2.5 rounded-full"
             style={{ backgroundColor: c }}
             initial={{ height: 8, opacity: 0 }}
-            animate={{ height: BAR_HEIGHTS[i], opacity: 1 }}
-            transition={{
-              type: "spring",
-              stiffness: 350,
-              damping: 28,
-              delay: 0.08 * i,
-            }}
+            animate={
+              settled && !reduce
+                ? {
+                    height: [
+                      BAR_HEIGHTS[i],
+                      BAR_HEIGHTS[i] * 0.82,
+                      BAR_HEIGHTS[i] * 1.1,
+                      BAR_HEIGHTS[i] * 0.92,
+                      BAR_HEIGHTS[i],
+                    ],
+                    opacity: 1,
+                  }
+                : { height: BAR_HEIGHTS[i], opacity: 1 }
+            }
+            transition={
+              settled && !reduce
+                ? {
+                    height: {
+                      duration: 2.2 + i * 0.25,
+                      ease: "easeInOut",
+                      repeat: 2,
+                      delay: i * 0.15,
+                    },
+                    opacity: { duration: 0.2 },
+                  }
+                : { type: "spring", stiffness: 350, damping: 28, delay: 0.08 * i }
+            }
           />
         ))}
       </div>
