@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { ClipboardPaste, LoaderCircle, LockKeyhole, ShieldAlert, Ticket } from "lucide-react";
+import { ClipboardPaste, LoaderCircle, LockKeyhole, ShieldAlert, Ticket, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -322,8 +322,31 @@ function TicketJoin({ probe }: { probe?: ExtState["probe"] }) {
     );
   }
 
+  // Collapse back to the one-line link, clearing whatever was typed so it
+  // reopens fresh.
+  const close = () => {
+    setOpen(false);
+    setRaw("");
+    setPass("");
+    setPwError(false);
+    setChecking(false);
+  };
+
   return (
     <div className="space-y-2 rounded-xl bg-card p-3">
+      <div className="flex items-center justify-between px-0.5">
+        <span className="text-[11px] font-medium text-muted-foreground">
+          {t("haveInviteCode")}
+        </span>
+        <button
+          type="button"
+          onClick={close}
+          aria-label={t("close")}
+          className="grid size-5 place-items-center rounded text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+        >
+          <X className="size-3.5" />
+        </button>
+      </div>
       <div className="flex items-center gap-2">
         <div className="relative min-w-0 flex-1">
           <Input

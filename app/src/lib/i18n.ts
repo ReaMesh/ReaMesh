@@ -42,6 +42,7 @@ const en = {
   trustBody:
     "Joining {name} downloads and opens the host's project. Its effects and plugins run as code on your computer.",
   cancel: "Cancel",
+  close: "Close",
   joinAnyway: "Join",
   haveInviteCode: "Have an invite code?",
   ticketPlaceholder: "Paste the invite code…",
@@ -209,6 +210,7 @@ const de: Record<MsgKey, string> = {
   trustBody:
     "Beim Beitritt zu {name} wird das Projekt des Hosts heruntergeladen und geöffnet. Seine Effekte und Plugins laufen als Code auf deinem Computer.",
   cancel: "Abbrechen",
+  close: "Schließen",
   joinAnyway: "Beitreten",
   haveInviteCode: "Hast du einen Einladungscode?",
   ticketPlaceholder: "Einladungscode einfügen…",

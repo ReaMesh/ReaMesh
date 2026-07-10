@@ -88,7 +88,7 @@ function InviteTicket({ ticket }: { ticket: string }) {
       className="flex shrink-0 items-center gap-1.5 self-start px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
     >
       {copied ? (
-        <Check className="size-3 text-emerald-500" />
+        <Check className="size-3" />
       ) : (
         <Ticket className="size-3" />
       )}
