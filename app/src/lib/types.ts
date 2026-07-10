@@ -64,6 +64,10 @@ export interface ExtState {
   overridden?: number;
   /** True while the extension is trying to rejoin a lost host automatically. */
   reconnecting?: boolean;
+  /** Invite code for the hosted session ("" while the host's addresses are
+   *  still being learned, and always "" when not hosting). Someone outside
+   *  mDNS reach (VPN, strict LAN) pastes it in their Lobby to join. */
+  ticket?: string;
   sessions: SessionAd[];
   peers: Peer[];
   /** Result of a passphrase pre-check: `ok` is null while in flight, then a

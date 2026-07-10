@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { Crown, Eye, EyeOff, TriangleAlert } from "lucide-react";
+import { Check, Crown, Eye, EyeOff, Ticket, TriangleAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -43,6 +43,57 @@ function PeerRow({ peer }: { peer: Peer }) {
         </Badge>
       )}
     </motion.div>
+  );
+}
+
+// Copy the ticket text to the clipboard: the async clipboard API where the
+// webview grants it, with the hidden-textarea fallback where it doesn't.
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+// One-line copy control for the session's invite code, in the same quiet style
+// as the password reveal below it. The code lets someone outside mDNS reach
+// (VPN, strict LAN) join this session by pasting it in their Lobby.
+function InviteTicket({ ticket }: { ticket: string }) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const id = setTimeout(() => setCopied(false), 2500);
+    return () => clearTimeout(id);
+  }, [copied]);
+  return (
+    <button
+      onClick={async () => {
+        if (await copyText(ticket)) setCopied(true);
+      }}
+      title={t("inviteTicketHint")}
+      className="flex shrink-0 items-center gap-1.5 self-start px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+    >
+      {copied ? (
+        <Check className="size-3 text-emerald-500" />
+      ) : (
+        <Ticket className="size-3" />
+      )}
+      <span>{copied ? t("inviteCopied") : t("copyInvite")}</span>
+    </button>
   );
 }
 
@@ -124,6 +175,7 @@ export function Session({
           button stays pinned to the bottom. */}
       <div className="min-h-0 flex-1" />
 
+      {hosting && !!state.ticket && <InviteTicket ticket={state.ticket} />}
       {hostPass && <HostPassword pass={hostPass} />}
 
       <Button variant="secondary" className="shrink-0" onClick={requestLeave}>

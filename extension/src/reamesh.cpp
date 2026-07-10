@@ -268,11 +268,18 @@ struct Reconnect {
   std::string sessionId;
   std::string sessionName;
   std::string passphrase;
+  // Invite ticket the session was joined through (empty for LAN-discovered
+  // sessions). A ticket host is usually NOT on this LAN, so waiting for its
+  // lobby announce would wait forever: the rejoin re-dials the ticket instead.
+  std::string ticket;
   std::chrono::steady_clock::time_point deadline;
 };
 static std::optional<Reconnect> g_reconnect;
 // Passphrase the current session was joined with, kept for auto-rejoin.
 static std::string g_joinPassphrase;
+// Invite ticket the current session was joined with ("" = discovered on the
+// LAN), kept for auto-rejoin like the passphrase.
+static std::string g_joinTicket;
 
 // Two parameter-free convenience actions; the companion app is the real UI
 // and drives everything (browse/join/leave) over the control server instead.
@@ -2014,6 +2021,28 @@ static bool joinSessionById(const std::string& sid, const std::string& sname,
   g_mode = Mode::Downloading;
   g_lastError = json();
   g_joinPassphrase = passphrase;
+  g_joinTicket.clear();
+  logEvent("joining", {{"name", sname}}, "joining \"" + sname + "\", downloading the project");
+  return true;
+}
+
+// Join a session through a pasted invite ticket (Browsing -> Downloading).
+// The Rust side dials the ticket's addresses and joins once the host's
+// announce arrives over that connection; this is how a session outside
+// mDNS/multicast reach (VPN, strict LAN) is joined.
+static bool joinSessionByTicket(const std::string& ticket, const std::string& sname,
+                                const std::string& passphrase) {
+  if (g_mode != Mode::Browsing || !g_handle) return false;
+  if (!reamesh_join_ticket(g_handle, ticket.c_str(), passphrase.c_str())) {
+    g_lastError = logEvent("bad_ticket", json::object(),
+                           "that invite ticket doesn't look valid; copy it again from the host");
+    return false;
+  }
+  g_lastReverts = 0;
+  g_mode = Mode::Downloading;
+  g_lastError = json();
+  g_joinPassphrase = passphrase;
+  g_joinTicket = ticket;
   logEvent("joining", {{"name", sname}}, "joining \"" + sname + "\", downloading the project");
   return true;
 }
@@ -2027,6 +2056,7 @@ static void beginReconnect(const json& st) {
   rc.sessionName = jsonStr(st, "session_name");
   if (rc.sessionName.empty()) rc.sessionName = "session";
   rc.passphrase = g_joinPassphrase;
+  rc.ticket = g_joinTicket;
   rc.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
   leaveSession("", json::object(), "");  // silent: this is not (yet) an error
   if (rc.sessionId.empty() || !startBrowse()) {
@@ -2047,6 +2077,17 @@ static void reconnectTick() {
     g_lastError = logEvent("reconnect_failed", {{"name", g_reconnect->sessionName}},
                            "could not reconnect to \"" + g_reconnect->sessionName + "\"");
     g_reconnect.reset();
+    return;
+  }
+  // Ticket-joined session: the host is usually beyond mDNS reach, so its
+  // announce will never show up here: re-dial the ticket instead. The Rust
+  // side keeps dialing + waiting for the pinned host for up to 30s on its own,
+  // which covers a network blip; a host that actually re-hosted has a new
+  // session id and can't be auto-rejoined either way.
+  if (!g_reconnect->ticket.empty()) {
+    Reconnect rc = *g_reconnect;
+    g_reconnect.reset();
+    joinSessionByTicket(rc.ticket, rc.sessionName, rc.passphrase);
     return;
   }
   json sessions = handleJson(reamesh_sessions, json::array());
@@ -2213,16 +2254,28 @@ static void ctlDispatch(const json& cmd) {
   } else if (c == "join") {
     if (g_mode == Mode::Idle) startBrowse();
     std::string name = jsonStr(cmd, "session_name");
-    joinSessionById(jsonStr(cmd, "session_id"), name.empty() ? "session" : name,
-                    jsonStr(cmd, "passphrase"));
+    std::string ticket = jsonStr(cmd, "ticket");
+    if (!ticket.empty()) {
+      joinSessionByTicket(ticket, name.empty() ? "session" : name, jsonStr(cmd, "passphrase"));
+    } else {
+      joinSessionById(jsonStr(cmd, "session_id"), name.empty() ? "session" : name,
+                      jsonStr(cmd, "passphrase"));
+    }
   } else if (c == "check") {
     // Passphrase pre-check: verify with the owner BEFORE the app shows the
     // trust dialog or starts downloading. Stays in Browsing; the result rides
-    // the status `probe` field. Never transitions the session.
+    // the status `probe` field. Never transitions the session. With a `ticket`
+    // the check dials the ticket's host instead of an announced session.
     if (g_mode == Mode::Idle) startBrowse();
-    if (g_handle && g_mode == Mode::Browsing)
-      reamesh_check_passphrase(g_handle, jsonStr(cmd, "session_id").c_str(),
-                               jsonStr(cmd, "passphrase").c_str());
+    if (g_handle && g_mode == Mode::Browsing) {
+      std::string ticket = jsonStr(cmd, "ticket");
+      if (!ticket.empty()) {
+        reamesh_check_ticket(g_handle, ticket.c_str(), jsonStr(cmd, "passphrase").c_str());
+      } else {
+        reamesh_check_passphrase(g_handle, jsonStr(cmd, "session_id").c_str(),
+                                 jsonStr(cmd, "passphrase").c_str());
+      }
+    }
   } else if (c == "leave") {
     onLeave();
   } else if (c == "reveal_peer") {
@@ -2361,6 +2414,16 @@ static void ctlTick() {
   std::string session = jsonStr(st, "session_name");
   if (session.empty() && !g_sessionProjectPath.empty()) session = fileStem(g_sessionProjectPath);
   state["session"] = session;
+  // Invite ticket for the hosted session ("" while addresses are still being
+  // learned, and always "" when not hosting): the app shows a copy control.
+  std::string ticket;
+  if (g_mode == Mode::Hosting && g_handle) {
+    if (char* t = reamesh_session_ticket(g_handle)) {
+      ticket = t;
+      reamesh_free_string(t);
+    }
+  }
+  state["ticket"] = ticket;
   state["sessions"] = handleJson(reamesh_sessions, json::array());
   state["peers"] = std::move(peers);
 

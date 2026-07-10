@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { LoaderCircle, LockKeyhole, ShieldAlert } from "lucide-react";
+import { LoaderCircle, LockKeyhole, ShieldAlert, Ticket } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -221,6 +221,179 @@ function SessionCard({
   );
 }
 
+// What the app itself reads out of a pasted invite code: enough to show the
+// session name, ask for a passphrase when one is needed, and match the
+// extension's `probe` result. The addresses inside are the extension's
+// business; the whole raw code is sent along with the join/check commands.
+function decodeTicket(raw: string): { sid: string; name: string; auth: boolean } | null {
+  const s = raw.trim();
+  if (!s.startsWith("RM1:") || s.length > 8192) return null;
+  try {
+    const b64 = s.slice(4).replace(/-/g, "+").replace(/_/g, "/");
+    const pad = b64.length % 4 === 2 ? "==" : b64.length % 4 === 3 ? "=" : "";
+    const json = JSON.parse(
+      new TextDecoder().decode(Uint8Array.from(atob(b64 + pad), (c) => c.charCodeAt(0))),
+    );
+    if (json?.v !== 1 || typeof json.sid !== "string" || !json.sid) return null;
+    if (!Array.isArray(json.addrs) || json.addrs.length === 0) return null;
+    return {
+      sid: json.sid,
+      name: typeof json.name === "string" ? json.name : "",
+      auth: !!json.auth,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Join through a pasted invite code: the path to a host outside mDNS reach
+// (VPN like Tailscale, multicast-blocking network). Collapsed to one quiet
+// line until asked for; once a valid code is pasted it behaves exactly like a
+// SessionCard: passphrase pre-check first, the once-per-run trust gate, then
+// the join (the extension dials the code's addresses instead of an announced
+// session).
+function TicketJoin({ probe }: { probe?: ExtState["probe"] }) {
+  const [open, setOpen] = useState(false);
+  const [raw, setRaw] = useState("");
+  const [pass, setPass] = useState("");
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [pwError, setPwError] = useState(false);
+  const sawPending = useRef(false);
+  const ticket = decodeTicket(raw);
+  const invalid = raw.trim().length > 0 && !ticket;
+  const name = ticket?.name || t("sessionFallback");
+
+  const join = () => {
+    if (!ticket) return;
+    trustWarningAccepted = true;
+    setConfirmOpen(false);
+    send({ cmd: "join", ticket: raw.trim(), session_name: name, passphrase: pass });
+  };
+  const proceedJoin = () => {
+    if (trustWarningAccepted) join();
+    else setConfirmOpen(true);
+  };
+  const beginJoin = () => {
+    if (!ticket || checking) return;
+    if (!ticket.auth) return proceedJoin();
+    if (!pass) return;
+    setPwError(false);
+    setChecking(true);
+    sawPending.current = false;
+    send({ cmd: "check", ticket: raw.trim(), passphrase: pass });
+  };
+
+  // Same probe reconciliation as SessionCard, keyed on the code's session id.
+  // A code check can take a while (the extension is dialing the host), so the
+  // spinner may spin for many seconds; that is the honest state.
+  useEffect(() => {
+    if (!checking || !ticket || probe?.session_id !== ticket.sid) return;
+    if (probe.ok === null || probe.ok === undefined) {
+      sawPending.current = true;
+      return;
+    }
+    if (!sawPending.current) return;
+    setChecking(false);
+    if (probe.ok) proceedJoin();
+    else setPwError(true);
+  }, [probe, checking]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        title={t("ticketJoinHint")}
+        className="flex shrink-0 items-center gap-1.5 self-start px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <Ticket className="size-3" />
+        <span>{t("haveInviteCode")}</span>
+      </button>
+    );
+  }
+
+  return (
+    <div className="space-y-2 rounded-xl bg-card p-3">
+      <div className="flex items-center gap-3">
+        <Input
+          value={raw}
+          placeholder={t("ticketPlaceholder")}
+          autoFocus
+          className="h-8 min-w-0 flex-1 border-0 bg-secondary font-mono text-[12px]"
+          onChange={(e) => {
+            setRaw(e.target.value);
+            setPwError(false);
+          }}
+          onKeyDown={(e) => e.key === "Enter" && ticket && (!ticket.auth || pass) && beginJoin()}
+        />
+        <Button
+          size="sm"
+          className="h-7 w-16 shrink-0 px-3 text-[12px]"
+          disabled={!ticket || (ticket.auth && !pass) || checking}
+          onClick={beginJoin}
+        >
+          {checking ? <LoaderCircle className="size-3.5 animate-spin" /> : t("join")}
+        </Button>
+      </div>
+      {invalid && <p className="px-0.5 text-[12px] text-red-400">{t("invalidTicket")}</p>}
+      {ticket && (
+        <div className="flex items-center gap-1.5 px-0.5">
+          {ticket.auth && <LockKeyhole className="size-3.5 shrink-0 text-muted-foreground" />}
+          <span className="truncate text-[12px] text-muted-foreground">{name}</span>
+        </div>
+      )}
+      {ticket?.auth && (
+        <>
+          <PasswordInput
+            value={pass}
+            placeholder={t("password")}
+            className={cn(
+              "h-8 border-0 bg-secondary text-[13px]",
+              pwError && "ring-1 ring-red-500/70",
+            )}
+            onChange={(e) => {
+              setPass(e.target.value);
+              setPwError(false);
+            }}
+            onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
+          />
+          {pwError && (
+            <p className="px-0.5 text-[12px] text-red-400">{t("wrongPassword")}</p>
+          )}
+        </>
+      )}
+
+      {/* The same explicit trust decision as joining an announced session:
+          a pasted code downloads and runs the host's project all the same. */}
+      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <DialogContent className="max-w-[340px] gap-4 rounded-2xl">
+          <DialogHeader>
+            <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-amber-500/15 sm:mx-0">
+              <ShieldAlert className="size-5 text-amber-500" />
+            </div>
+            <DialogTitle className="text-[15px]">{t("trustTitle")}</DialogTitle>
+            <DialogDescription className="text-[13px] leading-relaxed">
+              {t("trustBody", { name })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              className="flex-1"
+              onClick={() => setConfirmOpen(false)}
+            >
+              {t("cancel")}
+            </Button>
+            <Button className="flex-1" onClick={join}>
+              {t("joinAnyway")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
 function HostCard({ project, error }: { project: string; error: ExtState["error"] }) {
   const [pass, setPass] = useState("");
   // Keep the host button pending until hosting starts or an error arrives.
@@ -320,6 +493,8 @@ export function Lobby({ state }: { state: ExtState }) {
           </div>
         )}
       </div>
+
+      <TicketJoin probe={state.probe} />
 
       <HostCard project={state.project} error={state.error} />
     </div>

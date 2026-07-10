@@ -43,6 +43,11 @@ const en = {
     "Joining {name} downloads and opens the host's project. Its effects and plugins run as code on your computer.",
   cancel: "Cancel",
   joinAnyway: "Join",
+  haveInviteCode: "Have an invite code?",
+  ticketPlaceholder: "Paste the invite code…",
+  invalidTicket: "This doesn't look like a ReaMesh invite code.",
+  ticketJoinHint:
+    "An invite code reaches a host beyond this network, for example over a VPN like Tailscale.",
 
   // Session
   sessionFallback: "Session",
@@ -58,6 +63,10 @@ const en = {
   stopHostingBodyOne: "One other person is connected. Stopping the session disconnects them.",
   stopHostingBodyMany:
     "{count} other people are connected. Stopping the session disconnects them all.",
+  copyInvite: "Copy invite code",
+  inviteCopied: "Invite code copied",
+  inviteTicketHint:
+    "Send this code to someone outside this network. They paste it in their lobby to join (works over VPNs like Tailscale). It is valid while this session is hosted.",
 
   // Downloading
   joiningLabel: "Joining",
@@ -154,6 +163,7 @@ const en = {
   logMediaTimeout: "Gave up waiting for media: {file}",
   logReconnecting: "Lost the host. Reconnecting to “{name}”…",
   reconnectFailed: "Couldn’t reconnect to “{name}”.",
+  logBadTicket: "That invite code doesn’t look valid. Copy it again from the host.",
   editLocked: "Your edit snapped back: someone else is editing it.",
   editLockedTrack: "Your edit to “{track}” snapped back: someone else is editing it.",
   editLockedBy: "{by} is editing this right now.",
@@ -198,6 +208,11 @@ const de: Record<MsgKey, string> = {
     "Beim Beitritt zu {name} wird das Projekt des Hosts heruntergeladen und geöffnet. Seine Effekte und Plugins laufen als Code auf deinem Computer.",
   cancel: "Abbrechen",
   joinAnyway: "Beitreten",
+  haveInviteCode: "Hast du einen Einladungscode?",
+  ticketPlaceholder: "Einladungscode einfügen…",
+  invalidTicket: "Das sieht nicht nach einem ReaMesh-Einladungscode aus.",
+  ticketJoinHint:
+    "Ein Einladungscode erreicht einen Host auch außerhalb dieses Netzwerks, zum Beispiel über ein VPN wie Tailscale.",
 
   sessionFallback: "Session",
   hostingBadge: "Hosting",
@@ -213,6 +228,10 @@ const de: Record<MsgKey, string> = {
     "Eine weitere Person ist verbunden. Wenn du die Session beendest, wird sie getrennt.",
   stopHostingBodyMany:
     "{count} weitere Personen sind verbunden. Wenn du die Session beendest, werden alle getrennt.",
+  copyInvite: "Einladungscode kopieren",
+  inviteCopied: "Einladungscode kopiert",
+  inviteTicketHint:
+    "Schick diesen Code jemandem außerhalb dieses Netzwerks. Er fügt ihn in seiner Lobby ein, um beizutreten (funktioniert über VPNs wie Tailscale). Er gilt, solange diese Session gehostet wird.",
 
   joiningLabel: "Trete bei",
   downloadingProject: "Projekt wird heruntergeladen…",
@@ -304,6 +323,7 @@ const de: Record<MsgKey, string> = {
   logMediaTimeout: "Warten auf Medien aufgegeben: {file}",
   logReconnecting: "Host verloren. Verbinde erneut mit „{name}“…",
   reconnectFailed: "Erneutes Verbinden mit „{name}“ ist fehlgeschlagen.",
+  logBadTicket: "Dieser Einladungscode scheint ungültig zu sein. Kopiere ihn beim Host erneut.",
   editLocked: "Deine Änderung wurde zurückgesetzt. Jemand anderes bearbeitet sie gerade.",
   editLockedTrack: "Deine Änderung an „{track}“ wurde zurückgesetzt. Jemand anderes bearbeitet sie gerade.",
   editLockedBy: "{by} bearbeitet das gerade.",

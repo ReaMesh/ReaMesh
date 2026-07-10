@@ -1,11 +1,11 @@
 # ReaMesh
 
 Work on a REAPER project together. ReaMesh shares project files and keeps edits
-in sync between computers on a local network. No account or server needed.
+in sync between computers on a local network or VPN. No account or server needed.
 
 One person hosts a project, the others join and get a local copy. Everyone can
 then edit tracks, arrange audio and MIDI, and work on effects. A desktop app
-handles sessions and setup alongside REAPER.
+handles sessions, invitations and setup alongside REAPER.
 
 ## Getting started
 
@@ -18,15 +18,17 @@ or [build from source](#building-from-source).
 2. Restart REAPER so it loads the extension. ReaMesh connects automatically.
 3. Save a project in its own folder, then host it from the app. You can set a
    passphrase when creating the session.
-4. On the other computer, join from the lobby. ReaMesh downloads the project and
-   opens it in REAPER.
+4. On the other computer, join from the lobby or paste the host's invite code.
+   ReaMesh downloads the project and opens it in REAPER.
 
 **Hosting shares the project folder**, including files that aren't used in the
 project. Dotfiles, `.rpp-bak` backups and `.reapeaks` caches are excluded.
 Referenced media outside the folder is copied into it for sharing.
 
-Sessions are discovered automatically on the LAN. ReaMesh has no relay or NAT
-traversal, so everyone needs to be on the same local network.
+Sessions are discovered automatically on the LAN. For a VPN or a network where
+discovery doesn't work, use an invite code. Both computers still need a direct
+network route to each other; ReaMesh has no relay or NAT traversal. An invite
+code is valid only while that hosting session is running.
 
 ## What syncs
 
@@ -44,8 +46,7 @@ does sync. Master-track state, hardware outputs, pooled automation items, marker
 ruler lanes and project extension state aren't synced.
 
 An optional floating roster shows who's connected and which track each person is
-on. Click someone to jump to where they are. It can also draw other people's
-playheads and selections over the arrange view.
+on. Click someone to jump to where they are.
 
 ## Working together
 
@@ -63,15 +64,20 @@ When the host stops the session, everyone keeps their local project copy.
 To use the project's effects, you'll need the plugins installed locally.
 
 Only join people you trust: shared projects can load plugins on your computer.
-Passphrase-protected sessions restrict downloading and editing. Session names
-remain public for discovery, and session messages aren't encrypted with the
-passphrase.
+Passphrase-protected sessions restrict downloading and editing and encrypt
+session messages. Session names remain public for discovery. Open sessions
+don't have this extra message encryption.
 
 ## Building from source
 
 Install Rust, Bun, CMake 3.20 or newer, the Xcode command-line tools and the
 [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) for
 macOS.
+
+The macOS config includes the maintainer's signing identity. Before a local
+build, set `bundle.macOS.signingIdentity` in
+[`app/src-tauri/tauri.conf.json`](app/src-tauri/tauri.conf.json) to your own
+identity, or `"-"` for [ad-hoc signing](https://v2.tauri.app/distribute/sign/macos/#ad-hoc-signing).
 
 From the repository root:
 

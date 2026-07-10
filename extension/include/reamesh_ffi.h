@@ -66,6 +66,32 @@ bool reamesh_check_passphrase(struct ReameshHandle *handle,
                               const char *passphrase);
 
 /**
+ * Invite ticket for the session this owner handle is hosting: a copyable
+ * string a remote peer pastes to join without LAN discovery (works across
+ * VPNs like Tailscale and on multicast-blocking networks). Empty until the
+ * host's listen addresses are known, and always empty on client handles.
+ * Valid only for this hosting run. Free the result with
+ * `reamesh_free_string`.
+ */
+char *reamesh_session_ticket(struct ReameshHandle *handle);
+
+/**
+ * Join a session through a pasted invite ticket (client handles only):
+ * dials the ticket's addresses directly, then joins once the host's announce
+ * arrives over that connection. `passphrase` as in `reamesh_join_session`.
+ * Returns true if the attempt was started; watch `reamesh_status` for
+ * connecting/downloading/ready/failed.
+ */
+bool reamesh_join_ticket(struct ReameshHandle *handle, const char *ticket, const char *passphrase);
+
+/**
+ * Pre-check a passphrase against a ticket's host without joining: the ticket
+ * analogue of `reamesh_check_passphrase`, reporting through the same `probe`
+ * status field. An unreachable host reports ok=false rather than hanging.
+ */
+bool reamesh_check_ticket(struct ReameshHandle *handle, const char *ticket, const char *passphrase);
+
+/**
  * Current session status as JSON:
  * `{"state","progress","project_path","session_id","session_name","message"}`
  * where state is hosting|browsing|connecting|downloading|ready|failed.

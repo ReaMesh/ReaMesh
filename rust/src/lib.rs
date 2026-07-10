@@ -116,6 +116,19 @@ const PRESENCE_STALE: Duration = Duration::from_secs(8);
 /// Session farewell: published by the owner right before it stops hosting so
 /// clients end cleanly instead of waiting out a silence.
 const TAG_SESSION_END: u8 = b'E';
+/// Sealed envelope: `'X'` + 24-byte nonce + XChaCha20-Poly1305 ciphertext of a
+/// whole tagged message (tag byte included, so even message *types* are
+/// hidden). In a passphrase-protected session every session-topic message is
+/// sealed with a key derived from the session token, and unsealed messages are
+/// dropped: a LAN peer without the passphrase can subscribe to the (publicly
+/// announced) topic but can neither read the gossip nor lift the session token
+/// out of a proposal envelope. Open sessions stay plaintext (no secret to
+/// derive a key from). The sender's peer id is bound as AAD, so a captured
+/// ciphertext replayed from a different (transport-authenticated) peer id
+/// fails to open.
+const TAG_SEALED: u8 = b'X';
+/// XChaCha20 nonce length: 24 bytes, safe to draw at random per message.
+const SEAL_NONCE_LEN: usize = 24;
 /// Client fallback: if the owner has been gone from the session topic this
 /// long (crash, network drop: no farewell seen), treat the session as ended.
 const OWNER_GONE_TIMEOUT: Duration = Duration::from_secs(12);
@@ -536,6 +549,59 @@ fn presence_mac(auth_token: &str, peer_id: &str) -> String {
     blake3::keyed_hash(&key, peer_id.as_bytes()).to_hex().to_string()
 }
 
+/// Symmetric key sealing this session's gossip, derived from the session
+/// token. `None` for open sessions (empty token: nothing secret to derive
+/// from), whose gossip stays plaintext. Deriving per message is a single
+/// blake3 hash: cheap enough to skip caching and its invalidation questions.
+fn gossip_key(auth_token: &str) -> Option<chacha20poly1305::Key> {
+    if auth_token.is_empty() {
+        return None;
+    }
+    Some(chacha20poly1305::Key::from(blake3::derive_key(
+        "reamesh/v3/gossip",
+        auth_token.as_bytes(),
+    )))
+}
+
+/// Seal one tagged session-topic message (see `TAG_SEALED`). `sender` is the
+/// publishing peer's id, bound as AAD: receivers open against the gossipsub
+/// message's authenticated source, so a replay under any other identity fails.
+/// Returns `None` only if the OS RNG fails (the message is then not sent).
+fn seal_session_msg(key: &chacha20poly1305::Key, tagged: &[u8], sender: &str) -> Option<Vec<u8>> {
+    use chacha20poly1305::aead::{Aead, Payload};
+    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+    let mut nonce = [0u8; SEAL_NONCE_LEN];
+    if let Err(e) = getrandom::getrandom(&mut nonce) {
+        eprintln!("[reamesh] seal: getrandom failed ({e}); message not sent");
+        return None;
+    }
+    let ct = XChaCha20Poly1305::new(key)
+        .encrypt(XNonce::from_slice(&nonce), Payload { msg: tagged, aad: sender.as_bytes() })
+        .ok()?;
+    let mut out = Vec::with_capacity(1 + SEAL_NONCE_LEN + ct.len());
+    out.push(TAG_SEALED);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Some(out)
+}
+
+/// Open a sealed session-topic message against the sender's authenticated peer
+/// id. `None` on anything that doesn't verify: wrong key (no/other passphrase),
+/// tampering, truncation, or a ciphertext replayed from a different peer id.
+fn open_session_msg(key: &chacha20poly1305::Key, data: &[u8], sender: &str) -> Option<Vec<u8>> {
+    use chacha20poly1305::aead::{Aead, Payload};
+    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+    if data.first() != Some(&TAG_SEALED) || data.len() < 1 + SEAL_NONCE_LEN + 16 {
+        return None;
+    }
+    XChaCha20Poly1305::new(key)
+        .decrypt(
+            XNonce::from_slice(&data[1..1 + SEAL_NONCE_LEN]),
+            Payload { msg: &data[1 + SEAL_NONCE_LEN..], aad: sender.as_bytes() },
+        )
+        .ok()
+}
+
 /// Lower-case hex of a byte slice (no external dep for this one use).
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -574,10 +640,138 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+// ---------- join-by-ticket ----------
+//
+// Discovery is normally mDNS + the lobby topic, which never leaves the local
+// subnet. A *ticket* is a copyable invite that carries everything a client
+// needs to reach the host directly instead: the host's peer id and listen
+// addresses, plus the session id/name and whether it takes a passphrase. Over
+// a VPN (Tailscale etc.) or a multicast-blocking LAN, pasting the ticket is
+// what stands in for the announcement being overheard: the client dials the
+// addresses, the (signed) lobby announce then arrives over that direct
+// connection, and the join proceeds exactly like a discovered one: same
+// manifest auth, same download, same session topic. The ticket is only valid
+// while that hosting run lives (id and ports change on re-host), like a
+// meeting link.
+
+/// Ticket wire format: this prefix + unpadded base64url JSON
+/// `{"v":1,"sid","name","peer","addrs":[..],"auth"}`. Plain base64url (not
+/// binary) so the companion app can decode it in the webview to show the
+/// session name and passphrase flag before anything touches the network.
+const TICKET_PREFIX: &str = "RM1:";
+/// Hard cap on pasted-ticket length before any decoding.
+const TICKET_MAX_LEN: usize = 8 * 1024;
+/// Cap on the addresses a ticket may carry (a host has a handful of
+/// interfaces; hundreds would be a dial-storm request, not an invite).
+const TICKET_MAX_ADDRS: usize = 16;
+/// How long a ticket join keeps dialing + waiting for the host's announce
+/// before it fails. Longer than MANIFEST_TIMEOUT: this leg spans WAN/VPN
+/// connection setup, not just one request round-trip.
+const TICKET_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+const B64URL_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Unpadded base64url (RFC 4648 §5), implemented locally to avoid a dependency
+/// for one wire format.
+fn base64url_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+        for i in 0..=chunk.len() {
+            out.push(B64URL_ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+fn base64url_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    };
+    let bytes = s.as_bytes();
+    if bytes.len() % 4 == 1 {
+        return None; // no unpadded encoding has this length
+    }
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let mut n: u32 = 0;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= val(c)? << (18 - 6 * i as u32);
+        }
+        let all = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        out.extend_from_slice(&all[..chunk.len() - 1]);
+    }
+    Some(out)
+}
+
+/// Everything a "join by ticket" needs, decoded from the pasted string.
+#[derive(Clone, Debug)]
+struct TicketInfo {
+    session_id: String,
+    session_name: String,
+    /// The host's peer id. The join is *pinned* to it: only an announce whose
+    /// authenticated signer is this peer is accepted, so a LAN peer announcing
+    /// the same session id can't hijack a ticket join.
+    peer: PeerId,
+    addrs: Vec<Multiaddr>,
+}
+
+fn parse_ticket(ticket: &str) -> Option<TicketInfo> {
+    let t = ticket.trim();
+    if t.len() > TICKET_MAX_LEN {
+        return None;
+    }
+    let bytes = base64url_decode(t.strip_prefix(TICKET_PREFIX)?)?;
+    let v: JsonValue = serde_json::from_slice(&bytes).ok()?;
+    if v.get("v").and_then(|x| x.as_u64()) != Some(1) {
+        return None;
+    }
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    let session_id = s("sid").filter(|x| !x.is_empty())?;
+    let session_name = s("name").unwrap_or_default();
+    let peer = s("peer")?.parse::<PeerId>().ok()?;
+    let addrs: Vec<Multiaddr> = v
+        .get("addrs")?
+        .as_array()?
+        .iter()
+        .take(TICKET_MAX_ADDRS)
+        .filter_map(|a| a.as_str().and_then(|x| x.parse().ok()))
+        .collect();
+    if addrs.is_empty() {
+        return None;
+    }
+    // The ticket also carries an "auth" flag; it is read by the companion app
+    // (to ask for a passphrase before joining), not by this side.
+    Some(TicketInfo { session_id, session_name, peer, addrs })
+}
+
+/// The first IP protocol component of a multiaddr, if any.
+fn addr_ip(addr: &Multiaddr) -> Option<std::net::IpAddr> {
+    addr.iter().find_map(|p| match p {
+        Protocol::Ip4(ip) => Some(std::net::IpAddr::from(ip)),
+        Protocol::Ip6(ip) => Some(std::net::IpAddr::from(ip)),
+        _ => None,
+    })
+}
+
 enum Command {
     PublishAuthoritative(Vec<u8>),
     PublishProposal(Vec<u8>),
     JoinSession { session_id: String, passphrase: String },
+    /// Join (or, with `probe_only`, just passphrase-check) a session reached
+    /// through a pasted ticket instead of LAN discovery: dial the ticket's
+    /// addresses, wait for the pinned owner's announce, then proceed exactly
+    /// like a discovered session.
+    JoinTicket { info: TicketInfo, passphrase: String, probe_only: bool },
     /// Pre-check a passphrase against the owner without joining (a lone manifest
     /// request whose accept/reject answers "is this passphrase right?").
     ProbeAuth { session_id: String, passphrase: String },
@@ -1091,6 +1285,90 @@ impl Reamesh {
             .send(Command::JoinSession {
                 session_id: session_id.to_string(),
                 passphrase: passphrase.to_string(),
+            })
+            .is_ok()
+    }
+
+    /// Invite ticket for the session this peer is hosting: a copyable string
+    /// carrying the host's peer id + listen addresses and the session id/name/
+    /// auth flag, so a peer that can't overhear the LAN announcement (VPN,
+    /// multicast-blocked network) can still reach it. Empty until at least one
+    /// non-loopback listen address is known, and always empty on clients.
+    pub fn session_ticket(&self) -> String {
+        if self.role != Role::Owner {
+            return String::new();
+        }
+        let (sid, name) = {
+            let st = self.shared.status.lock().unwrap();
+            (st.session_id.clone(), st.session_name.clone())
+        };
+        let (Some(sid), Some(name)) = (sid, name) else {
+            return String::new();
+        };
+        // Loopback/unspecified addresses are meaningless off-machine; a
+        // same-host client re-derives loopback itself (see dial_ticket).
+        let addrs: Vec<String> = self
+            .shared
+            .listen_addrs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| addr_ip(a).is_some_and(|ip| !ip.is_loopback() && !ip.is_unspecified()))
+            .take(TICKET_MAX_ADDRS)
+            .map(|a| a.to_string())
+            .collect();
+        if addrs.is_empty() {
+            return String::new();
+        }
+        let auth = !self.shared.auth_token.lock().unwrap().is_empty();
+        let payload = json!({
+            "v": 1,
+            "sid": sid,
+            "name": name,
+            "peer": self.local_peer_id,
+            "addrs": addrs,
+            "auth": auth,
+        });
+        format!("{TICKET_PREFIX}{}", base64url_encode(payload.to_string().as_bytes()))
+    }
+
+    /// Join a session through a pasted ticket (client only): dial the ticket's
+    /// addresses directly, wait for the (pinned) owner's announce, then join as
+    /// if it had been discovered. Returns whether the attempt was started;
+    /// watch `status_json` for connecting/downloading/failed.
+    pub fn join_ticket(&self, ticket: &str, passphrase: &str) -> bool {
+        if self.role != Role::Client {
+            return false;
+        }
+        let Some(info) = parse_ticket(ticket) else {
+            return false;
+        };
+        self.cmd_tx
+            .send(Command::JoinTicket {
+                info,
+                passphrase: passphrase.to_string(),
+                probe_only: false,
+            })
+            .is_ok()
+    }
+
+    /// Pre-check a passphrase against a ticket's host without joining (the
+    /// ticket analogue of `check_passphrase`; same `probe` reporting). An
+    /// unreachable host reports `ok: false` too: the caller gets a definite
+    /// answer either way.
+    pub fn check_ticket(&self, ticket: &str, passphrase: &str) -> bool {
+        if self.role != Role::Client {
+            return false;
+        }
+        let Some(info) = parse_ticket(ticket) else {
+            return false;
+        };
+        *self.shared.probe_result.lock().unwrap() = Some((info.session_id.clone(), None));
+        self.cmd_tx
+            .send(Command::JoinTicket {
+                info,
+                passphrase: passphrase.to_string(),
+                probe_only: true,
             })
             .is_ok()
     }
@@ -1928,6 +2206,167 @@ fn admit_proposal(shared: &Shared, payload: &[u8], proposer: &str) -> Option<Vec
     Some(update)
 }
 
+/// Publish one tagged message on the session topic, sealing it first when the
+/// session is passphrase-protected (see `TAG_SEALED`). Every session-topic
+/// publish goes through here so no message class can leak plaintext by
+/// accident. Returns whether the publish succeeded: callers use a failure to
+/// queue a retry / full sync exactly as they did with a raw publish. Callers
+/// keep (and retry with) the *plaintext* tagged message; each attempt is
+/// sealed fresh with a new nonce.
+fn publish_session(
+    swarm: &mut Swarm<Behaviour>,
+    shared: &Shared,
+    topic: &gossipsub::IdentTopic,
+    tagged: &[u8],
+) -> bool {
+    let data = match gossip_key(&shared.auth_token.lock().unwrap()) {
+        Some(key) => {
+            let sender = swarm.local_peer_id().to_string();
+            match seal_session_msg(&key, tagged, &sender) {
+                Some(sealed) => sealed,
+                None => return false,
+            }
+        }
+        None => tagged.to_vec(),
+    };
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish(topic.clone(), data)
+        .is_ok()
+}
+
+/// An in-flight ticket join/check: dialing + waiting for the pinned owner's
+/// announce (see Command::JoinTicket and the tick handling).
+struct PendingJoin {
+    info: TicketInfo,
+    passphrase: String,
+    probe_only: bool,
+    started: Instant,
+    last_dial: Instant,
+}
+
+/// Dial a ticket's host: remember its addresses (request-response dials by
+/// peer id), mark it an explicit gossipsub peer, and connect. When one of the
+/// ticket's addresses is actually one of *our own* IPs (two instances on one
+/// machine: the documented dev setup), also try the loopback rewrite, for the
+/// same reason the mDNS path does.
+fn dial_ticket(
+    swarm: &mut Swarm<Behaviour>,
+    info: &TicketInfo,
+    local_ips: &std::collections::HashSet<std::net::IpAddr>,
+) {
+    swarm.behaviour_mut().gossipsub.add_explicit_peer(&info.peer);
+    let mut addresses = Vec::new();
+    for addr in &info.addrs {
+        if let Some(lo) = loopback_variant(addr, local_ips) {
+            swarm.add_peer_address(info.peer, lo.clone());
+            addresses.push(lo);
+        }
+        swarm.add_peer_address(info.peer, addr.clone());
+        addresses.push(addr.clone());
+    }
+    if let Err(e) = swarm.dial(
+        DialOpts::peer_id(info.peer)
+            .addresses(addresses)
+            .allocate_new_port()
+            .build(),
+    ) {
+        // Includes the benign "already connected/dialing" conditions.
+        eprintln!("[reamesh] ticket dial: {e}");
+    }
+}
+
+/// Begin joining an announced session: derive + remember the token, reset the
+/// per-session client state, and fire the manifest request. Returns the
+/// in-progress download, or None with status already set to "failed". Shared
+/// by discovered joins (Command::JoinSession) and ticket joins once the
+/// ticket's owner announce arrived.
+fn start_join(
+    swarm: &mut Swarm<Behaviour>,
+    shared: &Shared,
+    staging_dir: Option<&Path>,
+    session_id: &str,
+    passphrase: &str,
+) -> Option<Download> {
+    let info = shared.sessions.lock().unwrap().get(session_id).cloned();
+    let Some(info) = info else {
+        set_status(shared, |s| {
+            s.state = "failed".into();
+            s.message = Some(format!("session {session_id} is no longer announced"));
+        });
+        return None;
+    };
+    let Ok(owner) = info.owner.parse::<PeerId>() else {
+        set_status(shared, |s| {
+            s.state = "failed".into();
+            s.message = Some("bad owner peer id in announcement".into());
+        });
+        return None;
+    };
+    // Derive (and remember) this session's access token so we
+    // both present it and can serve other peers later.
+    let token = auth_token(&info.salt, passphrase);
+    *shared.auth_token.lock().unwrap() = token.clone();
+    *shared.owner_peer.lock().unwrap() = info.owner.clone();
+    // Deliberately NOT subscribing to the session topic yet:
+    // joining the topic is what makes a peer visible in the
+    // session (peer lists, presence). That visibility must be
+    // gated on the owner accepting our token: otherwise a
+    // wrong-passphrase joiner flashes up as a ghost peer on
+    // everyone's roster until its download fails. The
+    // subscribe happens when the manifest arrives.
+    let staging = staging_dir.map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir);
+    let dir = staging.join(format!(
+        "{}-{}",
+        sanitize_dir_name(&info.session_name),
+        &session_id[..session_id.len().min(8)]
+    ));
+    let sid = session_id.to_string();
+    let name = info.session_name.clone();
+    set_status(shared, |s| {
+        s.state = "connecting".into();
+        s.progress = 0.0;
+        s.session_id = Some(sid);
+        s.session_name = Some(name);
+        s.message = None;
+        s.end_reason = None;
+    });
+    shared.reverts.store(0, Ordering::Relaxed);
+    shared.reverts_detail.lock().unwrap().clear();
+    shared.peer_locks.lock().unwrap().clear();
+    shared.force_revert.lock().unwrap().clear();
+    // Drop any proposals left in flight from a previous session
+    // (e.g. before an auto-rejoin): their stale timestamps would
+    // otherwise time out and surface as phantom snap-backs the
+    // moment we reconnect.
+    shared.doc.lock().unwrap().pending.clear();
+    let req = swarm
+        .behaviour_mut()
+        .xfer
+        .send_request(&owner, XferRequest::Manifest { auth: token.clone() });
+    Some(Download {
+        owner,
+        session_id: session_id.to_string(),
+        dir,
+        project_file: info.project_file.clone(),
+        auth: token,
+        got_manifest: false,
+        manifest_req: Some(req),
+        files: Vec::new(),
+        queue: VecDeque::new(),
+        inflight: HashMap::new(),
+        peers: vec![owner],
+        next_peer: 0,
+        total: 0,
+        done: 0,
+        last_activity: Instant::now(),
+        started: Instant::now(),
+        last_progress: Instant::now(),
+        verifying: 0,
+    })
+}
+
 async fn run_network(
     mut swarm: Swarm<Behaviour>,
     cfg: NetConfig,
@@ -1978,6 +2417,9 @@ async fn run_network(
     let mut fetch_reqs: FetchReqs = HashMap::new();
     // In-flight passphrase pre-check (at most one at a time).
     let mut probe: Option<Probe> = None;
+    // In-flight ticket join/check: dialing the ticket's addresses and waiting
+    // for the pinned owner's announce to arrive over the direct connection.
+    let mut pending_join: Option<PendingJoin> = None;
 
     // Anti-entropy (owner): whenever a peer (re)appears on the session topic,
     // or a publish fails because nobody was listening, we owe the network a
@@ -2016,7 +2458,7 @@ async fn run_network(
                     let mut data = vec![TAG_AUTHORITATIVE];
                     data.extend_from_slice(&update);
                     if let Some(t) = &sess_topic {
-                        if swarm.behaviour_mut().gossipsub.publish(t.clone(), data).is_err() {
+                        if !publish_session(&mut swarm, &shared, t, &data) {
                             need_full_sync = true;
                         }
                     }
@@ -2024,10 +2466,11 @@ async fn run_network(
                 Some(Command::PublishProposal(payload)) => {
                     let mut data = vec![TAG_PROPOSAL];
                     data.extend_from_slice(&payload);
-                    match &sess_topic {
+                    match sess_topic.clone() {
                         Some(t) => {
-                            if swarm.behaviour_mut().gossipsub.publish(t.clone(), data.clone()).is_err() {
-                                if retry_pubs.len() < 256 { retry_pubs.push(data); }
+                            if !publish_session(&mut swarm, &shared, &t, &data)
+                                && retry_pubs.len() < 256 {
+                                retry_pubs.push(data);
                             }
                         }
                         None => eprintln!("[reamesh] dropped proposal: not in a session"),
@@ -2054,79 +2497,45 @@ async fn run_network(
                     }
                 }
                 Some(Command::JoinSession { session_id, passphrase }) => {
-                    let info = shared.sessions.lock().unwrap().get(&session_id).cloned();
-                    let Some(info) = info else {
+                    pending_join = None;
+                    if let Some(dl) = start_join(
+                        &mut swarm,
+                        &shared,
+                        cfg.staging_dir.as_deref(),
+                        &session_id,
+                        &passphrase,
+                    ) {
+                        download = Some(dl);
+                    }
+                }
+                Some(Command::JoinTicket { info, passphrase, probe_only }) => {
+                    eprintln!(
+                        "[reamesh] ticket {}: dialing {} at {} address(es)",
+                        if probe_only { "check" } else { "join" },
+                        info.peer,
+                        info.addrs.len()
+                    );
+                    dial_ticket(&mut swarm, &info, &local_ips);
+                    if !probe_only {
+                        // Show "connecting" (with the ticket's own name) while
+                        // we wait for the host's announce to arrive over the
+                        // fresh connection.
+                        let (sid, name) = (info.session_id.clone(), info.session_name.clone());
                         set_status(&shared, |s| {
-                            s.state = "failed".into();
-                            s.message = Some(format!("session {session_id} is no longer announced"));
+                            s.state = "connecting".into();
+                            s.progress = 0.0;
+                            s.session_id = Some(sid);
+                            s.session_name = Some(name);
+                            s.message = None;
+                            s.end_reason = None;
                         });
-                        continue;
-                    };
-                    let Ok(owner) = info.owner.parse::<PeerId>() else {
-                        set_status(&shared, |s| {
-                            s.state = "failed".into();
-                            s.message = Some("bad owner peer id in announcement".into());
-                        });
-                        continue;
-                    };
-                    // Derive (and remember) this session's access token so we
-                    // both present it and can serve other peers later.
-                    let token = auth_token(&info.salt, &passphrase);
-                    *shared.auth_token.lock().unwrap() = token.clone();
-                    *shared.owner_peer.lock().unwrap() = info.owner.clone();
-                    // Deliberately NOT subscribing to the session topic yet:
-                    // joining the topic is what makes a peer visible in the
-                    // session (peer lists, presence). That visibility must be
-                    // gated on the owner accepting our token; otherwise a
-                    // wrong-passphrase joiner flashes up as a ghost peer on
-                    // everyone's roster until its download fails. The
-                    // subscribe happens when the manifest arrives.
-                    let staging = cfg.staging_dir.clone().unwrap_or_else(std::env::temp_dir);
-                    let dir = staging.join(format!(
-                        "{}-{}",
-                        sanitize_dir_name(&info.session_name),
-                        &session_id[..session_id.len().min(8)]
-                    ));
-                    set_status(&shared, |s| {
-                        s.state = "connecting".into();
-                        s.progress = 0.0;
-                        s.session_id = Some(session_id.clone());
-                        s.session_name = Some(info.session_name.clone());
-                        s.message = None;
-                        s.end_reason = None;
-                    });
-                    shared.reverts.store(0, Ordering::Relaxed);
-                    shared.reverts_detail.lock().unwrap().clear();
-                    shared.peer_locks.lock().unwrap().clear();
-                    shared.force_revert.lock().unwrap().clear();
-                    // Drop any proposals left in flight from a previous session
-                    // (e.g. before an auto-rejoin): their stale timestamps would
-                    // otherwise time out and surface as phantom snap-backs the
-                    // moment we reconnect.
-                    shared.doc.lock().unwrap().pending.clear();
-                    let req = swarm
-                        .behaviour_mut()
-                        .xfer
-                        .send_request(&owner, XferRequest::Manifest { auth: token.clone() });
-                    download = Some(Download {
-                        owner,
-                        session_id: session_id.clone(),
-                        dir,
-                        project_file: info.project_file.clone(),
-                        auth: token,
-                        got_manifest: false,
-                        manifest_req: Some(req),
-                        files: Vec::new(),
-                        queue: VecDeque::new(),
-                        inflight: HashMap::new(),
-                        peers: vec![owner],
-                        next_peer: 0,
-                        total: 0,
-                        done: 0,
-                        last_activity: Instant::now(),
+                    }
+                    pending_join = Some(PendingJoin {
+                        info,
+                        passphrase,
+                        probe_only,
                         started: Instant::now(),
-                        last_progress: Instant::now(),
-                        verifying: 0,
+                        last_dial: Instant::now(),
                     });
                 }
                 Some(Command::FetchFile(rel)) => {
@@ -2151,11 +2560,11 @@ async fn run_network(
                     // Client: a topic unsubscribe, so the other peers drop it
                     // from their rosters immediately instead of waiting out
                     // the presence staleness window.
-                    if let Some(t) = &sess_topic {
+                    if let Some(t) = sess_topic.clone() {
                         if hosting.is_some() {
-                            let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), vec![TAG_SESSION_END]);
+                            let _ = publish_session(&mut swarm, &shared, &t, &[TAG_SESSION_END]);
                         } else {
-                            swarm.behaviour_mut().gossipsub.unsubscribe(t);
+                            swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                         }
                         let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
                         loop {
@@ -2174,6 +2583,69 @@ async fn run_network(
                 if probe.as_ref().is_some_and(|p| p.started.elapsed() > PROBE_TIMEOUT) {
                     let p = probe.take().unwrap();
                     *shared.probe_result.lock().unwrap() = Some((p.session_id, Some(false)));
+                }
+                // Ticket join/check in flight: once the *pinned* owner's
+                // announce lands in the session table, proceed exactly like a
+                // discovered session; keep re-dialing until then; give up
+                // after TICKET_JOIN_TIMEOUT. An announce for the same session
+                // id signed by anyone else is ignored: fail closed rather
+                // than join an impostor.
+                if let Some(pj) = &mut pending_join {
+                    let announced_by_pinned_owner = shared
+                        .sessions
+                        .lock()
+                        .unwrap()
+                        .get(&pj.info.session_id)
+                        .is_some_and(|i| i.owner == pj.info.peer.to_string());
+                    if announced_by_pinned_owner {
+                        let pj = pending_join.take().unwrap();
+                        if pj.probe_only {
+                            // Same lone manifest request as Command::ProbeAuth.
+                            let salt = shared
+                                .sessions
+                                .lock()
+                                .unwrap()
+                                .get(&pj.info.session_id)
+                                .map(|i| i.salt.clone())
+                                .unwrap_or_default();
+                            let token = auth_token(&salt, &pj.passphrase);
+                            let req = swarm
+                                .behaviour_mut()
+                                .xfer
+                                .send_request(&pj.info.peer, XferRequest::Manifest { auth: token });
+                            probe = Some(Probe {
+                                req,
+                                session_id: pj.info.session_id,
+                                started: Instant::now(),
+                            });
+                        } else if let Some(dl) = start_join(
+                            &mut swarm,
+                            &shared,
+                            cfg.staging_dir.as_deref(),
+                            &pj.info.session_id,
+                            &pj.passphrase,
+                        ) {
+                            download = Some(dl);
+                        }
+                    } else if pj.started.elapsed() > TICKET_JOIN_TIMEOUT {
+                        let pj = pending_join.take().unwrap();
+                        eprintln!("[reamesh] ticket join timed out ({})", pj.info.peer);
+                        if pj.probe_only {
+                            // Unreachable reports false, like an unanswered
+                            // probe: a definite answer beats a hang.
+                            *shared.probe_result.lock().unwrap() =
+                                Some((pj.info.session_id, Some(false)));
+                        } else {
+                            set_status(&shared, |s| {
+                                s.state = "failed".into();
+                                s.message =
+                                    Some("could not reach the host from the ticket".into());
+                            });
+                        }
+                    } else if pj.last_dial.elapsed() >= Duration::from_secs(3) {
+                        pj.last_dial = Instant::now();
+                        dial_ticket(&mut swarm, &pj.info, &local_ips);
+                    }
                 }
                 // Recompute session-topic peers from gossipsub's view. (Event
                 // counting misses subscriptions learned before we joined the
@@ -2224,7 +2696,7 @@ async fn run_network(
                 // Everyone: presence beacon on the session topic every ~1s so
                 // peers can show who is here: name, color, focused track,
                 // playhead and selection.
-                if tick_count % 2 == 0 && let Some(t) = &sess_topic {
+                if tick_count % 2 == 0 && let Some(t) = sess_topic.clone() {
                     let (name, color) = PROFILE.lock().unwrap().clone();
                     let live = LIVE.lock().unwrap().clone();
                     // The MAC proves token possession; peers only roster
@@ -2247,14 +2719,14 @@ async fn run_network(
                         .to_string()
                         .as_bytes(),
                     );
-                    let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), data);
+                    let _ = publish_session(&mut swarm, &shared, &t, &data);
                 }
                 // Owner: republish the editing-lock table whenever the live set
                 // changes (an acquisition or a lapse), so peers can snap a
                 // rejected edit back at once and name who holds each field.
                 // `peer_locks` doubles as the owner's last-broadcast cache (the
-                // owner never receives a lock table; only clients do).
-                if hosting.is_some() && let Some(t) = &sess_topic {
+                // owner never receives a lock table: only clients do).
+                if hosting.is_some() && let Some(t) = sess_topic.clone() {
                     let live = {
                         let mut ds = shared.doc.lock().unwrap();
                         live_locks(&mut ds.locks, Instant::now())
@@ -2282,12 +2754,12 @@ async fn run_network(
                     if changed || lock_resend > 0 {
                         let mut data = vec![TAG_LOCKS];
                         data.extend_from_slice(&lock_table_json(&live));
-                        let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), data);
+                        let _ = publish_session(&mut swarm, &shared, &t, &data);
                     }
                 }
                 // Owner: full-state anti-entropy.
                 if need_full_sync && shared.topic_peers.load(Ordering::Relaxed) > 0 {
-                    if let Some(t) = &sess_topic {
+                    if let Some(t) = sess_topic.clone() {
                         let mut data = vec![TAG_AUTHORITATIVE];
                         {
                             let ds = shared.doc.lock().unwrap();
@@ -2295,7 +2767,7 @@ async fn run_network(
                                 &ds.doc.transact().encode_state_as_update_v1(&StateVector::default()),
                             );
                         }
-                        if swarm.behaviour_mut().gossipsub.publish(t.clone(), data).is_ok() {
+                        if publish_session(&mut swarm, &shared, &t, &data) {
                             need_full_sync = false;
                         }
                     }
@@ -2306,7 +2778,7 @@ async fn run_network(
                     if let Some(t) = sess_topic.clone() {
                         let queued = std::mem::take(&mut retry_pubs);
                         for data in queued {
-                            if swarm.behaviour_mut().gossipsub.publish(t.clone(), data.clone()).is_err() {
+                            if !publish_session(&mut swarm, &shared, &t, &data) {
                                 retry_pubs.push(data);
                             }
                         }
@@ -2444,12 +2916,43 @@ async fn run_network(
                             }
                         }
                     } else if sess_topic.as_ref().is_some_and(|st| message.topic == st.hash()) {
-                        match (message.data.first(), cfg.role) {
+                        // All session gossip is signed (MessageAuthenticity::
+                        // Signed), so every legitimate message carries its
+                        // authenticated author; one without a source can't be
+                        // checked against anything below: drop it.
+                        let Some(src) = message.source else { continue };
+                        // Confidentiality gate: in a passphrase-protected
+                        // session every message must arrive sealed (and open
+                        // against the sender's peer id). Drop plaintext from a
+                        // peer without the passphrase and sealed data sent to
+                        // an open session before dispatch.
+                        let plain: Vec<u8> = match (
+                            gossip_key(&shared.auth_token.lock().unwrap()),
+                            message.data.first(),
+                        ) {
+                            (Some(key), Some(&TAG_SEALED)) => {
+                                match open_session_msg(&key, &message.data, &src.to_string()) {
+                                    Some(pt) => pt,
+                                    None => {
+                                        eprintln!(
+                                            "[reamesh] dropped sealed session message from {src}: did not verify"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            (Some(_), _) => {
+                                eprintln!(
+                                    "[reamesh] dropped unsealed session message from {src} (protected session)"
+                                );
+                                continue;
+                            }
+                            (None, Some(&TAG_SEALED)) => continue, // sealed, but we have no key
+                            (None, _) => message.data.clone(),
+                        };
+                        match (plain.first(), cfg.role) {
                             (Some(&TAG_PRESENCE), _) => {
-                                // Signed gossipsub messages carry the author.
-                                if let Some(src) = message.source
-                                    && let Ok(v) = serde_json::from_slice::<JsonValue>(&message.data[1..])
-                                {
+                                if let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..]) {
                                     let get = |k: &str| {
                                         v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
                                     };
@@ -2490,13 +2993,11 @@ async fn run_network(
                                 // plugin code, into every client. Signed
                                 // messages carry an authenticated source, so we
                                 // accept 'A' only from the known owner peer.
-                                let from_owner = message.source.is_some_and(|src| {
-                                    src.to_string() == *shared.owner_peer.lock().unwrap()
-                                });
+                                let from_owner =
+                                    src.to_string() == *shared.owner_peer.lock().unwrap();
                                 if !from_owner {
                                     eprintln!(
-                                        "[reamesh] dropped authoritative update from non-owner {:?}",
-                                        message.source
+                                        "[reamesh] dropped authoritative update from non-owner {src}"
                                     );
                                     continue;
                                 }
@@ -2509,9 +3010,9 @@ async fn run_network(
                                 let mut q = shared.inbound.lock().unwrap();
                                 let queued_bytes: usize = q.iter().map(|u| u.len()).sum();
                                 if q.len() < MAX_PENDING_UPDATES
-                                    && queued_bytes + message.data.len() <= MAX_PENDING_BYTES
+                                    && queued_bytes + plain.len() <= MAX_PENDING_BYTES
                                 {
-                                    q.push(message.data[1..].to_vec());
+                                    q.push(plain[1..].to_vec());
                                     shared.dirty.store(true, Ordering::SeqCst);
                                 }
                             }
@@ -2519,9 +3020,8 @@ async fn run_network(
                                 // Only the owner may end the session (any topic
                                 // member can publish; signed messages carry the
                                 // authenticated source).
-                                let from_owner = message.source.is_some_and(|src| {
-                                    src.to_string() == *shared.owner_peer.lock().unwrap()
-                                });
+                                let from_owner =
+                                    src.to_string() == *shared.owner_peer.lock().unwrap();
                                 if from_owner {
                                     eprintln!("[reamesh] the owner ended the session");
                                     // A farewell can also land mid-download;
@@ -2537,15 +3037,14 @@ async fn run_network(
                             }
                             (Some(&TAG_PROPOSAL), Role::Owner) => {
                                 // The lock holder is the authenticated source.
-                                let proposer =
-                                    message.source.map(|p| p.to_string()).unwrap_or_default();
+                                let proposer = src.to_string();
                                 if let Some(update) =
-                                    admit_proposal(&shared, &message.data[1..], &proposer)
+                                    admit_proposal(&shared, &plain[1..], &proposer)
                                 {
                                     let mut data = vec![TAG_AUTHORITATIVE];
                                     data.extend_from_slice(&update);
-                                    if let Some(t) = &sess_topic
-                                        && swarm.behaviour_mut().gossipsub.publish(t.clone(), data).is_err() {
+                                    if let Some(t) = sess_topic.clone()
+                                        && !publish_session(&mut swarm, &shared, &t, &data) {
                                         need_full_sync = true;
                                     }
                                 }
@@ -2553,12 +3052,11 @@ async fn run_network(
                             (Some(&TAG_LOCKS), Role::Client) => {
                                 // The owner is the sole lock arbiter; ignore any
                                 // table from a non-owner topic member.
-                                let from_owner = message.source.is_some_and(|src| {
-                                    src.to_string() == *shared.owner_peer.lock().unwrap()
-                                });
+                                let from_owner =
+                                    src.to_string() == *shared.owner_peer.lock().unwrap();
                                 if from_owner
                                     && let Ok(v) =
-                                        serde_json::from_slice::<JsonValue>(&message.data[1..])
+                                        serde_json::from_slice::<JsonValue>(&plain[1..])
                                 {
                                     *shared.peer_locks.lock().unwrap() = parse_lock_table(&v);
                                 }
@@ -3328,6 +3826,62 @@ pub extern "C" fn reamesh_check_passphrase(
         .unwrap_or(false)
 }
 
+/// Invite ticket for the session this owner handle is hosting: a copyable
+/// string a remote peer pastes to join without LAN discovery (works across
+/// VPNs like Tailscale and on multicast-blocking networks). Empty until the
+/// host's listen addresses are known, and always empty on client handles.
+/// Valid only for this hosting run. Free the result with
+/// `reamesh_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_session_ticket(handle: *mut Reamesh) -> *mut c_char {
+    let out = if handle.is_null() {
+        String::new()
+    } else {
+        let r = unsafe { &*handle };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.session_ticket()))
+            .unwrap_or_default()
+    };
+    into_c_string(out)
+}
+
+/// Join a session through a pasted invite ticket (client handles only):
+/// dials the ticket's addresses directly, then joins once the host's announce
+/// arrives over that connection. `passphrase` as in `reamesh_join_session`.
+/// Returns true if the attempt was started; watch `reamesh_status` for
+/// connecting/downloading/ready/failed.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_join_ticket(
+    handle: *mut Reamesh,
+    ticket: *const c_char,
+    passphrase: *const c_char,
+) -> bool {
+    let (false, Some(t)) = (handle.is_null(), cstr_arg(ticket)) else {
+        return false;
+    };
+    let pass = cstr_arg(passphrase).unwrap_or_default();
+    let r = unsafe { &*handle };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.join_ticket(&t, &pass)))
+        .unwrap_or(false)
+}
+
+/// Pre-check a passphrase against a ticket's host without joining: the ticket
+/// analogue of `reamesh_check_passphrase`, reporting through the same `probe`
+/// status field. An unreachable host reports ok=false rather than hanging.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_check_ticket(
+    handle: *mut Reamesh,
+    ticket: *const c_char,
+    passphrase: *const c_char,
+) -> bool {
+    let (false, Some(t)) = (handle.is_null(), cstr_arg(ticket)) else {
+        return false;
+    };
+    let pass = cstr_arg(passphrase).unwrap_or_default();
+    let r = unsafe { &*handle };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.check_ticket(&t, &pass)))
+        .unwrap_or(false)
+}
+
 /// Current session status as JSON:
 /// `{"state","progress","project_path","session_id","session_name","message"}`
 /// where state is hosting|browsing|connecting|downloading|ready|failed.
@@ -3549,6 +4103,88 @@ mod tests {
         assert_ne!(a, presence_mac("token-a", "12D3KooPeerTwo"));
         // Open sessions (empty token) still MAC: deterministic too.
         assert_eq!(presence_mac("", "p"), presence_mac("", "p"));
+    }
+
+    #[test]
+    fn sealed_gossip_roundtrips_and_binds_key_and_sender() {
+        let key = gossip_key("token-a").expect("protected session must derive a key");
+        let msg = b"Ahello-world";
+        let sealed = seal_session_msg(&key, msg, "12D3KooPeerOne").unwrap();
+        assert_eq!(sealed[0], TAG_SEALED);
+        assert!(sealed.len() > 1 + SEAL_NONCE_LEN + msg.len(), "must carry nonce + auth tag");
+        // Round-trip against the same sender id.
+        assert_eq!(open_session_msg(&key, &sealed, "12D3KooPeerOne").unwrap(), msg);
+        // A replay under a different (transport-authenticated) peer id fails.
+        assert!(open_session_msg(&key, &sealed, "12D3KooPeerTwo").is_none());
+        // A different token (other passphrase / no passphrase) can't open it.
+        let other = gossip_key("token-b").unwrap();
+        assert!(open_session_msg(&other, &sealed, "12D3KooPeerOne").is_none());
+        // Tampering is detected.
+        let mut bad = sealed.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert!(open_session_msg(&key, &bad, "12D3KooPeerOne").is_none());
+        // Truncation is rejected, not panicked on.
+        assert!(open_session_msg(&key, &sealed[..10], "12D3KooPeerOne").is_none());
+        assert!(open_session_msg(&key, &[], "12D3KooPeerOne").is_none());
+        // Fresh nonce per seal: the same message never seals identically.
+        let sealed2 = seal_session_msg(&key, msg, "12D3KooPeerOne").unwrap();
+        assert_ne!(sealed, sealed2);
+        // Open sessions have no key at all: gossip stays plaintext.
+        assert!(gossip_key("").is_none());
+    }
+
+    #[test]
+    fn base64url_roundtrips_all_lengths() {
+        for len in 0..64usize {
+            let data: Vec<u8> = (0..len).map(|i| (i * 37 + len) as u8).collect();
+            let enc = base64url_encode(&data);
+            assert!(
+                enc.bytes().all(|c| B64URL_ALPHABET.contains(&c)),
+                "encoding must stay in the url-safe alphabet"
+            );
+            assert_eq!(base64url_decode(&enc).unwrap(), data, "len {len}");
+        }
+        // Invalid input is rejected, not mangled.
+        assert!(base64url_decode("a").is_none()); // impossible length
+        assert!(base64url_decode("ab=d").is_none()); // padding/invalid char
+        assert!(base64url_decode("a+cd").is_none()); // standard-b64 char
+    }
+
+    #[test]
+    fn ticket_roundtrips_and_rejects_garbage() {
+        let peer = "12D3KooWQYhTNQdmr3ArTeUHRYzFg94BKyTkoWBDWez9kSCVe2Xo";
+        let payload = json!({
+            "v": 1,
+            "sid": "abc123-9f",
+            "name": "Late Night Mix",
+            "peer": peer,
+            "addrs": ["/ip4/192.168.1.7/tcp/54001", "/ip4/100.101.102.103/udp/54002/quic-v1"],
+            "auth": true,
+        });
+        let ticket = format!("{TICKET_PREFIX}{}", base64url_encode(payload.to_string().as_bytes()));
+        let info = parse_ticket(&ticket).expect("well-formed ticket must parse");
+        assert_eq!(info.session_id, "abc123-9f");
+        assert_eq!(info.session_name, "Late Night Mix");
+        assert_eq!(info.peer.to_string(), peer);
+        assert_eq!(info.addrs.len(), 2);
+        // Surrounding whitespace from a sloppy paste is tolerated.
+        assert!(parse_ticket(&format!("  {ticket}\n")).is_some());
+        // Garbage in all its forms is rejected.
+        assert!(parse_ticket("").is_none());
+        assert!(parse_ticket("RM1:").is_none());
+        assert!(parse_ticket("RM1:!!!!").is_none());
+        assert!(parse_ticket("RM2:aGVsbG8").is_none()); // wrong prefix
+        assert!(parse_ticket(&"x".repeat(TICKET_MAX_LEN + 1)).is_none());
+        // Wrong version, bad peer id, or no usable address.
+        let mut bad = payload.clone();
+        bad["v"] = json!(2);
+        assert!(parse_ticket(&format!("{TICKET_PREFIX}{}", base64url_encode(bad.to_string().as_bytes()))).is_none());
+        let mut bad = payload.clone();
+        bad["peer"] = json!("not-a-peer-id");
+        assert!(parse_ticket(&format!("{TICKET_PREFIX}{}", base64url_encode(bad.to_string().as_bytes()))).is_none());
+        let mut bad = payload;
+        bad["addrs"] = json!(["not an address"]);
+        assert!(parse_ticket(&format!("{TICKET_PREFIX}{}", base64url_encode(bad.to_string().as_bytes()))).is_none());
     }
 
     #[test]

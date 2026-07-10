@@ -163,6 +163,69 @@ fn client_join_downloads_project_files() {
 }
 
 #[test]
+fn ticket_join_works_without_lan_discovery() {
+    let project = temp_dir("proj-ticket");
+    let staging = temp_dir("staging-ticket");
+    make_project(&project);
+
+    // Passphrase-protected, so this also runs the sealed-gossip path.
+    let owner = Reamesh::host("ticket-test", project.to_str().unwrap(), "Song.rpp", "hunter2")
+        .expect("host failed");
+    // The ticket appears once the host knows its listen addresses.
+    let mut ticket = String::new();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            ticket = owner.session_ticket();
+            !ticket.is_empty()
+        }),
+        "host never produced a ticket"
+    );
+    assert!(ticket.starts_with("RM1:"), "unexpected ticket format: {ticket}");
+
+    let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
+    assert_eq!(client.session_ticket(), "", "clients must not mint tickets");
+    // Garbage is refused outright.
+    assert!(!client.join_ticket("RM1:garbage!", "hunter2"));
+    assert!(!client.join_ticket("", "hunter2"));
+
+    // Deliberately no interconnect(): the ticket alone must reach the host.
+    // First the passphrase pre-check through the ticket, wrong then right.
+    assert!(client.check_ticket(&ticket, "wrong-pass"));
+    let wrong = wait_until(Duration::from_secs(45), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        s["probe"]["ok"] == false
+    });
+    assert!(wrong, "wrong-passphrase ticket check never resolved");
+    assert!(client.check_ticket(&ticket, "hunter2"));
+    let right = wait_until(Duration::from_secs(45), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        s["probe"]["ok"] == true
+    });
+    assert!(right, "right-passphrase ticket check never resolved");
+
+    assert!(client.join_ticket(&ticket, "hunter2"), "join_ticket refused");
+    let ready = wait_until(Duration::from_secs(45), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        assert_ne!(s["state"], "failed", "ticket join failed: {}", s["message"]);
+        s["state"] == "ready"
+    });
+    assert!(ready, "ticket join never completed: {}", client.status_json());
+
+    let status: Value = serde_json::from_str(&client.status_json()).unwrap();
+    let path = PathBuf::from(status["project_path"].as_str().unwrap());
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        fs::read(project.join("Song.rpp")).unwrap(),
+        "project file corrupted over ticket join"
+    );
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
 fn owner_edit_propagates_to_client() {
     let project = temp_dir("proj-owneredit");
     let staging = temp_dir("staging-owneredit");
