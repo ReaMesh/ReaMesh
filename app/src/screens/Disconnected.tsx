@@ -39,11 +39,19 @@ export function Disconnected({ found = false }: { found?: boolean }) {
   );
 }
 
+// Concrete color values (mirror --muted-foreground / --found in index.css).
+// Hardcoded rather than `var(...)` because Motion can only interpolate between
+// real colors; a CSS variable would snap instead of easing grey→blue. The
+// theme is always-dark (one value each), so there's no light-mode variant.
+const SCAN_COLOR = "#8b8b94"; // --muted-foreground
+const FOUND_COLOR = "#6aa6f0"; // --found
+
 // A center dot with two rings that expand and fade outward on a stagger:
-// a heartbeat, not a spinner. Muted grey while scanning; the whole beacon
-// switches to found-blue for the brief handoff beat.
+// a heartbeat, not a spinner. Muted grey while scanning; when REAPER answers
+// the beacon eases its color to found-blue *in place*; the breathing loop
+// keeps running, so it never replays its entrance, it just tints over.
 function BreathingBeacon({ found }: { found: boolean }) {
-  const color = found ? "var(--found)" : "var(--muted-foreground)";
+  const color = found ? FOUND_COLOR : SCAN_COLOR;
   return (
     <div className="flex h-11 w-11 items-center justify-center">
       <div className="relative flex items-center justify-center">
@@ -51,9 +59,8 @@ function BreathingBeacon({ found }: { found: boolean }) {
           <motion.span
             key={i}
             className="absolute size-[9px] rounded-full border-[1.5px]"
-            style={{ borderColor: color }}
-            initial={{ scale: 1, opacity: 0 }}
-            animate={{ scale: 4.2, opacity: [0, 0.5, 0] }}
+            initial={{ scale: 1, opacity: 0, borderColor: SCAN_COLOR }}
+            animate={{ scale: 4.2, opacity: [0, 0.5, 0], borderColor: color }}
             transition={{
               scale: {
                 duration: 2,
@@ -70,14 +77,19 @@ function BreathingBeacon({ found }: { found: boolean }) {
                 times: [0, 0.2, 0.8],
                 delay: i,
               },
+              // Color changes independently so the pulse does not restart.
+              borderColor: { duration: 0.45, ease: "easeOut" },
             }}
           />
         ))}
         <motion.span
           className="size-[9px] rounded-full"
-          style={{ backgroundColor: color }}
-          animate={found ? { scale: [1, 1.35, 1] } : { scale: 1 }}
-          transition={{ duration: 0.5, ease: "easeOut" }}
+          initial={{ backgroundColor: SCAN_COLOR }}
+          animate={{ scale: found ? [1, 1.35, 1] : 1, backgroundColor: color }}
+          transition={{
+            scale: { duration: 0.5, ease: "easeOut" },
+            backgroundColor: { duration: 0.45, ease: "easeOut" },
+          }}
         />
       </div>
     </div>

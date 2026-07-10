@@ -139,25 +139,23 @@ export default function App() {
   const waiting =
     !settingsOpen && reaper !== undefined && !state && !(reaper && !reaper.installed);
   const [foundBeat, setFoundBeat] = useState(false);
-  const wasWaiting = useRef(false);
+  // Detect the waiting-to-connected transition during render. This avoids a
+  // one-frame trip through the lobby that would replay the entire entrance.
+  const [prevWaiting, setPrevWaiting] = useState(waiting);
+  if (prevWaiting !== waiting) {
+    setPrevWaiting(waiting);
+    if (prevWaiting && hasState) setFoundBeat(true);
+  }
   useEffect(() => {
-    // REAPER gone → no found beat, ever. This also clears the beat if the
-    // connection drops mid-handoff (e.g. REAPER closing right after it briefly
-    // answered): otherwise the 850ms timeout is cancelled by this effect's
-    // cleanup before it fires and the beat sticks on "found" forever.
+    // Clear the beat after the handoff, or immediately if the connection drops.
+    if (!foundBeat) return;
     if (!hasState) {
       setFoundBeat(false);
       return;
     }
-    if (wasWaiting.current) {
-      setFoundBeat(true);
-      const id = setTimeout(() => setFoundBeat(false), 850);
-      return () => clearTimeout(id);
-    }
-  }, [hasState]);
-  useEffect(() => {
-    wasWaiting.current = waiting;
-  });
+    const id = setTimeout(() => setFoundBeat(false), 850);
+    return () => clearTimeout(id);
+  }, [foundBeat, hasState]);
 
   // Settings is opened from the native menu (ReaMesh → Settings…, Cmd+,). On
   // macOS the backend opens a native AppKit window instead and emits
