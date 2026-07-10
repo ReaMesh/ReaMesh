@@ -1,12 +1,6 @@
-import { useEffect, useState } from "react";
-import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import {
-  CheckCircle2,
-  ExternalLink,
-  FolderSearch,
-  Puzzle,
-  TriangleAlert,
-} from "lucide-react";
+import { useState } from "react";
+import { AnimatePresence, motion } from "motion/react";
+import { CheckCircle2, ExternalLink, TriangleAlert } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -19,69 +13,11 @@ import {
   type ReaperStatus,
 } from "@/lib/install";
 
-// First-run onboarding: shown until the bundled REAPER extension is
-// installed. Two entry states: REAPER's folder wasn't found (point us at
-// it), or it was (one-click install), plus a success step that hands off
-// to the normal app on Finish.
+// First-run setup for locating REAPER, installing the extension, and handing
+// control back to the main app.
 
 const BAR_COLORS = ["#f0846b", "#e8d35c", "#7bd88f", "#5b8def"];
 const BAR_HEIGHTS = [22, 34, 28, 38];
-
-function Wordmark() {
-  // After the entrance springs land, the bars sway through a few slow,
-  // desynced equalizer passes (this is a DAW tool, after all) and settle.
-  const [settled, setSettled] = useState(false);
-  const reduce = useReducedMotion();
-  useEffect(() => {
-    const id = setTimeout(() => setSettled(true), 1100);
-    return () => clearTimeout(id);
-  }, []);
-  return (
-    <div className="flex flex-col items-center gap-4">
-      <div className="flex h-10 items-end gap-1.5">
-        {BAR_COLORS.map((c, i) => (
-          <motion.div
-            key={c}
-            className="w-2.5 rounded-full"
-            style={{ backgroundColor: c }}
-            initial={{ height: 8, opacity: 0 }}
-            animate={
-              settled && !reduce
-                ? {
-                    height: [
-                      BAR_HEIGHTS[i],
-                      BAR_HEIGHTS[i] * 0.82,
-                      BAR_HEIGHTS[i] * 1.1,
-                      BAR_HEIGHTS[i] * 0.92,
-                      BAR_HEIGHTS[i],
-                    ],
-                    opacity: 1,
-                  }
-                : { height: BAR_HEIGHTS[i], opacity: 1 }
-            }
-            transition={
-              settled && !reduce
-                ? {
-                    height: {
-                      duration: 2.2 + i * 0.25,
-                      ease: "easeInOut",
-                      repeat: 2,
-                      delay: i * 0.15,
-                    },
-                    opacity: { duration: 0.2 },
-                  }
-                : { type: "spring", stiffness: 350, damping: 28, delay: 0.08 * i }
-            }
-          />
-        ))}
-      </div>
-      <div className="space-y-1 text-center">
-        <h1 className="text-lg font-semibold tracking-tight">{t("welcome")}</h1>
-        <p className="text-[13px] text-muted-foreground">{t("tagline")}</p>
-      </div>
-    </div>
-  );
-}
 
 function LocateStep({ status }: { status: ReaperStatus }) {
   const pick = async () => {
@@ -96,17 +32,12 @@ function LocateStep({ status }: { status: ReaperStatus }) {
   };
 
   return (
-    <div className="space-y-4 rounded-xl bg-card p-4">
-      <div className="flex items-start gap-3">
-        <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-amber-500/15">
-          <FolderSearch className="size-4.5 text-amber-500" />
-        </div>
-        <div className="min-w-0 space-y-1">
-          <h2 className="text-[14px] font-semibold">{t("reaperNotFound")}</h2>
-          <p className="text-[13px] leading-relaxed text-muted-foreground">
-            {t("reaperNotFoundBody")}
-          </p>
-        </div>
+    <div className="space-y-3 rounded-xl bg-card p-3.5">
+      <div className="space-y-1">
+        <h2 className="text-[13px] font-semibold">{t("reaperNotFound")}</h2>
+        <p className="text-[12px] leading-relaxed text-muted-foreground">
+          {t("reaperNotFoundBody")}
+        </p>
       </div>
       <div className="flex items-center gap-2">
         <p className="min-w-0 flex-1 break-all rounded-md bg-secondary/60 px-2.5 py-1.5 text-[12px] leading-relaxed text-foreground/80">
@@ -115,7 +46,7 @@ function LocateStep({ status }: { status: ReaperStatus }) {
         <Button
           variant="outline"
           size="sm"
-          className="h-8 shrink-0 text-[12px]"
+          className="h-7 shrink-0 text-[12px]"
           onClick={pick}
         >
           {t("change")}
@@ -124,7 +55,7 @@ function LocateStep({ status }: { status: ReaperStatus }) {
       <div className="flex gap-2">
         <Button
           size="sm"
-          className="h-8 flex-1 gap-1.5 text-[12px]"
+          className="h-7 flex-1 gap-1.5 text-[12px]"
           onClick={() => openUrl("https://www.reaper.fm/download.php")}
         >
           {t("downloadReaper")}
@@ -133,7 +64,7 @@ function LocateStep({ status }: { status: ReaperStatus }) {
         <Button
           variant="outline"
           size="sm"
-          className="h-8 flex-1 text-[12px]"
+          className="h-7 flex-1 text-[12px]"
           onClick={() => refreshStatus()}
         >
           {t("checkAgain")}
@@ -164,21 +95,16 @@ function InstallStep({
   };
 
   return (
-    <div className="space-y-4 rounded-xl bg-card p-4">
-      <div className="flex items-start gap-3">
-        <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-secondary">
-          <Puzzle className="size-4.5 text-foreground/80" />
-        </div>
-        <div className="min-w-0 space-y-1">
-          <h2 className="text-[14px] font-semibold">{t("installExtTitle")}</h2>
-          <p className="text-[13px] leading-relaxed text-muted-foreground">
-            {t("installExtBody")}{" "}
-            <span className="break-all text-foreground/80">
-              {status.userPlugins}
-            </span>
-            .
-          </p>
-        </div>
+    <div className="space-y-3 rounded-xl bg-card p-3.5">
+      <div className="space-y-1">
+        <h2 className="text-[13px] font-semibold">{t("installExtTitle")}</h2>
+        <p className="text-[12px] leading-relaxed text-muted-foreground">
+          {t("installExtBody")}{" "}
+          <span className="break-all text-foreground/80">
+            {status.userPlugins}
+          </span>
+          .
+        </p>
       </div>
       {!status.isReaperDir && (
         <p className="flex items-start gap-2 rounded-lg bg-amber-500/10 p-2.5 text-[12px] leading-relaxed text-amber-500">
@@ -188,7 +114,7 @@ function InstallStep({
       )}
       <Button
         size="sm"
-        className="h-8 w-full text-[12px]"
+        className="h-7 w-full text-[12px]"
         disabled={busy}
         onClick={install}
       >
@@ -200,21 +126,19 @@ function InstallStep({
 
 function DoneStep() {
   return (
-    <div className="space-y-4 rounded-xl bg-card p-4">
-      <div className="flex items-start gap-3">
-        <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-emerald-500/15">
-          <CheckCircle2 className="size-4.5 text-emerald-500" />
-        </div>
-        <div className="min-w-0 space-y-1">
-          <h2 className="text-[14px] font-semibold">{t("allSet")}</h2>
-          <p className="text-[13px] leading-relaxed text-muted-foreground">
-            {t("allSetBody")}
-          </p>
-        </div>
+    <div className="space-y-3 rounded-xl bg-card p-3.5">
+      <div className="space-y-1">
+        <h2 className="flex items-center gap-1.5 text-[13px] font-semibold">
+          <CheckCircle2 className="size-4 shrink-0 text-emerald-500" />
+          {t("allSet")}
+        </h2>
+        <p className="text-[12px] leading-relaxed text-muted-foreground">
+          {t("allSetBody")}
+        </p>
       </div>
       <Button
         size="sm"
-        className="h-8 w-full text-[12px]"
+        className="h-7 w-full text-[12px]"
         onClick={() => refreshStatus()}
       >
         {t("finish")}
@@ -235,8 +159,22 @@ export function Onboarding({ status }: { status: ReaperStatus }) {
   const step = done ? "done" : status.reaperFound ? "install" : "locate";
 
   return (
-    <div className="flex flex-1 flex-col justify-center gap-8 px-6 pb-10">
-      <Wordmark />
+    <div className="flex flex-1 flex-col justify-center gap-5 px-6 pb-8">
+      <div className="space-y-3 px-0.5">
+        <div className="flex h-10 items-end gap-1.5">
+          {BAR_COLORS.map((c, i) => (
+            <div
+              key={c}
+              className="w-2.5 rounded-full"
+              style={{ backgroundColor: c, height: BAR_HEIGHTS[i] }}
+            />
+          ))}
+        </div>
+        <div className="space-y-1">
+          <h1 className="text-[15px] font-semibold">{t("welcome")}</h1>
+          <p className="text-[13px] text-muted-foreground">{t("tagline")}</p>
+        </div>
+      </div>
       <AnimatePresence mode="wait">
         <motion.div
           key={step}

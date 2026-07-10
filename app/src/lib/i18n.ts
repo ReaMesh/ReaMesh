@@ -80,7 +80,7 @@ const en = {
   reaperBusyBanner: "REAPER isn't responding; a dialog there is likely waiting for an answer.",
 
   // Onboarding
-  welcome: "Welcome to ReaMesh",
+  welcome: "Set up ReaMesh",
   tagline: "Real-time collaboration for REAPER",
   reaperNotFound: "REAPER not found",
   reaperNotFoundBody:
@@ -95,9 +95,9 @@ const en = {
     "This folder doesn't look like a REAPER data folder yet (no reaper.ini). Installing is harmless, but double-check the location in Settings if REAPER doesn't pick it up.",
   installing: "Installing…",
   installExtension: "Install extension",
-  allSet: "You're all set",
+  allSet: "Extension installed",
   allSetBody:
-    "The extension is installed. Start REAPER (or restart it if it's already running) and ReaMesh will connect automatically.",
+    "Start REAPER (or restart it if it's already running). ReaMesh connects automatically.",
   finish: "Finish",
   locateReaperFolder: "Locate your REAPER folder",
 
@@ -241,7 +241,7 @@ const de: Record<MsgKey, string> = {
   etaAboutMinutes: "Noch etwa {m} Min.",
   reaperBusyBanner: "REAPER reagiert nicht, vermutlich wartet dort ein Dialog auf eine Antwort.",
 
-  welcome: "Willkommen bei ReaMesh",
+  welcome: "ReaMesh einrichten",
   tagline: "Echtzeit-Kollaboration für REAPER",
   reaperNotFound: "REAPER nicht gefunden",
   reaperNotFoundBody:
@@ -256,9 +256,9 @@ const de: Record<MsgKey, string> = {
     "Dieser Ordner sieht noch nicht nach einem REAPER-Datenordner aus (keine reaper.ini). Die Installation ist unbedenklich. Prüfe aber den Ort in den Einstellungen, falls REAPER sie nicht lädt.",
   installing: "Installiere…",
   installExtension: "Erweiterung installieren",
-  allSet: "Alles bereit",
+  allSet: "Erweiterung installiert",
   allSetBody:
-    "Die Erweiterung ist installiert. Starte REAPER (oder starte es neu, falls es bereits läuft). ReaMesh verbindet sich dann automatisch.",
+    "Starte REAPER (oder starte es neu, falls es bereits läuft). ReaMesh verbindet sich dann automatisch.",
   finish: "Fertig",
   locateReaperFolder: "Wähle deinen REAPER-Ordner",
 
