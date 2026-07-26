@@ -11,8 +11,13 @@ import type { ExtState, Instance } from "./types";
 import { getProfile } from "./profile";
 import { getOverlaySettings, subscribeOverlaySettings } from "./overlaySettings";
 
-const PORTS = [47415, 47416, 47417, 47418];
+const ALL_PORTS = [47415, 47416, 47417, 47418];
 const RETRY_MS = 2000;
+
+// VITE_CTL_PORT pins this window to one REAPER instance. Without it,
+// scan all control ports and offer an instance switcher.
+const pinnedPort = Number(import.meta.env.VITE_CTL_PORT) || 0;
+const PORTS = pinnedPort ? [pinnedPort] : ALL_PORTS;
 
 interface StoreState {
   instances: Instance[];
