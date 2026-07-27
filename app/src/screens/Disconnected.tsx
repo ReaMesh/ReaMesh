@@ -1,7 +1,10 @@
 import { motion } from "motion/react";
+import { invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { FirewallNotice } from "@/components/FirewallNotice";
+import { isWindows } from "@/lib/platform";
 // Concrete color values (mirrors of index.css variables) because Motion can
 // only interpolate between real colors: a CSS variable would snap instead of
 // easing grey→blue.
@@ -10,7 +13,10 @@ import { t } from "@/lib/i18n";
 
 async function launchReaper() {
   try {
-    await openPath("/Applications/REAPER.app");
+    // macOS has one canonical bundle path; on Windows the .exe location
+    // varies by install, so the backend resolves it (the webview can't).
+    if (isWindows) await invoke("launch_reaper");
+    else await openPath("/Applications/REAPER.app");
   } catch {
     toast.error(t("couldntOpenReaper"));
   }
@@ -38,6 +44,9 @@ export function Disconnected({ found = false }: { found?: boolean }) {
         <Button className="w-full" onClick={launchReaper} disabled={found}>
           {t("openReaper")}
         </Button>
+        {/* Warn while REAPER is still down: once it starts, the firewall
+            prompt is already on screen and the advice comes too late. */}
+        {!found && <FirewallNotice dismissible />}
       </div>
     </div>
   );

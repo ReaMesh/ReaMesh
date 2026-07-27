@@ -101,6 +101,17 @@ const en = {
   finish: "Finish",
   locateReaperFolder: "Locate your REAPER folder",
 
+  // Windows Firewall (Windows only). Shown *before* the prompt appears.
+  // ReaMesh is silently unusable if it gets dismissed.
+  firewallTitle: "Windows will ask for network access",
+  firewallBody:
+    "The first time REAPER runs with ReaMesh, Windows Defender Firewall asks whether to allow it. Choose “Allow access” with “Private networks” ticked; ReaMesh can't reach anyone on your network without it.",
+  firewallNamesReaper:
+    "The prompt says REAPER, not ReaMesh: ReaMesh runs inside REAPER.",
+  firewallRecover:
+    "Already dismissed it? Windows Security → Firewall & network protection → Allow an app through firewall, then tick Private for REAPER.",
+  firewallGotIt: "Got it",
+
   // Settings
   back: "Back",
   settings: "Settings",
@@ -261,6 +272,15 @@ const de: Record<MsgKey, string> = {
     "Starte REAPER (oder starte es neu, falls es bereits läuft). ReaMesh verbindet sich dann automatisch.",
   finish: "Fertig",
   locateReaperFolder: "Wähle deinen REAPER-Ordner",
+
+  firewallTitle: "Windows fragt nach Netzwerkzugriff",
+  firewallBody:
+    "Wenn REAPER zum ersten Mal mit ReaMesh läuft, fragt die Windows-Defender-Firewall, ob der Zugriff erlaubt werden soll. Wähle „Zugriff zulassen“ und aktiviere „Private Netzwerke“. Ohne das erreicht ReaMesh niemanden in deinem Netzwerk.",
+  firewallNamesReaper:
+    "Der Dialog nennt REAPER, nicht ReaMesh: ReaMesh läuft in REAPER.",
+  firewallRecover:
+    "Schon weggeklickt? Windows-Sicherheit → Firewall- & Netzwerkschutz → Zulassen einer App durch die Firewall, dann „Privat“ für REAPER aktivieren.",
+  firewallGotIt: "Verstanden",
 
   back: "Zurück",
   settings: "Einstellungen",

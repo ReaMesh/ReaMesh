@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { FirewallNotice } from "@/components/FirewallNotice";
 import { t } from "@/lib/i18n";
 import {
   installExtension,
@@ -136,6 +137,7 @@ function DoneStep() {
           {t("allSetBody")}
         </p>
       </div>
+      <FirewallNotice />
       <Button
         size="sm"
         className="h-7 w-full text-[12px]"
