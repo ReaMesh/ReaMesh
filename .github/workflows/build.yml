@@ -3,7 +3,8 @@
 # and mDNS. Type-check and test the frontend on both platforms.
 name: build
 on:
-  push:
+  #disabled for now
+  #push:
   workflow_dispatch:
 
 jobs:
