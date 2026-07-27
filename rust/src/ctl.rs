@@ -33,20 +33,21 @@ pub const CTL_PORTS: [u16; 4] = [47415, 47416, 47417, 47418];
 /// stuck extension can't accumulate unbounded input.
 const INBOUND_CAP: usize = 64;
 
-/// WebSocket `Origin` values allowed to control the extension. The companion
-/// app's webview presents its page origin (`tauri://localhost` in the bundled
-/// app, the Vite dev origin while developing); a browser will not let page
-/// JavaScript cannot forge this header, so the allow list prevents websites
-/// from sending host, join, or leave commands to the local control server.
-/// Requests with no `Origin`
-/// (non-browser clients) are allowed: those run as the user already.
+/// Allowed WebSocket origins for the companion app and development server.
+/// Browser JavaScript cannot forge Origin; checking it prevents websites from
+/// sending commands to the local control server. Local non-browser clients
+/// may omit Origin because they already run as the user.
+///
+/// Include http://tauri.localhost for Windows, where Tauri uses HTTP unless
+/// useHttpsScheme is enabled.
 fn origin_allowed(origin: Option<&str>) -> bool {
     match origin {
         None => true,
         Some(o) => matches!(
             o,
             "tauri://localhost"          // macOS / Linux bundled app
-                | "https://tauri.localhost" // Windows bundled app
+                | "https://tauri.localhost" // Windows bundled app, useHttpsScheme = true
+                | "http://tauri.localhost"  // Windows bundled app, Tauri v2 default
                 | "http://localhost:1420"   // `tauri dev`
                 | "http://127.0.0.1:1420"
         ),
@@ -271,6 +272,7 @@ mod tests {
         assert!(origin_allowed(None)); // non-browser client
         assert!(origin_allowed(Some("tauri://localhost")));
         assert!(origin_allowed(Some("https://tauri.localhost")));
+        assert!(origin_allowed(Some("http://tauri.localhost")));
         assert!(origin_allowed(Some("http://localhost:1420")));
     }
 
