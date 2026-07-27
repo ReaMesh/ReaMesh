@@ -12,6 +12,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { topRightGutter } from "@/components/TitleBar";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { Rolling, TrackNumber } from "@/components/Rolling";
 import { send } from "@/lib/connection";
@@ -201,7 +202,8 @@ export function Session({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
-      <div className="flex items-center gap-3">
+      {/* On Windows the Settings gear floats over this row's right end. */}
+      <div className={cn("flex items-center gap-3", topRightGutter)}>
         <h2 className="min-w-0 flex-1 truncate text-[15px] font-semibold tracking-tight">
           {state.session || t("sessionFallback")}
         </h2>

@@ -299,7 +299,9 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-full flex-col">
+    // `relative` anchors the Windows title bar layer, which floats the
+    // Settings gear over the top-right corner instead of taking a strip.
+    <div className="relative flex h-full flex-col">
       <TitleBar
         onOpenSettings={() => {
           // Open first, refresh after: the screen must appear even if the

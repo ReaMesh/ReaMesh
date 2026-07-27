@@ -6,7 +6,12 @@
 import { fileURLToPath } from "node:url";
 import { Resvg } from "@resvg/resvg-js";
 
-const SIZES = [16, 24, 32, 48, 64, 128, 256];
+// Windows asks for whatever size the current DPI scaling works out to, not
+// just the round ones: 20 and 40 are the 125% and 250% small-icon sizes, 96 is
+// the 200% Explorer tile. Leaving them out is what makes an icon look
+// pixelated: Windows resamples the nearest entry it does find rather than
+// rendering the right size.
+const SIZES = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256];
 
 // fileURLToPath, not URL.pathname: on Windows the latter yields "/C:/..." with
 // a leading slash, which no file API accepts.

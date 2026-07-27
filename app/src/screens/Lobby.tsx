@@ -20,6 +20,7 @@ import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
 import { getProfile, saveProfile, PALETTE, type Profile } from "@/lib/profile";
 import { initials, type ExtState, type SessionAd } from "@/lib/types";
+import { topRightGutter } from "@/components/TitleBar";
 import { cn } from "@/lib/utils";
 
 // The "only join people you trust" warning is shown once per app run: the
@@ -70,7 +71,10 @@ function ProfileRow({
   onChange: (p: Profile) => void;
 }) {
   return (
-    <div className="flex items-center gap-3.5 rounded-xl bg-card p-3.5">
+    // Extra right padding on Windows: this is the lobby's topmost card, and
+    // the Settings gear floats over its top-right corner. Padding rather than
+    // a narrower card, so the card's edge still lines up with the ones below.
+    <div className={cn("flex items-center gap-3.5 rounded-xl bg-card p-3.5", topRightGutter)}>
       <div
         className="flex size-11 shrink-0 items-center justify-center rounded-full text-sm font-semibold text-black/80 transition-colors duration-300 ease-out"
         style={{ backgroundColor: profile.color }}

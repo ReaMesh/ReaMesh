@@ -19,6 +19,7 @@ import {
   setOverlaySetting,
   useOverlaySettings,
 } from "@/lib/overlaySettings";
+import { isWindows } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 
 const OVERLAY_TOGGLES: { key: keyof OverlaySettings; label: () => string }[] = [
@@ -100,9 +101,8 @@ export function Settings({ onBack }: { onBack: () => void }) {
   ];
 
   return (
-    <div className="scroll-slim flex flex-1 flex-col overflow-y-auto">
-      {/* No max-width: every other screen lets its content use the full window
-          width, and capping this one made Settings look inset by comparison. */}
+    // Style WebView2's scrollbar on Windows; keep the native macOS overlay.
+    <div className={cn("flex flex-1 flex-col overflow-y-auto", isWindows && "scroll-slim")}>
       <div className="w-full space-y-6 px-6 py-5">
         <div className="flex items-center gap-2">
           <Button

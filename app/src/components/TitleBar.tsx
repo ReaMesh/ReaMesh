@@ -4,57 +4,66 @@ import { t } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 
-// Overlay title bar. On macOS the traffic lights float over this strip, so it
-// stays draggable (data-tauri-drag-region) and keeps ~76px clear on the left;
-// Windows draws its own decorations above it, so that reserved gutter would
-// just be a hole. When several REAPER instances run, each becomes a small
-// project-name tab.
+// Right-hand inset for a screen's topmost row, so whatever it right-aligns
+// (the Hosting badge, a card's contents) clears the floating Settings gear.
+// Empty on macOS, where the gear does not exist and the title bar is a real
+// strip in the layout.
+export const topRightGutter = isWindows ? "pr-9" : "";
+
+// Title bar. The two platforms need opposite things from it:
 //
-// The gear is Windows-only on purpose: macOS reaches Settings through the
-// application menu (ReaMesh → Settings…, Cmd+,), which Windows has no
-// equivalent of; without it Settings would be unreachable there.
+// On macOS this 44px strip leaves room for the traffic lights and provides a
+// draggable area.
+//
+// On Windows the controls float above the screen and leave room for the native
+// title bar.
+//
+// Windows needs the gear because macOS exposes Settings in the application menu.
 export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
   const { instances, activePort } = useConnections();
 
-  return (
-    <header
-      data-tauri-drag-region
-      className={cn(
-        "relative flex h-11 shrink-0 items-center bg-background/80 pr-3",
-        isWindows ? "pl-3" : "pl-[76px]",
-      )}
-    >
-      {instances.length > 1 && (
-        <nav className="ml-auto flex items-center gap-1">
-          {instances.map((inst) => (
-            <button
-              key={inst.port}
-              onClick={() => setActivePort(inst.port)}
-              className={cn(
-                "max-w-28 truncate rounded-md px-2 py-1 text-[11px] transition-colors",
-                inst.port === activePort
-                  ? "bg-secondary text-foreground"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {inst.state?.project || `REAPER :${inst.port}`}
-            </button>
-          ))}
-        </nav>
-      )}
-      {isWindows && (
+  const tabs = instances.length > 1 && (
+    <nav className="pointer-events-auto flex items-center gap-1">
+      {instances.map((inst) => (
+        <button
+          key={inst.port}
+          onClick={() => setActivePort(inst.port)}
+          className={cn(
+            "max-w-28 truncate rounded-md px-2 py-1 text-[11px] transition-colors",
+            inst.port === activePort
+              ? "bg-secondary text-foreground"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {inst.state?.project || `REAPER :${inst.port}`}
+        </button>
+      ))}
+    </nav>
+  );
+
+  if (isWindows) {
+    return (
+      // Let clicks pass through the title-bar layer outside its controls.
+      <div className="pointer-events-none absolute right-0 top-0 z-50 flex items-center gap-1 p-2">
+        {tabs}
         <button
           onClick={onOpenSettings}
           aria-label={t("settings")}
           title={t("settings")}
-          className={cn(
-            "rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground",
-            instances.length > 1 ? "ml-1" : "ml-auto",
-          )}
+          className="pointer-events-auto rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
         >
           <Settings2 className="size-4" />
         </button>
-      )}
+      </div>
+    );
+  }
+
+  return (
+    <header
+      data-tauri-drag-region
+      className="relative flex h-11 shrink-0 items-center bg-background/80 pl-[76px] pr-3"
+    >
+      {tabs && <div className="ml-auto">{tabs}</div>}
     </header>
   );
 }
