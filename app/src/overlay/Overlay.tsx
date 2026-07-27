@@ -8,7 +8,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
-import { ChevronUp, Crosshair, Crown, Eye, Flag, Snowflake, X } from "lucide-react";
+import { ChevronUp, Crown, Eye, Flag, Footprints, Snowflake, X } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { currentMonitor, getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { TrackNumber } from "@/components/Rolling";
@@ -115,7 +116,7 @@ function PeerRow({
       )}
       {isFollowTarget && (
         <span title={t("followingName", { name: displayName(peer) })} className="shrink-0">
-          <Crosshair className="size-3 text-found" />
+          <Footprints className="size-3 text-found" />
         </span>
       )}
       {peer.is_self && followerCount > 0 && (
@@ -245,18 +246,59 @@ export function Overlay({ port }: { port: number | null }) {
     if (followingId) setPickMode(false);
   }, [followingId]);
 
+  // Temporarily let the HUD take focus while the marker field is open, then
+  // return focus to REAPER. Focus the field only after the native call finishes.
+  const markerInput = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    let alive = true;
+    invoke("set_overlay_interactive", { on: markerOpen })
+      .then(() => {
+        if (alive && markerOpen) markerInput.current?.focus();
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [markerOpen]);
+  useEffect(
+    () => () => {
+      invoke("set_overlay_interactive", { on: false }).catch(() => {});
+    },
+    [],
+  );
+
+  const closeMarker = () => {
+    setMarkerOpen(false);
+    setMarkerName("");
+  };
+
+  // Close the marker field on blur so later HUD clicks cannot steal focus.
+  useEffect(() => {
+    if (!markerOpen) return;
+    const onBlur = () => closeMarker();
+    window.addEventListener("blur", onBlur);
+    return () => window.removeEventListener("blur", onBlur);
+  }, [markerOpen]); // eslint-disable-line react-hooks/exhaustive-deps
   const shareMarker = () => {
     const name = markerName.trim();
     if (!name) return;
     send({ cmd: "share_marker", name });
-    setMarkerName("");
-    setMarkerOpen(false);
+    closeMarker();
   };
   const pickFollow = (peer: Peer) => {
     setPickMode(false);
     send({ cmd: "follow", peer_id: peer.id });
   };
   const stopFollowing = () => send({ cmd: "follow", peer_id: "" });
+  // The two tools share one fold below the bar, so only one is ever open.
+  const openMarker = () => {
+    setPickMode(false);
+    setMarkerOpen((v) => !v);
+  };
+  const openPick = () => {
+    closeMarker();
+    setPickMode((v) => !v);
+  };
 
   return (
     <div
@@ -339,21 +381,16 @@ export function Overlay({ port }: { port: number | null }) {
               </div>
             )}
 
-            {/* Roster bar: shared markers + follow mode. Two quiet tools that
-                act in REAPER, not in this window: a flag everyone can keep or
-                delete, and a transport that mirrors someone else's. */}
+            {/* Markers and follow mode share this expandable area. */}
             <div className="border-t border-white/10 px-1.5 py-1">
               <div className="flex h-6 items-center gap-1">
                 <button
                   type="button"
-                  onClick={() => {
-                    setMarkerOpen((v) => !v);
-                    setPickMode(false);
-                  }}
+                  onClick={openMarker}
                   aria-expanded={markerOpen}
                   aria-label={t("shareMarkerTitle")}
                   title={t("shareMarkerTitle")}
-                  className={`grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring ${
+                  className={`grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
                     markerOpen ? "bg-white/10 text-foreground" : "text-muted-foreground"
                   }`}
                 >
@@ -365,7 +402,7 @@ export function Overlay({ port }: { port: number | null }) {
                     onClick={stopFollowing}
                     aria-label={t("stopFollowing")}
                     title={t("stopFollowing")}
-                    className="flex h-6 min-w-0 items-center gap-1 rounded-md px-1.5 text-found transition-colors outline-none hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-ring"
+                    className="flex h-6 min-w-0 items-center gap-1 rounded-md px-1.5 text-found transition-colors outline-none hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                   >
                     <X className="size-3.5 shrink-0" aria-hidden="true" />
                     <span className="min-w-0 truncate text-[11px] font-medium">
@@ -375,28 +412,20 @@ export function Overlay({ port }: { port: number | null }) {
                 ) : (
                   <button
                     type="button"
-                    onClick={() => {
-                      setPickMode((v) => !v);
-                      setMarkerOpen(false);
-                    }}
-                    aria-pressed={pickMode}
+                    onClick={openPick}
+                    aria-expanded={pickMode}
                     aria-label={t("followMode")}
                     title={t("followMode")}
-                    className={`grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring ${
+                    className={`grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
                       pickMode ? "bg-white/10 text-foreground" : "text-muted-foreground"
                     }`}
                   >
-                    <Crosshair className="size-3.5" aria-hidden="true" />
+                    <Footprints className="size-3.5" aria-hidden="true" />
                   </button>
                 )}
-                {pickMode && !followTarget && (
-                  <span className="min-w-0 flex-1 truncate text-[10px] text-muted-foreground">
-                    {t("pickPersonToFollow")}
-                  </span>
-                )}
               </div>
-              <AnimatePresence initial={false}>
-                {markerOpen && (
+              <AnimatePresence initial={false} mode="wait">
+                {markerOpen ? (
                   <motion.div
                     key="marker"
                     initial={{ height: 0, opacity: 0 }}
@@ -405,31 +434,47 @@ export function Overlay({ port }: { port: number | null }) {
                     transition={{ type: "spring", stiffness: 400, damping: 38 }}
                     className="overflow-hidden"
                   >
-                    <div className="flex items-center gap-1 pt-1 pb-0.5">
+                    {/* px-px so the focus ring (drawn inside, see ring-inset)
+                        still has a hair of room and never clips against the
+                        card's rounded edge. */}
+                    <div className="flex items-center gap-1 px-px pt-1 pb-0.5">
                       <input
+                        ref={markerInput}
                         value={markerName}
                         onChange={(e) => setMarkerName(e.target.value)}
                         onKeyDown={(e) => {
                           if (e.key === "Enter") shareMarker();
-                          if (e.key === "Escape") setMarkerOpen(false);
+                          if (e.key === "Escape") closeMarker();
                         }}
-                        autoFocus
                         maxLength={80}
                         aria-label={t("markerNamePlaceholder")}
                         placeholder={t("markerNamePlaceholder")}
-                        className="h-6 min-w-0 flex-1 rounded-md bg-white/5 px-1.5 text-[11px] outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                        className="h-6 min-w-0 flex-1 rounded-md bg-white/5 px-1.5 text-[11px] outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                       />
                       <button
                         type="button"
                         onClick={shareMarker}
                         disabled={!markerName.trim()}
-                        className="h-6 shrink-0 rounded-md px-2 text-[11px] font-medium text-foreground transition-colors outline-none hover:bg-white/10 disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-ring"
+                        className="h-6 shrink-0 rounded-md px-2 text-[11px] font-medium text-foreground transition-colors outline-none hover:bg-white/10 disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                       >
                         {t("share")}
                       </button>
                     </div>
                   </motion.div>
-                )}
+                ) : pickMode && !followTarget ? (
+                  <motion.div
+                    key="pick"
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ type: "spring", stiffness: 400, damping: 38 }}
+                    className="overflow-hidden"
+                  >
+                    <p className="px-1.5 pt-1 pb-0.5 text-[10px] leading-relaxed text-muted-foreground">
+                      {t("pickPersonToFollow")}
+                    </p>
+                  </motion.div>
+                ) : null}
               </AnimatePresence>
             </div>
           </motion.div>

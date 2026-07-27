@@ -405,6 +405,20 @@ void reamesh_overlay_detach(void) {
     }
 }
 
+// Let the panel accept text while REAPER remains the active app.
+// When the field closes, remove key status so keyboard input returns to REAPER.
+void reamesh_overlay_set_interactive(int on) {
+    if (!gOverlay || !gOverlay.panel) return;
+    NSPanel *panel = gOverlay.panel;
+    if (on) {
+        panel.becomesKeyOnlyIfNeeded = NO;
+        [panel makeKeyAndOrderFront:nil];
+    } else {
+        panel.becomesKeyOnlyIfNeeded = YES;
+        [panel resignKeyWindow];
+    }
+}
+
 // Whether REAPER is the frontmost app right now. The Rust side asks before
 // badging the dock on a session join: while the user is in REAPER the overlay
 // roster is visible and already showed them the join.

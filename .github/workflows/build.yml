@@ -68,9 +68,8 @@ jobs:
           bun run build
           bun run test
         working-directory: app
-      # --no-bundle: builds the real app binary (the part that can break) but
-      # skips bundling/signing: tauri.macos.conf.json pins a signingIdentity
-      # that CI does not have, so a full `tauri build` can never pass here.
+      # Compile check only; the release workflow builds the signed bundle.
+      # Pass --no-bundle directly; an extra -- would forward it to Cargo.
       - name: Build companion app (unbundled)
-        run: bun run tauri build -- --no-bundle
+        run: bun run tauri build --no-bundle
         working-directory: app

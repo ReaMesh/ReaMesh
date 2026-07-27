@@ -467,9 +467,27 @@ fn client_wins_after_owner_lock_lapses() {
         client_state.get("{T7}").map(|t| t["vol"].clone()) == Some(serde_json::json!(0.9))
     }));
 
-    // Wait past LOCK_HOLD so the owner's lock on vol lapses, then the client
-    // edits it; it is now the (only) active editor and takes the field.
-    std::thread::sleep(Duration::from_millis(2400));
+    // Wait for the owner's lock on vol to lapse, as observed by the CLIENT,
+    // not by a bare sleep, which a loaded machine can outrun. The sequence has
+    // to be *held, then released*: polling only for "not held" is ambiguous,
+    // because an empty table is also what the client has before the owner's
+    // first lock broadcast ever arrives (and editing then races a lock that is
+    // still very much alive).
+    let vol_held_by_other = || {
+        let locked: Value =
+            serde_json::from_str(&client.locked_entities_json()).unwrap_or(Value::Null);
+        locked
+            .as_array()
+            .is_some_and(|a| a.iter().any(|e| e["id"] == "{T7}" && e["field"] == "vol"))
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), vol_held_by_other),
+        "the client never saw the owner hold the lock on vol"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || !vol_held_by_other()),
+        "the owner's lock on vol never lapsed from the client's point of view"
+    );
     client.push_local(r#"{"tracks":{"{T7}":{"vol":0.1}}}"#);
 
     let mut owner_state = serde_json::Map::new();

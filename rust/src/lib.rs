@@ -424,6 +424,17 @@ struct Shared {
     /// owner last sent. Keyed (section, id, field) -> holder peer id. Lets a
     /// client snap a rejected edit back at once and name who holds the field.
     peer_locks: Mutex<HashMap<FieldKey, String>>,
+    /// When `peer_locks` was last replaced by an owner broadcast (client side).
+    ///
+    /// A lock table that arrived *before* we made an edit says nothing about
+    /// that edit's fate: the holder it names may well have lapsed in the
+    /// meantime, which is precisely the moment a new editor takes the field.
+    /// Snapping back on such a table produces a visible glitch (the edit
+    /// reverts, then the owner admits it and it re-applies) and made the
+    /// lock-lapse handover test flaky under load. Only a table received after
+    /// the proposal is evidence; otherwise the `PROPOSAL_TIMEOUT` fallback
+    /// decides.
+    peer_locks_at: Mutex<Option<Instant>>,
     /// Owner only: fields whose owner-local edit was rejected because a client
     /// holds the lock. drain_remote re-emits the authoritative (holder's) value
     /// for these so the owner's own REAPER snaps back: the lock binds the owner
@@ -1145,6 +1156,7 @@ impl Reamesh {
             reverts: AtomicUsize::new(0),
             reverts_detail: Mutex::new(VecDeque::new()),
             peer_locks: Mutex::new(HashMap::new()),
+            peer_locks_at: Mutex::new(None),
             force_revert: Mutex::new(Vec::new()),
             probe_result: Mutex::new(None),
             session_meta: Mutex::new(String::new()),
@@ -1394,6 +1406,7 @@ impl Reamesh {
         // owner's lock broadcast names the holder); an unexplained miss falls
         // back to the proposal timeout.
         let locks = self.shared.peer_locks.lock().unwrap();
+        let locks_at = *self.shared.peer_locks_at.lock().unwrap();
         let pending = &mut ds.pending;
         pending.retain(|(section, id, field), (proposed, when)| {
             let doc_val = new_state
@@ -1406,7 +1419,15 @@ impl Reamesh {
                 return false;
             }
             let holder = locks.get(&(section.clone(), id.clone(), field.clone()));
-            let held_by_other = holder.is_some_and(|h| *h != own_id);
+            // Only a lock table that arrived AFTER this edit can say the edit
+            // lost the field. An older table is about a world before the edit
+            // existed, and the holder it names may have lapsed since, which is
+            // exactly when someone else legitimately takes over. Judging by it
+            // snaps the edit back and then re-applies it a moment later when
+            // the owner admits it. The owner re-broadcasts the table every tick
+            // while any lock is live, so a genuine rejection still arrives fast.
+            let fresh = locks_at.is_some_and(|t| t > *when);
+            let held_by_other = fresh && holder.is_some_and(|h| *h != own_id);
             if held_by_other || now.duration_since(*when) > PROPOSAL_TIMEOUT {
                 // Lost the field: snap REAPER back to the authoritative value
                 // and record who holds it (when known) so the UI can name them.
@@ -2610,6 +2631,7 @@ fn start_join(
     shared.reverts.store(0, Ordering::Relaxed);
     shared.reverts_detail.lock().unwrap().clear();
     shared.peer_locks.lock().unwrap().clear();
+    *shared.peer_locks_at.lock().unwrap() = None;
     shared.force_revert.lock().unwrap().clear();
     // Per-session extras from any previous join on this handle.
     shared.session_meta.lock().unwrap().clear();
@@ -3470,6 +3492,10 @@ async fn run_network(
                                         serde_json::from_slice::<JsonValue>(&plain[1..])
                                 {
                                     *shared.peer_locks.lock().unwrap() = parse_lock_table(&v);
+                                    // Stamp the arrival: reconciliation only
+                                    // trusts a table newer than the proposal
+                                    // it is judging (see `peer_locks_at`).
+                                    *shared.peer_locks_at.lock().unwrap() = Some(Instant::now());
                                 }
                             }
                             _ => {}

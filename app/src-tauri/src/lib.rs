@@ -835,6 +835,34 @@ fn ensure_hud_overlay(app: &AppHandle, port: u16, pid: u32) -> Result<(), String
 }
 
 /// Close the presence overlay (on leaving/stopping a session).
+/// Let the overlay HUD take keyboard focus, or hand it back to REAPER.
+///
+/// Called only when the user opens the roster bar's marker-name field (and
+/// again when it closes). The HUD is deliberately non-activating so clicking
+/// the roster can never steal keys mid-take, which also means it can hold no
+/// text field until that is lifted for the one interaction that asks for it.
+#[tauri::command]
+async fn set_overlay_interactive(app: AppHandle, on: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        // AppKit: main thread only.
+        app.run_on_main_thread(move || native_overlay::set_interactive(on))
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = &app;
+        // Win32 window calls are thread-safe; this is already off the main
+        // thread (async command), which is where it must stay: see open_overlay.
+        overlay_panel_win::set_interactive(on);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (&app, on);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn close_overlay(app: AppHandle) -> Result<(), String> {
     close_hud_overlay(&app);
@@ -1136,6 +1164,7 @@ pub fn run() {
             launch_reaper,
             open_overlay,
             close_overlay,
+            set_overlay_interactive,
             get_reaper_path,
             set_reaper_path,
             get_language,
@@ -1384,6 +1413,7 @@ mod native_overlay {
     extern "C" {
         fn reamesh_overlay_attach(ns_window: *mut c_void, width: f64, reaper_pid: i32);
         fn reamesh_overlay_detach();
+        fn reamesh_overlay_set_interactive(on: i32);
     }
 
     /// `reaper_pid` pins the HUD to one REAPER instance (0 = follow whichever
@@ -1396,5 +1426,9 @@ mod native_overlay {
 
     pub fn detach() {
         unsafe { reamesh_overlay_detach() };
+    }
+
+    pub fn set_interactive(on: bool) {
+        unsafe { reamesh_overlay_set_interactive(on as i32) };
     }
 }
