@@ -124,6 +124,32 @@
 using nlohmann::json;
 namespace fs = std::filesystem;
 
+// ---------- UTF-8 <-> filesystem path ----------
+//
+// REAPER's API speaks UTF-8 on every platform, but std::filesystem::path
+// decodes a *narrow* string with the ANSI code page on Windows: a project in
+// ".../Übungen/" turns into mojibake, every fs::exists() against it misses, and
+// its media is "missing" forever (items defer, then get dropped). Convert
+// explicitly at both boundaries. On POSIX the native encoding is already UTF-8,
+// so both are the identity.
+
+static fs::path fsPath(const std::string& utf8) {
+#ifdef _WIN32
+  return fs::path(std::u8string(reinterpret_cast<const char8_t*>(utf8.data()), utf8.size()));
+#else
+  return fs::path(utf8);
+#endif
+}
+
+static std::string fsUtf8(const fs::path& p) {
+#ifdef _WIN32
+  const std::u8string s = p.u8string();
+  return std::string(reinterpret_cast<const char*>(s.data()), s.size());
+#else
+  return p.string();
+#endif
+}
+
 // ---------- state ----------
 
 struct TrackState {
@@ -694,7 +720,7 @@ static MediaItem* findItemByGuid(const std::string& guid) {
 }
 
 static fs::path projectDir() {
-  return fs::path(g_sessionProjectPath).parent_path();
+  return fsPath(g_sessionProjectPath).parent_path();
 }
 
 // ---------- project-wide state: tempo map + markers/regions ----------
@@ -1160,7 +1186,7 @@ static void internalizeExternalMedia() {
   }
   for (const CopyResult& r : done) {
     g_copyInFlight.erase(r.src);
-    const std::string name = fs::path(r.src).filename().string();
+    const std::string name = fsUtf8(fsPath(r.src).filename());
     if (!r.ok) {
       g_copyFailed.insert(r.src);  // don't retry (and re-log) every capture
       logEvent("media_copy_failed", {{"file", name}},
@@ -1185,7 +1211,7 @@ static void internalizeExternalMedia() {
     GetMediaSourceFileName(src, fn, sizeof(fn));
     if (!fn[0]) continue;  // in-project MIDI etc.
     std::error_code ec;
-    fs::path source = fs::path(fn);
+    fs::path source = fsPath(fn);
     fs::path rel = fs::relative(source, projDir, ec);
     // A leading ".." component means the source lives outside the project
     // folder. Compare the first *component* rather than a string prefix:
@@ -1202,25 +1228,28 @@ static void internalizeExternalMedia() {
     fs::path dest = projDir / source.filename();
     for (int k = 2; fs::exists(dest, ec) && fs::file_size(dest, ec) != fs::file_size(source, ec);
          ++k)
-      dest = projDir / (source.stem().string() + " (" + std::to_string(k) + ")" +
-                        source.extension().string());
+      dest = projDir / fsPath(fsUtf8(source.stem()) + " (" + std::to_string(k) + ")" +
+                              fsUtf8(source.extension()));
     if (fs::exists(dest, ec)) {
       // Identical-size copy already in the project (a prior run): repoint now.
-      repointed |= repointTakes(fn, dest.string());
+      repointed |= repointTakes(fn, fsUtf8(dest));
       continue;
     }
 
     g_copyInFlight.insert(fn);
     g_itemsAwaitingCopy[itemGuid(item)] = fn;
-    std::thread([srcPath = source.string(), destPath = dest.string()] {
+    // srcPath/destPath stay UTF-8: they are compared against REAPER's own take
+    // filenames and reported back to the app. Only the fs calls get converted.
+    std::thread([srcPath = fsUtf8(source), destPath = fsUtf8(dest)] {
       std::error_code tec;
-      fs::path tmp = fs::path(destPath).parent_path() /
-                     (".reamesh-copy-" + fs::path(destPath).filename().string());
-      fs::copy_file(srcPath, tmp, fs::copy_options::overwrite_existing, tec);
+      const fs::path destination = fsPath(destPath);
+      fs::path tmp = destination.parent_path() /
+                     fsPath(".reamesh-copy-" + fsUtf8(destination.filename()));
+      fs::copy_file(fsPath(srcPath), tmp, fs::copy_options::overwrite_existing, tec);
       bool ok = !tec;
       std::string err = tec ? tec.message() : "";
       if (ok) {
-        fs::rename(tmp, destPath, tec);
+        fs::rename(tmp, destination, tec);
         ok = !tec;
         if (!ok) err = tec.message();
       }
@@ -1498,7 +1527,7 @@ static std::vector<std::string> missingMediaIn(const json& fields) {
     if (!isRelativePath(p)) continue;  // absolute: nothing we can fetch
     std::replace(p.begin(), p.end(), '\\', '/');
     std::error_code ec;
-    if (!fs::exists(projDir / fs::path(p), ec)) missing.push_back(p);
+    if (!fs::exists(projDir / fsPath(p), ec)) missing.push_back(p);
   }
   return missing;
 }
@@ -1712,7 +1741,7 @@ static void processDeferredItems() {
   std::erase_if(g_deferredItems, [&](DeferredItem& d) {
     std::error_code ec;
     std::erase_if(d.missing,
-                  [&](const std::string& rel) { return fs::exists(projDir / fs::path(rel), ec); });
+                  [&](const std::string& rel) { return fs::exists(projDir / fsPath(rel), ec); });
     if (d.missing.empty()) {
       ready.push_back(std::move(d));
       return true;
