@@ -302,8 +302,10 @@ export default function App() {
     <div className="flex h-full flex-col">
       <TitleBar
         onOpenSettings={() => {
-          refreshStatus();
+          // Open first, refresh after: the screen must appear even if the
+          // status probe throws (no backend in the plain-browser dev harness).
           setSettingsOpen(true);
+          refreshStatus();
         }}
       />
       {/* REAPER may be waiting on a modal dialog. Hide this during the expected

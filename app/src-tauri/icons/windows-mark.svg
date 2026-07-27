@@ -1,0 +1,24 @@
+<!--
+  Source art for the Windows app icon (icons/icon.ico), rendered by
+  `bun run icons:windows`.
+
+  The macOS icon is the bar mark on a dark rounded plate, because that is what
+  macOS expects: every icon in the Dock sits on the same squircle footprint.
+  Windows expects the opposite: taskbar and Start icons are free-form shapes on
+  whatever background the user picked, and a dark plate there just looks like a
+  screenshot of a macOS icon. So Windows gets the bars alone, transparent.
+
+  Vertically centred with the mark's own colours, matching the plate icon's
+  arrangement rather than the bottom-aligned web mark (components/logo.tsx).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- x = 3 + i*16, width 10, gap 6: the mark's own spacing.
+       Heights are the mark's 22/34/28/38 scaled 1.25 to fill a plateless
+       canvas, each centred on y=32. -->
+  <g>
+    <rect x="3"  y="18.25" width="10" height="27.5" rx="5" fill="#f0846b"/>
+    <rect x="19" y="10.75" width="10" height="42.5" rx="5" fill="#e8d35c"/>
+    <rect x="35" y="14.50" width="10" height="35.0" rx="5" fill="#7bd88f"/>
+    <rect x="51" y="8.25"  width="10" height="47.5" rx="5" fill="#5b8def"/>
+  </g>
+</svg>

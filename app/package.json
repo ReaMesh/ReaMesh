@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "dmg": "bash scripts/make-dmg.sh",
-    "dmg:full": "bash scripts/build-dmg.sh"
+    "dmg:full": "bash scripts/build-dmg.sh",
+    "icons:windows": "bun scripts/render-windows-icon.ts"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.16",

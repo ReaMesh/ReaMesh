@@ -26,10 +26,10 @@ const OVERLAY_TOGGLES: { key: keyof OverlaySettings; label: () => string }[] = [
   { key: "tint", label: () => t("olItemTint") },
 ];
 
-// Full-screen app settings, opened from the native menu on non-macOS
-// platforms (macOS opens the native AppKit settings window instead). Holds
-// the REAPER folder override (portable installs), the extension
-// install/update controls, and the app language.
+// Full-screen app settings. macOS opens the native AppKit settings window
+// instead; everywhere else this is the Settings screen, reached from the
+// title-bar gear. Holds the REAPER folder override (portable installs), the
+// extension install/update controls, and the app language.
 export function Settings({ onBack }: { onBack: () => void }) {
   const [busy, setBusy] = useState(false);
   const status = useReaperStatus();
@@ -100,8 +100,10 @@ export function Settings({ onBack }: { onBack: () => void }) {
   ];
 
   return (
-    <div className="flex flex-1 flex-col overflow-y-auto">
-      <div className="mx-auto w-full max-w-md space-y-6 px-6 py-5">
+    <div className="scroll-slim flex flex-1 flex-col overflow-y-auto">
+      {/* No max-width: every other screen lets its content use the full window
+          width, and capping this one made Settings look inset by comparison. */}
+      <div className="w-full space-y-6 px-6 py-5">
         <div className="flex items-center gap-2">
           <Button
             variant="ghost"

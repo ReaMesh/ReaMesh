@@ -1,13 +1,5 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "app": {
-    "windows": [
-      {
-        "title": "ReaMesh",
-        "decorations": true
-      }
-    ]
-  },
   "bundle": {
     "targets": [
       "nsis"

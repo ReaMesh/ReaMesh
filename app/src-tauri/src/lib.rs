@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Manager};
 
+#[cfg(target_os = "windows")]
+mod overlay_panel_win;
+
 #[cfg(target_os = "macos")]
 const PLUGIN_NAME: &str = "reaper_reamesh.dylib";
 #[cfg(target_os = "windows")]
@@ -467,9 +470,15 @@ const OVERLAY_WIDTH: f64 = 232.0;
 /// Open the frameless presence HUD without stealing focus from REAPER. `port`
 /// selects the same control server as the main window.
 #[tauri::command]
-fn open_overlay(app: AppHandle, port: u16) -> Result<(), String> {
-    ensure_hud_overlay(&app, port)?;
-    Ok(())
+// `async` is load-bearing on Windows. A synchronous Tauri command runs on the
+// main thread, and building a window from there deadlocks: the builder posts
+// the creation to the event loop and blocks waiting for it, but the event loop
+// *is* the thread it just blocked. The window appears and the command never
+// returns, so the overlay was created but never attached, positioned or
+// hidden, and the frontend's `.catch()` saw nothing because no error was ever
+// produced. Marking the command async moves it off the main thread.
+async fn open_overlay(app: AppHandle, port: u16) -> Result<(), String> {
+    ensure_hud_overlay(&app, port)
 }
 
 /// The top-right HUD window (roster + click-to-follow).
@@ -502,7 +511,14 @@ fn ensure_hud_overlay(app: &AppHandle, port: u16) -> Result<(), String> {
     {
         let _ = app.run_on_main_thread(move || native_overlay::attach(&win));
     }
-    #[cfg(not(target_os = "macos"))]
+    // Win32 window calls are thread-safe, so this needs no main-thread hop.
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(hwnd) = win.hwnd() {
+            overlay_panel_win::attach(hwnd.0 as isize, win.scale_factor().unwrap_or(1.0));
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = &win;
     }
@@ -526,6 +542,8 @@ fn close_overlay(app: AppHandle) -> Result<(), String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
+        #[cfg(target_os = "windows")]
+        overlay_panel_win::detach();
         if let Some(w) = hud {
             let _ = w.close();
         }

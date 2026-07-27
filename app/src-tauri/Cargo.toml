@@ -29,3 +29,15 @@ tungstenite = "0.24"
 # Device language for the "system" language preference (native menus/dialogs).
 sys-locale = "0.3"
 
+# The presence overlay's native behaviour on Windows (src/overlay_panel_win.rs):
+# a non-activating topmost window that follows REAPER's and hides when REAPER
+# is not in front. macOS does the same job in Objective-C (src/overlay_panel.m),
+# compiled by build.rs. Version pinned to the one tao already pulls in, so this
+# does not build a second copy of the crate.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+] }
+

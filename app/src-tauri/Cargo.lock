@@ -60,6 +60,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "tungstenite",
+ "windows",
 ]
 
 [[package]]
