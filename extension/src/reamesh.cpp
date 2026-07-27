@@ -1187,7 +1187,12 @@ static void internalizeExternalMedia() {
     std::error_code ec;
     fs::path source = fs::path(fn);
     fs::path rel = fs::relative(source, projDir, ec);
-    if (!ec && !rel.empty() && rel.native().rfind("..", 0) != 0) continue;  // already inside
+    // A leading ".." component means the source lives outside the project
+    // folder. Compare the first *component* rather than a string prefix:
+    // path::native() is wide on Windows, and a directory literally named
+    // "..something" must not read as "outside".
+    const bool outside = !rel.empty() && *rel.begin() == fs::path("..");
+    if (!ec && !rel.empty() && !outside) continue;  // already inside
     if (g_copyFailed.count(fn)) continue;
     if (g_copyInFlight.count(fn)) {
       g_itemsAwaitingCopy[itemGuid(item)] = fn;  // still copying: keep it off the wire
