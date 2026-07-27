@@ -79,6 +79,22 @@ int main() {
   assert(norm.find("base64data==") != std::string::npos);
   assert(norm.find("FILE \"Audio/kick.wav\"") != std::string::npos);
 
+  // The same chunk with Windows line endings must normalize to exactly the
+  // same bytes as the macOS one: REAPER serializes with the platform's EOL,
+  // so without this a Windows and a macOS peer would each see every
+  // chunk-carried field as changed and overwrite each other forever.
+  std::string crlf;
+  for (char c : std::string(kTrackChunk)) {
+    if (c == '\n') crlf.push_back('\r');
+    crlf.push_back(c);
+  }
+  assert(crlf != std::string(kTrackChunk));  // the fixture really did change
+  assert(normalizeChunk(crlf) == norm);
+  assert(normalizeChunk(crlf).find('\r') == std::string::npos);
+  // Idempotent: re-normalizing already-LF text is a no-op, so capture ->
+  // apply -> recapture cannot drift.
+  assert(normalizeChunk(norm) == norm);
+
   // extractTrackBlocks pulls all synced parts, not items.
   TrackBlocks blocks = extractTrackBlocks(norm);
   assert(blocks.fxchain.find("<FXCHAIN") == 0 || blocks.fxchain.find("  <FXCHAIN") == 0);

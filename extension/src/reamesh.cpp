@@ -400,6 +400,12 @@ static std::string normalizeChunk(const std::string& chunk) {
     size_t eol = chunk.find('\n', pos);
     if (eol == std::string::npos) eol = chunk.size();
     std::string_view line(chunk.data() + pos, eol - pos);
+    // REAPER serializes chunks with the platform's line ending: the very same
+    // track reads back CRLF on Windows and LF on macOS. Left alone, every
+    // chunk-carried field would look changed to a peer on the other platform
+    // and the two would overwrite each other forever. LF-only on the wire:
+    // REAPER's parser accepts either on apply, so this round-trips stably.
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
     if (!isVolatileChunkLine(ltrim(line))) {
       out.append(line);
       out.push_back('\n');
@@ -881,7 +887,12 @@ static void applyProjectString(const char* desc, const std::string& value) {
 static std::string captureProjectNotes() {
   std::vector<char> buf(1 << 16, '\0');
   GetSetProjectNotes(nullptr, false, buf.data(), (int)buf.size());
-  return buf.data();
+  // LF-only on the wire, for the same reason as normalizeChunk: notes come
+  // back CRLF on Windows and LF on macOS, and the raw difference alone would
+  // read as an edit every tick between peers on different platforms.
+  std::string notes = buf.data();
+  notes.erase(std::remove(notes.begin(), notes.end(), '\r'), notes.end());
+  return notes;
 }
 
 static void applyProjectNotes(const std::string& notes) {
