@@ -508,6 +508,247 @@ fn launch_reaper(app: AppHandle) -> Result<(), String> {
     }
 }
 
+// ---------- installed-plugin scan ----------
+//
+// The trust dialog marks each plugin a session would load as installed /
+// missing / unknown on THIS machine. REAPER already maintains plugin caches in
+// its resource dir (the same ones its own FX browser is built from) so the
+// scan is a file parse, not a plugin enumeration. Names are returned raw;
+// matching against the host's claimed list happens in the frontend (it also
+// owns the parsing of "VST3: Serum (Xfer Records)"-style display names).
+
+/// Display names from REAPER's VST cache (`reaper-vstplugins*.ini`): each
+/// value line is `hash,timestamp,Display Name` (the name may contain commas,
+/// so only the first two are separators). Instruments carry a `!!!VSTi`
+/// prefix, stripped here.
+fn vst_cache_names(path: &Path, out: &mut Vec<String>) {
+    let Ok(text) = fs::read_to_string(path) else { return };
+    for line in text.lines() {
+        let Some((_, value)) = line.split_once('=') else { continue };
+        let mut parts = value.splitn(3, ',');
+        let (_, _, name) = (parts.next(), parts.next(), parts.next());
+        if let Some(name) = name {
+            let name = name.trim().trim_start_matches("!!!VSTi").trim();
+            if !name.is_empty() {
+                out.push(name.to_string());
+            }
+        }
+    }
+}
+
+/// Display names from REAPER's CLAP cache (`reaper-clap-*.ini`): value lines
+/// are `flags,Display Name`.
+fn clap_cache_names(path: &Path, out: &mut Vec<String>) {
+    let Ok(text) = fs::read_to_string(path) else { return };
+    for line in text.lines() {
+        let Some((_, value)) = line.split_once('=') else { continue };
+        if let Some((_, name)) = value.split_once(',') {
+            let name = name.trim();
+            if !name.is_empty() {
+                out.push(name.to_string());
+            }
+        }
+    }
+}
+
+/// Names from REAPER's AU cache (`reaper-auplugins*.ini`, macOS): the key side
+/// carries the display name.
+fn au_cache_names(path: &Path, out: &mut Vec<String>) {
+    let Ok(text) = fs::read_to_string(path) else { return };
+    for line in text.lines() {
+        if line.starts_with('[') {
+            continue;
+        }
+        if let Some((key, _)) = line.split_once('=') {
+            let key = key.trim();
+            if !key.is_empty() {
+                out.push(key.to_string());
+            }
+        }
+    }
+}
+
+/// JS effects are files under `<resource>/Effects`; a project references them
+/// by that relative path, so the walk gives exact, reliable matches.
+fn js_effect_names(effects_dir: &Path, out: &mut Vec<String>) {
+    let mut stack = vec![effects_dir.to_path_buf()];
+    let mut budget = 20_000u32;
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            if budget == 0 {
+                return;
+            }
+            budget -= 1;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(rel) = path.strip_prefix(effects_dir) {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                out.push(format!("JS: {rel}"));
+            }
+        }
+    }
+}
+
+/// Every plugin display name this machine's REAPER knows about, from its own
+/// plugin caches. Empty when nothing could be read: the frontend renders that
+/// as "can't tell", never as "nothing installed".
+#[tauri::command]
+fn installed_plugins(app: AppHandle) -> Vec<String> {
+    let Ok(dir) = resource_dir(&load_custom_path(&app)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for name in [
+        "reaper-vstplugins64.ini",
+        "reaper-vstplugins.ini",
+        "reaper-vstplugins_arm64.ini",
+    ] {
+        vst_cache_names(&dir.join(name), &mut out);
+    }
+    for name in [
+        "reaper-clap-win64.ini",
+        "reaper-clap-macos-arm64.ini",
+        "reaper-clap-macos-x64.ini",
+        "reaper-clap-linux-x64.ini",
+    ] {
+        clap_cache_names(&dir.join(name), &mut out);
+    }
+    for name in ["reaper-auplugins64.ini", "reaper-auplugins-arm64.ini"] {
+        au_cache_names(&dir.join(name), &mut out);
+    }
+    js_effect_names(&dir.join("Effects"), &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+// ---------- Windows Firewall block detection ----------
+//
+// Dismissing (or cancelling) the firewall prompt REAPER triggers leaves
+// *block* rules behind that a later allow can't override, and the failure is
+// perfectly silent: empty lobby, unreachable peers, no error anywhere. The
+// registry mirror of the rule set is world-readable, so the app can at least
+// say "Windows is blocking REAPER" and hand the user the exact fix.
+
+/// Active inbound Block rules for a reaper.exe, read via `reg.exe query` (no
+/// registry crate needed; the value format is locale-independent). Returns the
+/// blocked exe path, or None when no block exists / not on Windows.
+#[tauri::command]
+fn firewall_block() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let out = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKLM\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules",
+                "/f",
+                "reaper.exe",
+                "/d",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            // Value lines: `  <name>  REG_SZ  v2.33|Action=Block|Active=TRUE|...`
+            let Some(idx) = line.find("REG_SZ") else { continue };
+            let value = line[idx + "REG_SZ".len()..].trim();
+            let lower = value.to_ascii_lowercase();
+            if lower.contains("|action=block|")
+                && lower.contains("|active=true|")
+                && lower.contains("|dir=in|")
+                && lower.contains("reaper.exe")
+            {
+                // The App= segment carries the exact exe path the rule binds.
+                for seg in value.split('|') {
+                    if let Some(app) = seg.strip_prefix("App=") {
+                        return Some(app.to_string());
+                    }
+                }
+                return Some(String::new());
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+/// Open the Windows Firewall control panel (the allowed-apps surface) so the
+/// user can fix a block themselves: the app never touches firewall rules.
+#[tauri::command]
+fn open_firewall_settings() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("control")
+            .arg("firewall.cpl")
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Windows only".into())
+    }
+}
+
+// ---------- no-free-port detection ----------
+
+/// Whether a loaded extension is currently portless: the control server writes
+/// (and keeps refreshing) a marker in the temp dir while all four control
+/// ports are taken, and removes it the moment one binds. Only a *fresh* marker
+/// counts: a crash while portless must not leave a permanent false alarm.
+#[tauri::command]
+fn port_trouble() -> bool {
+    let Ok(rd) = fs::read_dir(std::env::temp_dir()) else {
+        return false;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("reamesh-noport-") {
+            continue;
+        }
+        let fresh = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() < 90)
+            .unwrap_or(false);
+        if fresh {
+            return true;
+        }
+    }
+    false
+}
+
+// ---------- network identity reset ----------
+
+/// Delete the persisted per-install network identity
+/// (`<resource>/reamesh-identity.key`). A live session keeps its identity
+/// until it ends; the next session start mints a fresh one. Returns whether a
+/// stored identity existed.
+#[tauri::command]
+fn reset_network_identity(app: AppHandle) -> Result<bool, String> {
+    let dir = resource_dir(&load_custom_path(&app))?;
+    let path = dir.join("reamesh-identity.key");
+    if !path.is_file() {
+        return Ok(false);
+    }
+    fs::remove_file(&path).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 #[tauri::command]
 fn get_reaper_path(app: AppHandle) -> Option<String> {
     load_custom_path(&app)
@@ -905,7 +1146,12 @@ pub fn run() {
             set_auto_install,
             set_session_state,
             notify_join,
-            clear_join_badge
+            clear_join_badge,
+            installed_plugins,
+            firewall_block,
+            open_firewall_settings,
+            port_trouble,
+            reset_network_identity
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
