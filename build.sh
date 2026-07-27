@@ -1,15 +1,29 @@
 #!/bin/bash
-# ReaMesh build: Rust core -> FFI header -> REAPER extension dylib.
-# On macOS, also builds the Tauri companion app (which bundles the dylib).
+# ReaMesh build: Rust core -> FFI header -> REAPER extension -> companion app.
+# Runs on macOS and on Windows (from Git Bash / MSYS, which ships with Git).
 set -euo pipefail
 cd "$(dirname "$0")"
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
-# The companion app is only built on macOS; Windows is built in CI, and the
-# app bundles the dylib produced by step 3, so it must run after it.
+case "$(uname -s)" in
+  Darwin)               PLATFORM=macos ;;
+  MINGW*|MSYS*|CYGWIN*) PLATFORM=windows ;;
+  *)                    PLATFORM=other ;;
+esac
+
+# cmake's Visual Studio generator is multi-config, so the DLL lands in a
+# Release/ subfolder; the single-config generator used on macOS does not.
+if [[ "$PLATFORM" == windows ]]; then
+  EXT_OUT="extension/build/Release/reaper_reamesh.dll"
+else
+  EXT_OUT="extension/build/reaper_reamesh.dylib"
+fi
+
+# The companion app bundles the extension binary produced by step 3, so it has
+# to run after it. Platforms without an app target stop at step 3.
 STEPS=3
-[[ "$(uname)" == "Darwin" ]] && STEPS=4
+[[ "$PLATFORM" != other ]] && STEPS=4
 
 echo "==> [1/$STEPS] Building Rust library (release)"
 (cd rust && cargo build --release)
@@ -23,21 +37,31 @@ else
   echo "    (install with: cargo install cbindgen)"
 fi
 
-echo "==> [3/$STEPS] Building reaper_reamesh.dylib"
-cmake -S extension -B extension/build -DCMAKE_BUILD_TYPE=Release >/dev/null
+echo "==> [3/$STEPS] Building $(basename "$EXT_OUT")"
+if [[ "$PLATFORM" == windows ]]; then
+  # Multi-config generator: the config is chosen at build time, not configure
+  # time, and passing CMAKE_BUILD_TYPE here only earns an "unused variable".
+  cmake -S extension -B extension/build >/dev/null
+else
+  cmake -S extension -B extension/build -DCMAKE_BUILD_TYPE=Release >/dev/null
+fi
 cmake --build extension/build --config Release
 
 echo
-echo "Built: extension/build/reaper_reamesh.dylib"
+echo "Built: $EXT_OUT"
 
-if [[ "$(uname)" == "Darwin" ]]; then
-  echo
-  echo "==> [4/$STEPS] Building the companion app (ReaMesh.app)"
-  (cd app && bun install && bun run tauri build)
-  echo
-  echo "Built: app/src-tauri/target/release/bundle/macos/ReaMesh.app"
-  echo "       (it installs the bundled dylib itself on first launch)"
-else
-  echo "Install with:"
-  echo "  cp extension/build/reaper_reamesh.dylib ~/Library/Application\\ Support/REAPER/UserPlugins/"
+if [[ "$PLATFORM" == other ]]; then
+  echo "No companion app target on this platform."
+  exit 0
 fi
+
+echo
+echo "==> [4/$STEPS] Building the companion app"
+(cd app && bun install && bun run tauri build)
+echo
+if [[ "$PLATFORM" == windows ]]; then
+  echo "Built: app/src-tauri/target/release/bundle/nsis/ (installer)"
+else
+  echo "Built: app/src-tauri/target/release/bundle/macos/ReaMesh.app"
+fi
+echo "       (it installs the bundled extension itself on first launch)"

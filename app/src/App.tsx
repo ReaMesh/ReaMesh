@@ -300,12 +300,14 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col">
-      <TitleBar />
-      {/* REAPER's main thread stopped ticking, usually a modal dialog waiting
-          over there. Without this, a frozen Downloading/Lobby just looks hung
-          (and Cancel etc. silently do nothing until the dialog is answered).
-          Suppressed while a finished download is being opened: that block is
-          expected and the stepper already narrates it. */}
+      <TitleBar
+        onOpenSettings={() => {
+          refreshStatus();
+          setSettingsOpen(true);
+        }}
+      />
+      {/* REAPER may be waiting on a modal dialog. Hide this during the expected
+          pause while a completed download opens. */}
       <AnimatePresence>
         {instance?.busy && !state?.opening && (
           <motion.div

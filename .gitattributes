@@ -1,0 +1,22 @@
+# The repo is developed on macOS and Windows, so pin line endings rather than
+# leaving them to each machine's core.autocrlf.
+* text=auto eol=lf
+
+# build.sh runs from Git Bash on Windows, and a CRLF shebang makes it fail with
+# "$'\r': command not found"; these have to stay LF even on a Windows checkout.
+*.sh text eol=lf
+
+# Windows-native scripts want the opposite.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Never touch binaries.
+*.png binary
+*.icns binary
+*.ico binary
+*.car binary
+*.dylib binary
+*.dll binary
+*.a binary
+*.lib binary

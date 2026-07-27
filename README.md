@@ -9,7 +9,7 @@ handles sessions, invitations and setup alongside REAPER.
 
 ## Getting started
 
-You'll need REAPER and the ReaMesh app on each Mac. See
+You'll need REAPER and the ReaMesh app on each computer. See
 [Releases](https://github.com/ReaMesh/ReaMesh/releases) for packaged builds,
 or [build from source](#building-from-source).
 
@@ -70,9 +70,10 @@ don't have this extra message encryption.
 
 ## Building from source
 
-Install Rust, Bun, CMake 3.20 or newer, the Xcode command-line tools and the
-[Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) for
-macOS.
+Install Rust, Bun, CMake 3.20 or newer, and the
+[Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) for your
+platform. On Windows, use the MSVC toolchain and run the script from Git Bash.
+On macOS, install the Xcode command-line tools.
 
 The macOS config includes the maintainer's signing identity. Before a local
 build, set `bundle.macOS.signingIdentity` in
@@ -90,12 +91,10 @@ optional; without it, the build uses the checked-in FFI header.
 
 | Output | Location |
 | --- | --- |
+| Windows installer | `app/src-tauri/target/release/bundle/nsis/` |
 | macOS app | `app/src-tauri/target/release/bundle/macos/ReaMesh.app` |
+| Windows extension | `extension/build/Release/reaper_reamesh.dll` |
 | macOS extension | `extension/build/reaper_reamesh.dylib` |
-
-The companion app is macOS only for now. A
-[CI workflow](.github/workflows/build.yml) also builds `reaper_reamesh.dll` for
-Windows, but that build hasn't been tested yet.
 
 After building the extension, run the app in development mode:
 

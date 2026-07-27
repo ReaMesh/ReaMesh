@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": [
+      "app"
+    ],
+    "resources": {
+      "../../extension/build/reaper_reamesh.dylib": "reaper_reamesh.dylib"
+    }
+  }
+}

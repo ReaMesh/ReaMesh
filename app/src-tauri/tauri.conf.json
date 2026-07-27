@@ -30,9 +30,6 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "app"
-    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -40,9 +37,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": {
-      "../../extension/build/reaper_reamesh.dylib": "reaper_reamesh.dylib"
-    },
     "macOS": {
       "files": {
         "Resources/Assets.car": "resources/Assets.car"

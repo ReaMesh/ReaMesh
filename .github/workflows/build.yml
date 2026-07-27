@@ -1,7 +1,6 @@
 # Builds the REAPER extension for Windows (reaper_reamesh.dll) and macOS
-# (reaper_reamesh.dylib) and uploads them as artifacts. Push this repo to
-# GitHub and grab the dll from the Actions tab, no Windows machine needed
-# to produce it (you still need one, or a collaborator, to run it).
+# (reaper_reamesh.dylib), plus the Windows installer, and uploads them as
+# artifacts.
 name: build
 on:
   push:
@@ -12,9 +11,18 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
       - name: Build Rust staticlib
         run: cargo build --release
         working-directory: rust
+      # The session tests drive real sockets between two in-process peers, and
+      # some of them discover each other over mDNS. That works locally; whether
+      # a hosted runner allows the multicast is unproven, so a failure here
+      # shouldn't fail the build until it's been seen to pass.
+      - name: Rust tests
+        run: cargo test --release
+        working-directory: rust
+        continue-on-error: true
       - name: Build extension DLL
         run: |
           cmake -S extension -B extension/build
@@ -23,6 +31,16 @@ jobs:
         with:
           name: reaper_reamesh-windows-x64
           path: extension/build/Release/reaper_reamesh.dll
+      # The app bundles the DLL built above, so this has to come after it.
+      - name: Build companion app + installer
+        run: |
+          bun install
+          bun run tauri build
+        working-directory: app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReaMesh-windows-installer
+          path: app/src-tauri/target/release/bundle/nsis/*-setup.exe
 
   macos:
     runs-on: macos-latest

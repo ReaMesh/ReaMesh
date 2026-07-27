@@ -371,6 +371,43 @@ fn install_extension(app: AppHandle) -> Result<ReaperStatus, String> {
     do_install(&app, &load_custom_path(&app))
 }
 
+/// Locate reaper.exe on Windows. Check portable installs first, then the known
+/// folder names in both Program Files directories.
+#[cfg(target_os = "windows")]
+fn reaper_executable(app: &AppHandle) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(dir) = resource_dir(&load_custom_path(app)) {
+        candidates.push(dir.join("reaper.exe"));
+    }
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(base) = std::env::var_os(var) {
+            let base = PathBuf::from(base);
+            candidates.push(base.join("REAPER (x64)").join("reaper.exe"));
+            candidates.push(base.join("REAPER").join("reaper.exe"));
+        }
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Launch REAPER from the "waiting for REAPER" screen. Windows only: macOS
+/// opens the bundle straight from the webview through the opener plugin.
+#[tauri::command]
+fn launch_reaper(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let exe = reaper_executable(&app).ok_or("could not find reaper.exe")?;
+        std::process::Command::new(exe)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = &app;
+        Err("launch_reaper is only used on Windows".into())
+    }
+}
+
 #[tauri::command]
 fn get_reaper_path(app: AppHandle) -> Option<String> {
     load_custom_path(&app)
@@ -674,6 +711,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             reaper_status,
             install_extension,
+            launch_reaper,
             open_overlay,
             close_overlay,
             get_reaper_path,
