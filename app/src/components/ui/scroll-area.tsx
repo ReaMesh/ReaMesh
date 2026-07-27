@@ -14,9 +14,12 @@ function ScrollArea({
       className={cn("relative", className)}
       {...props}
     >
+      {/* Radix does not make the viewport focusable. tabIndex keeps keyboard
+          scrolling available even when the contents have no focusable elements. */}
       <ScrollAreaPrimitive.Viewport
         data-slot="scroll-area-viewport"
-        className="size-full rounded-[inherit] transition-[color,box-shadow] outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-1"
+        tabIndex={0}
+        className="size-full rounded-[inherit] transition-[color,box-shadow] outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-1"
       >
         {children}
       </ScrollAreaPrimitive.Viewport>

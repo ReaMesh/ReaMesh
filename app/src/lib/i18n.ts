@@ -33,8 +33,15 @@ const en = {
   join: "Join",
   password: "Password",
   passwordOptional: "Password (optional)",
+  passwordTooShort: "Use at least {min} characters.",
   showPassword: "Show password",
   hidePassword: "Hide password",
+  passwordProtected: "Password protected",
+  identityColor: "Your color",
+  identityColorN: "Color {n}",
+  checkNoAnswer: "No answer from the host. Try again.",
+  sessionContested: "Someone else on this network is announcing this session too. Make sure you know who you're joining.",
+  trustHostClaims: "The host says they are “{host}”. That name is not verified.",
   hostAction: "Host",
   untitledProject: "Untitled project",
   shareProject: "Share this project with your network",
@@ -186,6 +193,24 @@ const en = {
   peerTitleChanged: "Project info changed",
   peerNotesChanged: "Project notes changed",
   reconnectingBanner: "Connection to the host lost. Reconnecting…",
+
+  // Download
+  downloadStalled: "Nothing arriving. The host may have gone quiet.",
+  downloadProgress: "Download progress",
+  fileOfTotal: "File {done} of {total}",
+
+  // A11y labels
+  peopleList: "People in this session",
+  reaperInstances: "REAPER instances",
+  copyInviteFailed: "Couldn't copy. Select and copy the code:",
+
+  // Crash fallback
+  crashTitle: "ReaMesh hit a problem",
+  crashBody:
+    "The window couldn't finish drawing. Your session in REAPER is unaffected; reloading brings the app back.",
+  crashReload: "Reload",
+  crashCopy: "Copy details",
+  crashCopied: "Copied",
 } as const;
 
 export type MsgKey = keyof typeof en;
@@ -207,8 +232,15 @@ const de: Record<MsgKey, string> = {
   join: "Beitreten",
   password: "Passwort",
   passwordOptional: "Passwort (optional)",
+  passwordTooShort: "Verwende mindestens {min} Zeichen.",
   showPassword: "Passwort anzeigen",
   hidePassword: "Passwort verbergen",
+  passwordProtected: "Passwortgeschützt",
+  identityColor: "Deine Farbe",
+  identityColorN: "Farbe {n}",
+  checkNoAnswer: "Keine Antwort vom Host. Versuch es noch einmal.",
+  sessionContested: "Jemand anderes in diesem Netzwerk kündigt diese Session ebenfalls an. Vergewissere dich, wem du beitrittst.",
+  trustHostClaims: "Der Host gibt an, „{host}“ zu sein. Dieser Name ist nicht verifiziert.",
   hostAction: "Hosten",
   untitledProject: "Unbenanntes Projekt",
   shareProject: "Teile dieses Projekt mit deinem Netzwerk",
@@ -353,6 +385,21 @@ const de: Record<MsgKey, string> = {
   peerTitleChanged: "Projektinfo geändert",
   peerNotesChanged: "Projektnotizen geändert",
   reconnectingBanner: "Verbindung zum Host verloren. Verbinde erneut…",
+
+  downloadStalled: "Es kommt nichts an. Der Host ist vielleicht weg.",
+  downloadProgress: "Download-Fortschritt",
+  fileOfTotal: "Datei {done} von {total}",
+
+  peopleList: "Personen in dieser Session",
+  reaperInstances: "REAPER-Instanzen",
+  copyInviteFailed: "Kopieren nicht möglich. Markiere und kopiere den Code:",
+
+  crashTitle: "ReaMesh hat ein Problem",
+  crashBody:
+    "Das Fenster konnte nicht fertig gezeichnet werden. Deine Session in REAPER ist davon nicht betroffen. Ein Neuladen holt die App zurück.",
+  crashReload: "Neu laden",
+  crashCopy: "Details kopieren",
+  crashCopied: "Kopiert",
 };
 
 function readStoredPref(): LangPref {
@@ -405,7 +452,17 @@ function applyPref(p: LangPref) {
   } catch {
     // localStorage unavailable; keep the in-memory value
   }
+  syncDocumentLang();
   emit();
+}
+
+/** Tell the platform which language the UI is actually in. index.html can only
+ *  hardcode one, so without this a screen reader narrates the whole German UI
+ *  with an English voice and English pronunciation rules, which for a sentence
+ *  like "Beim Beitritt zu … laufen als Code auf deinem Computer" is not merely
+ *  wrong-sounding but unintelligible. */
+function syncDocumentLang() {
+  if (typeof document !== "undefined") document.documentElement.lang = resolveLang();
 }
 
 /** Subscribe a component to language changes; returns the resolved language. */
@@ -425,6 +482,7 @@ export function useLang(): Lang {
  *  webview was gone) and follow native-side changes live. No-ops in
  *  plain-browser dev where the Tauri APIs reject. */
 export function initLanguage() {
+  syncDocumentLang();
   invoke<string | null>("get_language")
     .then((v) => {
       if (v === "en" || v === "de" || v === "system") applyPref(v);

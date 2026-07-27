@@ -10,13 +10,16 @@ import {
 import { Button } from "@/components/ui/button";
 import { FG_COLOR, FOUND_COLOR, SCAN_COLOR } from "@/lib/colors";
 import { send } from "@/lib/connection";
-import { formatBytes, useRate } from "@/lib/format";
+import { formatBytes, useTransfer } from "@/lib/format";
 import { resolveLang, t } from "@/lib/i18n";
 import type { ExtState } from "@/lib/types";
 
 // The beacon covers three stages: connecting, downloading, and opening the
 // project in REAPER. Phase 3 is the brief completion state owned by App.
 function phaseIndex(state: ExtState): number {
+  // The extension publishes one final downloading frame before handling a
+  // failure. Keep that frame in the transfer phase until the screen changes.
+  if (state.state === "failed" || state.state === "ended") return 1;
   if (state.opening || state.state === "ready") return 2;
   if (state.state === "downloading") return 1;
   return 0; // connecting: join sent, waiting for the host's manifest
@@ -194,7 +197,7 @@ function CurrentFile({ path }: { path?: string }) {
             animate={{ y: 0, opacity: 1 }}
             exit={{ y: -10, opacity: 0 }}
             transition={{ duration: 0.2, ease: "easeOut" }}
-            className="absolute inset-0 truncate text-center text-[11px] text-muted-foreground/60"
+            className="absolute inset-0 truncate text-center text-[11px] text-muted-foreground"
           >
             {name}
           </motion.p>
@@ -212,21 +215,30 @@ function eta(remaining: number, rate: number): string | null {
   return t("etaAboutMinutes", { m: Math.round(s / 60) });
 }
 
-// `done` is App's completion beat: the project just opened (mode is already
-// client) and this screen is held for a moment so the ring can sweep to the
-// found-blue and the checkmark can pop before handing off to Session.
-export function Downloading({ state, done = false }: { state: ExtState; done?: boolean }) {
+// App holds `done` briefly after the project opens so the completion animation
+// can finish before the session screen appears.
+export function Downloading({
+  state,
+  done = false,
+  port,
+}: {
+  state: ExtState;
+  done?: boolean;
+  port?: number | null;
+}) {
   const phase = done ? 3 : phaseIndex(state);
   const lang = resolveLang();
   const doneBytes = state.done_bytes || 0;
   const total = state.total_bytes || 0;
-  const rate = useRate(doneBytes);
-  const remainingTime = eta(total - doneBytes, rate);
+  const { rate, stalled } = useTransfer(doneBytes, total);
+  const remainingTime = stalled ? null : eta(total - doneBytes, rate);
+  const filesDone = state.files_done || 0;
+  const filesTotal = state.files_total || 0;
 
-  // While downloading, the narration line answers the one question that
-  // matters (how long) in the same voice as the other phases. The raw
-  // numbers (bytes, rate) recede into a quiet detail line below it.
+  // Keep file count, bytes, and rate in a secondary line. The file count still
+  // provides useful progress when one large file stalls the byte counter.
   const detail = [
+    filesTotal > 0 ? t("fileOfTotal", { done: filesDone, total: filesTotal }) : null,
     total > 0 ? `${formatBytes(doneBytes, lang)} / ${formatBytes(total, lang)}` : null,
     rate > 0 ? `${formatBytes(rate, lang)}/s` : null,
   ]
@@ -239,25 +251,36 @@ export function Downloading({ state, done = false }: { state: ExtState; done?: b
       : phase === 2
         ? t("openingInReaper")
         : phase === 1
-          ? remainingTime || t("downloadingProject")
+          ? stalled
+            ? t("downloadStalled")
+            : remainingTime || t("downloadingProject")
           : t("connectingToHost");
-  // Crossfade the narration only when its *kind* changes (phase, or the
-  // one-time hop from "Downloading…" to a real ETA); the ETA number itself
-  // updates in place, so it never re-animates on every tick.
-  const lineKey = phase === 1 ? (remainingTime ? "eta" : "dl") : String(phase);
+  // Only animate when the status type changes. ETA updates stay in place.
+  const lineKey =
+    phase === 1 ? (stalled ? "stall" : remainingTime ? "eta" : "dl") : String(phase);
 
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-6 px-10 text-center">
-      <ProgressBeacon phase={phase} progress={state.progress || 0} />
+      <div
+        role="progressbar"
+        aria-label={t("downloadProgress")}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={phase === 1 ? Math.round((state.progress || 0) * 100) : undefined}
+      >
+        <ProgressBeacon phase={phase} progress={state.progress || 0} />
+      </div>
 
       <div className="w-full space-y-1.5">
-        <h2 className="truncate text-[15px] font-semibold tracking-tight">
+        <h2
+          className="truncate text-[15px] font-semibold tracking-tight"
+          title={state.session || undefined}
+        >
           {state.session || t("sessionFallback")}
         </h2>
-        {/* One narration line per wait, crossfading on phase changes; the
-            stats update in place without re-animating. Fixed-height so the
-            swap never shifts the beacon above. */}
-        <div className="relative h-[18px]">
+        {/* Crossfade on phase changes; update stats in place. Reserve the line
+            height so status changes do not move the progress ring. */}
+        <div className="relative h-[18px]" role="status" aria-live="polite">
           <AnimatePresence initial={false}>
             <motion.p
               key={lineKey}
@@ -282,7 +305,7 @@ export function Downloading({ state, done = false }: { state: ExtState; done?: b
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
                 transition={{ duration: 0.2, ease: "easeOut" }}
-                className="truncate text-[11px] tabular-nums text-muted-foreground/60"
+                className="truncate text-[11px] tabular-nums text-muted-foreground"
               >
                 {detail}
               </motion.p>
@@ -296,8 +319,11 @@ export function Downloading({ state, done = false }: { state: ExtState; done?: b
         variant="ghost"
         size="sm"
         className="text-muted-foreground"
-        onClick={() => send({ cmd: "leave" })}
-        disabled={phase >= 2}
+        onClick={() => send({ cmd: "leave" }, port ?? undefined)}
+        // Stays usable through a stall: the one moment the user most wants out
+        // is while nothing is arriving. Only a project actually opening in
+        // REAPER (which blocks its main thread anyway) disables it.
+        disabled={!stalled && phase >= 2}
       >
         {t("cancel")}
       </Button>

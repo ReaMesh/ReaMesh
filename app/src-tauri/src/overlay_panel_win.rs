@@ -14,7 +14,7 @@
 //! Unlike AppKit, Win32 window calls are safe to make from any thread, so the
 //! follow loop lives on its own thread rather than hopping to the main one.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -43,6 +43,12 @@ const DEFAULT_OFFSET_Y: f64 = 48.0;
 
 static OVERLAY: AtomicIsize = AtomicIsize::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(false);
+/// REAPER process supplying this HUD's roster. If the extension has not
+/// reported a pid, 0 allows any REAPER instance. Pinning the pid prevents
+/// the HUD from following a different instance's window.
+static REAPER_PID: AtomicU32 = AtomicU32::new(0);
+/// Last resolved REAPER main window, revalidated rather than re-enumerated.
+static CACHED_REAPER: AtomicIsize = AtomicIsize::new(0);
 
 
 /// Offset of the overlay's top-right corner from REAPER's, in physical pixels.
@@ -65,9 +71,14 @@ fn rect_of(hwnd: HWND) -> Option<RECT> {
     Some(r)
 }
 
-fn process_name(hwnd: HWND) -> Option<String> {
+fn pid_of(hwnd: HWND) -> u32 {
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    pid
+}
+
+fn process_name(hwnd: HWND) -> Option<String> {
+    let pid = pid_of(hwnd);
     if pid == 0 {
         return None;
     }
@@ -82,8 +93,24 @@ fn process_name(hwnd: HWND) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase())
 }
 
+/// Is this window one of *our* REAPER's? When a pid is pinned the check is a
+/// cheap integer compare and no process is opened at all; only the unpinned
+/// fallback pays for the image-name lookup.
 fn is_reaper(hwnd: HWND) -> bool {
+    let want = REAPER_PID.load(Ordering::Relaxed);
+    if want != 0 {
+        return pid_of(hwnd) == want;
+    }
     process_name(hwnd).is_some_and(|p| p.ends_with("\\reaper.exe") || p.ends_with("/reaper.exe"))
+}
+
+/// True if `hwnd` is still a live, visible, non-minimised window of our REAPER.
+fn still_valid(hwnd: HWND) -> bool {
+    !hwnd.is_invalid()
+        && unsafe { IsWindow(Some(hwnd)) }.as_bool()
+        && unsafe { IsWindowVisible(hwnd) }.as_bool()
+        && !unsafe { IsIconic(hwnd) }.as_bool()
+        && is_reaper(hwnd)
 }
 
 struct Search {
@@ -111,19 +138,24 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::core
     TRUE
 }
 
-/// REAPER's main window, or None when REAPER isn't running (or is minimised).
-/// Matched on the owning process rather than a window class, so it does not
-/// break if Cockos renames the class in a future version.
+/// Find the largest visible window belonging to the REAPER process.
+/// Cache and revalidate it to avoid enumerating every window on each tick.
 fn find_reaper_window() -> Option<HWND> {
+    let cached = HWND(CACHED_REAPER.load(Ordering::Relaxed) as *mut _);
+    if still_valid(cached) {
+        return Some(cached);
+    }
     let mut search = Search {
         best: HWND::default(),
         best_area: 0,
     };
     let _ = unsafe { EnumWindows(Some(enum_proc), LPARAM(&mut search as *mut Search as isize)) };
-    (!search.best.is_invalid() && search.best_area > 0).then_some(search.best)
+    let found = (!search.best.is_invalid() && search.best_area > 0).then_some(search.best);
+    CACHED_REAPER.store(found.map_or(0, |h| h.0 as isize), Ordering::Relaxed);
+    found
 }
 
-fn reaper_is_foreground() -> bool {
+pub fn reaper_is_foreground() -> bool {
     let fg = unsafe { GetForegroundWindow() };
     if fg.is_invalid() {
         return false;
@@ -137,9 +169,23 @@ fn reaper_is_foreground() -> bool {
     is_reaper(fg)
 }
 
+/// Is *any* REAPER the foreground app? Used by the join-notification gate,
+/// which cares whether the user can see a REAPER-side surface at all rather
+/// than which instance it belongs to, so it must not be narrowed by the pinned
+/// pid the HUD follower uses.
+pub fn any_reaper_is_foreground() -> bool {
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.is_invalid() {
+        return false;
+    }
+    process_name(fg).is_some_and(|p| p.ends_with("\\reaper.exe") || p.ends_with("/reaper.exe"))
+}
+
 /// Turn the Tauri window into a non-activating tool window and start following
 /// REAPER. Idempotent: a second call just re-seeds the offset.
-pub fn attach(hwnd: isize, scale: f64) {
+pub fn attach(hwnd: isize, scale: f64, reaper_pid: u32) {
+    REAPER_PID.store(reaper_pid, Ordering::SeqCst);
+    CACHED_REAPER.store(0, Ordering::SeqCst);
     let overlay = HWND(hwnd as *mut _);
     unsafe {
         // NOACTIVATE: clicks on the roster never pull focus off REAPER.
@@ -172,6 +218,8 @@ pub fn attach(hwnd: isize, scale: f64) {
 pub fn detach() {
     RUNNING.store(false, Ordering::SeqCst);
     OVERLAY.store(0, Ordering::SeqCst);
+    REAPER_PID.store(0, Ordering::SeqCst);
+    CACHED_REAPER.store(0, Ordering::SeqCst);
 }
 
 fn follow_loop() {
@@ -187,7 +235,10 @@ fn follow_loop() {
             break; // window went away underneath us
         }
 
-        let Some(reaper) = find_reaper_window().filter(|_| reaper_is_foreground()) else {
+        // Foreground check first: while the user is in a browser or the app,
+        // the HUD is hidden anyway and there is nothing to place, so the window
+        // lookup can be skipped entirely.
+        let Some(reaper) = reaper_is_foreground().then(find_reaper_window).flatten() else {
             if shown {
                 let _ = unsafe { ShowWindow(overlay, SW_HIDE) };
                 shown = false;

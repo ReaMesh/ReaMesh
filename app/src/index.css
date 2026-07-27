@@ -27,7 +27,12 @@
   --destructive-foreground: #fff;
   --border: rgba(255, 255, 255, 0.08);
   --input: rgba(255, 255, 255, 0.1);
-  --ring: rgba(255, 255, 255, 0.25);
+  /* Opaque on purpose. Every consumer halves this again (`ring-ring/50`,
+     `outline-ring/50`), and a translucent base composited over #101013 landed
+     at ~1.4:1, far under the 3:1 a focus indicator needs, i.e. no visible
+     focus anywhere in the app for a keyboard user. At this value the halved
+     form still clears the threshold. */
+  --ring: #7c7c8a;
   --radius: 0.625rem;
 }
 
@@ -63,6 +68,10 @@
 @layer base {
   * {
     @apply border-border outline-ring/50;
+  }
+  :root {
+    /* Use dark native controls, selections, scrollbars, and autofill styling. */
+    color-scheme: dark;
   }
   html,
   body,

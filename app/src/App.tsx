@@ -22,32 +22,28 @@ import { displayName, type ExtState, type Mode } from "@/lib/types";
 startScanning();
 loadReaperPath().then(refreshStatus);
 
-/** Toast people joining/leaving by diffing the peers list between states.
- *  Suppressed across mode changes so entering a session doesn't announce
- *  everyone already there as "joined".
- *
- *  Joins that happen while the user is *away* (this window unfocused and
- *  (checked backend-side) REAPER not frontmost either, so neither this list
- *  nor the overlay roster was visible) additionally badge the dock icon.
- *  Returns the ids of those peers once the user is back: the Session screen
- *  flashes their rows so the returning eye lands on who's new. */
-function usePresenceToasts(state: ExtState | undefined): string[] {
+/** Show join and leave toasts during a session.
+ *  Ignore mode changes so existing peers are not announced as new. If both
+ *  this window and REAPER are out of view, badge the app and return unseen
+ *  peer ids so Session can highlight them when the user returns. */
+function usePresenceToasts(state: ExtState | undefined, port: number | undefined): string[] {
   const prev = useRef<
-    { mode: Mode; ids: Map<string, { name: string; color: string }> } | undefined
+    { port: number | undefined; mode: Mode; ids: Map<string, { name: string; color: string }> } | undefined
   >(undefined);
   const unseen = useRef<Set<string>>(new Set());
   const [flash, setFlash] = useState<string[]>([]);
 
   useEffect(() => {
-    if (!state) {
-      prev.current = undefined;
-      return;
-    }
-    const inSession = state.mode === "hosting" || state.mode === "client";
-    // Session over: whatever the badge was announcing no longer exists.
+    // The badge outlives `state` going undefined (REAPER quitting closes the
+    // socket), so clear it before that early return rather than after it.
+    const inSession = state?.mode === "hosting" || state?.mode === "client";
     if (!inSession && unseen.current.size) {
       unseen.current.clear();
       invoke("clear_join_badge").catch(() => {});
+    }
+    if (!state) {
+      prev.current = undefined;
+      return;
     }
     const ids = new Map(
       state.peers
@@ -55,8 +51,10 @@ function usePresenceToasts(state: ExtState | undefined): string[] {
         .map((p) => [p.id, { name: displayName(p), color: p.color }]),
     );
     const before = prev.current;
-    prev.current = { mode: state.mode, ids };
-    if (!before || before.mode !== state.mode || !inSession) return;
+    prev.current = { port, mode: state.mode, ids };
+    // A mode or instance switch replaces the entire roster. Comparing the old
+    // and new lists would report every peer as joining or leaving.
+    if (!before || before.port !== port || before.mode !== state.mode || !inSession) return;
 
     const dot = (color: string) => (
       <span
@@ -96,7 +94,7 @@ function usePresenceToasts(state: ExtState | undefined): string[] {
         );
       }
     }
-  }, [state]);
+  }, [state, port]);
 
   // The user is back: drop the badge and hand the missed joins to the Session
   // screen for their one-shot row flash.
@@ -120,29 +118,41 @@ function usePresenceToasts(state: ExtState | undefined): string[] {
   return flash;
 }
 
-function useErrorToasts(state: ExtState | undefined) {
-  const last = useRef("");
+/** Deduplicate control-server errors per REAPER instance. The server replays
+ *  its latest state after reconnects, so clearing the key while disconnected
+ *  would show dismissed errors again. */
+function useErrorToasts(state: ExtState | undefined, port: number | undefined) {
+  const last = useRef<Map<number, string>>(new Map());
   useEffect(() => {
+    if (port == null) return;
     const err = state?.error ?? null;
+    // A missing state frame does not mean the error was cleared.
+    if (!state) return;
     const key = err ? JSON.stringify(err) : "";
-    if (err && key !== last.current) toast.error(localizeLogEntry(err));
-    last.current = key;
-  }, [state?.error]);
+    if (err && key !== last.current.get(port)) toast.error(localizeLogEntry(err));
+    last.current.set(port, key);
+  }, [state, state?.error, port]);
 }
 
-/** One of our edits snapped back because someone else holds the soft editing
- *  lock on that field. It reads as a glitch otherwise, so tell the user calmly.
- *  Fires in either role, since the lock binds the host too. Debounced so a quick
- *  back-and-forth can't stack notices. */
-function useOverrideToasts(state: ExtState | undefined) {
-  const prev = useRef<{ mode?: Mode; count: number; lastAt: number; enteredAt: number }>({
+/** Explain when a remote editing lock reverts a local change. Debounce the
+ *  notice so quick back-and-forth edits do not stack toasts. */
+function useOverrideToasts(state: ExtState | undefined, port: number | undefined) {
+  const prev = useRef<{
+    port?: number;
+    mode?: Mode;
+    count: number;
+    lastAt: number;
+    enteredAt: number;
+  }>({
     count: 0,
     lastAt: 0,
     enteredAt: 0,
   });
   useEffect(() => {
     const count = state?.overridden ?? 0;
-    const sameSession = prev.current.mode === state?.mode;
+    // The counter belongs to one REAPER instance. Comparing across instances
+    // could report an old conflict as a new one.
+    const sameSession = prev.current.mode === state?.mode && prev.current.port === port;
     const inSession = state?.mode === "client" || state?.mode === "hosting";
     const now = Date.now();
     if (inSession && !sameSession) prev.current.enteredAt = now; // just joined/started
@@ -161,8 +171,9 @@ function useOverrideToasts(state: ExtState | undefined) {
       prev.current.lastAt = now;
     }
     prev.current.mode = state?.mode;
+    prev.current.port = port;
     prev.current.count = count;
-  }, [state?.overridden, state?.mode]);
+  }, [state?.overridden, state?.mode, state?.log, port]);
 }
 
 export default function App() {
@@ -171,9 +182,13 @@ export default function App() {
   const reaper = useReaperStatus();
   const [settingsOpen, setSettingsOpen] = useState(false);
   useLang(); // re-render the whole tree when the language changes
-  const flashPeers = usePresenceToasts(state);
-  useErrorToasts(state);
-  useOverrideToasts(state);
+  // Every cross-render hook below is keyed to the instance as well as the mode:
+  // the active instance swaps wholesale on a tab click or when a REAPER quits,
+  // and none of this state carries across.
+  const activePort = instance?.port;
+  const flashPeers = usePresenceToasts(state, activePort);
+  useErrorToasts(state, activePort);
+  useOverrideToasts(state, activePort);
 
   // Hold the Disconnected screen briefly after REAPER answers so its
   // success animation finishes before the lobby appears. `waiting` matches
@@ -247,25 +262,39 @@ export default function App() {
   }, []);
 
   // The lobby needs discovery running; the extension's browse is idempotent.
+  // Addressed to the instance this render is for, never to whatever
+  // `activePort` happens to be when the effect runs.
   const mode = state?.mode;
-  const port = instance?.port;
+  const port = activePort;
   useEffect(() => {
-    if (mode === "idle") send({ cmd: "browse" });
+    if (mode === "idle" && port != null) send({ cmd: "browse" }, port);
   }, [mode, port]);
 
-  // The floating presence overlay rides along with the active instance for as
-  // long as it's in a session, pinned to that instance's control port.
+  // Give the overlay the active instance's port and process. A port change must
+  // rebuild the HUD even when both instances are already in sessions.
   const inSession = mode === "hosting" || mode === "client";
+  const pid = instance?.pid;
   useEffect(() => {
-    if (inSession && port != null) openOverlay(port);
+    if (inSession && port != null) openOverlay(port, pid ?? null);
     else closeOverlay();
-  }, [inSession, port]);
+  }, [inSession, port, pid]);
 
-  // Keep the backend's quit handler informed of whether we're hosting and on
-  // which control port, so it can stop the session before the app exits.
+  // The control server's watchdog only clears `busy` on its own 1s tick, but a
+  // fresh state frame is itself proof the main thread ticked. Without this the
+  // amber "REAPER isn't responding" banner animates in and straight back out
+  // for up to a second right as a finished download opens, the join flow's
+  // payoff moment.
+  const stateSeq = state ? JSON.stringify(state.progress) + state.mode + state.state : "";
+  const [busySince, setBusySince] = useState("");
   useEffect(() => {
-    setSessionState(mode === "hosting", port ?? null);
-  }, [mode, port]);
+    if (instance?.busy) setBusySince(stateSeq);
+  }, [instance?.busy]); // eslint-disable-line react-hooks/exhaustive-deps
+  const busy = !!instance?.busy && !state?.opening && stateSeq === busySince;
+
+  // Give the quit handler a port only during a session so it can leave cleanly.
+  useEffect(() => {
+    setSessionState(mode === "hosting", inSession ? (port ?? null) : null);
+  }, [mode, inSession, port]);
 
   // Run onboarding until the bundled extension is installed. Skip the gate
   // while the check is pending and in plain-browser development.
@@ -284,18 +313,17 @@ export default function App() {
   } else if (!state) {
     screen = { key: "disconnected", node: <Disconnected /> };
   } else if (mode === "downloading") {
-    screen = { key: "downloading", node: <Downloading state={state} /> };
+    screen = { key: "downloading", node: <Downloading state={state} port={port} /> };
   } else if (beatActive && mode === "client") {
-    // Keep the "downloading" key so the screen isn't torn down; it just
-    // switches to its done state in place.
-    screen = { key: "downloading", node: <Downloading state={state} done /> };
+    // Keep the screen mounted while it switches to the completed state.
+    screen = { key: "downloading", node: <Downloading state={state} port={port} done /> };
   } else if (mode === "hosting" || mode === "client") {
     screen = {
       key: "session",
       node: <Session state={state} port={port ?? null} flashPeers={flashPeers} />,
     };
   } else {
-    screen = { key: "lobby", node: <Lobby state={state} /> };
+    screen = { key: "lobby", node: <Lobby state={state} port={port ?? null} /> };
   }
 
   return (
@@ -313,7 +341,7 @@ export default function App() {
       {/* REAPER may be waiting on a modal dialog. Hide this during the expected
           pause while a completed download opens. */}
       <AnimatePresence>
-        {instance?.busy && !state?.opening && (
+        {busy && (
           <motion.div
             key="busy"
             initial={{ height: 0, opacity: 0 }}
@@ -321,8 +349,11 @@ export default function App() {
             exit={{ height: 0, opacity: 0 }}
             className="overflow-hidden"
           >
-            <div className="mx-4 mt-2 flex items-center gap-2.5 rounded-xl bg-amber-500/10 px-3 py-2.5 text-amber-500">
-              <TriangleAlert className="size-4 shrink-0" />
+            <div
+              role="status"
+              className="mx-4 mt-2 flex items-center gap-2.5 rounded-xl bg-amber-500/10 px-3 py-2.5 text-amber-500"
+            >
+              <TriangleAlert className="size-4 shrink-0" aria-hidden="true" />
               <span className="text-[12px] font-medium">{t("reaperBusyBanner")}</span>
             </div>
           </motion.div>

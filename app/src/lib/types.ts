@@ -24,10 +24,20 @@ export interface SessionAd {
   session_name: string;
   project_file: string;
   owner: string;
+  /** The host's *self-reported* display name/color from the announce. There is
+   *  no presence beacon before a join, so this is the only pre-join signal of
+   *  who is hosting, and it is chosen by the host, so present it as a claimed
+   *  label, never as a verified identity. "" from an older host. */
+  owner_name?: string;
+  owner_color?: string;
   auth: boolean;
   /** Shareable file count + total bytes, from the announce (0 = unknown/old host). */
   files?: number;
   bytes?: number;
+  /** A second peer announced this same session id. The first-seen owner keeps
+   *  the entry, but someone on the network is impersonating the session, so the
+   *  lobby warns before a join. */
+  contested?: boolean;
 }
 
 /** Structured activity-log entry / error from the extension. `code` (plus
@@ -91,9 +101,16 @@ export function displayName(p: Peer): string {
   return t("guest");
 }
 
+/** First character of a word, as a whole code point; indexing with [0] would
+ *  split an astral character (an emoji name) into a lone surrogate, which
+ *  renders as a replacement glyph in every peer's roster. */
+function firstChar(word: string): string {
+  return Array.from(word)[0] ?? "";
+}
+
 export function initials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
   if (parts.length === 0) return "?";
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+  if (parts.length === 1) return Array.from(parts[0]).slice(0, 2).join("").toUpperCase();
+  return (firstChar(parts[0]) + firstChar(parts[parts.length - 1])).toUpperCase();
 }

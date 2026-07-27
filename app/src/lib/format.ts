@@ -14,28 +14,74 @@ export function formatBytes(n: number, lang = resolveLang()): string {
   return fmt(n, "B", 0);
 }
 
-/** Smoothed transfer rate (bytes/s) from a monotonically growing byte counter.
- *  EMA over the per-update deltas, so the display doesn't flicker with every
- *  extension timer tick. Resets when the counter restarts (new download). */
-export function useRate(done: number): number {
-  const ref = useRef({ last: 0, at: 0, ema: 0 });
-  const [rate, setRate] = useState(0);
+/** No bytes for this long and the transfer is treated as stalled: the rate
+ *  decays and the UI stops promising a time. The Rust side gives a stall a full
+ *  60s before failing the join, which is a long time to sit under a confident
+ *  "About 7s to go". */
+export const STALL_AFTER_MS = 6000;
+
+export interface Transfer {
+  /** Smoothed bytes/s. Decays toward 0 while nothing arrives, so it can't sit
+   *  frozen at the last optimistic value through an entire stall. */
+  rate: number;
+  /** True once nothing has arrived for `STALL_AFTER_MS`. */
+  stalled: boolean;
+}
+
+/** Smooth byte-counter deltas with an EMA. A timer decays the rate during
+ *  stalls even when the counter stops changing. The first update after the
+ *  manifest establishes the baseline, since it includes reused files that
+ *  were never transferred over the network. */
+export function useTransfer(done: number, total: number): Transfer {
+  const ref = useRef({ last: 0, at: 0, ema: 0, seenTotal: false });
+  const [state, setState] = useState<Transfer>({ rate: 0, stalled: false });
+
   useEffect(() => {
     const now = performance.now();
     const r = ref.current;
-    if (r.at > 0 && done > r.last) {
+
+    // New (or restarted) download: rebaseline and report nothing yet.
+    if (r.at === 0 || done < r.last) {
+      ref.current = { last: done, at: now, ema: 0, seenTotal: total > 0 };
+      setState({ rate: 0, stalled: false });
+      return;
+    }
+    // The manifest just arrived and brought the deduped/already-present bytes
+    // with it: a baseline, not a transfer.
+    if (!r.seenTotal && total > 0) {
+      r.seenTotal = true;
+      r.last = done;
+      r.at = now;
+      setState({ rate: 0, stalled: false });
+      return;
+    }
+    if (done > r.last) {
       const dt = (now - r.at) / 1000;
       if (dt > 0.05) {
         const inst = (done - r.last) / dt;
         r.ema = r.ema === 0 ? inst : r.ema * 0.8 + inst * 0.2;
         r.last = done;
         r.at = now;
-        setRate(r.ema);
+        setState({ rate: r.ema, stalled: false });
       }
-    } else if (r.at === 0 || done < r.last) {
-      ref.current = { last: done, at: now, ema: 0 };
-      setRate(0);
     }
-  }, [done]);
-  return rate;
+  }, [done, total]);
+
+  // Age the last sample even when nothing arrives.
+  useEffect(() => {
+    const id = setInterval(() => {
+      const r = ref.current;
+      if (r.at === 0) return;
+      const idle = performance.now() - r.at;
+      if (idle < STALL_AFTER_MS / 2) return;
+      // Decay the rate with a half-life of STALL_AFTER_MS/2; set it to zero
+      // and report a stall once the threshold is reached.
+      const stalled = idle >= STALL_AFTER_MS;
+      r.ema = stalled ? 0 : r.ema * 0.5;
+      setState({ rate: r.ema, stalled });
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  return state;
 }

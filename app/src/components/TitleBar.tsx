@@ -2,7 +2,7 @@ import { Settings2 } from "lucide-react";
 import { useConnections, setActivePort } from "@/lib/connection";
 import { t } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
-import { cn } from "@/lib/utils";
+import { cn, focusRing } from "@/lib/utils";
 
 // Right-hand inset for a screen's topmost row, so whatever it right-aligns
 // (the Hosting badge, a card's contents) clears the floating Settings gear.
@@ -23,21 +23,36 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
   const { instances, activePort } = useConnections();
 
   const tabs = instances.length > 1 && (
-    <nav className="pointer-events-auto flex items-center gap-1">
-      {instances.map((inst) => (
-        <button
-          key={inst.port}
-          onClick={() => setActivePort(inst.port)}
-          className={cn(
-            "max-w-28 truncate rounded-md px-2 py-1 text-[11px] transition-colors",
-            inst.port === activePort
-              ? "bg-secondary text-foreground"
-              : "text-muted-foreground hover:text-foreground",
-          )}
-        >
-          {inst.state?.project || `REAPER :${inst.port}`}
-        </button>
-      ))}
+    // Use a radio group so assistive technology can identify the active REAPER.
+    // Include the port to distinguish instances with the same project name.
+    <nav
+      role="radiogroup"
+      aria-label={t("reaperInstances")}
+      className="pointer-events-auto flex items-center gap-1"
+    >
+      {instances.map((inst) => {
+        const label = inst.state?.project || `REAPER :${inst.port}`;
+        const active = inst.port === activePort;
+        return (
+          <button
+            key={inst.port}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            title={`${label} · :${inst.port}`}
+            onClick={() => setActivePort(inst.port)}
+            className={cn(
+              "max-w-28 truncate rounded-md px-2 py-1 text-[11px] transition-colors",
+              active
+                ? "bg-secondary text-foreground"
+                : "text-muted-foreground hover:text-foreground",
+              focusRing,
+            )}
+          >
+            {label}
+          </button>
+        );
+      })}
     </nav>
   );
 
@@ -50,9 +65,12 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
           onClick={onOpenSettings}
           aria-label={t("settings")}
           title={t("settings")}
-          className="pointer-events-auto rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+          className={cn(
+            "pointer-events-auto rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground",
+            focusRing,
+          )}
         >
-          <Settings2 className="size-4" />
+          <Settings2 className="size-4" aria-hidden="true" />
         </button>
       </div>
     );

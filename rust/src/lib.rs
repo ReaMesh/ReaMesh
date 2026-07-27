@@ -210,6 +210,14 @@ struct SessionInfo {
     session_name: String,
     project_file: String,
     owner: String, // peer id string
+    /// The host's *self-reported* display name and color, carried on the public
+    /// lobby announce so the lobby can say who is hosting before a join (there
+    /// is no presence beacon until after the manifest is accepted). Bound to
+    /// the authenticated signer like everything else in the announce, but the
+    /// values themselves are chosen by the host: the UI must present them as a
+    /// claimed label, never as a verified identity.
+    owner_name: String,
+    owner_color: String,
     /// Whether the session is passphrase-protected, and the per-session salt a
     /// client mixes with the passphrase to reproduce the access token.
     auth: bool,
@@ -219,6 +227,12 @@ struct SessionInfo {
     files: u64,
     bytes: u64,
     last_seen: Instant,
+    /// Set when a *different* peer announced this same session id while the
+    /// first-seen owner's entry was still live. The first-seen owner keeps the
+    /// entry (see the announce handler), and the lobby greys the session out:
+    /// a session id is public, so an impostor can otherwise re-point a card at
+    /// itself simply by announcing faster than the real host.
+    contested: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1270,9 +1284,13 @@ impl Reamesh {
                     "session_name": s.session_name,
                     "project_file": s.project_file,
                     "owner": s.owner,
+                    // Self-reported by the host: a label, not an identity.
+                    "owner_name": s.owner_name,
+                    "owner_color": s.owner_color,
                     "auth": s.auth,
                     "files": s.files,
                     "bytes": s.bytes,
+                    "contested": s.contested,
                 })
             })
             .collect();
@@ -2408,7 +2426,9 @@ async fn run_network(
         }
         sess_topic = Some(t);
     }
-    let announce: Option<Vec<u8>> = hosting.as_ref().map(|h| {
+    // Everything in the announce except the host's profile, which the user can
+    // change mid-session; that half is stamped on at publish time below.
+    let announce_base: Option<JsonValue> = hosting.as_ref().map(|h| {
         json!({
             "kind": "announce",
             "session_id": h.session_id,
@@ -2422,8 +2442,6 @@ async fn run_network(
             "files": h.files.len() as u64,
             "bytes": h.files.iter().map(|f| f.size).sum::<u64>(),
         })
-        .to_string()
-        .into_bytes()
     });
 
     let mut download: Option<Download> = None;
@@ -2719,9 +2737,18 @@ async fn run_network(
                         }
                     }
                 }
-                // Owner: announce the session on the lobby every ~1s.
-                if let (Some(bytes), true) = (&announce, tick_count % 2 == 0) {
-                    let _ = swarm.behaviour_mut().gossipsub.publish(lobby.clone(), bytes.clone());
+                // Owner: announce the session on the lobby every ~1s. The
+                // profile half is stamped on per publish so a name/color change
+                // mid-session reaches the lobby without a re-host.
+                if let (Some(base), true) = (&announce_base, tick_count % 2 == 0) {
+                    let (name, color) = PROFILE.lock().unwrap().clone();
+                    let mut v = base.clone();
+                    v["owner_name"] = json!(name);
+                    v["owner_color"] = json!(color);
+                    let _ = swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(lobby.clone(), v.to_string().into_bytes());
                 }
                 // Everyone: presence beacon on the session topic every ~1s so
                 // peers can show who is here: name, color, focused track,
@@ -2936,19 +2963,54 @@ async fn run_network(
                             let signer_is_owner = message
                                 .source
                                 .is_some_and(|src| src.to_string() == owner);
-                            let info = SessionInfo {
+                            let mut info = SessionInfo {
                                 session_id: get("session_id"),
                                 session_name: get("session_name"),
                                 project_file: get("project_file"),
                                 owner,
+                                owner_name: get("owner_name"),
+                                owner_color: get("owner_color"),
                                 auth: v.get("auth").and_then(|x| x.as_bool()).unwrap_or(false),
                                 salt: get("salt"),
                                 files: v.get("files").and_then(|x| x.as_u64()).unwrap_or(0),
                                 bytes: v.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0),
                                 last_seen: Instant::now(),
+                                contested: false,
                             };
                             if signer_is_owner && !info.session_id.is_empty() {
-                                shared.sessions.lock().unwrap().insert(info.session_id.clone(), info);
+                                let mut sessions = shared.sessions.lock().unwrap();
+                                match sessions.get_mut(&info.session_id) {
+                                    // Pin the first-seen owner. Binding the
+                                    // announce to its signer (above) stops a
+                                    // peer naming *someone else* as owner, but
+                                    // not from naming *itself* under a session
+                                    // id it overheard: the ids are public and
+                                    // last-write-wins would hand the card, and
+                                    // with it the manifest request and the
+                                    // user's trust, to whoever announces last.
+                                    // A re-host always mints a fresh id, so a
+                                    // second owner on a live id is never
+                                    // legitimate: keep the incumbent, flag the
+                                    // clash, and let the lobby say so.
+                                    Some(existing) if existing.owner != info.owner => {
+                                        existing.contested = true;
+                                        existing.last_seen = Instant::now();
+                                        eprintln!(
+                                            "[reamesh] session {} announced by a second peer ({}); keeping the first-seen owner {}",
+                                            info.session_id, info.owner, existing.owner
+                                        );
+                                    }
+                                    Some(existing) => {
+                                        // Same owner: refresh, but a clash once
+                                        // seen stays sticky for the entry's life
+                                        // so the warning can't be raced away.
+                                        info.contested = existing.contested;
+                                        *existing = info;
+                                    }
+                                    None => {
+                                        sessions.insert(info.session_id.clone(), info);
+                                    }
+                                }
                             }
                         }
                     } else if sess_topic.as_ref().is_some_and(|st| message.topic == st.hash()) {

@@ -4,6 +4,7 @@ import ReactDOM from "react-dom/client";
 import "./index.css";
 import "slot-text/style.css";
 import { initLanguage } from "./lib/i18n";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 
 // Two entry points share this bundle. The floating presence HUD is opened as a
 // separate Tauri window pointed at `index.html?overlay=1&port=<n>`; every other
@@ -69,7 +70,9 @@ if (params.get("overlay") === "1") {
       <React.StrictMode>
         {/* Honor the OS "reduce motion" setting for every Motion animation. */}
         <MotionConfig reducedMotion="user">
-          <Overlay port={port} />
+          <ErrorBoundary where="overlay">
+            <Overlay port={port} />
+          </ErrorBoundary>
         </MotionConfig>
       </React.StrictMode>,
     );
@@ -79,7 +82,9 @@ if (params.get("overlay") === "1") {
     root.render(
       <React.StrictMode>
         <MotionConfig reducedMotion="user">
-          <App />
+          <ErrorBoundary>
+            <App />
+          </ErrorBoundary>
         </MotionConfig>
       </React.StrictMode>,
     );

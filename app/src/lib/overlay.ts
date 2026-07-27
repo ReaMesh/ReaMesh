@@ -4,8 +4,12 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
-export function openOverlay(port: number) {
-  invoke("open_overlay", { port }).catch(() => {});
+/** Open (or re-target) the presence HUD for one REAPER instance.
+ *
+ *  `port` selects the roster source. `pid` selects the matching REAPER window
+ *  when multiple instances are open. */
+export function openOverlay(port: number, pid: number | null) {
+  invoke("open_overlay", { port, pid }).catch(() => {});
 }
 
 export function closeOverlay() {

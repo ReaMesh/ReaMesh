@@ -19,16 +19,25 @@ import { send } from "@/lib/connection";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
 import { t } from "@/lib/i18n";
 import { displayName, type ExtState, type Peer } from "@/lib/types";
-import { cn } from "@/lib/utils";
+import { cn, focusRing } from "@/lib/utils";
 
-function PeerRow({ peer, flash }: { peer: Peer; flash?: boolean }) {
+// Forward the ref so popLayout can measure and remove an exiting row from flow.
+function PeerRow({
+  ref,
+  peer,
+  flash,
+  port,
+}: {
+  ref?: React.Ref<HTMLDivElement>;
+  peer: Peer;
+  flash?: boolean;
+  port: number | null;
+}) {
   // Click-to-follow, same as the overlay HUD: only meaningful for someone
   // else who's actually on a track.
   const clickable = !peer.is_self && peer.track != null && peer.track > 0;
-  const reveal = () => send({ cmd: "reveal_peer", peer_id: peer.id });
-  // "While you were away": this peer joined while the window was unfocused;
-  // wash the row in their color once, fading out, so a returning user's eye
-  // lands on who's new.
+  const reveal = () => send({ cmd: "reveal_peer", peer_id: peer.id }, port ?? undefined);
+  // Briefly tint peers who joined while the window was unfocused.
   const [flashScope, animateFlash] = useAnimate();
   useEffect(() => {
     if (!flash || !flashScope.current) return;
@@ -43,6 +52,7 @@ function PeerRow({ peer, flash }: { peer: Peer; flash?: boolean }) {
   }, [flash, peer.color, flashScope, animateFlash]);
   return (
     <motion.div
+      ref={ref}
       layout
       initial={{ opacity: 0, x: -10 }}
       animate={{ opacity: 1, x: 0 }}
@@ -77,8 +87,11 @@ function PeerRow({ peer, flash }: { peer: Peer; flash?: boolean }) {
         {displayName(peer)}
       </span>
       {peer.is_owner && (
-        <span title={t("sessionHost")}>
-          <Crown className="size-3.5 text-amber-400" />
+        // `title` on a bare span is name-prohibited by accname, so the crown
+        // needs real text for the host to be identifiable non-visually.
+        <span title={t("sessionHost")} className="flex shrink-0 items-center">
+          <Crown className="size-3.5 text-amber-400" aria-hidden="true" />
+          <span className="sr-only">{t("sessionHost")}</span>
         </span>
       )}
       {peer.is_self && (
@@ -119,18 +132,42 @@ async function copyText(text: string): Promise<boolean> {
 // (VPN, strict LAN) join this session by pasting it in their Lobby.
 function InviteTicket({ ticket }: { ticket: string }) {
   const [copied, setCopied] = useState(false);
+  // Reveal the code for manual selection if clipboard access fails.
+  const [reveal, setReveal] = useState(false);
   useEffect(() => {
     if (!copied) return;
     const id = setTimeout(() => setCopied(false), 2500);
     return () => clearTimeout(id);
   }, [copied]);
+  if (reveal) {
+    return (
+      <div className="flex shrink-0 flex-col gap-1 self-stretch px-1">
+        <span className="text-[11px] text-muted-foreground">{t("copyInviteFailed")}</span>
+        <textarea
+          readOnly
+          autoFocus
+          aria-label={t("copyInvite")}
+          value={ticket}
+          onFocus={(e) => e.currentTarget.select()}
+          className={cn(
+            "h-14 w-full resize-none rounded-lg bg-secondary p-2 font-mono text-[10px] leading-tight break-all",
+            focusRing,
+          )}
+        />
+      </div>
+    );
+  }
   return (
     <button
       onClick={async () => {
         if (await copyText(ticket)) setCopied(true);
+        else setReveal(true);
       }}
       title={t("inviteTicketHint")}
-      className="flex shrink-0 items-center gap-1.5 self-start px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+      className={cn(
+        "flex shrink-0 items-center gap-1.5 self-start rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground",
+        focusRing,
+      )}
     >
       {/* Morph, don't cut: the checkmark springs in over the ticket icon. */}
       <span className="relative size-3 shrink-0">
@@ -143,7 +180,11 @@ function InviteTicket({ ticket }: { ticket: string }) {
             exit={{ scale: 0.4, opacity: 0 }}
             transition={{ type: "spring", stiffness: 500, damping: 30 }}
           >
-            {copied ? <Check className="size-3" /> : <Ticket className="size-3" />}
+            {copied ? (
+              <Check className="size-3" aria-hidden="true" />
+            ) : (
+              <Ticket className="size-3" aria-hidden="true" />
+            )}
           </motion.span>
         </AnimatePresence>
       </span>
@@ -163,9 +204,17 @@ function HostPassword({ pass }: { pass: string }) {
   return (
     <button
       onClick={() => setShown((v) => !v)}
-      className="flex shrink-0 items-center gap-1.5 self-start px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+      aria-expanded={shown}
+      className={cn(
+        "flex shrink-0 items-center gap-1.5 self-start rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground",
+        focusRing,
+      )}
     >
-      {shown ? <EyeOff className="size-3" /> : <Eye className="size-3" />}
+      {shown ? (
+        <EyeOff className="size-3" aria-hidden="true" />
+      ) : (
+        <Eye className="size-3" aria-hidden="true" />
+      )}
       {shown ? (
         <span className="font-mono">{pass}</span>
       ) : (
@@ -192,13 +241,17 @@ export function Session({
   const leave = () => {
     setConfirmStop(false);
     forgetHostPass(port);
-    send({ cmd: "leave" });
+    send({ cmd: "leave" }, port ?? undefined);
   };
   // Confirm only when stopping the session would disconnect other people.
   const requestLeave = () => {
     if (hosting && others > 0) setConfirmStop(true);
     else leave();
   };
+  // Close the confirmation if the last guest leaves while it is open.
+  useEffect(() => {
+    if (confirmStop && others <= 0) setConfirmStop(false);
+  }, [confirmStop, others]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
@@ -223,13 +276,19 @@ export function Session({
             }
           />
         </h3>
-        <ScrollArea className="min-h-0 rounded-xl bg-card p-2">
-          {/* initial={false} suppresses entrance animations for people
-              already present when the screen mounts (they fade in with the
-              whole screen), while later join/leave still animate. */}
+        <ScrollArea
+          className="min-h-0 rounded-xl bg-card p-2"
+          aria-label={t("peopleList")}
+        >
+          {/* Animate later roster changes, but not the initial peer list. */}
           <AnimatePresence mode="popLayout" initial={false}>
             {state.peers.map((p) => (
-              <PeerRow key={p.id} peer={p} flash={flashPeers.includes(p.id)} />
+              <PeerRow
+                key={p.id}
+                peer={p}
+                flash={flashPeers.includes(p.id)}
+                port={port}
+              />
             ))}
           </AnimatePresence>
         </ScrollArea>
@@ -256,7 +315,7 @@ export function Session({
         <DialogContent className="max-w-[340px] gap-4 rounded-2xl">
           <DialogHeader>
             <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-amber-500/15 sm:mx-0">
-              <TriangleAlert className="size-5 text-amber-500" />
+              <TriangleAlert className="size-5 text-amber-500" aria-hidden="true" />
             </div>
             <DialogTitle className="text-[15px]">{t("stopHostingTitle")}</DialogTitle>
             <DialogDescription className="text-[13px] leading-relaxed">

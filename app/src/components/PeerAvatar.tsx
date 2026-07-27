@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils";
+import { inkFor } from "@/lib/colors";
 import { displayName, initials, type Peer } from "@/lib/types";
 
 // Use the presence beacon's color so each peer looks consistent across
@@ -20,11 +21,14 @@ export function PeerAvatar({
   return (
     <div
       className={cn(
-        "flex shrink-0 items-center justify-center rounded-full font-semibold text-black/80",
+        "flex shrink-0 items-center justify-center rounded-full font-semibold",
         sizes[size],
         className,
       )}
-      style={{ backgroundColor: peer.color }}
+      // Ink chosen from the background rather than fixed: peer colours are not
+      // limited to the app's palette (the beacon carries any hex, and the
+      // extension derives an arbitrary hue from the peer id when it's unset).
+      style={{ backgroundColor: peer.color, color: inkFor(peer.color) }}
       title={displayName(peer)}
     >
       {initials(displayName(peer))}

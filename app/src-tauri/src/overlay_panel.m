@@ -46,6 +46,7 @@ static const NSTimeInterval kDragPause = 0.25; // suspend follow during a drag
 @property (assign) BOOL isProgrammaticMove;
 @property (assign) BOOL visible;
 @property (assign) NSTimeInterval followPausedUntil;
+@property (assign) pid_t pinnedReaperPID; // the instance this HUD belongs to; 0 = any
 @property (assign) pid_t cachedReaperPID;
 @property (assign) CGWindowID cachedWindowID; // REAPER's main window, re-resolved when stale
 @property (assign) NSTimeInterval nextWindowScan; // throttle for failed full scans
@@ -59,6 +60,8 @@ static ReaMeshOverlayController *gOverlay = nil;
 #pragma mark - REAPER lookup
 
 - (pid_t)reaperPID {
+    // Follow the same REAPER instance that supplies the HUD roster.
+    if (self.pinnedReaperPID > 0) return self.pinnedReaperPID;
     if (self.cachedReaperPID > 0) return self.cachedReaperPID;
     for (NSRunningApplication *a in [[NSWorkspace sharedWorkspace] runningApplications]) {
         if ([a.bundleIdentifier isEqualToString:kReaperBundleId]) {
@@ -71,6 +74,7 @@ static ReaMeshOverlayController *gOverlay = nil;
 
 - (BOOL)reaperFrontmost {
     NSRunningApplication *front = [[NSWorkspace sharedWorkspace] frontmostApplication];
+    if (self.pinnedReaperPID > 0) return front.processIdentifier == self.pinnedReaperPID;
     return [front.bundleIdentifier isEqualToString:kReaperBundleId];
 }
 
@@ -383,16 +387,22 @@ static ReaMeshOverlayController *gOverlay = nil;
 
 #pragma mark - C ABI
 
-void reamesh_overlay_attach(void *ns_window, double width) {
+void reamesh_overlay_attach(void *ns_window, double width, int reaper_pid) {
     (void)width; // width is fixed by the webview; kept in the ABI for symmetry
     if (!ns_window) return;
     NSWindow *window = (__bridge NSWindow *)ns_window;
     if (!gOverlay) gOverlay = [[ReaMeshOverlayController alloc] init];
-    [gOverlay attachToWindow:window];
+    // 0 means "unknown" (an extension too old to report its pid): fall back to
+    // the first-found REAPER, which is what this did before.
+    gOverlay.pinnedReaperPID = reaper_pid > 0 ? (pid_t)reaper_pid : 0;
+    [gOverlay attachToWindow:window]; // clears the pid/window caches itself
 }
 
 void reamesh_overlay_detach(void) {
-    if (gOverlay) [gOverlay detach];
+    if (gOverlay) {
+        gOverlay.pinnedReaperPID = 0;
+        [gOverlay detach];
+    }
 }
 
 // Whether REAPER is the frontmost app right now. The Rust side asks before

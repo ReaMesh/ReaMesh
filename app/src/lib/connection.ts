@@ -13,6 +13,11 @@ import { getOverlaySettings, subscribeOverlaySettings } from "./overlaySettings"
 
 const ALL_PORTS = [47415, 47416, 47417, 47418];
 const RETRY_MS = 2000;
+/** Retry unused ports less often after repeated refusals. This avoids
+ *  unnecessary wakeups and loopback TIME_WAIT entries when fewer than four
+ *  REAPER instances are running. */
+const BACKOFF_AFTER = 3;
+const BACKOFF_MS = 10000;
 
 // VITE_CTL_PORT pins this window to one REAPER instance. Without it,
 // scan all control ports and offer an instance switcher.
@@ -30,6 +35,27 @@ let activePort: number | null = null;
 let snapshot: StoreState = { instances: [], activePort: null };
 const listeners = new Set<() => void>();
 let started = false;
+/** Consecutive failed connects per port, and the wall-clock time we may next
+ *  retry it. Reset the moment a port answers. */
+const failures = new Map<number, { count: number; nextAt: number }>();
+
+/** A `state` frame, with the array fields forced to arrays.
+ *
+ *  The frame is JSON from another process that ships and versions separately:
+ *  an older or newer extension, a partial publish, a renamed field. Everything
+ *  downstream reads `state.peers`, `state.sessions` and `state.log` without
+ *  guarding, and an uncaught render throw takes the whole window down to a grey
+ *  rectangle with no way to reload (see components/ErrorBoundary). The boundary
+ *  is the backstop; this is the part that keeps skew from reaching it at all. */
+function normalizeState(msg: Record<string, unknown>): ExtState {
+  const arr = <T,>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
+  return {
+    ...(msg as unknown as ExtState),
+    peers: arr(msg.peers),
+    sessions: arr(msg.sessions),
+    log: arr(msg.log),
+  };
+}
 
 function emit() {
   // Stable instance order (by port) so the UI never reshuffles.
@@ -48,15 +74,19 @@ function ensureActive() {
 
 function connect(port: number) {
   if (sockets.has(port)) return;
+  const fail = failures.get(port);
+  if (fail && fail.count >= BACKOFF_AFTER && Date.now() < fail.nextAt) return;
   let ws: WebSocket;
   try {
     ws = new WebSocket(`ws://127.0.0.1:${port}`);
   } catch {
+    noteFailure(port);
     return;
   }
   sockets.set(port, ws);
 
   ws.onopen = () => {
+    failures.delete(port);
     live.set(port, { port });
     ensureActive();
     sendProfile(port);
@@ -74,7 +104,7 @@ function connect(port: number) {
     if (msg.type === "hello") {
       inst.pid = Number(msg.pid) || undefined;
     } else if (msg.type === "state") {
-      inst.state = msg as unknown as ExtState;
+      inst.state = normalizeState(msg);
     } else if (msg.type === "busy") {
       // Watchdog from the control server: REAPER's main thread stopped
       // ticking (usually a modal dialog waiting for an answer over there).
@@ -86,12 +116,22 @@ function connect(port: number) {
   };
   ws.onclose = () => {
     sockets.delete(port);
+    // Only a port that never answered counts toward the backoff; an instance
+    // that was live and went away deserves the fast cadence back.
     if (live.delete(port)) {
+      failures.delete(port);
       ensureActive();
       emit();
+    } else {
+      noteFailure(port);
     }
   };
   ws.onerror = () => ws.close();
+}
+
+function noteFailure(port: number) {
+  const count = (failures.get(port)?.count ?? 0) + 1;
+  failures.set(port, { count, nextAt: Date.now() + BACKOFF_MS });
 }
 
 export function startScanning() {

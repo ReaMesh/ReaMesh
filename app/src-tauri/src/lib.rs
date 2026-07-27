@@ -5,6 +5,7 @@
 // UserPlugins folder, and the native menu (Settings…).
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Manager};
@@ -470,22 +471,29 @@ const OVERLAY_WIDTH: f64 = 232.0;
 /// Open the frameless presence HUD without stealing focus from REAPER. `port`
 /// selects the same control server as the main window.
 #[tauri::command]
-// `async` is load-bearing on Windows. A synchronous Tauri command runs on the
-// main thread, and building a window from there deadlocks: the builder posts
-// the creation to the event loop and blocks waiting for it, but the event loop
-// *is* the thread it just blocked. The window appears and the command never
-// returns, so the overlay was created but never attached, positioned or
-// hidden, and the frontend's `.catch()` saw nothing because no error was ever
-// produced. Marking the command async moves it off the main thread.
-async fn open_overlay(app: AppHandle, port: u16) -> Result<(), String> {
-    ensure_hud_overlay(&app, port)
+// Keep this command async. On Windows, the window builder waits for the
+// event loop to create the window; calling it on the main thread deadlocks.
+async fn open_overlay(app: AppHandle, port: u16, pid: Option<u32>) -> Result<(), String> {
+    ensure_hud_overlay(&app, port, pid.unwrap_or(0))
 }
 
+/// The port the currently-open HUD window was built for. The port is baked into
+/// the window's URL, so re-targeting it means rebuilding it.
+static OVERLAY_PORT: AtomicU16 = AtomicU16::new(0);
+
 /// The top-right HUD window (roster + click-to-follow).
-fn ensure_hud_overlay(app: &AppHandle, port: u16) -> Result<(), String> {
+fn ensure_hud_overlay(app: &AppHandle, port: u16, pid: u32) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("overlay") {
-        let _ = win.show();
-        return Ok(());
+        if OVERLAY_PORT.load(Ordering::SeqCst) == port {
+            let _ = win.show();
+            return Ok(());
+        }
+        // Different instance: the existing window is still wired to the
+        // previous REAPER's control server (and, on Windows, following its
+        // process). Tear it down so the build below binds to the new one.
+        // Switching between two instances that are both in a session never
+        // passes through a state where the frontend closes it for us.
+        close_hud_overlay(app);
     }
     let url = format!("index.html?overlay=1&port={port}");
     let win = tauri::WebviewWindowBuilder::new(app, "overlay", tauri::WebviewUrl::App(url.into()))
@@ -509,25 +517,32 @@ fn ensure_hud_overlay(app: &AppHandle, port: u16) -> Result<(), String> {
     // now owned natively (no manual parking here).
     #[cfg(target_os = "macos")]
     {
-        let _ = app.run_on_main_thread(move || native_overlay::attach(&win));
+        let _ = app.run_on_main_thread(move || native_overlay::attach(&win, pid));
     }
     // Win32 window calls are thread-safe, so this needs no main-thread hop.
     #[cfg(target_os = "windows")]
     {
         if let Ok(hwnd) = win.hwnd() {
-            overlay_panel_win::attach(hwnd.0 as isize, win.scale_factor().unwrap_or(1.0));
+            overlay_panel_win::attach(hwnd.0 as isize, win.scale_factor().unwrap_or(1.0), pid);
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = &win;
+        let _ = (&win, pid);
     }
+    OVERLAY_PORT.store(port, Ordering::SeqCst);
     Ok(())
 }
 
 /// Close the presence overlay (on leaving/stopping a session).
 #[tauri::command]
 fn close_overlay(app: AppHandle) -> Result<(), String> {
+    close_hud_overlay(&app);
+    Ok(())
+}
+
+fn close_hud_overlay(app: &AppHandle) {
+    OVERLAY_PORT.store(0, Ordering::SeqCst);
     let hud = app.get_webview_window("overlay");
     // Stop the follow timer / observers before the window goes away, in the same
     // main-thread hop so detach always precedes close.
@@ -548,7 +563,6 @@ fn close_overlay(app: AppHandle) -> Result<(), String> {
             let _ = w.close();
         }
     }
-    Ok(())
 }
 
 // ---------- join attention ----------
@@ -570,7 +584,15 @@ fn frontmost_is_reaper() -> bool {
 }
 
 /// Without a native frontmost check, only the webview's focus gate applies.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn frontmost_is_reaper() -> bool {
+    // Not the pinned-pid variant: this gate asks whether the user can see *a*
+    // REAPER (and therefore the roster HUD floating over it), not whether it is
+    // the instance the app currently has selected.
+    overlay_panel_win::any_reaper_is_foreground()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn frontmost_is_reaper() -> bool {
     false
 }
@@ -1010,13 +1032,15 @@ mod native_overlay {
     use tauri::WebviewWindow;
 
     extern "C" {
-        fn reamesh_overlay_attach(ns_window: *mut c_void, width: f64);
+        fn reamesh_overlay_attach(ns_window: *mut c_void, width: f64, reaper_pid: i32);
         fn reamesh_overlay_detach();
     }
 
-    pub fn attach(win: &WebviewWindow) {
+    /// `reaper_pid` pins the HUD to one REAPER instance (0 = follow whichever
+    /// one is found first, the pre-instance-switcher behaviour).
+    pub fn attach(win: &WebviewWindow, reaper_pid: u32) {
         if let Ok(ns) = win.ns_window() {
-            unsafe { reamesh_overlay_attach(ns, super::OVERLAY_WIDTH) };
+            unsafe { reamesh_overlay_attach(ns, super::OVERLAY_WIDTH, reaper_pid as i32) };
         }
     }
 
