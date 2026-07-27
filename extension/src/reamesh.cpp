@@ -392,6 +392,25 @@ static bool isVolatileChunkLine(std::string_view trimmed) {
          trimmed.rfind("ARM ", 0) == 0 || trimmed.rfind("VIS ", 0) == 0;
 }
 
+// REAPER writes media paths with the platform's separator, so an item captured
+// on Windows carries `FILE "Media\take.wav"`. macOS cannot resolve that at all
+// on POSIX a backslash is an ordinary filename character, not a separator:
+// so every item from a Windows host would land with dead media. Forward
+// slashes work on both, so that is what goes on the wire. Windows REAPER
+// re-serializes them back to backslashes locally, and this normalizes them
+// away again on the next capture, so the round trip stays byte-stable.
+//
+// Only the quoted path is touched: the rest of a chunk (base64 FX state in
+// particular) must survive verbatim.
+static std::string normalizeFilePathLine(std::string_view line) {
+  std::string out(line);
+  const size_t q1 = out.find('"');
+  const size_t q2 = out.rfind('"');
+  if (q1 == std::string::npos || q2 <= q1) return out;
+  std::replace(out.begin() + q1 + 1, out.begin() + q2, '\\', '/');
+  return out;
+}
+
 static std::string normalizeChunk(const std::string& chunk) {
   std::string out;
   out.reserve(chunk.size());
@@ -406,8 +425,12 @@ static std::string normalizeChunk(const std::string& chunk) {
     // and the two would overwrite each other forever. LF-only on the wire:
     // REAPER's parser accepts either on apply, so this round-trips stably.
     if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-    if (!isVolatileChunkLine(ltrim(line))) {
-      out.append(line);
+    const std::string_view trimmed = ltrim(line);
+    if (!isVolatileChunkLine(trimmed)) {
+      if (trimmed.rfind("FILE \"", 0) == 0)
+        out.append(normalizeFilePathLine(line));
+      else
+        out.append(line);
       out.push_back('\n');
     }
     pos = eol + 1;

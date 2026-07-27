@@ -95,6 +95,20 @@ int main() {
   // apply -> recapture cannot drift.
   assert(normalizeChunk(norm) == norm);
 
+  // Windows media paths must reach the wire with forward slashes: macOS treats
+  // a backslash as an ordinary filename character, so it could not resolve
+  // them at all. Only the quoted path is rewritten: base64 FX state and
+  // anything else on the line survives verbatim.
+  const std::string winPaths =
+      "  <SOURCE WAVE\n"
+      "    FILE \"Media\\Drums\\kick.wav\" 1\n"
+      "  >\n"
+      "  DATA \"a\\\\b/c==\"\n";
+  const std::string normWin = normalizeChunk(winPaths);
+  assert(normWin.find("FILE \"Media/Drums/kick.wav\" 1") != std::string::npos);
+  assert(normWin.find("DATA \"a\\\\b/c==\"") != std::string::npos);  // untouched
+  assert(normalizeChunk(normWin) == normWin);                       // still idempotent
+
   // extractTrackBlocks pulls all synced parts, not items.
   TrackBlocks blocks = extractTrackBlocks(norm);
   assert(blocks.fxchain.find("<FXCHAIN") == 0 || blocks.fxchain.find("  <FXCHAIN") == 0);
