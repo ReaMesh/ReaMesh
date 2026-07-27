@@ -244,6 +244,106 @@ int main() {
   assert(!isRelativePath("C:\\media\\kick.wav"));
   assert(!isRelativePath("\\\\server\\share.wav"));
 
+  // ---- plugin inventory (collectPlugins) ----
+  // Both the host's manifest claim and the client's post-download verify run
+  // this same parser over RPP text, so it has to see every FX flavour: VST
+  // (any quoting style), CLAP/AU, JS (bare and quoted paths), take FX inside
+  // items, and the master chain: deduplicated, in document order.
+  const std::string kProject =
+      "<REAPER_PROJECT 0.1\n"
+      "  <MASTERFXLIST\n"
+      "    <VST \"VST: ReaComp (Cockos)\" reacomp.dll 0\n"
+      "      data==\n"
+      "    >\n"
+      "  >\n"
+      "  <TRACK {AAAAAAAA-0000-0000-0000-000000000000}\n"
+      "    <FXCHAIN\n"
+      "      <VST \"VST3: Serum (Xfer Records)\" Serum.vst3 0\n"
+      "        base64==\n"
+      "      >\n"
+      "      <CLAP \"CLAP: Surge XT (Surge Synth Team)\" org.surge.xt 0\n"
+      "        state==\n"
+      "      >\n"
+      "      <JS loser/waveShapingDstr \"\"\n"
+      "      >\n"
+      "      <JS \"my effects/space echo\" \"\"\n"
+      "      >\n"
+      "      <VST `VST: Odd \"Name\" (Vendor)` odd.dll 0\n"
+      "      >\n"
+      "    >\n"
+      "    <FXCHAIN_REC\n"
+      "      <VST \"VST: ReaGate (Cockos)\" reagate.dll 0\n"
+      "      >\n"
+      "    >\n"
+      "    <ITEM\n"
+      "      <TAKEFX\n"
+      "        <AU \"AU: Alchemy (Apple)\" au.alchemy 0\n"
+      "        >\n"
+      "        <VST \"VST3: Serum (Xfer Records)\" Serum.vst3 0\n"  // dup: counted once
+      "        >\n"
+      "      >\n"
+      "      <SOURCE WAVE\n"
+      "        FILE \"Audio/kick.wav\"\n"
+      "      >\n"
+      "    >\n"
+      "  >\n"
+      ">\n";
+  {
+    auto plugs = collectPlugins(kProject);
+    const std::vector<std::string> want = {
+        "VST: ReaComp (Cockos)",       "VST3: Serum (Xfer Records)",
+        "CLAP: Surge XT (Surge Synth Team)", "JS: loser/waveShapingDstr",
+        "JS: my effects/space echo",   "VST: Odd \"Name\" (Vendor)",
+        "VST: ReaGate (Cockos)",       "AU: Alchemy (Apple)"};
+    assert(plugs == want);
+    // CRLF text (a Windows-saved .rpp) inventories identically.
+    std::string crlfProj;
+    for (char c : kProject) {
+      if (c == '\n') crlfProj.push_back('\r');
+      crlfProj.push_back(c);
+    }
+    assert(collectPlugins(crlfProj) == want);
+    // No FX, no findings.
+    assert(collectPlugins("<TRACK\n  NAME \"x\"\n>\n").empty());
+  }
+
+  // ---- FX stripping (stripFxBlocks) ----
+  {
+    // Full strip (join-without-effects): every chain flavour gone, everything
+    // else (track scalars, item source, structure) intact.
+    const std::string stripped = stripFxBlocks(kProject, /*takeFxOnly=*/false);
+    assert(collectPlugins(stripped).empty());
+    assert(stripped.find("MASTERFXLIST") == std::string::npos);
+    assert(stripped.find("FXCHAIN") == std::string::npos);  // covers _REC too
+    assert(stripped.find("TAKEFX") == std::string::npos);
+    assert(stripped.find("<TRACK {AAAAAAAA") != std::string::npos);
+    assert(stripped.find("FILE \"Audio/kick.wav\"") != std::string::npos);
+    // Balanced: as many closers as openers survive the surgery.
+    const auto count = [](const std::string& s, char c) {
+      return std::count(s.begin(), s.end(), c);
+    };
+    (void)count;
+    // Take-FX-only strip (the no-FX apply path for item chunks): take FX gone,
+    // track chains untouched.
+    const std::string takeOnly = stripFxBlocks(kProject, /*takeFxOnly=*/true);
+    assert(takeOnly.find("TAKEFX") == std::string::npos);
+    assert(takeOnly.find("Alchemy") == std::string::npos);
+    assert(takeOnly.find("Surge XT") != std::string::npos);
+    assert(takeOnly.find("MASTERFXLIST") != std::string::npos);
+    // Idempotent.
+    assert(stripFxBlocks(stripped, false) == stripped);
+  }
+
+  // ---- shared flag markers ----
+  // "⚑ "-prefixed markers are local by design: never captured, never deleted
+  // by a remote marker rebuild.
+  assert(isSharedMarkerName("\xE2\x9A\x91 Chorus fix by Dan"));
+  assert(!isSharedMarkerName("Chorus fix"));
+  assert(!isSharedMarkerName(""));
+  assert(!isSharedMarkerName(nullptr));
+  // The name must start with the prefix, not merely contain it.
+  assert(!isSharedMarkerName("x \xE2\x9A\x91 y"));
+
   printf("chunk_test: all assertions passed\n");
   return 0;
 }

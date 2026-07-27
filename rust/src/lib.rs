@@ -113,6 +113,18 @@ const TAG_LOCKS: u8 = b'L';
 const TAG_PRESENCE: u8 = b'N';
 /// Presence entries not refreshed within this window are dropped.
 const PRESENCE_STALE: Duration = Duration::from_secs(8);
+/// Shared (non-synced) marker: `'M'` + JSON `{"name","pos","by","color","mac"}`,
+/// published once when a user shares a flag marker from the roster bar. Every
+/// receiver drops a *local* marker into its project: deliberately outside the
+/// synced marker list, so each person can keep or delete it independently.
+/// Authenticated exactly like a presence beacon (token-keyed MAC over the
+/// sender's peer id), so open-topic bystanders can't inject markers.
+const TAG_MARKER: u8 = b'M';
+/// If the extension's main-thread presence feed (`set_presence`, called every
+/// timer tick) has been silent this long while the network thread still runs,
+/// REAPER's main thread is stuck (modal dialog, plugin hang): the beacon
+/// carries that as `frozen` so peers' rosters can say so.
+const MAIN_THREAD_STALE: Duration = Duration::from_secs(4);
 /// Session farewell: published by the owner right before it stops hosting so
 /// clients end cleanly instead of waiting out a silence.
 const TAG_SESSION_END: u8 = b'E';
@@ -187,6 +199,12 @@ enum XferResponse {
         session_name: String,
         project_file: String,
         files: Vec<FileMeta>,
+        /// Host-reported session meta JSON ("" when the host never set one):
+        /// track count + the plugin list parsed from the served .rpp. Shown in
+        /// the joiner's trust dialog and checked against the actually-received
+        /// project before it opens. `default` keeps older peers decodable.
+        #[serde(default)]
+        meta: String,
     },
     /// Response to `File`: `size` is the file's full *uncompressed* length so
     /// the requester knows when it is done; `data` is one chunk, zstd-deflated
@@ -412,12 +430,26 @@ struct Shared {
     /// too. Carries the holder id for the "X is editing this" notice.
     force_revert: Mutex<Vec<(FieldKey, String)>>,
     /// Result of the latest passphrase pre-check (`check_passphrase`):
-    /// `(session_id, Some(ok))` once it resolves, `(session_id, None)` while in
-    /// flight, `None` when no probe is active. Lets the app validate a
-    /// passphrase against the owner *before* it shows the trust dialog or starts
-    /// the download, so a wrong passphrase shows an inline error in the input
-    /// instead of flashing the whole join animation.
-    probe_result: Mutex<Option<(String, Option<bool>)>>,
+    /// `(session_id, Some(ok), preview)` once it resolves, `(session_id, None,
+    /// Null)` while in flight, `None` when no probe is active. Lets the app
+    /// validate a passphrase against the owner *before* it shows the trust
+    /// dialog or starts the download, so a wrong passphrase shows an inline
+    /// error in the input instead of flashing the whole join animation. On
+    /// success `preview` carries what a join would mean, straight from the
+    /// owner's manifest: file count, total bytes, project file name, and the
+    /// host-reported session meta (track count + plugin list): everything the
+    /// trust dialog shows. All of it is *host-reported*: the UI labels it as a
+    /// claim, and the post-download verify checks the plugin part for real.
+    probe_result: Mutex<Option<(String, Option<bool>, JsonValue)>>,
+    /// The session meta blob for the current session: what this owner set via
+    /// `set_session_meta`, or (on a client) what the owner's manifest claimed.
+    /// The extension reads it back after the download to verify the received
+    /// project against the claim before opening it.
+    session_meta: Mutex<String>,
+    /// Shared markers received from peers ('M' messages), queued for the
+    /// extension to drain on its main-thread tick and drop into the project as
+    /// local, non-synced markers.
+    marker_inbox: Mutex<Vec<JsonValue>>,
 }
 
 #[derive(Clone, Debug)]
@@ -434,6 +466,14 @@ struct PeerPresence {
     /// it so the follower lands with the same zoom + scroll. 0/0 = unknown.
     v0: f64,
     v1: f64,
+    /// Whether this peer's transport is rolling (drives follow mode).
+    playing: bool,
+    /// Peer id this peer is following ("" = nobody): the followed person's
+    /// roster shows "someone is following you" from this.
+    follow: String,
+    /// This peer's REAPER main thread has stopped feeding presence while its
+    /// network thread still beacons: i.e. their REAPER isn't responding.
+    frozen: bool,
     last_seen: Instant,
 }
 
@@ -466,6 +506,12 @@ struct LivePresence {
     /// reproduce this peer's zoom + scroll, not just centre on their cursor.
     v0: f64,
     v1: f64,
+    /// Whether the transport is rolling: follow mode mirrors the followed
+    /// peer's transport, so "playing" has to ride the beacon, not be inferred.
+    playing: bool,
+    /// Peer id this user is currently *following* ("" = nobody). Broadcast so
+    /// the followed person's roster can show "someone is following you".
+    follow: String,
 }
 
 static LIVE: Mutex<LivePresence> = Mutex::new(LivePresence {
@@ -473,7 +519,25 @@ static LIVE: Mutex<LivePresence> = Mutex::new(LivePresence {
     play: 0.0,
     v0: 0.0,
     v1: 0.0,
+    playing: false,
+    follow: String::new(),
 });
+
+/// Last time the extension's main-thread tick fed us presence. The network
+/// thread keeps beaconing while REAPER's main thread is stuck, so the gap
+/// between "beacons still flowing" and "presence feed silent" is exactly the
+/// "REAPER isn't responding" signal peers show in their rosters.
+static PRESENCE_TOUCH: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Whether the extension's main-thread presence feed has gone quiet (see
+/// `MAIN_THREAD_STALE`). `false` until the first tick ever lands: an extension
+/// that hasn't started feeding presence isn't frozen, just early.
+fn main_thread_stale() -> bool {
+    PRESENCE_TOUCH
+        .lock()
+        .unwrap()
+        .is_some_and(|t| t.elapsed() > MAIN_THREAD_STALE)
+}
 
 pub fn set_focus(guid: &str) {
     LIVE.lock().unwrap().focus = guid.chars().take(64).collect();
@@ -482,6 +546,8 @@ pub fn set_focus(guid: &str) {
 /// Replace the live presence from a JSON blob the extension composes each tick:
 /// `{"focus","play"}`. Any missing field resets to its empty/zero default.
 pub fn set_presence(json: &str) {
+    // Touch even on unparseable input: any call proves the main thread ticks.
+    *PRESENCE_TOUCH.lock().unwrap() = Some(Instant::now());
     let Ok(v) = serde_json::from_str::<JsonValue>(json) else {
         return;
     };
@@ -496,6 +562,95 @@ pub fn set_presence(json: &str) {
     p.play = v.get("play").and_then(|x| x.as_f64()).unwrap_or(0.0);
     p.v0 = v.get("v0").and_then(|x| x.as_f64()).unwrap_or(0.0);
     p.v1 = v.get("v1").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    p.playing = v.get("playing").and_then(|x| x.as_bool()).unwrap_or(false);
+    p.follow = v
+        .get("follow")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(128)
+        .collect();
+}
+
+// ---------- persistent network identity ----------
+//
+// Historically every host/join/browse built its swarm with a fresh ed25519
+// keypair, so "who is this peer" changed constantly: nothing could be
+// remembered about a host across restarts, invite tickets died with the
+// hosting run's identity, and a future blocklist/kick had nothing to bind to.
+// When the extension registers a path here (per REAPER install, under the
+// resource dir), the keypair is persisted there and every later swarm start
+// reuses it. Deliberately opt-in: the in-process test suite spins up many
+// peers in one process, and they must NOT share one identity. A lasting
+// identity is also a lasting tracker broadcast on the LAN, so it is per-install
+// and resettable (`reset_identity` deletes the file; the next session start
+// mints a fresh one).
+
+static IDENTITY_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+pub fn set_identity_path(path: &str) {
+    if path.is_empty() {
+        return;
+    }
+    *IDENTITY_PATH.lock().unwrap() = Some(PathBuf::from(path));
+}
+
+/// Delete the persisted identity (if any). The current session keeps its
+/// identity until it ends; the next swarm start generates and persists a new
+/// keypair. Returns whether a stored identity existed.
+pub fn reset_identity() -> bool {
+    let path = IDENTITY_PATH.lock().unwrap().clone();
+    match path {
+        Some(p) => fs::remove_file(p).is_ok(),
+        None => false,
+    }
+}
+
+/// The keypair every swarm starts with: the persisted per-install identity
+/// when a path is registered (created on first use), else a fresh ephemeral
+/// one (tests, or an extension that never registered a path).
+fn identity_keypair() -> libp2p::identity::Keypair {
+    let path = IDENTITY_PATH.lock().unwrap().clone();
+    match path {
+        Some(p) => load_or_create_identity_at(&p),
+        None => libp2p::identity::Keypair::generate_ed25519(),
+    }
+}
+
+/// Load the keypair stored at `path`, or mint + persist a fresh one there.
+/// Kept free of the `IDENTITY_PATH` global so it is unit-testable without
+/// contaminating the in-process network tests (which must each get their own
+/// ephemeral identity).
+fn load_or_create_identity_at(path: &Path) -> libp2p::identity::Keypair {
+    if let Ok(bytes) = fs::read(path)
+        && let Ok(kp) = libp2p::identity::Keypair::from_protobuf_encoding(&bytes)
+    {
+        return kp;
+    }
+    let kp = libp2p::identity::Keypair::generate_ed25519();
+    let persist = || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = kp
+            .to_protobuf_encoding()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        fs::write(path, bytes)?;
+        // The file is this install's network identity; keep it out of other
+        // users' reach where the OS supports it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    };
+    if let Err(e) = persist() {
+        eprintln!("[reamesh] could not persist identity to {}: {e}", path.display());
+    } else {
+        eprintln!("[reamesh] new persistent identity at {}", path.display());
+    }
+    kp
 }
 
 /// Stable fallback identity color for a peer that never told us one: a
@@ -807,6 +962,13 @@ enum Command {
     /// with an unhashed manifest so `host()` returns instantly (hashing a
     /// multi-GB project would otherwise freeze REAPER's main thread).
     ManifestReady(Vec<FileMeta>),
+    /// Owner-side: replace the manifest's session-meta blob (track count +
+    /// plugin list). Computed by the extension when hosting starts and again
+    /// when the served project file changes on disk.
+    SetMeta(String),
+    /// Share a flag marker with every session peer (one 'M' publish). The
+    /// sharer's display name and color are stamped on from the live profile.
+    ShareMarker { name: String, pos: f64 },
     Shutdown,
 }
 
@@ -820,6 +982,11 @@ struct Hosting {
     /// is required at all. The secret token itself lives in `Shared::auth_token`.
     salt: String,
     auth: bool,
+    /// Host-computed session meta JSON (track count + plugin list, parsed from
+    /// the served .rpp by the extension) carried on the manifest so a joiner's
+    /// trust dialog can say what a join loads *before* any download. "" until
+    /// the extension supplies it.
+    meta: String,
 }
 
 struct NetConfig {
@@ -872,6 +1039,7 @@ impl Reamesh {
             files,
             salt,
             auth: !passphrase.is_empty(),
+            meta: String::new(),
         };
         let status = StatusState {
             state: "hosting".into(),
@@ -979,6 +1147,8 @@ impl Reamesh {
             peer_locks: Mutex::new(HashMap::new()),
             force_revert: Mutex::new(Vec::new()),
             probe_result: Mutex::new(None),
+            session_meta: Mutex::new(String::new()),
+            marker_inbox: Mutex::new(Vec::new()),
         });
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (init_tx, init_rx) = std_mpsc::channel();
@@ -1394,7 +1564,8 @@ impl Reamesh {
         let Some(info) = parse_ticket(ticket) else {
             return false;
         };
-        *self.shared.probe_result.lock().unwrap() = Some((info.session_id.clone(), None));
+        *self.shared.probe_result.lock().unwrap() =
+            Some((info.session_id.clone(), None, JsonValue::Null));
         self.cmd_tx
             .send(Command::JoinTicket {
                 info,
@@ -1417,13 +1588,58 @@ impl Reamesh {
             return false;
         }
         // Mark the probe in flight so the app can show "checking…".
-        *self.shared.probe_result.lock().unwrap() = Some((session_id.to_string(), None));
+        *self.shared.probe_result.lock().unwrap() =
+            Some((session_id.to_string(), None, JsonValue::Null));
         self.cmd_tx
             .send(Command::ProbeAuth {
                 session_id: session_id.to_string(),
                 passphrase: passphrase.to_string(),
             })
             .is_ok()
+    }
+
+    /// Set the session-meta blob the manifest carries (owner only, but stored
+    /// unconditionally so `session_meta_json` reads back what was set).
+    pub fn set_session_meta(&self, meta: &str) {
+        let clipped: String = meta.chars().take(256 * 1024).collect();
+        *self.shared.session_meta.lock().unwrap() = clipped.clone();
+        let _ = self.cmd_tx.send(Command::SetMeta(clipped));
+    }
+
+    /// The current session's meta blob: what this owner set, or what the
+    /// owner's manifest claimed (client). "" when none is known.
+    pub fn session_meta_json(&self) -> String {
+        self.shared.session_meta.lock().unwrap().clone()
+    }
+
+    /// Share a flag marker with every session peer: `{"name","pos"}`. The
+    /// sharer's profile name/color are stamped on by the network task. The
+    /// caller inserts its own local marker itself (gossipsub does not loop a
+    /// publish back to its sender).
+    pub fn share_marker(&self, marker_json: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<JsonValue>(marker_json) else {
+            return false;
+        };
+        let name: String = v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(256)
+            .collect();
+        let pos = v.get("pos").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        if name.is_empty() {
+            return false;
+        }
+        self.cmd_tx.send(Command::ShareMarker { name, pos }).is_ok()
+    }
+
+    /// Shared markers received from peers since the last call, as a JSON array
+    /// of `{"name","pos","by","color"}` ("[]" when none).
+    pub fn drain_markers(&self) -> String {
+        let drained: Vec<JsonValue> =
+            std::mem::take(&mut *self.shared.marker_inbox.lock().unwrap());
+        json!(drained).to_string()
     }
 
     /// Current session status as JSON:
@@ -1440,7 +1656,9 @@ impl Reamesh {
             .map(|(s, i, by)| json!({ "section": s, "id": i, "by": by }))
             .collect();
         let probe = match &*self.shared.probe_result.lock().unwrap() {
-            Some((sid, ok)) => json!({ "session_id": sid, "ok": ok }),
+            Some((sid, ok, preview)) => {
+                json!({ "session_id": sid, "ok": ok, "preview": preview })
+            }
             None => JsonValue::Null,
         };
         self.shared
@@ -1491,20 +1709,31 @@ impl Reamesh {
         let owner = self.shared.owner_peer.lock().unwrap().clone();
         let (my_name, my_color) = PROFILE.lock().unwrap().clone();
         let me = LIVE.lock().unwrap().clone();
-        let entry =
-            |id: &str, name: &str, color: &str, focus: &str, play: f64, view: (f64, f64), is_self: bool| {
-                json!({
-                    "id": id,
-                    "name": name,
-                    "color": if color.is_empty() { default_color(id) } else { color.to_string() },
-                    "focus": focus,
-                    "play": play,
-                    "v0": view.0,
-                    "v1": view.1,
-                    "is_self": is_self,
-                    "is_owner": id == owner,
-                })
-            };
+        let entry = |id: &str,
+                     name: &str,
+                     color: &str,
+                     focus: &str,
+                     play: f64,
+                     view: (f64, f64),
+                     playing: bool,
+                     follow: &str,
+                     frozen: bool,
+                     is_self: bool| {
+            json!({
+                "id": id,
+                "name": name,
+                "color": if color.is_empty() { default_color(id) } else { color.to_string() },
+                "focus": focus,
+                "play": play,
+                "v0": view.0,
+                "v1": view.1,
+                "playing": playing,
+                "follow": follow,
+                "frozen": frozen,
+                "is_self": is_self,
+                "is_owner": id == owner,
+            })
+        };
         let mut arr = vec![entry(
             &self.local_peer_id,
             &my_name,
@@ -1512,6 +1741,9 @@ impl Reamesh {
             &me.focus,
             me.play,
             (me.v0, me.v1),
+            me.playing,
+            &me.follow,
+            false, // if our own main thread were frozen, nobody would be asking
             true,
         )];
         let mut infos = self.shared.peers_info.lock().unwrap();
@@ -1540,6 +1772,9 @@ impl Reamesh {
                     &info.focus,
                     info.play,
                     (info.v0, info.v1),
+                    info.playing,
+                    &info.follow,
+                    info.frozen,
                     false,
                 ));
             }
@@ -1785,7 +2020,10 @@ fn session_topic(session_id: &str) -> gossipsub::IdentTopic {
 }
 
 fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
-    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
+    // The per-install persisted keypair when the extension registered one
+    // (lasting identity: remembered hosts, tickets that survive a restart), a
+    // fresh ephemeral one otherwise (tests spin many peers per process).
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity_keypair())
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -2163,6 +2401,7 @@ fn serve_xfer(
                 session_name: h.session_name.clone(),
                 project_file: h.project_file.clone(),
                 files: h.files.clone(),
+                meta: h.meta.clone(),
             },
             None => XferResponse::Error {
                 message: "not hosting".into(),
@@ -2372,6 +2611,9 @@ fn start_join(
     shared.reverts_detail.lock().unwrap().clear();
     shared.peer_locks.lock().unwrap().clear();
     shared.force_revert.lock().unwrap().clear();
+    // Per-session extras from any previous join on this handle.
+    shared.session_meta.lock().unwrap().clear();
+    shared.marker_inbox.lock().unwrap().clear();
     // Drop any proposals left in flight from a previous session
     // (e.g. before an auto-rejoin): their stale timestamps would
     // otherwise time out and surface as phantom snap-backs the
@@ -2528,7 +2770,8 @@ async fn run_network(
                         }
                         None => {
                             // Session gone or unparseable owner -> can't verify.
-                            *shared.probe_result.lock().unwrap() = Some((session_id, Some(false)));
+                            *shared.probe_result.lock().unwrap() =
+                                Some((session_id, Some(false), JsonValue::Null));
                         }
                     }
                 }
@@ -2584,6 +2827,37 @@ async fn run_network(
                         h.files = files;
                     }
                 }
+                Some(Command::SetMeta(meta)) => {
+                    if let Some(h) = hosting.as_mut() {
+                        h.meta = meta;
+                    }
+                }
+                Some(Command::ShareMarker { name, pos }) => {
+                    let (by, color) = PROFILE.lock().unwrap().clone();
+                    let mac = presence_mac(
+                        &shared.auth_token.lock().unwrap().clone(),
+                        &swarm.local_peer_id().to_string(),
+                    );
+                    let mut data = vec![TAG_MARKER];
+                    data.extend_from_slice(
+                        json!({ "name": name, "pos": pos, "by": by, "color": color, "mac": mac })
+                            .to_string()
+                            .as_bytes(),
+                    );
+                    match sess_topic.clone() {
+                        Some(t) => {
+                            // Retry like a proposal if the mesh isn't up yet:
+                            // a marker shared right after joining must not
+                            // vanish into a not-yet-grafted mesh.
+                            if !publish_session(&mut swarm, &shared, &t, &data)
+                                && retry_pubs.len() < 256
+                            {
+                                retry_pubs.push(data);
+                            }
+                        }
+                        None => eprintln!("[reamesh] dropped shared marker: not in a session"),
+                    }
+                }
                 Some(Command::Dial(addr)) => {
                     if let Err(e) = swarm.dial(addr) {
                         eprintln!("[reamesh] dial failed: {e}");
@@ -2619,7 +2893,8 @@ async fn run_network(
                 // End an unanswered passphrase check with a timeout result.
                 if probe.as_ref().is_some_and(|p| p.started.elapsed() > PROBE_TIMEOUT) {
                     let p = probe.take().unwrap();
-                    *shared.probe_result.lock().unwrap() = Some((p.session_id, Some(false)));
+                    *shared.probe_result.lock().unwrap() =
+                        Some((p.session_id, Some(false), JsonValue::Null));
                 }
                 // Ticket join/check in flight: once the *pinned* owner's
                 // announce lands in the session table, proceed exactly like a
@@ -2681,7 +2956,7 @@ async fn run_network(
                             // Unreachable reports false, like an unanswered
                             // probe: a definite answer beats a hang.
                             *shared.probe_result.lock().unwrap() =
-                                Some((pj.info.session_id, Some(false)));
+                                Some((pj.info.session_id, Some(false), JsonValue::Null));
                         } else {
                             set_status(&shared, |s| {
                                 s.state = "failed".into();
@@ -2771,6 +3046,12 @@ async fn run_network(
                             "play": live.play,
                             "v0": live.v0,
                             "v1": live.v1,
+                            "playing": live.playing,
+                            "follow": live.follow,
+                            // This beacon is sent by the *network* thread; the
+                            // main-thread presence feed going quiet while it
+                            // still runs is exactly "REAPER isn't responding".
+                            "frozen": main_thread_stale(),
                             "mac": mac,
                         })
                         .to_string()
@@ -3076,9 +3357,41 @@ async fn run_network(
                                             play: v.get("play").and_then(|x| x.as_f64()).unwrap_or(0.0),
                                             v0: v.get("v0").and_then(|x| x.as_f64()).unwrap_or(0.0),
                                             v1: v.get("v1").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                                            playing: v.get("playing").and_then(|x| x.as_bool()).unwrap_or(false),
+                                            follow: get("follow"),
+                                            frozen: v.get("frozen").and_then(|x| x.as_bool()).unwrap_or(false),
                                             last_seen: Instant::now(),
                                         },
                                     );
+                                }
+                            }
+                            (Some(&TAG_MARKER), _) => {
+                                // A shared flag marker. Authenticated like a
+                                // presence beacon: only token holders may drop
+                                // markers into anyone's project.
+                                if let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..]) {
+                                    let get = |k: &str| {
+                                        v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+                                    };
+                                    let expected = presence_mac(
+                                        &shared.auth_token.lock().unwrap().clone(),
+                                        &src.to_string(),
+                                    );
+                                    if !ct_eq(get("mac").as_bytes(), expected.as_bytes()) {
+                                        eprintln!(
+                                            "[reamesh] dropped unauthenticated shared marker from {src}"
+                                        );
+                                        continue;
+                                    }
+                                    let mut inbox = shared.marker_inbox.lock().unwrap();
+                                    if inbox.len() < 64 {
+                                        inbox.push(json!({
+                                            "name": get("name").chars().take(256).collect::<String>(),
+                                            "pos": v.get("pos").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                                            "by": get("by").chars().take(64).collect::<String>(),
+                                            "color": get("color").chars().take(16).collect::<String>(),
+                                        }));
+                                    }
                                 }
                             }
                             (Some(&TAG_AUTHORITATIVE), Role::Client) => {
@@ -3173,11 +3486,27 @@ async fn run_network(
                         }
                         request_response::Message::Response { request_id, response } => {
                             if probe.as_ref().is_some_and(|p| p.req == request_id) {
-                                // Passphrase pre-check answer: Manifest = right,
-                                // Error = wrong. No download, no subscription.
+                                // A successful pre-check supplies the join preview without downloading
+                                // files or subscribing. Errors distinguish a ban from a rejected token.
                                 let p = probe.take().unwrap();
-                                let ok = matches!(response, XferResponse::Manifest { .. });
-                                *shared.probe_result.lock().unwrap() = Some((p.session_id, Some(ok)));
+                                let (ok, preview) = match &response {
+                                    XferResponse::Manifest { files, project_file, meta, .. } => {
+                                        let parsed_meta = serde_json::from_str::<JsonValue>(meta)
+                                            .unwrap_or(JsonValue::Null);
+                                        (
+                                            true,
+                                            json!({
+                                                "files": files.len() as u64,
+                                                "bytes": files.iter().map(|f| f.size).sum::<u64>(),
+                                                "project_file": project_file,
+                                                "meta": parsed_meta,
+                                            }),
+                                        )
+                                    }
+                                    _ => (false, JsonValue::Null),
+                                };
+                                *shared.probe_result.lock().unwrap() =
+                                    Some((p.session_id, Some(ok), preview));
                             } else if download.as_ref().is_some_and(|dl| dl.manifest_req == Some(request_id)) {
                                 // A manifest only arrives once the owner accepted
                                 // our session token: this is the moment we become
@@ -3210,7 +3539,8 @@ async fn run_network(
                     if probe.as_ref().is_some_and(|p| p.req == request_id) {
                         // Report an unreachable host separately from a rejected passphrase.
                         let p = probe.take().unwrap();
-                        *shared.probe_result.lock().unwrap() = Some((p.session_id, Some(false)));
+                        *shared.probe_result.lock().unwrap() =
+                            Some((p.session_id, Some(false), JsonValue::Null));
                     } else if download.as_ref().is_some_and(|dl| dl.manifest_req == Some(request_id)) {
                         // Manifest never arrived; re-request on the next tick.
                         if let Some(dl) = &mut download {
@@ -3466,10 +3796,14 @@ fn handle_download_manifest(
         dl.manifest_req = None;
         dl.last_activity = Instant::now();
         match response {
-            XferResponse::Manifest { files, project_file, .. } => {
+            XferResponse::Manifest { files, project_file, meta, .. } => {
                 if dl.got_manifest {
                     return; // duplicate (a retry raced the response)
                 }
+                // Remember what the host *claimed* the project loads; the
+                // extension checks the received .rpp against this before
+                // Main_openProject (a dishonest list must not survive).
+                *shared.session_meta.lock().unwrap() = meta;
                 // The owner-supplied project file name is later joined onto the
                 // staging dir and handed to Main_openProject; validate it like
                 // every other manifest path so a malicious owner can't point the
@@ -4115,6 +4449,80 @@ pub extern "C" fn reamesh_set_presence(json: *const c_char) {
     set_presence(&cstr_arg(json).unwrap_or_default());
 }
 
+/// Register the file this install's network identity is persisted in (usually
+/// `<REAPER resource>/reamesh-identity.key`). Once set, every session start
+/// reuses the same keypair: the peer id becomes a lasting, per-install
+/// identity (remembered hosts, tickets that survive a restart). Without this
+/// call every session start generates a fresh ephemeral identity (the old
+/// behavior, kept for tests). Call once at plugin load, before any session.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_identity_init(path: *const c_char) {
+    let Some(p) = cstr_arg(path) else { return };
+    set_identity_path(&p);
+}
+
+/// Delete the persisted network identity. The current session (if any) keeps
+/// its identity until it ends; the next session start mints and persists a
+/// fresh one. Returns whether a stored identity existed and was removed.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_identity_reset() -> bool {
+    std::panic::catch_unwind(reset_identity).unwrap_or(false)
+}
+
+/// Set the session-meta blob (JSON: track count + plugin list) the hosted
+/// session's manifest carries, so joiners can see what a join loads before
+/// downloading. Owner handles only (a no-op elsewhere beyond local storage).
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_set_session_meta(handle: *mut Reamesh, meta_json: *const c_char) {
+    let (false, Some(meta)) = (handle.is_null(), cstr_arg(meta_json)) else {
+        return;
+    };
+    let r = unsafe { &*handle };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.set_session_meta(&meta)));
+}
+
+/// The current session's meta blob: what this owner set via
+/// `reamesh_set_session_meta`, or (on a client) what the owner's manifest
+/// claimed. "" when none is known. Free with `reamesh_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_session_meta(handle: *mut Reamesh) -> *mut c_char {
+    let out = if handle.is_null() {
+        String::new()
+    } else {
+        let r = unsafe { &*handle };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.session_meta_json()))
+            .unwrap_or_default()
+    };
+    into_c_string(out)
+}
+
+/// Share a flag marker (`{"name","pos"}`) with every session peer. Receivers
+/// drop it into their project as a local, non-synced marker; the caller
+/// inserts its own copy itself. Returns whether the share was queued.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_share_marker(handle: *mut Reamesh, marker_json: *const c_char) -> bool {
+    let (false, Some(m)) = (handle.is_null(), cstr_arg(marker_json)) else {
+        return false;
+    };
+    let r = unsafe { &*handle };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.share_marker(&m))).unwrap_or(false)
+}
+
+/// Shared markers received from peers since the last call, as a JSON array of
+/// `{"name","pos","by","color"}` ("[]" when none). Free with
+/// `reamesh_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_drain_markers(handle: *mut Reamesh) -> *mut c_char {
+    let out = if handle.is_null() {
+        "[]".to_string()
+    } else {
+        let r = unsafe { &*handle };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.drain_markers()))
+            .unwrap_or_else(|_| "[]".to_string())
+    };
+    into_c_string(out)
+}
+
 /// Start the localhost control server the companion app connects to
 /// (idempotent). Returns the bound port, 0 if no port was available.
 #[unsafe(no_mangle)]
@@ -4287,6 +4695,32 @@ mod tests {
         let mut bad = payload;
         bad["addrs"] = json!(["not an address"]);
         assert!(parse_ticket(&format!("{TICKET_PREFIX}{}", base64url_encode(bad.to_string().as_bytes()))).is_none());
+    }
+
+    #[test]
+    fn identity_persists_and_survives_corruption() {
+        let dir = std::env::temp_dir().join(format!("reamesh-id-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("identity.key");
+        // First use mints and persists.
+        let a = load_or_create_identity_at(&path);
+        assert!(path.is_file(), "identity must be persisted");
+        // Reusing the path must load the same identity.
+        let b = load_or_create_identity_at(&path);
+        assert_eq!(
+            a.public().to_peer_id(),
+            b.public().to_peer_id(),
+            "the persisted identity must be stable across loads"
+        );
+        // A corrupt file is replaced, not crashed on.
+        fs::write(&path, b"not a keypair").unwrap();
+        let c = load_or_create_identity_at(&path);
+        assert_ne!(a.public().to_peer_id(), c.public().to_peer_id());
+        // Reset = delete: the next load mints fresh (per-install, revocable).
+        fs::remove_file(&path).unwrap();
+        let d = load_or_create_identity_at(&path);
+        assert_ne!(c.public().to_peer_id(), d.public().to_peer_id());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

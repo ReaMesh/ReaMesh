@@ -45,8 +45,8 @@ Track mute, solo, record arm, monitoring and window layout stay local. Item mute
 does sync. Master-track state, hardware outputs, pooled automation items, marker
 ruler lanes and project extension state aren't synced.
 
-An optional floating roster shows who's connected and which track each person is
-on. Click someone to jump to where they are.
+An optional floating roster shows who's connected. You can follow someone's
+playback and track focus or share a marker at your cursor.
 
 ## Working together
 
@@ -61,7 +61,9 @@ syncs too.
 
 When the host stops the session, everyone keeps their local project copy.
 
-To use the project's effects, you'll need the plugins installed locally.
+To use the project's effects, you'll need the plugins installed locally. The
+join preview checks for them in REAPER's plugin caches. You can also join without
+effects in view-only mode.
 
 Only join people you trust: shared projects can load plugins on your computer.
 Passphrase-protected sessions restrict downloading and editing and encrypt
@@ -112,14 +114,13 @@ The app uses Bun for package management.
 Run these from the repository root:
 
 ```sh
-cargo test --manifest-path rust/Cargo.toml
+cargo test --manifest-path rust/Cargo.toml -- --test-threads=1
 cd app
 bun install
 bun run build
 ```
 
-The Rust tests run a host and a guest in one process over real sockets, plus a
-round trip through the app's control connection. There are also
+Rust session tests use real sockets and must run serially. There are also
 [C ABI smoke tests](tools/ffi_smoke.cpp) and
 [state-chunk tests](tools/chunk_test.cpp).
 

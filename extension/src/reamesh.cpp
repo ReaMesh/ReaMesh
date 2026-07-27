@@ -104,6 +104,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -286,6 +287,39 @@ static long g_lastReverts = 0;
 // old "everything snapped back the moment I joined" bug).
 static bool g_bootstrapSynced = false;
 static std::chrono::steady_clock::time_point g_clientActiveSince{};
+
+// "Join without effects": the user chose the trust dialog's second button, so
+// this client opens a copy of the downloaded project with every FX chain
+// (track, input, take, master) stripped, and stays STRICTLY read-only for the
+// session: it never captures or proposes, and it drops fx fields (and take-FX
+// blocks) from incoming applies. The read-only part is what makes the mode
+// safe: a client that proposed anything from a stripped project would sooner
+// or later push a chunk with the host's plugins missing and wipe their work.
+static bool g_noFx = false;
+// Pre-host warning ({files,bytes,free,cloud,enough} or null): hosting would
+// copy this much external media into the project folder (and/or the project
+// lives in a cloud-synced folder). The app confirms before the host proceeds.
+static json g_hostWarning;
+// Post-download plugin verification ({extras:[...],listed} or null): the
+// received .rpp loads plugins the host's manifest meta didn't list. The open
+// is held until the app confirms (open_confirm) or the user leaves.
+static json g_pendingVerify;
+static std::string g_pendingOpenPath;  // project path held back for that answer
+// Follow mode: peer id whose transport/view this REAPER mirrors ("" = none).
+static std::string g_followPeer;
+static std::string g_followLastFocus;   // last focus GUID acted on
+static double g_followLastPlay = -1.0;  // last beacon position acted on
+static double g_followV0 = 0.0, g_followV1 = 0.0;  // last adopted view span
+// Hosting: mtime of the served .rpp when the session meta (track count +
+// plugin list) was last computed; a mid-session save changes the served file,
+// so the meta follows it.
+static fs::file_time_type g_metaRppMtime{};
+static std::chrono::steady_clock::time_point g_lastMetaCheck{};
+
+// Defined in the control-server section below; used before that point.
+static std::string jsonStr(const json& j, const char* key);
+static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback);
+static void openDownloadedProject(std::string path);
 
 // In-flight automatic rejoin after the host vanished without a farewell
 // (network blip / crash). While set, the Browsing tick watches the lobby for
@@ -695,6 +729,132 @@ static bool isRelativePath(const std::string& p) {
   return true;
 }
 
+// ---------- plugin inventory / FX stripping (pure text helpers) ----------
+//
+// Both sides of the join-preview story parse RPP text with the same helper:
+// the host inventories the .rpp it serves (the manifest's "this project loads
+// X, Y, Z" claim), and the client re-inventories the .rpp it actually received
+// before opening it, so a dishonest host's list is caught, not trusted.
+// Unit-tested by tools/chunk_test.cpp.
+
+// The first quoted token after `from` in an RPP line. RPP quotes with ", ' or
+// ` depending on what the payload itself contains.
+static std::string rppQuotedToken(std::string_view line, size_t from) {
+  for (size_t i = from; i < line.size(); ++i) {
+    const char q = line[i];
+    if (q == '"' || q == '\'' || q == '`') {
+      const size_t close = line.find(q, i + 1);
+      if (close == std::string_view::npos) return "";
+      return std::string(line.substr(i + 1, close - i - 1));
+    }
+    if (line[i] != ' ' && line[i] != '\t') return "";  // unquoted payload
+  }
+  return "";
+}
+
+// Every plugin an RPP-syntax text would instantiate, in document order,
+// de-duplicated: the display name of each <VST/<CLAP/<AU/<DX/<LV2 block
+// (e.g. "VST3: Serum (Xfer Records)") and "JS: <path>" for JS effects. Works
+// on whole project files and on single chunks/blocks alike.
+static std::vector<std::string> collectPlugins(const std::string& text) {
+  std::vector<std::string> out;
+  std::set<std::string> seen;
+  auto push = [&](std::string name) {
+    if (!name.empty() && seen.insert(name).second) out.push_back(std::move(name));
+  };
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t eol = text.find('\n', pos);
+    if (eol == std::string::npos) eol = text.size();
+    std::string_view line(text.data() + pos, eol - pos);
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    std::string_view t = ltrim(line);
+    if (!t.empty() && t.front() == '<') {
+      const std::string_view tag = blockTag(t);
+      if (tag == "VST" || tag == "CLAP" || tag == "AU" || tag == "DX" || tag == "LV2") {
+        push(rppQuotedToken(t, 1 + tag.size()));
+      } else if (tag == "JS") {
+        // JS lines carry the effect path, quoted only when it has spaces.
+        std::string_view rest = ltrim(t.substr(1 + tag.size()));
+        std::string name;
+        if (!rest.empty() && (rest.front() == '"' || rest.front() == '\'' || rest.front() == '`')) {
+          name = rppQuotedToken(rest, 0);
+        } else {
+          const size_t sp = rest.find_first_of(" \t");
+          name = std::string(rest.substr(0, sp == std::string_view::npos ? rest.size() : sp));
+        }
+        if (!name.empty()) push("JS: " + name);
+      }
+    }
+    pos = eol + 1;
+  }
+  return out;
+}
+
+// Remove every FX-carrying block from an RPP-syntax text, at any depth:
+// <FXCHAIN> (track FX), <FXCHAIN_REC> (input FX), <TAKEFX> (per-take FX) and
+// <MASTERFXLIST> (the master chain in a project file). With `takeFxOnly` only
+// <TAKEFX> goes: that is the item-chunk variant used by the no-FX apply path.
+// Output is LF-normalized (REAPER's parser accepts either ending).
+static std::string stripFxBlocks(const std::string& text, bool takeFxOnly) {
+  std::string out;
+  out.reserve(text.size());
+  int depth = 0;
+  int skipUntilDepth = -1;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t eol = text.find('\n', pos);
+    if (eol == std::string::npos) eol = text.size();
+    std::string_view line(text.data() + pos, eol - pos);
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    std::string_view t = ltrim(line);
+    const bool opens = !t.empty() && t.front() == '<';
+    const bool closes = (t == ">");
+    if (skipUntilDepth < 0 && opens) {
+      const std::string_view tag = blockTag(t);
+      const bool strip =
+          tag == "TAKEFX" ||
+          (!takeFxOnly && (tag == "FXCHAIN" || tag == "FXCHAIN_REC" || tag == "MASTERFXLIST"));
+      if (strip) {
+        skipUntilDepth = depth;
+        ++depth;
+        pos = eol + 1;
+        continue;
+      }
+    }
+    if (opens) {
+      ++depth;
+    } else if (closes) {
+      --depth;
+      if (skipUntilDepth >= 0 && depth == skipUntilDepth) {
+        skipUntilDepth = -1;
+        pos = eol + 1;
+        continue;
+      }
+    }
+    if (skipUntilDepth < 0) {
+      out.append(line);
+      out.push_back('\n');
+    }
+    pos = eol + 1;
+  }
+  return out;
+}
+
+// ---------- shared (non-synced) flag markers ----------
+//
+// A marker whose name starts with this prefix is a *shared flag* dropped by a
+// session peer from the roster bar. Deliberately outside the synced marker
+// list: captureMarkers skips them (they never ride the wire) and applyMarkers
+// leaves them standing (a remote marker rebuild deletes only synced ones), so
+// every person can keep or delete their copy independently. (Renaming a
+// normal marker to start with "⚑ " opts it out of sync: by design.)
+static constexpr const char kSharedMarkerPrefix[] = "\xE2\x9A\x91 ";  // "⚑ "
+
+static bool isSharedMarkerName(const char* name) {
+  return name && strncmp(name, kSharedMarkerPrefix, sizeof(kSharedMarkerPrefix) - 1) == 0;
+}
+
 // ---------- snapshot & diff (capture side) ----------
 
 static std::string trackGuid(MediaTrack* tr) {
@@ -810,6 +970,11 @@ static std::string captureMarkers() {
   int num = 0, color = 0;
   while ((next = EnumProjectMarkers3(nullptr, idx, &isrgn, &pos, &rgnend, &name, &num, &color)) !=
          0) {
+    // Shared flag markers are local by design: never on the wire.
+    if (isSharedMarkerName(name)) {
+      idx = next;
+      continue;
+    }
     char buf[160];
     snprintf(buf, sizeof(buf), "%s\t%d\t%.17g\t%.17g\t%d\t", isrgn ? "R" : "M", num, pos, rgnend,
              color);
@@ -822,9 +987,24 @@ static std::string captureMarkers() {
 }
 
 static void applyMarkers(const std::string& s) {
-  int nm = 0, nr = 0;
-  const int total = CountProjectMarkers(nullptr, &nm, &nr);
-  for (int i = total - 1; i >= 0; --i) DeleteProjectMarkerByIndex(nullptr, i);
+  // Rebuild only the *synced* markers: shared flag markers stay standing:
+  // each person keeps or deletes their own copy (capture filters them out, so
+  // the wire list never contains one to re-add either).
+  std::vector<int> doomed;
+  {
+    int idx = 0, next;
+    bool isrgn = false;
+    double pos = 0, rgnend = 0;
+    const char* name = nullptr;
+    int num = 0, color = 0;
+    while ((next = EnumProjectMarkers3(nullptr, idx, &isrgn, &pos, &rgnend, &name, &num,
+                                       &color)) != 0) {
+      if (!isSharedMarkerName(name)) doomed.push_back(idx);
+      idx = next;
+    }
+  }
+  for (auto it = doomed.rbegin(); it != doomed.rend(); ++it)
+    DeleteProjectMarkerByIndex(nullptr, *it);
 
   size_t pos = 0;
   while (pos < s.size()) {
@@ -1597,6 +1777,78 @@ static void applyItem(const std::string& guid, const json& fields) {
   UpdateItemInProject(item);
 }
 
+// Name the peer currently holding the editing lock on `(section, id)`: the
+// best available answer to "who made this change" (authoritative updates carry
+// no author; the active editor holds the lock while their edit lands).
+static std::string lockHolderName(const char* section, const std::string& id) {
+  if (!g_handle) return "";
+  char* raw = reamesh_locked_entities(g_handle);
+  std::string payload = raw ? raw : "[]";
+  reamesh_free_string(raw);
+  json arr = json::parse(payload, nullptr, false);
+  if (!arr.is_array()) return "";
+  for (const auto& e : arr) {
+    if (e.is_object() && jsonStr(e, "section") == section && jsonStr(e, "id") == id) {
+      json peers = handleJson(reamesh_peers, json::array());
+      return peerNameById(peers, jsonStr(e, "holder"));
+    }
+  }
+  return "";
+}
+
+// Report plugins introduced by remote changes, for example "Dan added Pro-Q 3
+// to Drums". This keeps later plugin loads as visible as the initial join. One
+// event per plugin, collapsed to a single summary when a whole chain lands at
+// once (pasting a track with 15 plugins is one notice, not fifteen).
+static void notePluginAdds(const std::string& trackName, const std::string& by,
+                           const std::vector<std::string>& oldPlugs,
+                           const std::vector<std::string>& newPlugs) {
+  std::set<std::string> oldSet(oldPlugs.begin(), oldPlugs.end());
+  std::vector<std::string> added;
+  for (const std::string& p : newPlugs)
+    if (!oldSet.count(p)) added.push_back(p);
+  if (added.empty()) return;
+  if (added.size() > 5) {
+    json params = {{"count", added.size()}};
+    if (!trackName.empty()) params["track"] = trackName;
+    if (!by.empty()) params["by"] = by;
+    activityEvent("plugins_added", params,
+                  std::to_string(added.size()) + " plugins were added" +
+                      (trackName.empty() ? "" : " to " + trackName));
+    return;
+  }
+  for (const std::string& p : added) {
+    json params = {{"plugin", p}};
+    if (!trackName.empty()) params["track"] = trackName;
+    if (!by.empty()) params["by"] = by;
+    std::string text = by.empty() ? p + " was added" : by + " added " + p;
+    if (!trackName.empty()) text += " to " + trackName;
+    activityEvent("plugin_added", params, text);
+  }
+}
+
+// No-FX mode: drop fx-chain fields from track applies and take-FX blocks from
+// item chunks, so a view-only client never instantiates third-party code.
+static json filterChangesetNoFx(json cs) {
+  if (cs.contains("tracks") && cs["tracks"].is_object()) {
+    for (auto& [guid, fields] : cs["tracks"].items()) {
+      (void)guid;
+      if (fields.is_object()) {
+        fields.erase("fxchain");
+        fields.erase("recfx");
+      }
+    }
+  }
+  if (cs.contains("items") && cs["items"].is_object()) {
+    for (auto& [guid, fields] : cs["items"].items()) {
+      (void)guid;
+      if (fields.is_object() && fields.contains("chunk") && fields["chunk"].is_string())
+        fields["chunk"] = stripFxBlocks(fields["chunk"].get<std::string>(), /*takeFxOnly=*/true);
+    }
+  }
+  return cs;
+}
+
 static void applyChangeset(const json& changeset) {
   if (changeset.contains("tracks") && changeset["tracks"].is_object()) {
     const json& tracks = changeset["tracks"];
@@ -1637,6 +1889,24 @@ static void applyChangeset(const json& changeset) {
         gbuf.push_back('\0');
         GetSetMediaTrackInfo_String(tr, "GUID", gbuf.data(), true);
         created = true;
+      }
+      // Narrate plugins this change introduces BEFORE the splice (the diff
+      // needs the pre-apply baseline). The baseline is the last synced state
+      // of this track; a brand-new track counts everything it carries.
+      if (fields.contains("fxchain") || fields.contains("recfx")) {
+        auto base = g_snapshot.tracks.find(guid);
+        std::string oldTxt, newTxt;
+        if (base != g_snapshot.tracks.end()) oldTxt = base->second.fxchain + base->second.recfx;
+        newTxt += (fields.contains("fxchain") && fields["fxchain"].is_string())
+                      ? fields["fxchain"].get<std::string>()
+                      : (base != g_snapshot.tracks.end() ? base->second.fxchain : "");
+        newTxt += (fields.contains("recfx") && fields["recfx"].is_string())
+                      ? fields["recfx"].get<std::string>()
+                      : (base != g_snapshot.tracks.end() ? base->second.recfx : "");
+        std::string nm = fields.value("name", std::string());
+        if (nm.empty()) nm = trackNameByGuid(guid);
+        notePluginAdds(nm, lockHolderName("tracks", guid), collectPlugins(oldTxt),
+                       collectPlugins(newTxt));
       }
       applyTrackFields(tr, fields);
       if (created) {
@@ -1682,6 +1952,20 @@ static void applyChangeset(const json& changeset) {
       const std::string& guid = it.key();
       const json& fields = it.value();
       if (!fields.is_object()) continue;
+
+      // Take-FX plugins arriving inside an item chunk get the same narration
+      // as track-chain arrivals.
+      if (fields.contains("chunk") && fields["chunk"].is_string() &&
+          fields.value("present", true)) {
+        auto base = g_snapshot.items.find(guid);
+        const std::string oldTxt =
+            base != g_snapshot.items.end() ? base->second.chunk : std::string();
+        std::string trGuid = fields.value("track", std::string());
+        if (trGuid.empty() && base != g_snapshot.items.end()) trGuid = base->second.track;
+        notePluginAdds(trackNameByGuid(trGuid), lockHolderName("items", guid),
+                       collectPlugins(oldTxt),
+                       collectPlugins(fields["chunk"].get<std::string>()));
+      }
 
       std::vector<std::string> missing = missingMediaIn(fields);
       if (!missing.empty()) {
@@ -1752,7 +2036,8 @@ static void applyRemoteChanges() {
   // as a normal local change next tick and synced back out; there is no
   // re-application loop because we re-baseline below.)
   PreventUIRefresh(1);
-  for (const auto& cs : changesets) applyChangeset(cs);
+  for (const auto& cs : changesets)
+    applyChangeset(g_noFx ? filterChangesetNoFx(cs) : cs);
   PreventUIRefresh(-1);
   TrackList_AdjustWindows(false);
   UpdateArrange();
@@ -2034,6 +2319,200 @@ static void revertLockedItemEdits(Snapshot& snap) {
   g_applyingRemote = false;
 }
 
+// ---------- shared markers, follow mode, session meta, verified open ----------
+
+// Parse "#rrggbb" to a native REAPER color int (with the custom-color flag),
+// 0 when the string isn't a color. Local display only: never on the wire.
+static int colorFromHex(const std::string& hex) {
+  if (hex.size() != 7 || hex[0] != '#') return 0;
+  char* end = nullptr;
+  const long v = strtol(hex.c_str() + 1, &end, 16);
+  if (!end || *end) return 0;
+  return 0x1000000 | ColorToNative((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+}
+
+// Drop a shared flag marker into this project: "⚑ <name> by <sharer>", tinted
+// with the sharer's identity color. Local and non-synced by construction (see
+// kSharedMarkerPrefix). No undo point, like a remote apply, Ctrl+Z must never
+// swallow it; deleting it by hand is the intended way to dismiss it.
+static void insertSharedMarker(const std::string& name, double pos, const std::string& by,
+                               const std::string& colorHex) {
+  std::string full = std::string(kSharedMarkerPrefix) + name;
+  if (!by.empty()) full += " by " + by;
+  AddProjectMarker2(nullptr, false, pos, 0, full.c_str(), -1, colorFromHex(colorHex));
+}
+
+// This user's own roster entry (peers[] is self-first), for name/color.
+static json selfPeerEntry() {
+  json peers = handleJson(reamesh_peers, json::array());
+  if (peers.is_array())
+    for (const auto& p : peers)
+      if (p.is_object() && p.value("is_self", false)) return p;
+  return json::object();
+}
+
+// Share the marker named by the user at the current edit cursor: broadcast to
+// every peer and insert our own local copy (gossip never loops back).
+static void shareMarker(const std::string& rawName) {
+  if ((g_mode != Mode::Hosting && g_mode != Mode::ClientActive) || !g_handle) return;
+  std::string name = sanitizeMarkerName(rawName.c_str());
+  if (name.size() > 200) name.resize(200);
+  if (name.empty()) return;
+  const double pos = GetCursorPosition();
+  const json m = {{"name", name}, {"pos", pos}};
+  if (!reamesh_share_marker(g_handle, m.dump().c_str())) return;
+  const json self = selfPeerEntry();
+  insertSharedMarker(name, pos, jsonStr(self, "name"), jsonStr(self, "color"));
+  UpdateArrange();
+  logEvent("marker_shared", {{"name", name}}, "shared marker \"" + name + "\"");
+}
+
+// Insert shared markers received from peers since the last tick.
+static void drainSharedMarkers() {
+  if (!g_handle || (g_mode != Mode::Hosting && g_mode != Mode::ClientActive)) return;
+  char* raw = reamesh_drain_markers(g_handle);
+  std::string payload = raw ? raw : "[]";
+  reamesh_free_string(raw);
+  if (payload == "[]") return;
+  json arr = json::parse(payload, nullptr, false);
+  if (!arr.is_array() || arr.empty()) return;
+  for (const auto& m : arr) {
+    if (!m.is_object()) continue;
+    const std::string name = jsonStr(m, "name");
+    const std::string by = jsonStr(m, "by");
+    if (name.empty()) continue;
+    insertSharedMarker(name, m.value("pos", 0.0), by, jsonStr(m, "color"));
+    logEvent("marker_received", {{"name", name}, {"by", by}},
+             by.empty() ? "marker \"" + name + "\" was shared"
+                        : by + " shared marker \"" + name + "\"");
+  }
+  UpdateArrange();
+}
+
+// Follow mode: mirror the followed peer's transport and view. Runs every tick
+// while a target is set. Beacons arrive ~1s apart, so this is a gentle
+// shepherd, not a sample-accurate link: play starts/stops mirror within a
+// beacon, a local pause is overridden (it starts again: following means
+// following), and only real drift (> 2.5s) re-seeks a rolling transport.
+static void followTick() {
+  if (g_followPeer.empty()) return;
+  json peers = handleJson(reamesh_peers, json::array());
+  const json* target = nullptr;
+  if (peers.is_array())
+    for (const auto& p : peers)
+      if (p.is_object() && jsonStr(p, "id") == g_followPeer) {
+        target = &p;
+        break;
+      }
+  if (!target) {
+    // The peer left (or went stale): stop following rather than freezing on
+    // their last known state.
+    g_followPeer.clear();
+    activityEvent("follow_ended", json::object(), "stopped following: they left the session");
+    return;
+  }
+  const bool tPlaying = target->value("playing", false);
+  const double tPlay = target->value("play", 0.0);
+  const std::string tFocus = jsonStr(*target, "focus");
+  const double tv0 = target->value("v0", 0.0), tv1 = target->value("v1", 0.0);
+  const bool playing = (GetPlayState() & 1) != 0;
+
+  if (tPlaying && !playing) {
+    // They are rolling and we are not (they just hit play, or the local user
+    // tried to pause): jump to where they are and roll.
+    SetEditCurPos(tPlay, true, true);
+    Main_OnCommand(1007, 0);  // Transport: Play
+  } else if (!tPlaying && playing) {
+    Main_OnCommand(1016, 0);  // Transport: Stop
+    SetEditCurPos(tPlay, true, false);
+  } else if (tPlaying && playing) {
+    if (std::abs(GetPlayPosition() - tPlay) > 2.5) SetEditCurPos(tPlay, false, true);
+  } else if (g_followLastPlay < 0 || std::abs(tPlay - g_followLastPlay) > 1e-9) {
+    // Both stopped: mirror their edit cursor as it moves.
+    SetEditCurPos(tPlay, true, false);
+  }
+  g_followLastPlay = tPlay;
+
+  if (!tFocus.empty() && tFocus != g_followLastFocus) {
+    if (MediaTrack* tr = findTrackByGuid(tFocus)) {
+      SetOnlyTrackSelected(tr);
+      Main_OnCommand(40913, 0);  // vertical scroll selected track into view
+    }
+    g_followLastFocus = tFocus;
+  }
+  if (tv1 > tv0 &&
+      (std::abs(tv0 - g_followV0) > 1e-6 || std::abs(tv1 - g_followV1) > 1e-6)) {
+    double ns = tv0, ne = tv1;
+    GetSet_ArrangeView2(nullptr, true, 0, 0, &ns, &ne);
+    g_followV0 = tv0;
+    g_followV1 = tv1;
+  }
+}
+
+static void stopFollowing() {
+  g_followPeer.clear();
+  g_followLastFocus.clear();
+  g_followLastPlay = -1.0;
+  g_followV0 = g_followV1 = 0.0;
+}
+
+// Read a whole file as UTF-8 text ("" on failure).
+static std::string readFileText(const std::string& path) {
+  std::ifstream f(fsPath(path), std::ios::binary);
+  if (!f) return "";
+  return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+// The hosted session's meta: track count + the plugin inventory of the .rpp
+// actually being served. Recomputed when that file changes (a mid-session
+// save), so a late joiner's preview matches what they will download.
+static void refreshSessionMeta(bool force) {
+  if (g_mode != Mode::Hosting || !g_handle || g_sessionProjectPath.empty()) return;
+  const auto now = std::chrono::steady_clock::now();
+  if (!force && now - g_lastMetaCheck < std::chrono::seconds(2)) return;
+  g_lastMetaCheck = now;
+  std::error_code ec;
+  const auto mtime = fs::last_write_time(fsPath(g_sessionProjectPath), ec);
+  if (ec || (!force && mtime == g_metaRppMtime)) return;
+  g_metaRppMtime = mtime;
+  const std::string text = readFileText(g_sessionProjectPath);
+  if (text.empty()) return;
+  json plugins = json::array();
+  for (const std::string& p : collectPlugins(text)) plugins.push_back(p);
+  const json meta = {{"v", 1}, {"tracks", CountTracks(nullptr)}, {"plugins", plugins}};
+  reamesh_set_session_meta(g_handle, meta.dump().c_str());
+}
+
+// Compare the received .rpp against what the host's manifest claimed it loads.
+// Null means the project is clean and may open immediately. Otherwise return
+// {"extras":[names...],"listed":bool}. If `listed` is false, every
+// plugin found counts as unlisted (a host must not dodge verification by
+// simply omitting the claim).
+static json verifyDownloadedPlugins(const std::string& path) {
+  const std::string text = readFileText(path);
+  if (text.empty()) return json();
+  const std::vector<std::string> found = collectPlugins(text);
+  if (found.empty()) return json();
+  std::set<std::string> claimed;
+  bool listed = false;
+  if (g_handle) {
+    char* raw = reamesh_session_meta(g_handle);
+    const std::string metaStr = raw ? raw : "";
+    reamesh_free_string(raw);
+    const json meta = json::parse(metaStr, nullptr, false);
+    if (meta.is_object() && meta.contains("plugins") && meta["plugins"].is_array()) {
+      listed = true;
+      for (const auto& p : meta["plugins"])
+        if (p.is_string()) claimed.insert(p.get<std::string>());
+    }
+  }
+  json extras = json::array();
+  for (const std::string& f : found)
+    if (!claimed.count(f)) extras.push_back(f);
+  if (extras.empty()) return json();
+  return json{{"extras", extras}, {"listed", listed}};
+}
+
 // Tear the session down. `code`/`params`/`text` describe why as a structured
 // log event (also flagged to the app as the error); empty text = silent.
 static void leaveSession(const char* code, json params, const std::string& text) {
@@ -2054,6 +2533,11 @@ static void leaveSession(const char* code, json params, const std::string& text)
   g_lastPeerCount = 0;
   g_lastReverts = 0;
   g_bootstrapSynced = false;
+  stopFollowing();
+  g_pendingVerify = json();
+  g_pendingOpenPath.clear();
+  // g_noFx deliberately survives a leave: an auto-rejoin must come back in the
+  // same mode the user chose. A fresh host/join sets it explicitly.
   if (!text.empty()) g_lastError = logEvent(code, std::move(params), text);
 }
 
@@ -2170,9 +2654,69 @@ static void reconnectTick() {
   }
 }
 
+// What hosting would silently do to this machine, computed BEFORE the host
+// starts: internalizeExternalMedia will copy every out-of-project source into
+// the project folder (potentially tens of GB, with no free-space check), and a
+// project inside a cloud-synced folder means the sync client will fight the
+// session over the very files peers are transferring. Null = nothing to warn
+// about; otherwise {files,bytes,free,free_known,cloud,enough} for the app's
+// confirm dialog.
+static json hostPrecheck() {
+  const std::string path = currentProjectPath();
+  if (path.empty()) return json();  // unsaved: onHost's save-first flow handles it
+  const fs::path projDir = fsPath(path).parent_path();
+
+  // External media that hosting would copy in (dedup by source path).
+  std::set<std::string> seen;
+  uint64_t bytes = 0;
+  int count = 0;
+  const int n = CountMediaItems(nullptr);
+  for (int i = 0; i < n; ++i) {
+    MediaItem_Take* take = GetActiveTake(GetMediaItem(nullptr, i));
+    if (!take) continue;
+    PCM_source* src = GetMediaItemTake_Source(take);
+    if (!src) continue;
+    char fn[4096] = "";
+    GetMediaSourceFileName(src, fn, sizeof(fn));
+    if (!fn[0]) continue;
+    std::error_code ec;
+    const fs::path source = fsPath(fn);
+    const fs::path rel = fs::relative(source, projDir, ec);
+    const bool outside = !rel.empty() && *rel.begin() == fs::path("..");
+    if (!ec && !rel.empty() && !outside) continue;  // already inside
+    if (!seen.insert(fn).second) continue;
+    ++count;
+    std::error_code sec;
+    const auto sz = fs::file_size(source, sec);
+    if (!sec) bytes += (uint64_t)sz;
+  }
+
+  // Cloud-synced folders by their well-known path fragments.
+  std::string lower = fsUtf8(projDir);
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return (char)tolower(c); });
+  const bool cloud = lower.find("dropbox") != std::string::npos ||
+                     lower.find("onedrive") != std::string::npos ||
+                     lower.find("google drive") != std::string::npos ||
+                     lower.find("googledrive") != std::string::npos ||
+                     lower.find("com~apple~clouddocs") != std::string::npos ||
+                     lower.find("mobile documents") != std::string::npos ||
+                     lower.find("icloud") != std::string::npos;
+  if (count == 0 && !cloud) return json();
+
+  std::error_code ec;
+  const fs::space_info sp = fs::space(projDir, ec);
+  const uint64_t freeB = ec ? 0 : (uint64_t)sp.available;
+  // Reserve 256 MiB of free space beyond the media copy size.
+  const bool enough = ec ? true : bytes + (256ull << 20) <= freeB;
+  return json{{"files", count},   {"bytes", bytes},   {"free", freeB},
+              {"free_known", !ec}, {"cloud", cloud},   {"enough", enough}};
+}
+
 static void onHost(const std::string& passphrase) {
   if (g_mode == Mode::Hosting) return;
   if (g_mode != Mode::Idle) leaveSession("left", json::object(), "left previous session");
+  g_noFx = false;  // hosting is always a full, read-write session
 
   std::string path = currentProjectPath();
   if (path.empty()) {
@@ -2214,6 +2758,10 @@ static void onHost(const std::string& passphrase) {
            passphrase.empty()
                ? "hosting \"" + name + "\", sharing all files under " + dir
                : "hosting \"" + name + "\" (passphrase-protected), sharing " + dir);
+  // Inventory the served .rpp (track count + plugin list) so joiners see what
+  // a join loads before downloading; kept fresh as the file changes.
+  g_metaRppMtime = {};
+  refreshSessionMeta(true);
 }
 
 static void onLeave() {
@@ -2313,14 +2861,32 @@ static void revealPeer(const std::string& peerId) {
 
 static void ctlDispatch(const json& cmd) {
   const std::string c = jsonStr(cmd, "cmd");
+  const auto cmdBool = [&](const char* key) {
+    return cmd.contains(key) && cmd[key].is_boolean() && cmd[key].get<bool>();
+  };
   // Any explicit user action supersedes a pending auto-rejoin.
   if (c == "host" || c == "join" || c == "leave") g_reconnect.reset();
   if (c == "browse") {
     startBrowse();
   } else if (c == "host") {
+    g_hostWarning = json();
+    if (!cmdBool("confirm")) {
+      // First pass: if hosting would copy external media in (or the project
+      // lives in a cloud-synced folder), surface the numbers and wait for the
+      // app's confirm instead of silently filling the disk.
+      json w = hostPrecheck();
+      if (!w.is_null()) {
+        g_hostWarning = std::move(w);
+        return;
+      }
+    }
     onHost(jsonStr(cmd, "passphrase"));
+  } else if (c == "host_dismiss") {
+    g_hostWarning = json();
   } else if (c == "join") {
     if (g_mode == Mode::Idle) startBrowse();
+    // "Join without effects": strictly view-only, every FX chain stripped.
+    g_noFx = cmdBool("nofx");
     std::string name = jsonStr(cmd, "session_name");
     std::string ticket = jsonStr(cmd, "ticket");
     if (!ticket.empty()) {
@@ -2329,6 +2895,27 @@ static void ctlDispatch(const json& cmd) {
       joinSessionById(jsonStr(cmd, "session_id"), name.empty() ? "session" : name,
                       jsonStr(cmd, "passphrase"));
     }
+  } else if (c == "open_confirm") {
+    // The user read the "loads plugins that weren't listed" warning and chose
+    // to continue: open the held-back download now.
+    if (!g_pendingOpenPath.empty() && g_mode == Mode::Downloading)
+      openDownloadedProject(g_pendingOpenPath);
+  } else if (c == "share_marker") {
+    shareMarker(jsonStr(cmd, "name"));
+  } else if (c == "follow") {
+    // "" stops following. Following yourself is meaningless: ignore it.
+    const std::string pid = jsonStr(cmd, "peer_id");
+    if (pid.empty()) {
+      stopFollowing();
+    } else if (jsonStr(selfPeerEntry(), "id") != pid) {
+      stopFollowing();
+      g_followPeer = pid;
+    }
+  } else if (c == "reset_identity") {
+    const bool had = reamesh_identity_reset();
+    logEvent("identity_reset", {{"had", had}},
+             had ? "network identity reset; a fresh one is minted next session"
+                 : "no stored network identity to reset");
   } else if (c == "check") {
     // Passphrase pre-check: verify with the owner BEFORE the app shows the
     // trust dialog or starts downloading. Stays in Browsing; the result rides
@@ -2390,9 +2977,12 @@ static void ctlTick() {
       // The app never shows timeline positions or view spans; keeping them
       // would republish the whole state on every presence beacon while someone
       // scrolls (click-to-follow asks the extension directly via `reveal_peer`).
+      // `follow` and `frozen` stay: the roster paints the "following you" and
+      // "REAPER isn't responding" indicators from them.
       p.erase("play");
       p.erase("v0");
       p.erase("v1");
+      p.erase("playing");
       if (guid.empty()) continue;
       if (MediaTrack* tr = findTrackByGuid(guid)) {
         int n = static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"));
@@ -2494,6 +3084,14 @@ static void ctlTick() {
     }
   }
   state["ticket"] = ticket;
+  // Pre-host media-copy warning ({files,bytes,free,cloud,enough} or null):
+  // the app confirms before re-sending host with confirm:true.
+  state["host_warning"] = g_hostWarning;
+  // Post-download plugin verification ({extras,listed} or null): the app
+  // confirms (open_confirm) or leaves; the open is held meanwhile.
+  state["verify"] = g_pendingVerify;
+  // This client joined without effects (view-only).
+  state["nofx"] = g_noFx;
   state["sessions"] = handleJson(reamesh_sessions, json::array());
   state["peers"] = std::move(peers);
 
@@ -2524,13 +3122,73 @@ static void pushLocalPresence() {
   double v0 = 0, v1 = 0;
   GetSet_ArrangeView2(nullptr, false, 0, 0, &v0, &v1);
 
-  json p = {{"focus", focus}, {"play", play}, {"v0", v0}, {"v1", v1}};
-  static std::string last;
-  std::string s = p.dump();
-  if (s != last) {
-    last = s;
-    reamesh_set_presence(s.c_str());
+  json p = {{"focus", focus}, {"play", play},          {"v0", v0},
+            {"v1", v1},       {"playing", playing},    {"follow", g_followPeer}};
+  // Deliberately UNCONDITIONAL (no change-gate): every call also proves the
+  // main thread is alive, which is what keeps this peer's beacon from
+  // reporting "frozen" while the user simply sits still.
+  reamesh_set_presence(p.dump().c_str());
+}
+
+// Forward-declared: pollDownload publishes an interim state through ctlTick.
+static void ctlTick();
+
+// Open the finished download in REAPER (Downloading -> ClientActive). In
+// no-FX mode a stripped sibling copy is written and opened instead: the
+// downloaded original stays byte-identical so this peer can still serve it to
+// other joiners (swarming hashes must keep matching the manifest).
+static void openDownloadedProject(std::string path) {
+  g_pendingVerify = json();
+  g_pendingOpenPath.clear();
+  if (g_noFx) {
+    const std::string text = readFileText(path);
+    if (!text.empty()) {
+      const fs::path stripped = fsPath(path).parent_path() / ".reamesh-nofx.rpp";
+      std::ofstream o(stripped, std::ios::binary | std::ios::trunc);
+      if (o) {
+        o << stripFxBlocks(text, /*takeFxOnly=*/false);
+        o.close();
+        path = fsUtf8(stripped);
+        logEvent("nofx_open", json::object(),
+                 "opening without effects (view-only, nothing third-party loads)");
+      }
+    }
   }
+  logEvent("download_complete", json::object(), "download complete, opening " + path);
+  // Main_openProject blocks the main thread for seconds on a big project and
+  // the next state publish only happens afterwards (mode=client): publish
+  // the "opening" phase first so the app's stepper doesn't sit frozen on the
+  // download bar meanwhile.
+  g_openingProject = true;
+  ctlTick();
+  g_applyingRemote = true;
+  Main_openProject(path.c_str());
+  // The loaded project IS the owner's state; baseline it so the load is
+  // never diffed as a burst of local edits.
+  g_snapshot = snapshotProject();
+  g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+  g_itemTints.clear();  // fresh download: start with no lock tints
+  g_captureCost = {};   // new project: re-learn what a capture costs
+  g_copyFailed.clear();
+  g_itemsAwaitingCopy.clear();
+  g_applyingRemote = false;
+  g_openingProject = false;
+  // Peak caches (.reapeaks) are deliberately not transferred, and REAPER
+  // does not always rebuild them on its own (e.g. with a central peaks
+  // folder, or "build peaks on the fly" off): items then render as flat
+  // blocks. Queue the missing ones now; the build runs in the background.
+  Main_OnCommand(40047, 0);  // Peaks: Build any missing peaks
+  g_mode = Mode::ClientActive;
+  // Don't propose anything until the owner's authoritative state has applied
+  // and re-baselined us; and don't narrate that settle (the whole project
+  // arriving as one changeset) as a flurry of "a track was added" events.
+  g_bootstrapSynced = false;
+  g_clientActiveSince = std::chrono::steady_clock::now();
+  muteActivity(std::chrono::seconds(6));
+  g_sessionProjectPath = currentProjectPath();
+  logEvent("connected", json::object(),
+           g_noFx ? "connected without effects (view-only)"
+                  : "connected: your edits are proposals; the session owner wins conflicts");
 }
 
 static void pollDownload() {
@@ -2542,41 +3200,23 @@ static void pollDownload() {
   std::string state = st.value("state", "");
 
   if (state == "ready") {
+    // Already holding for the user's verify answer: do nothing until the app
+    // confirms (open_confirm) or the user leaves.
+    if (!g_pendingOpenPath.empty()) return;
     std::string path = st.value("project_path", "");
-    logEvent("download_complete", json::object(), "download complete, opening " + path);
-    // Main_openProject blocks the main thread for seconds on a big project and
-    // the next state publish only happens afterwards (mode=client); publish
-    // the "opening" phase first so the app's stepper doesn't sit frozen on the
-    // download bar meanwhile.
-    g_openingProject = true;
-    ctlTick();
-    g_applyingRemote = true;
-    Main_openProject(path.c_str());
-    // The loaded project IS the owner's state; baseline it so the load is
-    // never diffed as a burst of local edits.
-    g_snapshot = snapshotProject();
-    g_lastChangeCount = GetProjectStateChangeCount(nullptr);
-    g_itemTints.clear();  // fresh download: start with no lock tints
-    g_captureCost = {};   // new project: re-learn what a capture costs
-    g_copyFailed.clear();
-    g_itemsAwaitingCopy.clear();
-    g_applyingRemote = false;
-    g_openingProject = false;
-    // Peak caches (.reapeaks) are deliberately not transferred, and REAPER
-    // does not always rebuild them on its own (e.g. with a central peaks
-    // folder, or "build peaks on the fly" off); items then render as flat
-    // blocks. Queue the missing ones now; the build runs in the background.
-    Main_OnCommand(40047, 0);  // Peaks: Build any missing peaks
-    g_mode = Mode::ClientActive;
-    // Don't propose anything until the owner's authoritative state has applied
-    // and re-baselined us; and don't narrate that settle (the whole project
-    // arriving as one changeset) as a flurry of "a track was added" events.
-    g_bootstrapSynced = false;
-    g_clientActiveSince = std::chrono::steady_clock::now();
-    muteActivity(std::chrono::seconds(6));
-    g_sessionProjectPath = currentProjectPath();
-    logEvent("connected", json::object(),
-             "connected: your edits are proposals; the session owner wins conflicts");
+    // In no-FX mode every chain is stripped before the open: nothing
+    // third-party loads, so there is nothing to verify against the claim.
+    if (!g_noFx) {
+      json verify = verifyDownloadedPlugins(path);
+      if (!verify.is_null()) {
+        g_pendingOpenPath = path;
+        g_pendingVerify = std::move(verify);
+        logEvent("verify_hold", {{"count", g_pendingVerify["extras"].size()}},
+                 "the received project loads plugins the host didn't list; waiting for you");
+        return;
+      }
+    }
+    openDownloadedProject(path);
   } else if (state == "failed") {
     std::string msg = st.value("message", std::string("unknown error"));
     // Every routine failure gets a stable code so the app can render it in the
@@ -2624,6 +3264,10 @@ static void timerTick() {
       reconnectTick();
       return;
     case Mode::Downloading:
+      // Keep the main-thread-alive presence feed running during the download
+      // too: beacons already flow (the topic is joined at manifest time), and
+      // without a touch this peer would read as "frozen" in everyone's roster.
+      pushLocalPresence();
       pollDownload();
       return;
     case Mode::Hosting:
@@ -2656,10 +3300,15 @@ static void timerTick() {
         g_lastPeerCount = peers;
       }
       pushLocalPresence();
+      followTick();
+      drainSharedMarkers();
+      if (g_mode == Mode::Hosting) refreshSessionMeta(false);
       // Capture before apply, so an edit made by the user in this tick
       // interval is diffed against the old baseline before remote
-      // application re-baselines.
-      captureLocalChanges();
+      // application re-baselines. A no-FX client NEVER captures: it is
+      // view-only, and proposing anything from a stripped project would sooner
+      // or later wipe the host's plugins.
+      if (!g_noFx) captureLocalChanges();
       applyRemoteChanges();
       processDeferredItems();
       // Last: re-paint the local lock tints. After capture (so the grey is
@@ -2719,6 +3368,13 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
   if (REAPERAPI_LoadAPI(rec->GetFunc) != 0) return 0;
 
   g_rec = rec;
+  // Lasting per-install network identity: persisted under REAPER's resource
+  // dir, so this machine keeps one peer id across sessions and restarts
+  // (remembered hosts, tickets that survive). Resettable from the app.
+  {
+    const std::string idPath = std::string(GetResourcePath()) + "/reamesh-identity.key";
+    reamesh_identity_init(idPath.c_str());
+  }
   g_cmdHost = rec->Register("custom_action", &g_caHost);
   g_cmdLeave = rec->Register("custom_action", &g_caLeave);
   rec->Register("hookcommand", (void*)hookCommand);

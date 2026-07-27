@@ -32,6 +32,32 @@ pub const CTL_PORTS: [u16; 4] = [47415, 47416, 47417, 47418];
 /// Commands queued but not yet drained by the extension tick. Bounded so a
 /// stuck extension can't accumulate unbounded input.
 const INBOUND_CAP: usize = 64;
+/// How long to wait between bind retries when every port was taken. A freed
+/// port (a REAPER instance quit, a squatting program closed) is picked up
+/// automatically: the extension never has to be reloaded to recover.
+const BIND_RETRY: Duration = Duration::from_secs(5);
+
+/// Marker for a loaded extension that could not bind any control port
+/// (47415-47418). Refresh on each failed attempt and remove after binding.
+/// The app ignores stale markers so crashes cannot leave a permanent warning.
+fn noport_marker_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("reamesh-noport-{}.json", std::process::id()))
+}
+
+fn write_noport_marker() {
+    let body = json!({
+        "pid": std::process::id(),
+        "ports": CTL_PORTS,
+    })
+    .to_string();
+    if let Err(e) = std::fs::write(noport_marker_path(), body) {
+        eprintln!("[reamesh] ctl: could not write no-port marker: {e}");
+    }
+}
+
+fn clear_noport_marker() {
+    let _ = std::fs::remove_file(noport_marker_path());
+}
 
 /// Allowed WebSocket origins for the companion app and development server.
 /// Browser JavaScript cannot forge Origin; checking it prevents websites from
@@ -100,23 +126,39 @@ pub fn start() -> u16 {
                     }
                 };
                 rt.block_on(async move {
-                    let mut bound = None;
-                    for port in CTL_PORTS {
-                        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                            Ok(l) => {
-                                bound = Some((l, port));
-                                break;
+                    // Keep trying until a port frees up. Another REAPER or
+                    // process may be using all four ports temporarily.
+                    // A marker file tells the app what is going on meanwhile.
+                    let mut reported = false;
+                    let (listener, port) = loop {
+                        let mut bound = None;
+                        for port in CTL_PORTS {
+                            match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                                Ok(l) => {
+                                    bound = Some((l, port));
+                                    break;
+                                }
+                                Err(_) => continue,
                             }
-                            Err(_) => continue,
                         }
-                    }
-                    let Some((listener, port)) = bound else {
-                        eprintln!("[reamesh] ctl server: no free port in {CTL_PORTS:?}");
-                        let _ = port_tx.send(0u16);
-                        return;
+                        if let Some(b) = bound {
+                            break b;
+                        }
+                        eprintln!(
+                            "[reamesh] ctl server: no free port in {CTL_PORTS:?}; retrying"
+                        );
+                        write_noport_marker();
+                        if !reported {
+                            reported = true;
+                            let _ = port_tx.send(0u16);
+                        }
+                        tokio::time::sleep(BIND_RETRY).await;
                     };
+                    clear_noport_marker();
                     shared.port.store(port, Ordering::Relaxed);
-                    let _ = port_tx.send(port);
+                    if !reported {
+                        let _ = port_tx.send(port);
+                    }
                     eprintln!("[reamesh] ctl server on 127.0.0.1:{port}");
                     // Main-thread watchdog: while the extension's timer beats,
                     // stay silent; once it goes quiet (a modal REAPER dialog,
@@ -156,9 +198,10 @@ pub fn start() -> u16 {
         }
     }
     let port = port_rx.recv_timeout(Duration::from_secs(3)).unwrap_or(0);
-    if port != 0 {
-        let _ = CTL.set(shared);
-    }
+    // Register the shared state even when no port bound yet: the server thread
+    // keeps retrying, and heartbeat/publish/poll must be live the moment a
+    // port frees up (they are harmless no-op buffers meanwhile).
+    let _ = CTL.set(shared);
     port
 }
 

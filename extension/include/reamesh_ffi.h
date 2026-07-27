@@ -169,6 +169,51 @@ void reamesh_set_focus(const char *guid);
 void reamesh_set_presence(const char *json);
 
 /**
+ * Register the file this install's network identity is persisted in (usually
+ * `<REAPER resource>/reamesh-identity.key`). Once set, every session start
+ * reuses the same keypair: the peer id becomes a lasting, per-install
+ * identity (remembered hosts, tickets that survive a restart). Without this
+ * call every session start generates a fresh ephemeral identity (the old
+ * behavior, kept for tests). Call once at plugin load, before any session.
+ */
+void reamesh_identity_init(const char *path);
+
+/**
+ * Delete the persisted network identity. The current session (if any) keeps
+ * its identity until it ends; the next session start mints and persists a
+ * fresh one. Returns whether a stored identity existed and was removed.
+ */
+bool reamesh_identity_reset(void);
+
+/**
+ * Set the session-meta blob (JSON: track count + plugin list) the hosted
+ * session's manifest carries, so joiners can see what a join loads before
+ * downloading. Owner handles only (a no-op elsewhere beyond local storage).
+ */
+void reamesh_set_session_meta(struct ReameshHandle *handle, const char *meta_json);
+
+/**
+ * The current session's meta blob: what this owner set via
+ * `reamesh_set_session_meta`, or (on a client) what the owner's manifest
+ * claimed. "" when none is known. Free with `reamesh_free_string`.
+ */
+char *reamesh_session_meta(struct ReameshHandle *handle);
+
+/**
+ * Share a flag marker (`{"name","pos"}`) with every session peer. Receivers
+ * drop it into their project as a local, non-synced marker; the caller
+ * inserts its own copy itself. Returns whether the share was queued.
+ */
+bool reamesh_share_marker(struct ReameshHandle *handle, const char *marker_json);
+
+/**
+ * Shared markers received from peers since the last call, as a JSON array of
+ * `{"name","pos","by","color"}` ("[]" when none). Free with
+ * `reamesh_free_string`.
+ */
+char *reamesh_drain_markers(struct ReameshHandle *handle);
+
+/**
  * Start the localhost control server the companion app connects to
  * (idempotent). Returns the bound port, 0 if no port was available.
  */
