@@ -70,6 +70,12 @@ export async function installExtension(): Promise<ReaperStatus> {
   return invoke<ReaperStatus>("install_extension");
 }
 
+/** Delete the installed extension (and any displaced copies), and turn
+ *  auto-install off so the next launch doesn't quietly put it back. */
+export async function removeExtension(): Promise<ReaperStatus> {
+  return invoke<ReaperStatus>("remove_extension");
+}
+
 export function useReaperStatus(): ReaperStatus | null | undefined {
   return useSyncExternalStore(
     (cb) => {

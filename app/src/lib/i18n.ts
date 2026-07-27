@@ -135,6 +135,9 @@ const en = {
   autoInstallExt: "Install and update automatically",
   restartNote: "REAPER loads the extension at startup, so restart it after installing or updating.",
   extInstalledToast: "Extension installed. Restart REAPER to load it.",
+  extUpdatedRestart: "ReaMesh updated REAPER's extension. Restart REAPER to load the new version.",
+  removeExtension: "Remove extension",
+  extRemovedToast: "Extension removed. Restart REAPER to unload it.",
   language: "Language",
   languageSystem: "System",
 
@@ -330,6 +333,9 @@ const de: Record<MsgKey, string> = {
   restartNote:
     "REAPER lädt die Erweiterung beim Start, also starte es nach einer Installation oder einem Update neu.",
   extInstalledToast: "Erweiterung installiert. Starte REAPER neu, um sie zu laden.",
+  extUpdatedRestart: "ReaMesh hat REAPERs Erweiterung aktualisiert. Starte REAPER neu, um die neue Version zu laden.",
+  removeExtension: "Erweiterung entfernen",
+  extRemovedToast: "Erweiterung entfernt. Starte REAPER neu, um sie zu entladen.",
   language: "Sprache",
   languageSystem: "System",
 

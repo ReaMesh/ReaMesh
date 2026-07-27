@@ -27,12 +27,8 @@
   --destructive-foreground: #fff;
   --border: rgba(255, 255, 255, 0.08);
   --input: rgba(255, 255, 255, 0.1);
-  /* Opaque on purpose. Every consumer halves this again (`ring-ring/50`,
-     `outline-ring/50`), and a translucent base composited over #101013 landed
-     at ~1.4:1, far under the 3:1 a focus indicator needs, i.e. no visible
-     focus anywhere in the app for a keyboard user. At this value the halved
-     form still clears the threshold. */
-  --ring: #7c7c8a;
+  /* Keep the halved global focus outline above the 3:1 contrast target. */
+  --ring: #b4b4c0;
   --radius: 0.625rem;
 }
 
@@ -98,8 +94,8 @@
     /* Clip brief size differences while the native window follows the card. */
     overflow: hidden;
   }
-  /* Belt and suspenders for WebKit: hide the scrollbar gutter outright. */
-  html.overlay-window ::-webkit-scrollbar {
+  /* Hide WebKit scrollbars outside explicitly scrollable overlay regions. */
+  html.overlay-window *:not(.scroll-slim)::-webkit-scrollbar {
     display: none;
   }
   /* The arrange overlay fills REAPER's whole window: transparent, no scrollbars,

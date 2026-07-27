@@ -32,7 +32,18 @@ export function getProfile(): Profile {
   } catch {
     // fall through to default
   }
-  return { name: "", color: PALETTE[Math.floor(Math.random() * PALETTE.length)] };
+  // Persist the initial random color so reconnects and other REAPER instances
+  // use the same identity color.
+  const p: Profile = {
+    name: "",
+    color: PALETTE[Math.floor(Math.random() * PALETTE.length)],
+  };
+  try {
+    saveProfile(p);
+  } catch {
+    // localStorage unavailable: at least this call is self-consistent
+  }
+  return p;
 }
 
 export function saveProfile(p: Profile) {

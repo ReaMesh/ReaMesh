@@ -243,8 +243,15 @@ fn maybe_auto_install(app: &AppHandle) {
     let Ok(st) = compute_status(app, &custom) else {
         return;
     };
-    if st.reaper_found && (!st.installed || !st.up_to_date) {
-        let _ = do_install(app, &custom);
+    // Only auto-install into a recognized REAPER resource folder.
+    // The manual install button also accepts unrecognized folders.
+    if st.reaper_found && st.is_reaper_dir && (!st.installed || !st.up_to_date) {
+        if do_install(app, &custom).is_ok() {
+            // The installed file changed, but a running REAPER still uses
+            // the copy loaded at startup. Notify the frontend to request a restart.
+            use tauri::Emitter;
+            let _ = app.emit("extension-installed", ());
+        }
     }
 }
 
@@ -338,7 +345,16 @@ fn compute_status(app: &AppHandle, custom_path: &Option<String>) -> Result<Reape
             .unwrap_or(false);
     Ok(ReaperStatus {
         reaper_found: dir.is_dir(),
-        is_reaper_dir: dir.join("reaper.ini").is_file() || user_plugins.is_dir(),
+        // Deliberately NOT `user_plugins.is_dir()`: do_install creates that
+        // folder, so counting it would make any directory we have written into
+        // look like a REAPER folder from then on: permanently suppressing the
+        // "this isn't a REAPER folder" warning for exactly the folder that
+        // needed it. Only REAPER's own artefacts count.
+        is_reaper_dir: dir.join("reaper.ini").is_file()
+            || dir.join("REAPER.ini").is_file()
+            || dir.join("reaper.exe").is_file()
+            || dir.join("reaper-vstplugins64.ini").is_file()
+            || dir.join("reaper-kb.ini").is_file(),
         resource_path: dir.to_string_lossy().into_owned(),
         user_plugins: user_plugins.to_string_lossy().into_owned(),
         installed,
@@ -362,45 +378,88 @@ fn do_install(app: &AppHandle, custom_path: &Option<String>) -> Result<ReaperSta
     let dest = user_plugins.join(PLUGIN_NAME);
     let tmp = user_plugins.join(format!(".{PLUGIN_NAME}.tmp"));
     fs::copy(&src, &tmp).map_err(|e| format!("copy failed: {e}"))?;
-    displace_loaded_plugin(&user_plugins, &dest);
-    fs::rename(&tmp, &dest).map_err(|e| format!("install failed: {e}"))?;
+    // Try the plain rename first: on macOS it always works, and on Windows it
+    // works whenever REAPER isn't holding the old copy, which avoids the
+    // displacement dance (and its leftovers) entirely.
+    if let Err(first) = fs::rename(&tmp, &dest) {
+        let parked = displace_loaded_plugin(&user_plugins, &dest);
+        if let Err(second) = fs::rename(&tmp, &dest) {
+            // The working extension has already been moved aside at this point.
+            // Leaving it there would mean an *update* had uninstalled ReaMesh,
+            // so put it back before reporting the failure.
+            if let Some(parked) = parked {
+                let _ = fs::rename(&parked, &dest);
+            }
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("install failed: {second} (and: {first})"));
+        }
+    }
     compute_status(app, custom_path)
 }
 
-/// Windows refuses to overwrite or delete a DLL that a process has loaded, so
-/// installing over a running REAPER (the normal case, since the app is used
-/// alongside it) would fail with access denied. It does allow the loaded file
-/// to be *renamed*, so park the old copy under a dotted name (REAPER only
-/// loads `reaper_*.dll`, so it will never pick one up) and let the fresh one
-/// take the real name. REAPER keeps running on the old code until it restarts,
-/// exactly as on macOS. Stale copies are swept on the next install, once
-/// REAPER has let go of them.
-///
-/// No-op on macOS: replacing a loaded dylib there is just a normal rename.
-#[cfg(target_os = "windows")]
-fn displace_loaded_plugin(user_plugins: &Path, dest: &Path) {
+/// Remove the installed extension (and any displaced copies). Best-effort on
+/// the main file: Windows won't delete a DLL a running REAPER has loaded, so
+/// fall back to parking it under a name REAPER never loads: it goes away on
+/// the next install's sweep, and REAPER stops loading it at the next restart
+/// either way.
+fn do_remove(app: &AppHandle, custom_path: &Option<String>) -> Result<ReaperStatus, String> {
+    let dir = resource_dir(custom_path)?;
+    let user_plugins = dir.join("UserPlugins");
+    let dest = user_plugins.join(PLUGIN_NAME);
+    if dest.is_file() && fs::remove_file(&dest).is_err() {
+        displace_loaded_plugin(&user_plugins, &dest);
+    }
+    sweep_displaced(&user_plugins);
+    compute_status(app, custom_path)
+}
+
+#[tauri::command]
+fn remove_extension(app: AppHandle) -> Result<ReaperStatus, String> {
+    // Disable auto-install so the extension stays removed on the next launch.
+    store_auto_install(&app, false);
+    use tauri::Emitter;
+    let _ = app.emit("auto-install-changed", false);
+    do_remove(&app, &load_custom_path(&app))
+}
+
+/// Delete parked copies REAPER has since let go of.
+fn sweep_displaced(user_plugins: &Path) {
     for entry in fs::read_dir(user_plugins).into_iter().flatten().flatten() {
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(&format!(".{PLUGIN_NAME}.old-")) {
+        if name.to_string_lossy().starts_with(&format!(".{PLUGIN_NAME}.old-")) {
             let _ = fs::remove_file(entry.path());
         }
     }
+}
+
+/// Windows cannot replace a loaded DLL. Rename the old copy to a name REAPER
+/// ignores, then install the new file under the expected name. REAPER keeps
+/// using the old code until restart, and stale copies are removed later.
+///
+/// No-op on macOS: replacing a loaded dylib there is just a normal rename.
+/// Returns where the old copy was parked, so a failed install can put it back.
+#[cfg(target_os = "windows")]
+fn displace_loaded_plugin(user_plugins: &Path, dest: &Path) -> Option<PathBuf> {
+    sweep_displaced(user_plugins);
     if !dest.exists() {
-        return;
+        return None;
     }
     for n in 0..64 {
         let stale = user_plugins.join(format!(".{PLUGIN_NAME}.old-{n}"));
         if stale.exists() {
             continue; // still held by a running REAPER from an earlier update
         }
-        let _ = fs::rename(dest, &stale);
-        return;
+        return fs::rename(dest, &stale).ok().map(|_| stale);
     }
+    None
 }
 
 #[cfg(not(target_os = "windows"))]
-fn displace_loaded_plugin(_user_plugins: &Path, _dest: &Path) {}
+fn displace_loaded_plugin(_user_plugins: &Path, dest: &Path) -> Option<PathBuf> {
+    // Replacing a loaded dylib on macOS is a plain rename; nothing to displace.
+    let _ = dest;
+    None
+}
 
 #[tauri::command]
 fn reaper_status(app: AppHandle) -> Result<ReaperStatus, String> {
@@ -642,7 +701,20 @@ fn set_session_state(hosting: bool, port: Option<u16>) {
 /// the user). Best-effort, fire-and-forget.
 fn send_leave(port: u16) {
     use tungstenite::Message;
-    if let Ok((mut socket, _)) = tungstenite::connect(format!("ws://127.0.0.1:{port}")) {
+    // A bare `connect` has no timeout, and exit is already prevented by the
+    // time we get here: a hung connect would leave an app that cannot be
+    // quit at all. Loopback either answers immediately or is not there.
+    let Ok(stream) = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(1500),
+    ) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(1500)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(1500)));
+    if let Ok((mut socket, _)) =
+        tungstenite::client(format!("ws://127.0.0.1:{port}"), stream)
+    {
         let _ = socket.send(Message::Text("{\"cmd\":\"leave\"}".to_string().into()));
         let _ = socket.flush();
     }
@@ -650,13 +722,19 @@ fn send_leave(port: u16) {
 
 /// Allow the second exit pass after sending leave without another confirmation.
 static QUIT_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A quit confirmation is already on screen. Without this a second Cmd+Q
+/// stacks a second native dialog, since the first one prevented the exit.
+static QUIT_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Native confirm shown when quitting while hosting. Returns true to proceed.
-/// MUST be called off the main thread: the dialog plugin then marshals the
-/// NSAlert onto the main run loop and blocks *this* thread for the answer.
-/// (Presenting it on the main thread, directly or via the run-loop ExitRequested
-/// observer, throws an ObjC exception that aborts the process.)
-fn confirm_quit_while_hosting(app: &AppHandle) -> bool {
+/// Confirm quitting for both hosts and clients. Returns true to proceed.
+///
+/// Call off the main thread: the dialog plugin dispatches NSAlert to the main
+/// run loop and blocks the calling thread. Presenting it directly from a
+/// run-loop observer throws an Objective-C exception.
+fn confirm_quit_while_hosting(app: &AppHandle, hosting: bool) -> bool {
+    if !hosting {
+        return confirm_quit_as_client(app);
+    }
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     let lang = resolved_lang(app);
     app.dialog()
@@ -669,6 +747,25 @@ fn confirm_quit_while_hosting(app: &AppHandle) -> bool {
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::OkCancelCustom(
             tr(lang, "Stop hosting", "Hosting beenden").into(),
+            tr(lang, "Cancel", "Abbrechen").into(),
+        ))
+        .blocking_show()
+}
+
+/// Same, for a guest: quitting leaves the session they are in.
+fn confirm_quit_as_client(app: &AppHandle) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let lang = resolved_lang(app);
+    app.dialog()
+        .message(tr(
+            lang,
+            "Quitting leaves the session you are in. The project stays open in REAPER, but it will stop syncing.",
+            "Beim Beenden verlässt du die Session. Das Projekt bleibt in REAPER offen, wird aber nicht mehr synchronisiert.",
+        ))
+        .title(tr(lang, "Leave the session and quit?", "Session verlassen und beenden?"))
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            tr(lang, "Leave session", "Session verlassen").into(),
             tr(lang, "Cancel", "Abbrechen").into(),
         ))
         .blocking_show()
@@ -769,9 +866,15 @@ fn build_menu(app: &AppHandle) -> tauri::Result<()> {
 /// the command before exiting. Confirmation runs on a background thread.
 fn confirm_leave_then_exit(app: AppHandle, hosting: bool, port: u16) {
     use std::sync::atomic::Ordering;
+    // Exit is already prevented at this point, so a second Cmd+Q while the
+    // dialog is up would stack another native dialog on top of the first.
+    if QUIT_PENDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
     std::thread::spawn(move || {
-        if hosting && !confirm_quit_while_hosting(&app) {
-            return; // user cancelled; stay running (exit already prevented)
+        if !confirm_quit_while_hosting(&app, hosting) {
+            QUIT_PENDING.store(false, Ordering::SeqCst);
+            return; // Exit was already prevented, so keep the app running.
         }
         send_leave(port);
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -788,6 +891,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             reaper_status,
             install_extension,
+            remove_extension,
             launch_reaper,
             open_overlay,
             close_overlay,

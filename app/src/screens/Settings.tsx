@@ -10,6 +10,7 @@ import {
   getReaperPath,
   installExtension,
   refreshStatus,
+  removeExtension,
   setReaperPath,
   useReaperStatus,
 } from "@/lib/install";
@@ -20,7 +21,7 @@ import {
   useOverlaySettings,
 } from "@/lib/overlaySettings";
 import { isWindows } from "@/lib/platform";
-import { cn } from "@/lib/utils";
+import { cn, focusRing } from "@/lib/utils";
 
 const OVERLAY_TOGGLES: { key: keyof OverlaySettings; label: () => string }[] = [
   { key: "roster", label: () => t("olRoster") },
@@ -74,6 +75,19 @@ export function Settings({ onBack }: { onBack: () => void }) {
     }
   };
 
+  const remove = async () => {
+    setBusy(true);
+    try {
+      await removeExtension();
+      await refreshStatus();
+      toast.success(t("extRemovedToast"));
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const extBadge = !status ? null : !status.installed ? (
     <Badge variant="outline" className="text-[11px] text-muted-foreground">
       {t("notInstalled")}
@@ -111,7 +125,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
             className="-ml-2 h-8 gap-1.5 px-2 text-[13px] text-muted-foreground hover:text-foreground"
             onClick={onBack}
           >
-            <ArrowLeft className="size-4" />
+            <ArrowLeft className="size-4" aria-hidden="true" />
             {t("back")}
           </Button>
           <h1 className="text-[15px] font-semibold">{t("settings")}</h1>
@@ -121,16 +135,24 @@ export function Settings({ onBack }: { onBack: () => void }) {
           <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
             {t("language")}
           </h3>
-          <div className="flex gap-1 rounded-xl bg-card p-1.5">
+          <div
+            role="radiogroup"
+            aria-label={t("language")}
+            className="flex gap-1 rounded-xl bg-card p-1.5"
+          >
             {langOptions.map((o) => (
               <button
                 key={o.value}
+                type="button"
+                role="radio"
+                aria-checked={getLangPref() === o.value}
                 onClick={() => setLangPref(o.value)}
                 className={cn(
                   "flex-1 rounded-lg px-2 py-1.5 text-[12px] transition-colors",
                   getLangPref() === o.value
                     ? "bg-secondary text-foreground"
                     : "text-muted-foreground hover:text-foreground",
+                  focusRing,
                 )}
               >
                 {o.label}
@@ -177,6 +199,15 @@ export function Settings({ onBack }: { onBack: () => void }) {
                 </Button>
               )}
             </div>
+            {/* Explain when the selected folder does not look like REAPER. */}
+            {status && status.reaperFound && !status.isReaperDir && (
+              <p
+                role="status"
+                className="rounded-lg bg-amber-500/10 px-2.5 py-2 text-[11px] leading-relaxed text-amber-500"
+              >
+                {t("notReaperDirWarning")}
+              </p>
+            )}
             {status && !status.reaperFound && (
               <Button
                 variant="ghost"
@@ -185,7 +216,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
                 onClick={() => openUrl("https://www.reaper.fm/download.php")}
               >
                 {t("dontHaveReaper")}
-                <ExternalLink className="size-3" />
+                <ExternalLink className="size-3" aria-hidden="true" />
               </Button>
             )}
           </div>
@@ -202,8 +233,13 @@ export function Settings({ onBack }: { onBack: () => void }) {
             </div>
             <button
               type="button"
+              role="checkbox"
+              aria-checked={autoInstall}
               onClick={() => toggleAuto(!autoInstall)}
-              className="flex w-full items-center gap-2.5 rounded-lg px-1 py-0.5 text-left text-[13px] transition-colors hover:bg-secondary/40"
+              className={cn(
+                "flex w-full items-center gap-2.5 rounded-lg px-1 py-0.5 text-left text-[13px] transition-colors hover:bg-secondary/40",
+                focusRing,
+              )}
             >
               <span
                 className={cn(
@@ -213,7 +249,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
                     : "border-border text-transparent",
                 )}
               >
-                <Check className="size-3" strokeWidth={3} />
+                <Check className="size-3" strokeWidth={3} aria-hidden="true" />
               </span>
               <span className="flex-1 text-foreground/90">{t("autoInstallExt")}</span>
             </button>
@@ -234,6 +270,19 @@ export function Settings({ onBack }: { onBack: () => void }) {
             <p className="text-[11px] leading-relaxed text-muted-foreground">
               {t("restartNote")}
             </p>
+            {/* Offer explicit removal because uninstalling the app leaves the
+                extension in REAPER's UserPlugins folder. */}
+            {status?.installed && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-full text-[12px] text-muted-foreground hover:text-destructive"
+                disabled={busy}
+                onClick={remove}
+              >
+                {t("removeExtension")}
+              </Button>
+            )}
           </div>
         </section>
 
@@ -248,8 +297,13 @@ export function Settings({ onBack }: { onBack: () => void }) {
                 <button
                   key={row.key}
                   type="button"
+                  role="checkbox"
+                  aria-checked={on}
                   onClick={() => setOverlaySetting(row.key, !on)}
-                  className="flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-secondary/60"
+                  className={cn(
+                    "flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-secondary/60",
+                    focusRing,
+                  )}
                 >
                   <span
                     className={cn(
@@ -259,7 +313,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
                         : "border-border text-transparent",
                     )}
                   >
-                    <Check className="size-3" strokeWidth={3} />
+                    <Check className="size-3" strokeWidth={3} aria-hidden="true" />
                   </span>
                   <span className="flex-1 text-foreground/90">{row.label()}</span>
                 </button>

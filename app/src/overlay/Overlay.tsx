@@ -9,7 +9,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
 import { ChevronUp, Crown } from "lucide-react";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { currentMonitor, getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { TrackNumber } from "@/components/Rolling";
 import { t, useLang } from "@/lib/i18n";
@@ -18,6 +18,11 @@ import { useOverlaySettings } from "@/lib/overlaySettings";
 import { useOverlayState } from "./useOverlayState";
 
 const WIDTH = 232;
+/// Maximum HUD height relative to its current monitor. The roster scrolls once
+/// it reaches this limit.
+const MAX_HEIGHT_FRACTION = 0.5;
+/// Floor for the clamp, so a tiny/odd monitor report can't collapse the HUD.
+const MIN_MAX_HEIGHT = 160;
 
 function PeerRow({
   peer,
@@ -98,11 +103,14 @@ function PeerRow({
   );
 }
 
+const STACK_MAX = 4;
+
 /** Overlapping identity avatars, shown only when collapsed. */
 function AvatarStack({ peers }: { peers: Peer[] }) {
+  const extra = peers.length - STACK_MAX;
   return (
-    <div className="flex">
-      {peers.slice(0, 4).map((p, i) => (
+    <div className="flex items-center">
+      {peers.slice(0, STACK_MAX).map((p, i) => (
         <motion.div
           key={p.id}
           layout
@@ -111,6 +119,12 @@ function AvatarStack({ peers }: { peers: Peer[] }) {
           <PeerAvatar peer={p} size="sm" className="ring-2 ring-background" />
         </motion.div>
       ))}
+      {/* Otherwise the collapsed HUD silently under-reports who is present. */}
+      {extra > 0 && (
+        <span className="ml-1 shrink-0 text-[10px] font-medium text-muted-foreground">
+          +{extra}
+        </span>
+      )}
     </div>
   );
 }
@@ -122,27 +136,44 @@ export function Overlay({ port }: { port: number | null }) {
   const cardRef = useRef<HTMLDivElement>(null);
   useLang(); // re-render on language change
 
-  // Keep the OS window glued to the card's actual height. The window is
-  // transparent, so any slack would block REAPER underneath; instead it grows
-  // and shrinks (smoothly, as the collapse animation runs) to fit.
+  // Fit the native window to the card throughout size animations.
+  // Extra transparent space would intercept clicks intended for REAPER.
+  const [maxBodyHeight, setMaxBodyHeight] = useState(MIN_MAX_HEIGHT);
   useEffect(() => {
     const el = cardRef.current;
     if (!el) return;
     const win = getCurrentWindow();
     let raf = 0;
+    // Recalculate the height limit when the HUD moves to another monitor.
+    let cap = Number.POSITIVE_INFINITY;
+    const measure = async () => {
+      try {
+        const mon = await currentMonitor();
+        if (!mon) return;
+        const scale = mon.scaleFactor || 1;
+        const logical = mon.size.height / scale;
+        cap = Math.max(MIN_MAX_HEIGHT, Math.floor(logical * MAX_HEIGHT_FRACTION));
+        // The header is fixed; the roster body gets whatever is left.
+        setMaxBodyHeight(Math.max(MIN_MAX_HEIGHT, cap - 36));
+      } catch {
+        // Plain-browser development has no Tauri window API.
+      }
+    };
     const fit = () => {
       cancelAnimationFrame(raf);
       raf = requestAnimationFrame(() => {
         const h = Math.max(1, Math.ceil(el.getBoundingClientRect().height));
-        win.setSize(new LogicalSize(WIDTH, h)).catch(() => {});
+        win.setSize(new LogicalSize(WIDTH, Math.min(h, cap))).catch(() => {});
       });
     };
     const ro = new ResizeObserver(fit);
     ro.observe(el);
-    fit();
+    void measure().then(fit);
+    const unlisten = win.onMoved(() => void measure().then(fit)).catch(() => null);
     return () => {
       ro.disconnect();
       cancelAnimationFrame(raf);
+      void unlisten.then((f) => f?.());
     };
   }, []);
 
@@ -181,14 +212,14 @@ export function Overlay({ port }: { port: number | null }) {
           type="button"
           onClick={() => setCollapsed((c) => !c)}
           aria-label={collapsed ? t("expand") : t("collapse")}
-          className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-white/5 hover:text-foreground"
+          className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
         >
           <motion.span
             animate={{ rotate: collapsed ? 180 : 0 }}
             transition={{ type: "spring", stiffness: 400, damping: 30 }}
             className="grid place-items-center"
           >
-            <ChevronUp className="size-4" />
+            <ChevronUp className="size-4" aria-hidden="true" />
           </motion.span>
         </button>
       </div>
@@ -204,7 +235,10 @@ export function Overlay({ port }: { port: number | null }) {
             style={{ overflow: "hidden" }}
           >
             {settings.roster && (
-              <div className="border-t border-white/10 px-1.5 py-1.5">
+              <div
+                className="scroll-slim overflow-y-auto border-t border-white/10 px-1.5 py-1.5"
+                style={{ maxHeight: maxBodyHeight }}
+              >
                 {peers.length === 0 ? (
                   <p className="px-1.5 py-1 text-[12px] text-muted-foreground">
                     {t("connecting")}

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { TriangleAlert } from "lucide-react";
+import { RefreshCw, TriangleAlert } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
@@ -18,6 +18,7 @@ import { loadReaperPath, refreshStatus, useReaperStatus } from "@/lib/install";
 import { t, useLang } from "@/lib/i18n";
 import { localizeLogEntry } from "@/lib/log";
 import { displayName, type ExtState, type Mode } from "@/lib/types";
+import { cn, focusRing } from "@/lib/utils";
 
 startScanning();
 loadReaperPath().then(refreshStatus);
@@ -279,11 +280,23 @@ export default function App() {
     else closeOverlay();
   }, [inSession, port, pid]);
 
-  // The control server's watchdog only clears `busy` on its own 1s tick, but a
-  // fresh state frame is itself proof the main thread ticked. Without this the
-  // amber "REAPER isn't responding" banner animates in and straight back out
-  // for up to a second right as a finished download opens, the join flow's
-  // payoff moment.
+  // Auto-install updates the file, but a running REAPER keeps using the copy it
+  // loaded at startup. Prompt for a restart just like the manual install flow.
+  const [installedThisRun, setInstalledThisRun] = useState(false);
+  const [restartDismissed, setRestartDismissed] = useState(false);
+  useEffect(() => {
+    const un = listen("extension-installed", () => {
+      setInstalledThisRun(true);
+      setRestartDismissed(false);
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
+  const needsRestart = installedThisRun && hasState && !restartDismissed;
+
+  // A fresh state frame proves the main thread responded, even before the
+  // watchdog clears `busy` on its next tick.
   const stateSeq = state ? JSON.stringify(state.progress) + state.mode + state.state : "";
   const [busySince, setBusySince] = useState("");
   useEffect(() => {
@@ -340,6 +353,35 @@ export default function App() {
       />
       {/* REAPER may be waiting on a modal dialog. Hide this during the expected
           pause while a completed download opens. */}
+      <AnimatePresence>
+        {needsRestart && (
+          <motion.div
+            key="restart"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="overflow-hidden"
+          >
+            <div
+              role="status"
+              className="mx-4 mt-2 flex items-center gap-2.5 rounded-xl bg-secondary px-3 py-2.5"
+            >
+              <RefreshCw className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+              <span className="flex-1 text-[12px] font-medium">{t("extUpdatedRestart")}</span>
+              <button
+                type="button"
+                onClick={() => setRestartDismissed(true)}
+                className={cn(
+                  "shrink-0 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:text-foreground",
+                  focusRing,
+                )}
+              >
+                {t("firewallGotIt")}
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       <AnimatePresence>
         {busy && (
           <motion.div
