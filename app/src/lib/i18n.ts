@@ -115,6 +115,7 @@ const en = {
     "The first time REAPER runs with ReaMesh, Windows Defender Firewall asks whether to allow it. Choose “Allow access” with “Private networks” ticked; ReaMesh can't reach anyone on your network without it.",
   firewallNamesReaper:
     "The prompt says REAPER, not ReaMesh: ReaMesh runs inside REAPER.",
+  firewallAlreadyDismissed: "Already dismissed the prompt?",
   firewallRecover:
     "Already dismissed it? Windows Security → Firewall & network protection → Allow an app through firewall, then tick Private for REAPER.",
   firewallGotIt: "Got it",
@@ -165,6 +166,9 @@ const en = {
   logJoining: "Joining “{name}”. Downloading the project…",
   logJoinUnavailable: "Couldn’t join “{name}”. It may have just closed, so try again.",
   logJoinFailed: "Join failed: {reason}",
+  logManifestTimeout: "The host never sent the project file list. Try joining again.",
+  logDownloadStalled: "The download stopped partway through. Try joining again.",
+  logHostUnreachable: "Couldn't reach the host. They may have stopped hosting.",
   logDownloadComplete: "Download complete. Opening the project…",
   logConnected: "Connected. You can edit together live now.",
   logPeerJoined: "Someone joined the session",
@@ -313,6 +317,7 @@ const de: Record<MsgKey, string> = {
     "Wenn REAPER zum ersten Mal mit ReaMesh läuft, fragt die Windows-Defender-Firewall, ob der Zugriff erlaubt werden soll. Wähle „Zugriff zulassen“ und aktiviere „Private Netzwerke“. Ohne das erreicht ReaMesh niemanden in deinem Netzwerk.",
   firewallNamesReaper:
     "Der Dialog nennt REAPER, nicht ReaMesh: ReaMesh läuft in REAPER.",
+  firewallAlreadyDismissed: "Prompt schon weggeklickt?",
   firewallRecover:
     "Schon weggeklickt? Windows-Sicherheit → Firewall- & Netzwerkschutz → Zulassen einer App durch die Firewall, dann „Privat“ für REAPER aktivieren.",
   firewallGotIt: "Verstanden",
@@ -360,6 +365,9 @@ const de: Record<MsgKey, string> = {
   logJoinUnavailable:
     "„{name}“ ließ sich nicht beitreten. Die Session wurde vielleicht gerade geschlossen, versuch es erneut.",
   logJoinFailed: "Beitritt fehlgeschlagen: {reason}",
+  logManifestTimeout: "Der Host hat die Dateiliste des Projekts nie gesendet. Versuch es noch einmal.",
+  logDownloadStalled: "Der Download ist mittendrin stehen geblieben. Versuch es noch einmal.",
+  logHostUnreachable: "Der Host war nicht erreichbar. Vielleicht hostet er nicht mehr.",
   logDownloadComplete: "Download abgeschlossen. Projekt wird geöffnet…",
   logConnected: "Verbunden. Ihr könnt jetzt gemeinsam live bearbeiten.",
   logPeerJoined: "Jemand ist der Session beigetreten",

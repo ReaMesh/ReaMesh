@@ -2579,13 +2579,26 @@ static void pollDownload() {
              "connected: your edits are proposals; the session owner wins conflicts");
   } else if (state == "failed") {
     std::string msg = st.value("message", std::string("unknown error"));
-    // Give the two routine failures stable codes so the app can translate them:
-    // a wrong passphrase, and an invite-code host that couldn't be reached.
+    // Every routine failure gets a stable code so the app can render it in the
+    // user's language. Without one, the raw English status text is spliced into
+    // the localized sentence and a German user reads
+    // "Beitritt fehlgeschlagen: manifest timeout". `join_failed` with a
+    // {reason} stays as the last-resort fallback for anything genuinely
+    // unexpected.
     if (msg.find("passphrase") != std::string::npos)
       leaveSession("wrong_password", json::object(), "join failed: " + msg);
     else if (msg.find("ticket host unreachable") != std::string::npos)
       leaveSession("ticket_unreachable", json::object(),
                    "couldn't reach the host from that invite code");
+    else if (msg.find("manifest") != std::string::npos)
+      leaveSession("manifest_timeout", json::object(),
+                   "the host never sent the project file list");
+    else if (msg.find("stall") != std::string::npos)
+      leaveSession("download_stalled", json::object(),
+                   "the download stopped partway through");
+    else if (msg.find("no longer announced") != std::string::npos ||
+             msg.find("owner") != std::string::npos)
+      leaveSession("host_unreachable", json::object(), "couldn't reach the host");
     else
       leaveSession("join_failed", {{"reason", msg}}, "join failed: " + msg);
   } else if (state == "ended") {

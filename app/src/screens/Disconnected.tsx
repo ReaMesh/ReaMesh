@@ -28,7 +28,7 @@ async function launchReaper() {
 // instant REAPER answers (`found`), just before the screen hands off.
 export function Disconnected({ found = false }: { found?: boolean }) {
   return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-6 px-10 text-center">
+    <div className="flex flex-1 flex-col items-center [justify-content:safe_center] overflow-y-auto gap-6 px-10 text-center">
       <BreathingBeacon found={found} />
 
       <div className="space-y-1.5">

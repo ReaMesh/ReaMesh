@@ -260,7 +260,7 @@ export function Downloading({
     phase === 1 ? (stalled ? "stall" : remainingTime ? "eta" : "dl") : String(phase);
 
   return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-6 px-10 text-center">
+    <div className="flex flex-1 flex-col items-center [justify-content:safe_center] overflow-y-auto gap-6 px-10 text-center">
       <div
         role="progressbar"
         aria-label={t("downloadProgress")}

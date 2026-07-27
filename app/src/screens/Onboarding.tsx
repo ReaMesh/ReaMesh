@@ -161,7 +161,7 @@ export function Onboarding({ status }: { status: ReaperStatus }) {
   const step = done ? "done" : status.reaperFound ? "install" : "locate";
 
   return (
-    <div className="flex flex-1 flex-col justify-center gap-5 px-6 pb-8">
+    <div className="flex flex-1 flex-col [justify-content:safe_center] overflow-y-auto gap-5 px-6 pb-8">
       <div className="space-y-3 px-0.5">
         <div className="flex h-10 items-end gap-1.5">
           {BAR_COLORS.map((c, i) => (
