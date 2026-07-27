@@ -355,11 +355,48 @@ fn do_install(app: &AppHandle, custom_path: &Option<String>) -> Result<ReaperSta
     fs::create_dir_all(&user_plugins)
         .map_err(|e| format!("could not create {}: {e}", user_plugins.display()))?;
     // Copy via temp + rename so a running REAPER never loads a half-written file.
+    let dest = user_plugins.join(PLUGIN_NAME);
     let tmp = user_plugins.join(format!(".{PLUGIN_NAME}.tmp"));
     fs::copy(&src, &tmp).map_err(|e| format!("copy failed: {e}"))?;
-    fs::rename(&tmp, user_plugins.join(PLUGIN_NAME)).map_err(|e| format!("install failed: {e}"))?;
+    displace_loaded_plugin(&user_plugins, &dest);
+    fs::rename(&tmp, &dest).map_err(|e| format!("install failed: {e}"))?;
     compute_status(app, custom_path)
 }
+
+/// Windows refuses to overwrite or delete a DLL that a process has loaded, so
+/// installing over a running REAPER (the normal case, since the app is used
+/// alongside it) would fail with access denied. It does allow the loaded file
+/// to be *renamed*, so park the old copy under a dotted name (REAPER only
+/// loads `reaper_*.dll`, so it will never pick one up) and let the fresh one
+/// take the real name. REAPER keeps running on the old code until it restarts,
+/// exactly as on macOS. Stale copies are swept on the next install, once
+/// REAPER has let go of them.
+///
+/// No-op on macOS: replacing a loaded dylib there is just a normal rename.
+#[cfg(target_os = "windows")]
+fn displace_loaded_plugin(user_plugins: &Path, dest: &Path) {
+    for entry in fs::read_dir(user_plugins).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&format!(".{PLUGIN_NAME}.old-")) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    if !dest.exists() {
+        return;
+    }
+    for n in 0..64 {
+        let stale = user_plugins.join(format!(".{PLUGIN_NAME}.old-{n}"));
+        if stale.exists() {
+            continue; // still held by a running REAPER from an earlier update
+        }
+        let _ = fs::rename(dest, &stale);
+        return;
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn displace_loaded_plugin(_user_plugins: &Path, _dest: &Path) {}
 
 #[tauri::command]
 fn reaper_status(app: AppHandle) -> Result<ReaperStatus, String> {
