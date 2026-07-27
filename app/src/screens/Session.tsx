@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
-import { Check, Crown, Eye, EyeOff, Ticket, TriangleAlert } from "lucide-react";
+import { Check, Crown, Eye, EyeOff, Snowflake, Ticket, TriangleAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -86,6 +86,13 @@ function PeerRow({
       <span className="min-w-0 flex-1 truncate text-[13px] font-medium">
         {displayName(peer)}
       </span>
+      {peer.frozen && !peer.is_self && (
+        // The peer is online, but their REAPER has stopped responding.
+        <span title={t("reaperNotRespondingPeer")} className="flex shrink-0 items-center">
+          <Snowflake className="size-3.5 text-sky-300" aria-hidden="true" />
+          <span className="sr-only">{t("reaperNotRespondingPeer")}</span>
+        </span>
+      )}
       {peer.is_owner && (
         // `title` on a bare span is name-prohibited by accname, so the crown
         // needs real text for the host to be identifiable non-visually.
@@ -260,6 +267,16 @@ export function Session({
         <h2 className="min-w-0 flex-1 truncate text-[15px] font-semibold tracking-tight">
           {state.session || t("sessionFallback")}
         </h2>
+        {/* Explain why edits are not sent in view-only mode. */}
+        {state.nofx && (
+          <Badge
+            variant="outline"
+            className="shrink-0 border-amber-500/40 text-amber-500"
+            title={t("nofxBadgeHint")}
+          >
+            {t("nofxBadge")}
+          </Badge>
+        )}
         <Badge variant={hosting ? "default" : "secondary"} className="shrink-0">
           {hosting ? t("hostingBadge") : t("connectedBadge")}
         </Badge>

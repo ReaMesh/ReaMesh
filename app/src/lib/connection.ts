@@ -7,7 +7,7 @@
 // the extension streams back one `state` message whenever anything changes.
 
 import { useSyncExternalStore } from "react";
-import type { ExtState, Instance } from "./types";
+import { normalizeState, type Instance } from "./types";
 import { getProfile } from "./profile";
 import { getOverlaySettings, subscribeOverlaySettings } from "./overlaySettings";
 
@@ -39,23 +39,9 @@ let started = false;
  *  retry it. Reset the moment a port answers. */
 const failures = new Map<number, { count: number; nextAt: number }>();
 
-/** A `state` frame, with the array fields forced to arrays.
- *
- *  The frame is JSON from another process that ships and versions separately:
- *  an older or newer extension, a partial publish, a renamed field. Everything
- *  downstream reads `state.peers`, `state.sessions` and `state.log` without
- *  guarding, and an uncaught render throw takes the whole window down to a grey
- *  rectangle with no way to reload (see components/ErrorBoundary). The boundary
- *  is the backstop; this is the part that keeps skew from reaching it at all. */
-function normalizeState(msg: Record<string, unknown>): ExtState {
-  const arr = <T,>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
-  return {
-    ...(msg as unknown as ExtState),
-    peers: arr(msg.peers),
-    sessions: arr(msg.sessions),
-    log: arr(msg.log),
-  };
-}
+// `normalizeState` (version-skew hardening of the state frame) lives in
+// lib/types.ts next to the frame's shape, where it is unit-testable without
+// pulling this module's Tauri wiring into the test runner.
 
 function emit() {
   // Stable instance order (by port) so the UI never reshuffles.

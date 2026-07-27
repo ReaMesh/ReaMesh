@@ -13,27 +13,22 @@ import {
 import { Input } from "@/components/ui/input";
 import { PasswordInput } from "@/components/PasswordInput";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { FirewallBlocked } from "@/components/FirewallNotice";
+import { TrustDialog } from "@/components/TrustDialog";
 import { FOUND_COLOR, inkFor } from "@/lib/colors";
 import { send, sendProfile } from "@/lib/connection";
 import { rememberHostPass } from "@/lib/hostPass";
+import { recordHostJoin } from "@/lib/knownHosts";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
 import { getProfile, saveProfile, PALETTE, type Profile } from "@/lib/profile";
+import { decodeTicket, normalizeTicket } from "@/lib/ticket";
 import { initials, type ExtState, type SessionAd } from "@/lib/types";
 import { topRightGutter } from "@/components/TitleBar";
 import { cn, focusRing } from "@/lib/utils";
 
-// The "only join people you trust" warning is shown once per app run: the
-// first join after launch gets it, later joins in the same run don't. Module
-// state (not localStorage) is exactly that lifetime: a restart shows it again.
-let trustWarningAccepted = false;
-
-/// Shortest passphrase the host card will accept. The Argon2id salt rides the
-/// lobby announce in the clear, so anyone in range can attack a session's
-/// passphrase offline, and that one secret gates downloading, editing, roster
-/// membership and the gossip encryption key alike. Three characters is not
-/// "secure"; it is the floor below which the padlock on the session card would
-/// be actively misleading.
+/// Shortest passphrase accepted by the host form. This is only a minimum for
+/// avoiding misleadingly weak protected sessions, not a security guarantee.
 const MIN_PASSPHRASE = 3;
 
 /// Deadline for a passphrase pre-check.
@@ -291,26 +286,22 @@ function SessionCard({
   // Skip the highlight for sessions present on mount or shortly afterward.
   const fresh = useRef(Date.now() - lobbyMountedAt > 1500).current;
 
-  const join = () => {
+  const join = (nofx: boolean) => {
     if (joining) return;
     setJoining(true);
-    trustWarningAccepted = true;
     setConfirmOpen(false);
+    // "You've joined this host N times" is a memory of trusting this identity.
+    recordHostJoin(session.owner);
     send(
       {
         cmd: "join",
         session_id: session.session_id,
         session_name: session.session_name,
         passphrase: pass,
+        nofx,
       },
       port ?? undefined,
     );
-  };
-  // Passphrase already verified (or none needed): the trust gate shows once per
-  // run, otherwise join straight away.
-  const proceedJoin = () => {
-    if (trustWarningAccepted) join();
-    else setConfirmOpen(true);
   };
 
   const { checking, begin } = usePassphraseCheck(
@@ -318,19 +309,17 @@ function SessionCard({
     probe,
     CHECK_TIMEOUT_MS,
     (outcome) => {
-      if (outcome === "ok") return proceedJoin();
-      setError(outcome);
+      if (outcome === "ok") return setConfirmOpen(true);
+      // A refused probe for an open session means the host did not answer.
+      setError(session.auth ? outcome : "unknown");
       shake();
     },
   );
 
-  // The Join button: for a locked session, verify the passphrase with the owner
-  // FIRST (no dialog, no animation, no transition) so a wrong one shows an
-  // inline error instead of flashing the whole join. Open sessions join directly.
+  // Probe first to verify the passphrase and load the join preview.
   const beginJoin = () => {
     if (checking || joining) return;
-    if (!session.auth) return proceedJoin();
-    if (!pass) return;
+    if (session.auth && !pass) return;
     setError("");
     begin();
     send({ cmd: "check", session_id: session.session_id, passphrase: pass }, port ?? undefined);
@@ -416,98 +405,24 @@ function SessionCard({
         </>
       )}
 
-      {/* Joining downloads and opens the host's project, and the host can load
-          track effects/plugins live during the session; both run code on this
-          machine. Make that trust decision explicit before the first join of
-          this app run. */}
-      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
-        <DialogContent className="max-w-[340px] gap-4 rounded-2xl">
-          <DialogHeader>
-            <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-amber-500/15 sm:mx-0">
-              <ShieldAlert className="size-5 text-amber-500" />
-            </div>
-            <DialogTitle className="text-[15px]">{t("trustTitle")}</DialogTitle>
-            <DialogDescription className="text-[13px] leading-relaxed">
-              {t("trustBody", { name: session.session_name })}
-              {session.owner_name && (
-                <>
-                  {" "}
-                  <span className="block pt-2">
-                    {t("trustHostClaims", { host: session.owner_name })}
-                  </span>
-                </>
-              )}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter className="gap-2 sm:gap-2">
-            <Button
-              variant="outline"
-              className="flex-1"
-              onClick={() => setConfirmOpen(false)}
-            >
-              {t("cancel")}
-            </Button>
-            <Button className="flex-1" onClick={join}>
-              {t("joinAnyway")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* Confirm the files, plugins, and claimed host before joining. */}
+      <TrustDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        name={session.session_name}
+        hostName={session.owner_name}
+        hostPeerId={session.owner}
+        bytes={session.bytes}
+        files={session.files}
+        preview={probe?.session_id === session.session_id ? probe?.preview : undefined}
+        onJoin={join}
+      />
     </motion.div>
   );
 }
 
-/** Strip every whitespace character, not just the ends.
- *
- *  Invite codes travel through chat and email, which line-wrap them. `atob`
- *  tolerates embedded whitespace; the extension's base64url decoder rejects any
- *  character outside the alphabet. So a wrapped code that decodes fine here
- *  would be refused over there: the app would show the session name and enable
- *  Join, and the join would then fail with nothing on screen to explain it.
- *  Normalizing here fixes both halves: the code becomes valid, and what we send
- *  is what we validated. */
-function normalizeTicket(raw: string): string {
-  return raw.replace(/\s+/g, "");
-}
-
-// What the app itself reads out of a pasted invite code: enough to show the
-// session name, ask for a passphrase when one is needed, and match the
-// extension's `probe` result. The addresses inside are the extension's
-// business; the whole normalized code is sent along with join/check.
-//
-// These checks deliberately mirror the extension's `parse_ticket`. Anything the
-// app accepts but the extension rejects becomes a dead end for the user: a
-// name renders, the passphrase field appears, Join enables, and then nothing
-// happens and no error is ever shown.
-function decodeTicket(raw: string): { sid: string; name: string; auth: boolean } | null {
-  const s = normalizeTicket(raw);
-  if (!s.startsWith("RM1:") || s.length > 8192) return null;
-  const body = s.slice(4);
-  if (!/^[A-Za-z0-9_-]+$/.test(body)) return null;
-  try {
-    const b64 = body.replace(/-/g, "+").replace(/_/g, "/");
-    const pad = b64.length % 4 === 2 ? "==" : b64.length % 4 === 3 ? "=" : "";
-    const json = JSON.parse(
-      new TextDecoder().decode(Uint8Array.from(atob(b64 + pad), (c) => c.charCodeAt(0))),
-    );
-    if (json?.v !== 1 || typeof json.sid !== "string" || !json.sid) return null;
-    // The extension requires `peer` to parse as a PeerId and at least one
-    // address to parse as a Multiaddr; it pins the join to that peer, so a
-    // ticket without a usable one is not joinable by any path.
-    if (typeof json.peer !== "string" || !/^[1-9A-HJ-NP-Za-km-z]{40,}$/.test(json.peer))
-      return null;
-    if (!Array.isArray(json.addrs) || json.addrs.length === 0) return null;
-    if (!json.addrs.some((a: unknown) => typeof a === "string" && a.startsWith("/")))
-      return null;
-    return {
-      sid: json.sid,
-      name: typeof json.name === "string" ? json.name : "",
-      auth: !!json.auth,
-    };
-  } catch {
-    return null;
-  }
-}
+// Ticket parsing lives in lib/ticket.ts (unit-tested; mirrors the extension's
+// parse_ticket so the app never accepts a code the extension would refuse).
 
 // Join hosts that are not discoverable through mDNS by pasting an invite code.
 function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number | null }) {
@@ -523,16 +438,15 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
   const invalid = code.length > 0 && !ticket;
   const name = ticket?.name || t("sessionFallback");
 
-  const join = () => {
+  const join = (nofx: boolean) => {
     if (!ticket || joining) return;
     setJoining(true);
-    trustWarningAccepted = true;
     setConfirmOpen(false);
-    send({ cmd: "join", ticket: code, session_name: name, passphrase: pass }, port ?? undefined);
-  };
-  const proceedJoin = () => {
-    if (trustWarningAccepted) join();
-    else setConfirmOpen(true);
+    recordHostJoin(ticket.peer);
+    send(
+      { cmd: "join", ticket: code, session_name: name, passphrase: pass, nofx },
+      port ?? undefined,
+    );
   };
 
   // Invite checks get a longer deadline because the host may be across a VPN.
@@ -541,16 +455,16 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
     probe,
     TICKET_CHECK_TIMEOUT_MS,
     (outcome) => {
-      if (outcome === "ok") return proceedJoin();
-      setError(outcome);
+      if (outcome === "ok") return setConfirmOpen(true);
+      setError(ticket?.auth ? outcome : "unknown");
       shake();
     },
   );
 
+  // Probe first to verify the passphrase and load the join preview.
   const beginJoin = () => {
     if (!ticket || checking || joining) return;
-    if (!ticket.auth) return proceedJoin();
-    if (!pass) return;
+    if (ticket.auth && !pass) return;
     setError("");
     begin();
     send({ cmd: "check", ticket: code, passphrase: pass }, port ?? undefined);
@@ -712,33 +626,15 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
         )}
       </AnimatePresence>
 
-      {/* The same explicit trust decision as joining an announced session:
-          a pasted code downloads and runs the host's project all the same. */}
-      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
-        <DialogContent className="max-w-[340px] gap-4 rounded-2xl">
-          <DialogHeader>
-            <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-amber-500/15 sm:mx-0">
-              <ShieldAlert className="size-5 text-amber-500" />
-            </div>
-            <DialogTitle className="text-[15px]">{t("trustTitle")}</DialogTitle>
-            <DialogDescription className="text-[13px] leading-relaxed">
-              {t("trustBody", { name })}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter className="gap-2 sm:gap-2">
-            <Button
-              variant="outline"
-              className="flex-1"
-              onClick={() => setConfirmOpen(false)}
-            >
-              {t("cancel")}
-            </Button>
-            <Button className="flex-1" onClick={join}>
-              {t("joinAnyway")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* Use the same confirmation for discovered and invite-code sessions. */}
+      <TrustDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        name={name}
+        hostPeerId={ticket?.peer}
+        preview={ticket && probe?.session_id === ticket.sid ? probe?.preview : undefined}
+        onJoin={join}
+      />
     </div>
   );
 }
@@ -746,10 +642,13 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
 function HostCard({
   project,
   error,
+  warning,
   port,
 }: {
   project: string;
   error: ExtState["error"];
+  /** Warning that pauses hosting until the user confirms or cancels. */
+  warning: ExtState["host_warning"];
   port: number | null;
 }) {
   const [pass, setPass] = useState("");
@@ -765,13 +664,17 @@ function HostCard({
   useEffect(() => {
     if (pending && errKey) setPending(false);
   }, [errKey, pending]);
+  // Stop the spinner while the user decides about a host warning.
+  useEffect(() => {
+    if (pending && warning) setPending(false);
+  }, [warning, pending]);
   useEffect(() => {
     if (!pending) return;
     const id = setTimeout(() => setPending(false), 10000); // safety net
     return () => clearTimeout(id);
   }, [pending]);
 
-  const host = () => {
+  const host = (confirm: boolean) => {
     if (pending || tooShort) return;
     // Do not enter a pending state if there is no socket to send through.
     if (port === null) return;
@@ -779,8 +682,10 @@ function HostCard({
     // Keep our own passphrase so the Session screen can re-reveal it if the
     // host forgets it; the extension never echoes it back.
     rememberHostPass(port, pass);
-    send({ cmd: "host", passphrase: pass }, port);
+    send(confirm ? { cmd: "host", passphrase: pass, confirm: true } : { cmd: "host", passphrase: pass }, port);
   };
+  const dismissWarning = () => send({ cmd: "host_dismiss" }, port ?? undefined);
+  const w = warning ?? null;
   return (
     <div className="space-y-2 rounded-xl bg-card p-3">
       <div className="flex items-center gap-3">
@@ -799,7 +704,7 @@ function HostCard({
           disabled={pending || tooShort}
           busy={pending}
           label={t("hostAction")}
-          onClick={host}
+          onClick={() => host(false)}
         />
       </div>
       <PasswordInput
@@ -811,9 +716,52 @@ function HostCard({
           tooShort && "ring-1 ring-red-500/70",
         )}
         onChange={(e) => setPass(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && host()}
+        onKeyDown={(e) => e.key === "Enter" && host(false)}
       />
       {tooShort && <ErrorLine>{t("passwordTooShort", { min: MIN_PASSPHRASE })}</ErrorLine>}
+
+      {/* Confirm media size, free space, and cloud-folder warnings. */}
+      <Dialog open={!!w} onOpenChange={(open) => !open && dismissWarning()}>
+        <DialogContent className="max-w-[340px] gap-4 rounded-2xl">
+          <DialogHeader>
+            <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-amber-500/15 sm:mx-0">
+              <ShieldAlert className="size-5 text-amber-500" aria-hidden="true" />
+            </div>
+            <DialogTitle className="text-[15px]">{t("hostCopyTitle")}</DialogTitle>
+            <DialogDescription asChild>
+              <div className="space-y-2 text-[13px] leading-relaxed">
+                {w && w.files > 0 && (
+                  <p>
+                    {t("hostCopyBody", { count: w.files, size: formatBytes(w.bytes) })}{" "}
+                    {w.free_known && (
+                      <span className={w.enough ? undefined : "font-medium text-red-400"}>
+                        {w.enough
+                          ? t("hostFreeOk", { free: formatBytes(w.free) })
+                          : t("hostFreeNotEnough", { free: formatBytes(w.free) })}
+                      </span>
+                    )}
+                  </p>
+                )}
+                {w?.cloud && <p className="text-amber-500">{t("hostCloudWarning")}</p>}
+              </div>
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button variant="outline" className="flex-1" onClick={dismissWarning}>
+              {t("cancel")}
+            </Button>
+            <Button
+              className="flex-1"
+              onClick={() => {
+                dismissWarning();
+                host(true);
+              }}
+            >
+              {t("hostAnyway")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -844,6 +792,9 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
           <span className="text-[12px] font-medium">{t("reconnectingBanner")}</span>
         </div>
       )}
+
+      {/* Show a repair path for an active Windows Firewall block rule. */}
+      <FirewallBlocked />
 
       <ProfileRow profile={profile} onChange={updateProfile} />
 
@@ -882,7 +833,12 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
 
       <TicketJoin probe={state.probe} port={port} />
 
-      <HostCard project={state.project} error={state.error} port={port} />
+      <HostCard
+        project={state.project}
+        error={state.error}
+        warning={state.host_warning}
+        port={port}
+      />
     </div>
   );
 }

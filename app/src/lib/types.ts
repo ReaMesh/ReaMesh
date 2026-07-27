@@ -17,6 +17,22 @@ export interface Peer {
    *  locally from their broadcast track GUID. Absent/0 when they're not on a
    *  track (or an older extension that doesn't report focus). */
   track?: number | null;
+  /** Peer id this peer is following ("" / absent = nobody). On the self entry
+   *  it is this user's own follow target; on others it powers the "following
+   *  you" indicator. */
+  follow?: string;
+  /** This peer's REAPER main thread stopped responding (their network thread
+   *  still beacons, so we can tell the difference from them leaving). */
+  frozen?: boolean;
+}
+
+/** Join preview from the owner's manifest. Sizes and metadata are host-reported;
+ *  the extension checks the plugin list against the received project before opening it. */
+export interface SessionPreview {
+  files?: number;
+  bytes?: number;
+  project_file?: string;
+  meta?: { v?: number; tracks?: number; plugins?: string[] } | null;
 }
 
 export interface SessionAd {
@@ -83,8 +99,26 @@ export interface ExtState {
   sessions: SessionAd[];
   peers: Peer[];
   /** Result of a passphrase pre-check: `ok` is null while in flight, then a
-   *  boolean. `null` (the whole field) when no check is active. */
-  probe?: { session_id: string; ok: boolean | null } | null;
+   *  boolean. `null` (the whole field) when no check is active. A successful
+   *  check also carries the join `preview`. */
+  probe?: { session_id: string; ok: boolean | null; preview?: SessionPreview | null } | null;
+  /** Pre-host warning: hosting would copy this much external media into the
+   *  project folder (and/or the project lives in a cloud-synced folder). The
+   *  app confirms before re-sending `host` with confirm:true. */
+  host_warning?: {
+    files: number;
+    bytes: number;
+    free: number;
+    free_known: boolean;
+    cloud: boolean;
+    enough: boolean;
+  } | null;
+  /** Post-download verification: the received project loads plugins the host
+   *  didn't list (`listed` false = the host reported no list at all). The open
+   *  is held until `open_confirm` or `leave`. */
+  verify?: { extras: string[]; listed: boolean } | null;
+  /** This client joined without effects (view-only, every FX chain stripped). */
+  nofx?: boolean;
 }
 
 /** One running REAPER instance (= one control server port). */
@@ -101,7 +135,20 @@ export function displayName(p: Peer): string {
   return t("guest");
 }
 
-/** First character of a word, as a whole code point; indexing with [0] would
+/** Normalize array fields at the process boundary. The extension versions
+ *  independently of the app, so missing or malformed arrays must not reach
+ *  components that call map or filter without further checks. */
+export function normalizeState(msg: Record<string, unknown>): ExtState {
+  const arr = <T,>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
+  return {
+    ...(msg as unknown as ExtState),
+    peers: arr(msg.peers),
+    sessions: arr(msg.sessions),
+    log: arr(msg.log),
+  };
+}
+
+/** First character of a word, as a whole code point: indexing with [0] would
  *  split an astral character (an emoji name) into a lone surrogate, which
  *  renders as a replacement glyph in every peer's roster. */
 function firstChar(word: string): string {

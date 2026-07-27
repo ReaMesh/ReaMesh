@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ArrowLeft, Check, ExternalLink } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -283,6 +284,32 @@ export function Settings({ onBack }: { onBack: () => void }) {
                 {t("removeExtension")}
               </Button>
             )}
+          </div>
+        </section>
+
+        <section className="space-y-2">
+          <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            {t("networkIdentity")}
+          </h3>
+          <div className="space-y-3 rounded-xl bg-card p-3.5">
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              {t("resetIdentityHint")}
+            </p>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-full text-[12px] text-muted-foreground hover:text-destructive"
+              onClick={async () => {
+                try {
+                  const had = await invoke<boolean>("reset_network_identity");
+                  toast.success(had ? t("identityWasReset") : t("noIdentityYet"));
+                } catch (e) {
+                  toast.error(String(e));
+                }
+              }}
+            >
+              {t("resetIdentity")}
+            </Button>
           </div>
         </section>
 

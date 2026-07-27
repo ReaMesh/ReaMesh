@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Check } from "lucide-react";
+import { Check, ShieldAlert } from "lucide-react";
 import {
   AnimatePresence,
   motion,
@@ -8,10 +8,19 @@ import {
   useTransform,
 } from "motion/react";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { FG_COLOR, FOUND_COLOR, SCAN_COLOR } from "@/lib/colors";
 import { send } from "@/lib/connection";
 import { formatBytes, useTransfer } from "@/lib/format";
 import { resolveLang, t } from "@/lib/i18n";
+import { parseFxName } from "@/lib/plugins";
 import type { ExtState } from "@/lib/types";
 
 // The beacon covers three stages: connecting, downloading, and opening the
@@ -320,13 +329,72 @@ export function Downloading({
         size="sm"
         className="text-muted-foreground"
         onClick={() => send({ cmd: "leave" }, port ?? undefined)}
-        // Stays usable through a stall: the one moment the user most wants out
-        // is while nothing is arriving. Only a project actually opening in
-        // REAPER (which blocks its main thread anyway) disables it.
-        disabled={!stalled && phase >= 2}
+        // Allow cancellation during stalls and plugin verification. Disable it
+        // only while REAPER is actively opening the project.
+        disabled={!stalled && phase >= 2 && !state.verify}
       >
         {t("cancel")}
       </Button>
+
+      {/* The received project loads plugins the host's list didn't mention (or
+          the host listed nothing); the extension holds the open until the
+          user decides. This is what makes the join preview a verified claim
+          rather than a reassuring picture. */}
+      <Dialog
+        open={!!state.verify}
+        onOpenChange={(open) => !open && send({ cmd: "leave" }, port ?? undefined)}
+      >
+        <DialogContent className="max-w-[360px] gap-4 rounded-2xl">
+          <DialogHeader>
+            <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-amber-500/15 sm:mx-0">
+              <ShieldAlert className="size-5 text-amber-500" aria-hidden="true" />
+            </div>
+            <DialogTitle className="text-[15px]">{t("verifyTitle")}</DialogTitle>
+            <DialogDescription className="text-left text-[13px] leading-relaxed">
+              {state.verify?.listed
+                ? t("verifyBodyListed", { count: state.verify.extras.length })
+                : t("verifyBodyNoList")}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="scroll-slim max-h-36 space-y-0.5 overflow-y-auto rounded-lg bg-secondary/50 p-1.5">
+            {(state.verify?.extras ?? []).map((raw) => {
+              const p = parseFxName(raw);
+              return (
+                <div key={raw} className="flex items-center gap-2 px-1 py-0.5" title={raw}>
+                  <span
+                    aria-hidden="true"
+                    className="size-1.5 shrink-0 rounded-full bg-amber-400"
+                  />
+                  <span className="min-w-0 flex-1 truncate text-[12px]">
+                    {p.name || raw}
+                    {p.vendor && <span className="text-muted-foreground"> · {p.vendor}</span>}
+                  </span>
+                  {p.fmt && (
+                    <span className="shrink-0 text-[10px] uppercase text-muted-foreground">
+                      {p.fmt}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              className="flex-1"
+              onClick={() => send({ cmd: "leave" }, port ?? undefined)}
+            >
+              {t("cancel")}
+            </Button>
+            <Button
+              className="flex-1"
+              onClick={() => send({ cmd: "open_confirm" }, port ?? undefined)}
+            >
+              {t("verifyContinue")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

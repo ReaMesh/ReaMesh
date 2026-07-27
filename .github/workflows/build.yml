@@ -1,6 +1,6 @@
-# Builds the REAPER extension for Windows (reaper_reamesh.dll) and macOS
-# (reaper_reamesh.dylib), plus the Windows installer, and uploads them as
-# artifacts.
+# Build the extension on Windows and macOS, the Windows installer, and an
+# unbundled macOS app. Run Rust tests serially because they share sockets
+# and mDNS. Type-check and test the frontend on both platforms.
 name: build
 on:
   push:
@@ -15,14 +15,11 @@ jobs:
       - name: Build Rust staticlib
         run: cargo build --release
         working-directory: rust
-      # The session tests drive real sockets between two in-process peers, and
-      # some of them discover each other over mDNS. That works locally; whether
-      # a hosted runner allows the multicast is unproven, so a failure here
-      # shouldn't fail the build until it's been seen to pass.
+      # Serial: the in-process session tests use real (non-sandboxed) sockets
+      # and mDNS; run in parallel they steal each other's discovery traffic.
       - name: Rust tests
-        run: cargo test --release
+        run: cargo test --release -- --test-threads=1
         working-directory: rust
-        continue-on-error: true
       - name: Build extension DLL
         run: |
           cmake -S extension -B extension/build
@@ -31,11 +28,15 @@ jobs:
         with:
           name: reaper_reamesh-windows-x64
           path: extension/build/Release/reaper_reamesh.dll
-      # The app bundles the DLL built above, so this has to come after it.
-      - name: Build companion app + installer
+      - name: App lint + unit tests
         run: |
           bun install
-          bun run tauri build
+          bun run build
+          bun run test
+        working-directory: app
+      # The app bundles the DLL built above, so this has to come after it.
+      - name: Build companion app + installer
+        run: bun run tauri build
         working-directory: app
       - uses: actions/upload-artifact@v4
         with:
@@ -46,8 +47,12 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
       - name: Build Rust staticlib
         run: cargo build --release
+        working-directory: rust
+      - name: Rust tests
+        run: cargo test --release -- --test-threads=1
         working-directory: rust
       - name: Build extension dylib
         run: |
@@ -57,3 +62,15 @@ jobs:
         with:
           name: reaper_reamesh-macos
           path: extension/build/reaper_reamesh.dylib
+      - name: App lint + unit tests
+        run: |
+          bun install
+          bun run build
+          bun run test
+        working-directory: app
+      # --no-bundle: builds the real app binary (the part that can break) but
+      # skips bundling/signing: tauri.macos.conf.json pins a signingIdentity
+      # that CI does not have, so a full `tauri build` can never pass here.
+      - name: Build companion app (unbundled)
+        run: bun run tauri build -- --no-bundle
+        working-directory: app

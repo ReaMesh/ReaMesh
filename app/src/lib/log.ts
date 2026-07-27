@@ -41,6 +41,11 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   peer_markers_changed: "peerMarkersChanged",
   peer_title_changed: "peerTitleChanged",
   peer_notes_changed: "peerNotesChanged",
+  marker_shared: "logMarkerShared",
+  follow_ended: "followEnded",
+  identity_reset: "identityReset",
+  nofx_open: "nofxOpen",
+  verify_hold: "verifyHold",
 };
 
 export function localizeLogEntry(entry: LogEntry | string): string {
@@ -63,6 +68,27 @@ export function localizeLogEntry(entry: LogEntry | string): string {
     case "peer_track_removed": {
       const name = entry.params?.name;
       return name ? t("peerTrackRemoved", { name }) : t("peerTrackRemovedUnnamed");
+    }
+    case "marker_received": {
+      const name = entry.params?.name ?? "";
+      const by = entry.params?.by;
+      return by
+        ? t("logMarkerReceived", { by, name })
+        : t("logMarkerReceivedUnnamed", { name });
+    }
+    case "plugin_added": {
+      const plugin = entry.params?.plugin ?? "";
+      const track = entry.params?.track;
+      const by = entry.params?.by;
+      if (by && track) return t("pluginAddedByTrack", { by, plugin, track });
+      if (by) return t("pluginAddedBy", { by, plugin });
+      if (track) return t("pluginAddedTrack", { plugin, track });
+      return t("pluginAdded", { plugin });
+    }
+    case "plugins_added": {
+      const count = entry.params?.count ?? 0;
+      const track = entry.params?.track;
+      return track ? t("pluginsAddedTrack", { count, track }) : t("pluginsAdded", { count });
     }
   }
   const key = entry.code ? CODE_KEYS[entry.code] : undefined;

@@ -8,7 +8,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
-import { ChevronUp, Crown } from "lucide-react";
+import { ChevronUp, Crosshair, Crown, Eye, Flag, Snowflake, X } from "lucide-react";
 import { currentMonitor, getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { TrackNumber } from "@/components/Rolling";
@@ -27,19 +27,33 @@ const MIN_MAX_HEIGHT = 160;
 function PeerRow({
   peer,
   onReveal,
+  pickMode = false,
+  onPick,
+  isFollowTarget = false,
+  followerCount = 0,
 }: {
   peer: Peer;
   onReveal?: (peer: Peer) => void;
+  /** Follow-mode picking: clicking any other person starts following them. */
+  pickMode?: boolean;
+  onPick?: (peer: Peer) => void;
+  /** This row is the peer this user is currently following. */
+  isFollowTarget?: boolean;
+  /** On the self row: how many peers are following this user. */
+  followerCount?: number;
 }) {
-  // Click-to-follow: only meaningful for someone else who's actually on a
-  // track. Tapping your own row, or a peer not on any track, does nothing.
+  // Other peers can be followed in pick mode or revealed when they are on a track.
+  const pickable = pickMode && !peer.is_self && !!onPick;
   const clickable =
-    !!onReveal && !peer.is_self && peer.track != null && peer.track > 0;
-  // The scroll this triggers happens over in REAPER, outside this window;
-  // flash the row in the peer's color so the click is acknowledged in place.
+    pickable || (!!onReveal && !peer.is_self && peer.track != null && peer.track > 0);
+  // Flash the row to acknowledge the change happening in REAPER.
   const [flashScope, animateFlash] = useAnimate();
   const activate = () => {
-    onReveal!(peer);
+    if (pickable) {
+      onPick!(peer);
+    } else {
+      onReveal!(peer);
+    }
     if (!flashScope.current) return;
     const tint = /^#[0-9a-fA-F]{6}$/.test(peer.color)
       ? [`${peer.color}4d`, `${peer.color}00`]
@@ -70,12 +84,16 @@ function PeerRow({
       }
       role={clickable ? "button" : undefined}
       tabIndex={clickable ? 0 : undefined}
-      title={clickable ? t("revealPeerTrack", { name: displayName(peer) }) : undefined}
+      title={
+        pickable
+          ? t("followingName", { name: displayName(peer) })
+          : clickable
+            ? t("revealPeerTrack", { name: displayName(peer) })
+            : undefined
+      }
       className={`relative flex items-center gap-2 rounded-md px-1.5 py-1 ${
-        clickable
-          ? "cursor-pointer transition-colors hover:bg-white/5"
-          : ""
-      }`}
+        clickable ? "cursor-pointer transition-colors hover:bg-white/5" : ""
+      } ${pickable ? "ring-1 ring-inset ring-white/15" : ""}`}
     >
       {clickable && (
         <span
@@ -88,6 +106,37 @@ function PeerRow({
       <span className="min-w-0 flex-1 truncate text-[12px] font-medium">
         {displayName(peer)}
       </span>
+      {peer.frozen && !peer.is_self && (
+        // The peer is online, but their REAPER has stopped responding.
+        <span title={t("reaperNotRespondingPeer")} className="shrink-0">
+          <Snowflake className="size-3 text-sky-300" />
+          <span className="sr-only">{t("reaperNotRespondingPeer")}</span>
+        </span>
+      )}
+      {isFollowTarget && (
+        <span title={t("followingName", { name: displayName(peer) })} className="shrink-0">
+          <Crosshair className="size-3 text-found" />
+        </span>
+      )}
+      {peer.is_self && followerCount > 0 && (
+        // The being-followed indicator: someone's transport now mirrors yours.
+        <span
+          title={
+            followerCount === 1
+              ? t("followingYouOne")
+              : t("followingYouMany", { count: followerCount })
+          }
+          className="flex shrink-0 items-center gap-0.5 text-found"
+        >
+          <Eye className="size-3" />
+          {followerCount > 1 && <span className="text-[9px]">{followerCount}</span>}
+          <span className="sr-only">
+            {followerCount === 1
+              ? t("followingYouOne")
+              : t("followingYouMany", { count: followerCount })}
+          </span>
+        </span>
+      )}
       {peer.is_owner && (
         <span title={t("sessionHost")} className="shrink-0">
           <Crown className="size-3 text-amber-400" />
@@ -180,6 +229,35 @@ export function Overlay({ port }: { port: number | null }) {
   const peers = state?.peers ?? [];
   const reveal = (peer: Peer) => send({ cmd: "reveal_peer", peer_id: peer.id });
 
+  // ---- roster bar: shared markers + follow mode ----
+  const self = peers.find((p) => p.is_self);
+  const followingId = self?.follow || "";
+  const followTarget = followingId ? peers.find((p) => p.id === followingId) : undefined;
+  const followerCount = self
+    ? peers.filter((p) => !p.is_self && p.follow && p.follow === self.id).length
+    : 0;
+  const [markerOpen, setMarkerOpen] = useState(false);
+  const [markerName, setMarkerName] = useState("");
+  const [pickMode, setPickMode] = useState(false);
+  // Follow target gone (left / went stale): the extension already stopped
+  // following; make sure pick mode isn't stuck either.
+  useEffect(() => {
+    if (followingId) setPickMode(false);
+  }, [followingId]);
+
+  const shareMarker = () => {
+    const name = markerName.trim();
+    if (!name) return;
+    send({ cmd: "share_marker", name });
+    setMarkerName("");
+    setMarkerOpen(false);
+  };
+  const pickFollow = (peer: Peer) => {
+    setPickMode(false);
+    send({ cmd: "follow", peer_id: peer.id });
+  };
+  const stopFollowing = () => send({ cmd: "follow", peer_id: "" });
+
   return (
     <div
       ref={cardRef}
@@ -246,13 +324,114 @@ export function Overlay({ port }: { port: number | null }) {
                 ) : (
                   <AnimatePresence initial={false} mode="popLayout">
                     {peers.map((p) => (
-                      <PeerRow key={p.id} peer={p} onReveal={reveal} />
+                      <PeerRow
+                        key={p.id}
+                        peer={p}
+                        onReveal={reveal}
+                        pickMode={pickMode}
+                        onPick={pickFollow}
+                        isFollowTarget={!!followingId && p.id === followingId}
+                        followerCount={followerCount}
+                      />
                     ))}
                   </AnimatePresence>
                 )}
               </div>
             )}
 
+            {/* Roster bar: shared markers + follow mode. Two quiet tools that
+                act in REAPER, not in this window: a flag everyone can keep or
+                delete, and a transport that mirrors someone else's. */}
+            <div className="border-t border-white/10 px-1.5 py-1">
+              <div className="flex h-6 items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMarkerOpen((v) => !v);
+                    setPickMode(false);
+                  }}
+                  aria-expanded={markerOpen}
+                  aria-label={t("shareMarkerTitle")}
+                  title={t("shareMarkerTitle")}
+                  className={`grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring ${
+                    markerOpen ? "bg-white/10 text-foreground" : "text-muted-foreground"
+                  }`}
+                >
+                  <Flag className="size-3.5" aria-hidden="true" />
+                </button>
+                {followTarget ? (
+                  <button
+                    type="button"
+                    onClick={stopFollowing}
+                    aria-label={t("stopFollowing")}
+                    title={t("stopFollowing")}
+                    className="flex h-6 min-w-0 items-center gap-1 rounded-md px-1.5 text-found transition-colors outline-none hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <X className="size-3.5 shrink-0" aria-hidden="true" />
+                    <span className="min-w-0 truncate text-[11px] font-medium">
+                      {t("followingName", { name: displayName(followTarget) })}
+                    </span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPickMode((v) => !v);
+                      setMarkerOpen(false);
+                    }}
+                    aria-pressed={pickMode}
+                    aria-label={t("followMode")}
+                    title={t("followMode")}
+                    className={`grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring ${
+                      pickMode ? "bg-white/10 text-foreground" : "text-muted-foreground"
+                    }`}
+                  >
+                    <Crosshair className="size-3.5" aria-hidden="true" />
+                  </button>
+                )}
+                {pickMode && !followTarget && (
+                  <span className="min-w-0 flex-1 truncate text-[10px] text-muted-foreground">
+                    {t("pickPersonToFollow")}
+                  </span>
+                )}
+              </div>
+              <AnimatePresence initial={false}>
+                {markerOpen && (
+                  <motion.div
+                    key="marker"
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ type: "spring", stiffness: 400, damping: 38 }}
+                    className="overflow-hidden"
+                  >
+                    <div className="flex items-center gap-1 pt-1 pb-0.5">
+                      <input
+                        value={markerName}
+                        onChange={(e) => setMarkerName(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") shareMarker();
+                          if (e.key === "Escape") setMarkerOpen(false);
+                        }}
+                        autoFocus
+                        maxLength={80}
+                        aria-label={t("markerNamePlaceholder")}
+                        placeholder={t("markerNamePlaceholder")}
+                        className="h-6 min-w-0 flex-1 rounded-md bg-white/5 px-1.5 text-[11px] outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                      />
+                      <button
+                        type="button"
+                        onClick={shareMarker}
+                        disabled={!markerName.trim()}
+                        className="h-6 shrink-0 rounded-md px-2 text-[11px] font-medium text-foreground transition-colors outline-none hover:bg-white/10 disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        {t("share")}
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>

@@ -58,6 +58,48 @@ const en = {
   ticketJoinHint:
     "An invite code reaches a host beyond this network, for example over a VPN like Tailscale.",
 
+  // Join preview / trust dialog
+  reportedByHost: "Reported by the host and checked against the real download before it opens.",
+  previewTracks: "{count} tracks",
+  joinNoFx: "Join without effects",
+  joinNoFxHint:
+    "Opens the project with every effect chain stripped: view-only, nothing third-party loads.",
+  pluginsTitle: "Plugins this project loads",
+  pluginsAllInstalled: "All {total} plugins are installed on this machine.",
+  pluginsMissingSummary: "{missing} of {total} plugins are not installed on this machine.",
+  pluginsUnknown: "Couldn't check which plugins are installed here.",
+  copyMissing: "Copy missing list",
+  missingCopied: "Copied",
+  missingPluginNote:
+    "A missing plugin doesn't block the join: REAPER keeps its place in the chain; it just stays silent until installed.",
+  hostFirstTime: "First time seeing this host on this machine.",
+  hostSeenOnce: "You've joined this host once before.",
+  hostSeenBefore: "You've joined this host {count} times before.",
+  pluginInstalled: "Installed",
+  pluginMissing: "Not installed",
+  pluginUnknown: "Can't tell",
+
+  // Pre-host warning
+  hostCopyTitle: "Before you host",
+  hostCopyBody:
+    "Hosting copies {count} file(s) ({size}) from outside the project into its folder, so guests can download them.",
+  hostFreeOk: "{free} free on that drive.",
+  hostFreeNotEnough: "Only {free} free on that drive, not enough.",
+  hostCloudWarning:
+    "The project lives in a cloud-synced folder (Dropbox / OneDrive / iCloud). The sync client will fight the session over the same files. Pause syncing while you host.",
+  hostAnyway: "Host anyway",
+
+  // Post-download plugin verification
+  verifyTitle: "Plugins weren't listed",
+  verifyBodyListed:
+    "The downloaded project loads {count} plugin(s) the host's list didn't mention:",
+  verifyBodyNoList: "The host didn't report a plugin list. The downloaded project loads:",
+  verifyContinue: "Open anyway",
+
+  // Join-without-effects session badge
+  nofxBadge: "Effects off",
+  nofxBadgeHint: "Joined without effects (view-only); your edits aren't sent to anyone.",
+
   // Session
   sessionFallback: "Session",
   hostingBadge: "Hosting",
@@ -155,6 +197,16 @@ const en = {
   overlaySettingsTitle: "Overlay",
   olRoster: "Participants",
   olItemTint: "Locked-item tint",
+  shareMarkerTitle: "Share a marker",
+  markerNamePlaceholder: "Marker name…",
+  share: "Share",
+  followMode: "Follow someone",
+  pickPersonToFollow: "Click a person to follow them",
+  stopFollowing: "Stop following",
+  followingName: "Following {name}",
+  followingYouOne: "Following you",
+  followingYouMany: "{count} following you",
+  reaperNotRespondingPeer: "Their REAPER isn't responding",
 
   // Activity-log / error events from the extension, rendered by code (see
   // lib/log.ts). `text` on the wire is the English fallback for unknown codes.
@@ -200,11 +252,49 @@ const en = {
   peerTitleChanged: "Project info changed",
   peerNotesChanged: "Project notes changed",
   reconnectingBanner: "Connection to the host lost. Reconnecting…",
+  logMarkerShared: "Shared marker “{name}”",
+  logMarkerReceived: "{by} shared marker “{name}”",
+  logMarkerReceivedUnnamed: "Marker “{name}” was shared",
+  pluginAddedByTrack: "{by} added {plugin} to “{track}”",
+  pluginAddedBy: "{by} added {plugin}",
+  pluginAddedTrack: "{plugin} was added to “{track}”",
+  pluginAdded: "{plugin} was added",
+  pluginsAddedTrack: "{count} plugins were added to “{track}”",
+  pluginsAdded: "{count} plugins were added",
+  pluginNotInstalledHere: "Not installed here; it'll show as offline.",
+  followEnded: "Stopped following: they left the session.",
+  identityReset: "Network identity reset. Takes effect next session.",
+  nofxOpen: "Opening without effects (view-only).",
+  verifyHold: "The downloaded project loads plugins the host didn't list.",
 
   // Download
   downloadStalled: "Nothing arriving. The host may have gone quiet.",
   downloadProgress: "Download progress",
   fileOfTotal: "File {done} of {total}",
+
+  // Disconnected variants
+  reaperClosed: "REAPER was closed",
+  reaperClosedBody: "Start it again to reconnect.",
+  reaperClosedSession: "The session ended when REAPER closed.",
+  portTroubleTitle: "ReaMesh is running, but every port is taken",
+  portTroubleBody:
+    "The extension is loaded, but all four ReaMesh ports are in use: a fifth REAPER, or another program. Close one and it connects by itself; nothing needs reinstalling.",
+
+  // Windows Firewall: an existing block detected
+  fwBlockedTitle: "Windows is blocking REAPER",
+  fwBlockedBody:
+    "An active firewall rule blocks REAPER's incoming connections, usually left behind by a dismissed prompt. Until it's removed, nobody on the network can reach you.",
+  fwOpenSettings: "Open firewall settings",
+  fwCopyFix: "Copy fix",
+  fwFixCopied: "Copied. Paste into an administrator PowerShell.",
+
+  // Settings: network identity
+  networkIdentity: "Network identity",
+  resetIdentity: "Reset network identity",
+  resetIdentityHint:
+    "This install has one stable, anonymous peer ID; it's how others recognise you across sessions. Resetting mints a new one at the next session.",
+  identityWasReset: "Identity reset. A new one is created next session.",
+  noIdentityYet: "No stored identity yet.",
 
   // A11y labels
   peopleList: "People in this session",
@@ -263,6 +353,44 @@ const de: Record<MsgKey, string> = {
   invalidTicket: "Das sieht nicht nach einem ReaMesh-Einladungscode aus.",
   ticketJoinHint:
     "Ein Einladungscode erreicht einen Host auch außerhalb dieses Netzwerks, zum Beispiel über ein VPN wie Tailscale.",
+
+  reportedByHost: "Vom Host angegeben und vor dem Öffnen mit dem echten Download abgeglichen.",
+  previewTracks: "{count} Tracks",
+  joinNoFx: "Ohne Effekte beitreten",
+  joinNoFxHint:
+    "Öffnet das Projekt ohne sämtliche Effektketten: nur ansehen, nichts von Drittanbietern wird geladen.",
+  pluginsTitle: "Plugins, die dieses Projekt lädt",
+  pluginsAllInstalled: "Alle {total} Plugins sind auf diesem Rechner installiert.",
+  pluginsMissingSummary: "{missing} von {total} Plugins sind auf diesem Rechner nicht installiert.",
+  pluginsUnknown: "Konnte nicht prüfen, welche Plugins hier installiert sind.",
+  copyMissing: "Fehlende kopieren",
+  missingCopied: "Kopiert",
+  missingPluginNote:
+    "Ein fehlendes Plugin verhindert den Beitritt nicht: REAPER hält seinen Platz in der Kette frei; es bleibt nur stumm, bis es installiert ist.",
+  hostFirstTime: "Dieser Host ist auf diesem Rechner zum ersten Mal zu sehen.",
+  hostSeenOnce: "Du bist diesem Host schon einmal beigetreten.",
+  hostSeenBefore: "Du bist diesem Host schon {count} Mal beigetreten.",
+  pluginInstalled: "Installiert",
+  pluginMissing: "Nicht installiert",
+  pluginUnknown: "Unbekannt",
+
+  hostCopyTitle: "Bevor du hostest",
+  hostCopyBody:
+    "Beim Hosten werden {count} Datei(en) ({size}) von außerhalb des Projekts in dessen Ordner kopiert, damit Gäste sie herunterladen können.",
+  hostFreeOk: "{free} frei auf dem Laufwerk.",
+  hostFreeNotEnough: "Nur {free} frei auf dem Laufwerk. Das reicht nicht.",
+  hostCloudWarning:
+    "Das Projekt liegt in einem Cloud-Sync-Ordner (Dropbox / OneDrive / iCloud). Der Sync-Client kämpft mit der Session um dieselben Dateien. Pausiere die Synchronisierung, solange du hostest.",
+  hostAnyway: "Trotzdem hosten",
+
+  verifyTitle: "Plugins waren nicht angegeben",
+  verifyBodyListed:
+    "Das heruntergeladene Projekt lädt {count} Plugin(s), die in der Liste des Hosts fehlten:",
+  verifyBodyNoList: "Der Host hat keine Plugin-Liste angegeben. Das heruntergeladene Projekt lädt:",
+  verifyContinue: "Trotzdem öffnen",
+
+  nofxBadge: "Effekte aus",
+  nofxBadgeHint: "Ohne Effekte beigetreten (nur ansehen); deine Änderungen werden nicht gesendet.",
 
   sessionFallback: "Session",
   hostingBadge: "Hosting",
@@ -355,6 +483,16 @@ const de: Record<MsgKey, string> = {
   overlaySettingsTitle: "Overlay",
   olRoster: "Teilnehmer",
   olItemTint: "Sperrtönung für Items",
+  shareMarkerTitle: "Marker teilen",
+  markerNamePlaceholder: "Marker-Name…",
+  share: "Teilen",
+  followMode: "Jemandem folgen",
+  pickPersonToFollow: "Klicke eine Person an, um ihr zu folgen",
+  stopFollowing: "Nicht mehr folgen",
+  followingName: "Du folgst {name}",
+  followingYouOne: "Folgt dir",
+  followingYouMany: "{count} folgen dir",
+  reaperNotRespondingPeer: "REAPER dieser Person reagiert nicht",
 
   hostEndedSession: "Der Host hat die Session beendet.",
   hostLost: "Verbindung zum Host verloren.",
@@ -399,10 +537,45 @@ const de: Record<MsgKey, string> = {
   peerTitleChanged: "Projektinfo geändert",
   peerNotesChanged: "Projektnotizen geändert",
   reconnectingBanner: "Verbindung zum Host verloren. Verbinde erneut…",
+  logMarkerShared: "Marker „{name}“ geteilt",
+  logMarkerReceived: "{by} hat den Marker „{name}“ geteilt",
+  logMarkerReceivedUnnamed: "Marker „{name}“ wurde geteilt",
+  pluginAddedByTrack: "{by} hat {plugin} zu „{track}“ hinzugefügt",
+  pluginAddedBy: "{by} hat {plugin} hinzugefügt",
+  pluginAddedTrack: "{plugin} wurde zu „{track}“ hinzugefügt",
+  pluginAdded: "{plugin} wurde hinzugefügt",
+  pluginsAddedTrack: "{count} Plugins wurden zu „{track}“ hinzugefügt",
+  pluginsAdded: "{count} Plugins wurden hinzugefügt",
+  pluginNotInstalledHere: "Hier nicht installiert. Es erscheint als offline.",
+  followEnded: "Folgen beendet. Die Person hat die Session verlassen.",
+  identityReset: "Netzwerk-Identität zurückgesetzt, gilt ab der nächsten Session.",
+  nofxOpen: "Öffne ohne Effekte (nur ansehen).",
+  verifyHold: "Das heruntergeladene Projekt lädt Plugins, die der Host nicht angegeben hat.",
 
   downloadStalled: "Es kommt nichts an. Der Host ist vielleicht weg.",
   downloadProgress: "Download-Fortschritt",
   fileOfTotal: "Datei {done} von {total}",
+
+  reaperClosed: "REAPER wurde beendet",
+  reaperClosedBody: "Starte es erneut, um dich wieder zu verbinden.",
+  reaperClosedSession: "Die Session endete, als REAPER beendet wurde.",
+  portTroubleTitle: "ReaMesh läuft, aber alle Ports sind belegt",
+  portTroubleBody:
+    "Die Extension ist geladen, aber alle vier ReaMesh-Ports sind in Benutzung: ein fünftes REAPER oder ein anderes Programm. Schließe eines, dann verbindet es sich von selbst; nichts muss neu installiert werden.",
+
+  fwBlockedTitle: "Windows blockiert REAPER",
+  fwBlockedBody:
+    "Eine aktive Firewall-Regel blockiert eingehende Verbindungen zu REAPER, meist von einem weggeklickten Hinweis übrig. Bis sie entfernt ist, kann dich niemand im Netzwerk erreichen.",
+  fwOpenSettings: "Firewall-Einstellungen öffnen",
+  fwCopyFix: "Korrektur kopieren",
+  fwFixCopied: "Kopiert. In eine Administrator-PowerShell einfügen.",
+
+  networkIdentity: "Netzwerk-Identität",
+  resetIdentity: "Netzwerk-Identität zurücksetzen",
+  resetIdentityHint:
+    "Diese Installation hat eine feste, anonyme Peer-ID. Daran erkennen dich andere über Sessions hinweg. Beim Zurücksetzen wird zur nächsten Session eine neue erzeugt.",
+  identityWasReset: "Identität zurückgesetzt. Eine neue entsteht bei der nächsten Session.",
+  noIdentityYet: "Noch keine gespeicherte Identität.",
 
   peopleList: "Personen in dieser Session",
   reaperInstances: "REAPER-Instanzen",

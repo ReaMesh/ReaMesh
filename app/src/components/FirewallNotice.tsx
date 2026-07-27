@@ -1,5 +1,6 @@
-import { useState } from "react";
-import { ChevronRight, ShieldAlert } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ChevronRight, ShieldAlert, ShieldX } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
 import { t } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
@@ -13,6 +14,77 @@ import { cn, focusRing } from "@/lib/utils";
 // the one-shot onboarding step shows it unconditionally.
 
 const ACK_KEY = "reamesh.firewallAck";
+
+/** Build the admin PowerShell command that replaces active REAPER block rules
+ *  with an allow rule for private networks. */
+export function firewallFixCommand(exe: string): string {
+  return (
+    `Get-NetFirewallApplicationFilter -Program "${exe}" | Get-NetFirewallRule | ` +
+    `Where-Object Action -eq Block | Remove-NetFirewallRule; ` +
+    `New-NetFirewallRule -DisplayName "REAPER" -Direction Inbound -Program "${exe}" ` +
+    `-Action Allow -Profile Private`
+  );
+}
+
+/** Show the repair command when Windows has an active inbound block rule for
+ *  REAPER. A later allow rule cannot override that rule. */
+export function FirewallBlocked() {
+  // undefined = not checked yet, null = no block, string = blocked exe path
+  // (may be "" when the rule carried no App segment).
+  const [exe, setExe] = useState<string | null | undefined>(undefined);
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!isWindows) return;
+    invoke<string | null>("firewall_block")
+      .then((v) => setExe(v ?? null))
+      .catch(() => setExe(null));
+  }, []);
+  useEffect(() => {
+    if (!copied) return;
+    const id = setTimeout(() => setCopied(false), 4000);
+    return () => clearTimeout(id);
+  }, [copied]);
+  if (!isWindows || exe === undefined || exe === null) return null;
+
+  const copyFix = async () => {
+    try {
+      await navigator.clipboard.writeText(firewallFixCommand(exe));
+      setCopied(true);
+    } catch {
+      // Clipboard denied; the settings button still works.
+    }
+  };
+
+  return (
+    <div role="alert" className="space-y-2 rounded-xl bg-red-500/10 p-3 text-left">
+      <p className="flex items-start gap-2 text-[12px] font-semibold leading-relaxed text-red-400">
+        <ShieldX className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+        {t("fwBlockedTitle")}
+      </p>
+      <p className="text-[12px] leading-relaxed text-red-400/90">{t("fwBlockedBody")}</p>
+      <div className="flex flex-wrap gap-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-6 px-2 text-[11px] text-red-400 hover:bg-red-500/15 hover:text-red-300"
+          onClick={() => invoke("open_firewall_settings").catch(() => {})}
+        >
+          {t("fwOpenSettings")}
+        </Button>
+        {exe && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-6 px-2 text-[11px] text-red-400 hover:bg-red-500/15 hover:text-red-300"
+            onClick={copyFix}
+          >
+            {copied ? t("fwFixCopied") : t("fwCopyFix")}
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
 
 export function FirewallNotice({
   dismissible = false,

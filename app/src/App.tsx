@@ -17,7 +17,8 @@ import { openOverlay, closeOverlay, setSessionState } from "@/lib/overlay";
 import { loadReaperPath, refreshStatus, useReaperStatus } from "@/lib/install";
 import { t, useLang } from "@/lib/i18n";
 import { localizeLogEntry } from "@/lib/log";
-import { displayName, type ExtState, type Mode } from "@/lib/types";
+import { pluginStatus, useInstalledPlugins } from "@/lib/plugins";
+import { displayName, type ExtState, type LogEntry, type Mode } from "@/lib/types";
 import { cn, focusRing } from "@/lib/utils";
 
 startScanning();
@@ -177,6 +178,56 @@ function useOverrideToasts(state: ExtState | undefined, port: number | undefined
   }, [state?.overridden, state?.mode, state?.log, port]);
 }
 
+/** Notify when a plugin is added during a session. Mention if it is missing
+ *  locally. Find new entries from the previous final item because the log is a
+ *  capped deque without ids. */
+function usePluginToasts(state: ExtState | undefined, port: number | undefined) {
+  const installed = useInstalledPlugins();
+  const prev = useRef<{ port?: number; lastKey: string; len: number }>({
+    lastKey: "",
+    len: 0,
+  });
+  useEffect(() => {
+    if (!state) return;
+    const inSession = state.mode === "hosting" || state.mode === "client";
+    const log = state.log ?? [];
+    const samePort = prev.current.port === port;
+    const newEntries: LogEntry[] = [];
+    if (samePort && inSession && prev.current.lastKey) {
+      let idx = -1;
+      for (let i = log.length - 1; i >= 0; i--) {
+        if (JSON.stringify(log[i]) === prev.current.lastKey) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx >= 0) newEntries.push(...log.slice(idx + 1));
+      else if (log.length > prev.current.len) newEntries.push(...log.slice(prev.current.len));
+    }
+    prev.current = {
+      port,
+      lastKey: log.length ? JSON.stringify(log[log.length - 1]) : "",
+      len: log.length,
+    };
+    for (const e of newEntries) {
+      if (e.code !== "plugin_added" && e.code !== "plugins_added") continue;
+      const plugin = e.code === "plugin_added" ? String(e.params?.plugin ?? "") : "";
+      const missing = plugin ? pluginStatus(plugin, installed) === "missing" : false;
+      const text = localizeLogEntry(e);
+      toast(
+        missing ? (
+          <span>
+            {text}
+            <span className="block text-amber-500">{t("pluginNotInstalledHere")}</span>
+          </span>
+        ) : (
+          text
+        ),
+      );
+    }
+  }, [state, port, installed]);
+}
+
 export default function App() {
   const instance = useActiveInstance();
   const state = instance?.state;
@@ -190,6 +241,18 @@ export default function App() {
   const flashPeers = usePresenceToasts(state, activePort);
   useErrorToasts(state, activePort);
   useOverrideToasts(state, activePort);
+  usePluginToasts(state, activePort);
+
+  // Remember the last connected mode so a closed REAPER gets a clear message
+  // instead of looking like a first launch.
+  const lastLive = useRef<{ mode: Mode } | null>(null);
+  useEffect(() => {
+    if (state) lastLive.current = { mode: state.mode };
+  }, [state]);
+  const reaperClosed = !state && lastLive.current != null;
+  const closedWasSession =
+    reaperClosed &&
+    (lastLive.current?.mode === "hosting" || lastLive.current?.mode === "client");
 
   // Hold the Disconnected screen briefly after REAPER answers so its
   // success animation finishes before the lobby appears. `waiting` matches
@@ -324,7 +387,10 @@ export default function App() {
   } else if (reaper && !reaper.installed && !state) {
     screen = { key: "onboarding", node: <Onboarding status={reaper} /> };
   } else if (!state) {
-    screen = { key: "disconnected", node: <Disconnected /> };
+    screen = {
+      key: "disconnected",
+      node: <Disconnected closed={reaperClosed} closedWasSession={closedWasSession} />,
+    };
   } else if (mode === "downloading") {
     screen = { key: "downloading", node: <Downloading state={state} port={port} /> };
   } else if (beatActive && mode === "client") {
