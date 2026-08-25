@@ -153,6 +153,17 @@ const MANIFEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// The owner-gone fallback usually fires first; this covers an owner that is
 /// still on the topic but no longer serving.
 const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often the owner re-walks the served project to keep the manifest
+/// honest. A joiner plans its whole download from the manifest, including piece
+/// offsets, chunk lengths, and the blake3 hash. A file the host
+/// changes mid-session (a Ctrl+S rewriting the .rpp, above all) has to be
+/// picked up, or every later join stalls on chunk lengths that no longer match.
+const MANIFEST_REFRESH: Duration = Duration::from_secs(5);
+/// Age after which an unused staging copy of a downloaded project is deleted.
+/// Every join downloads a full copy into its own directory and nothing else
+/// ever removes them, so without this a week of sessions leaves tens of
+/// gigabytes behind that no UI can clear.
+const STAGING_MAX_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 type Fields = JsonMap<String, JsonValue>;
 type SectionState = HashMap<String, Fields>;
@@ -169,7 +180,7 @@ pub enum Role {
 
 // ---------- file transfer protocol types ----------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FileMeta {
     /// Path relative to the project directory, '/'-separated.
     path: String,
@@ -1083,10 +1094,7 @@ impl Reamesh {
             let cmd_tx = r.cmd_tx.clone();
             std::thread::Builder::new()
                 .name("reamesh-hash".into())
-                .spawn(move || {
-                    let hashed = hash_manifest(&dir, files);
-                    let _ = cmd_tx.send(Command::ManifestReady(hashed));
-                })
+                .spawn(move || manifest_worker(dir, files, cmd_tx))
                 .ok();
         }
         Ok(r)
@@ -1096,6 +1104,16 @@ impl Reamesh {
     /// Joined sessions are downloaded into a fresh subdirectory of
     /// `staging_dir`.
     pub fn join(staging_dir: &str) -> anyhow::Result<Box<Self>> {
+        // Sweep stale project copies off disk before another one lands. This
+        // runs on REAPER's main thread, and removing gigabytes of media is not
+        // something to block it on, so it goes to its own thread.
+        {
+            let root = PathBuf::from(staging_dir);
+            std::thread::Builder::new()
+                .name("reamesh-prune".into())
+                .spawn(move || prune_staging(&root))
+                .ok();
+        }
         let status = StatusState {
             state: "browsing".into(),
             progress: 0.0,
@@ -1942,19 +1960,82 @@ fn build_manifest(dir: &Path) -> anyhow::Result<Vec<FileMeta>> {
     Ok(out)
 }
 
-/// Fill in the blake3 hash of every manifest entry. Runs on a background
-/// thread at host start (never on the REAPER main thread); the result replaces
-/// the served manifest via `Command::ManifestReady`. A file that changed size
-/// since the walk (the user is still editing) keeps an empty hash; the
-/// transfer path treats that as "download unconditionally, skip verify".
-fn hash_manifest(dir: &Path, mut files: Vec<FileMeta>) -> Vec<FileMeta> {
+/// Owner-side hash cache: project-relative path -> (size, mtime, blake3) as of
+/// the last time we hashed it. Never crosses the wire; it exists so a manifest
+/// refresh only re-hashes the files that actually changed.
+type HashCache = HashMap<String, (u64, Option<SystemTime>, String)>;
+
+/// Fill in the blake3 hash of every manifest entry, reusing `cache` for files
+/// whose size and mtime are unchanged. Runs on a background thread (never on
+/// the REAPER main thread); the result replaces the served manifest via
+/// `Command::ManifestReady`. A file that changed size since the walk (the user
+/// is still editing) keeps an empty hash; the transfer path treats that as
+/// "download unconditionally, skip resume and verify".
+fn hash_manifest(dir: &Path, mut files: Vec<FileMeta>, cache: &mut HashCache) -> Vec<FileMeta> {
     for meta in &mut files {
         let full = dir.join(&meta.path);
-        if fs::metadata(&full).map(|m| m.len()).ok() == Some(meta.size) {
-            meta.hash = blake3_file(&full).unwrap_or_default();
+        let Ok(m) = fs::metadata(&full) else { continue };
+        if m.len() != meta.size {
+            continue; // changed under the walk: leave it unhashed
         }
+        let mtime = m.modified().ok();
+        if let Some((size, stamp, hash)) = cache.get(&meta.path)
+            && *size == meta.size
+            && *stamp == mtime
+            && !hash.is_empty()
+        {
+            meta.hash = hash.clone();
+            continue;
+        }
+        meta.hash = blake3_file(&full).unwrap_or_default();
+        cache.insert(meta.path.clone(), (meta.size, mtime, meta.hash.clone()));
     }
     files
+}
+
+/// Owner-side background worker keeping the served manifest in step with the
+/// project on disk. Hosting starts with an unhashed manifest so `host()`
+/// returns instantly, and the manifest was historically hashed once and then
+/// frozen for the whole session, but a joiner plans its entire download
+/// against it (piece offsets, per-chunk length checks, the blake3 it verifies
+/// against), so any file the host rewrites mid-session: a Ctrl+S on the .rpp
+/// above all: left every later join requeueing a chunk whose length no longer
+/// matched until it timed out. Re-walking is cheap (one stat per file) and
+/// re-hashing is limited to entries whose size or mtime moved.
+///
+/// Exits when the network task's command receiver is gone (the session ended).
+fn manifest_worker(
+    dir: PathBuf,
+    files: Vec<FileMeta>,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<Command>,
+) {
+    let mut cache = HashCache::new();
+    let mut walked = files;
+    let mut last_sent: Option<Vec<FileMeta>> = None;
+    loop {
+        let hashed = hash_manifest(&dir, walked.clone(), &mut cache);
+        if last_sent.as_ref() != Some(&hashed) {
+            if cmd_tx.send(Command::ManifestReady(hashed.clone())).is_err() {
+                return;
+            }
+            last_sent = Some(hashed);
+        }
+        // Sleep in slices so a session that ends between refreshes doesn't
+        // leave this thread lingering for the whole interval.
+        let mut waited = Duration::ZERO;
+        while waited < MANIFEST_REFRESH {
+            if cmd_tx.is_closed() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            waited += Duration::from_millis(500);
+        }
+        // A momentarily unreadable project folder keeps the previous walk
+        // rather than publishing an empty manifest.
+        if let Ok(v) = build_manifest(&dir) {
+            walked = v;
+        }
+    }
 }
 
 /// blake3 of a file's contents as a hex string, streamed so large media never
@@ -1978,7 +2059,11 @@ fn blake3_file(path: &Path) -> std::io::Result<String> {
 /// raw to avoid burning CPU for nothing.
 fn is_compressible(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    [".rpp", ".rtracktemplate", ".rfxchain", ".txt", ".reapeaks", ".xml", ".csv"]
+    // No .reapeaks here: peak caches are deliberately never transferred
+    // (skip_in_manifest drops them, and a mid-session fetch only ever asks for
+    // media paths parsed out of item chunks), so listing them would only
+    // suggest otherwise.
+    [".rpp", ".rtracktemplate", ".rfxchain", ".txt", ".xml", ".csv"]
         .iter()
         .any(|ext| lower.ends_with(ext))
 }
@@ -1997,6 +2082,63 @@ fn zstd_decode_bounded(data: &[u8], limit: usize) -> std::io::Result<Vec<u8>> {
         return Err(std::io::Error::other("decompressed chunk exceeds limit"));
     }
     Ok(out)
+}
+
+/// Newest modification time anywhere under `dir` (the directory's own stamp
+/// when it is empty or unreadable). Bounded so a huge staging root can't turn
+/// the sweep into a full-disk walk.
+fn newest_mtime(dir: &Path) -> Option<SystemTime> {
+    let mut newest = fs::metadata(dir).and_then(|m| m.modified()).ok();
+    let mut stack = vec![dir.to_path_buf()];
+    let mut budget = 50_000u32;
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for entry in rd.flatten() {
+            if budget == 0 {
+                return newest;
+            }
+            budget -= 1;
+            let Ok(m) = entry.metadata() else { continue };
+            if m.is_dir() {
+                stack.push(entry.path());
+            }
+            if let Ok(t) = m.modified()
+                && newest.is_none_or(|n| t > n)
+            {
+                newest = Some(t);
+            }
+        }
+    }
+    newest
+}
+
+/// Delete staging subdirectories nothing has touched for `STAGING_MAX_AGE`.
+///
+/// Each join downloads a full copy of the host's project into its own
+/// directory, and a session id is minted fresh per hosting run, so rejoining
+/// the same project tomorrow never reuses today's directory, and the dedup path
+/// *copies* the matching bytes across rather than sharing them. Nothing else
+/// ever removes any of it, so a few evenings of sessions used to leave tens of
+/// gigabytes behind with no way for the user to find or clear them.
+///
+/// Age is the newest mtime found anywhere inside, so a live session, or one
+/// another REAPER instance on this machine is still serving from, is never
+/// touched.
+fn prune_staging(root: &Path) {
+    let Ok(rd) = fs::read_dir(root) else { return };
+    for entry in rd.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        let stale = newest_mtime(&path)
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STAGING_MAX_AGE);
+        if stale {
+            eprintln!("[reamesh] pruning stale staging copy {}", path.display());
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
 }
 
 fn sanitize_dir_name(name: &str) -> String {
@@ -2690,8 +2832,9 @@ async fn run_network(
         }
         sess_topic = Some(t);
     }
-    // Everything in the announce except the host's profile, which the user can
-    // change mid-session; that half is stamped on at publish time below.
+    // Everything in the announce except the host's profile and the project
+    // sizes, both of which can change mid-session: that half is stamped on at
+    // publish time below.
     let announce_base: Option<JsonValue> = hosting.as_ref().map(|h| {
         json!({
             "kind": "announce",
@@ -2701,10 +2844,6 @@ async fn run_network(
             "owner": swarm.local_peer_id().to_string(),
             "auth": h.auth,
             "salt": h.salt,
-            // Sizes come from the initial walk and the manifest is static for
-            // the session, so this precomputed announce never goes stale.
-            "files": h.files.len() as u64,
-            "bytes": h.files.iter().map(|f| f.size).sum::<u64>(),
         })
     });
 
@@ -2845,7 +2984,7 @@ async fn run_network(
                 }
                 Some(Command::ManifestReady(files)) => {
                     if let Some(h) = hosting.as_mut() {
-                        eprintln!("[reamesh] manifest hashing done ({} files)", files.len());
+                        eprintln!("[reamesh] manifest updated ({} files)", files.len());
                         h.files = files;
                     }
                 }
@@ -3042,6 +3181,13 @@ async fn run_network(
                     let mut v = base.clone();
                     v["owner_name"] = json!(name);
                     v["owner_color"] = json!(color);
+                    // Sizes ride along per publish: the manifest follows the
+                    // project on disk (see manifest_worker), so a precomputed
+                    // pair would drift the moment the host saves or records.
+                    if let Some(h) = &hosting {
+                        v["files"] = json!(h.files.len() as u64);
+                        v["bytes"] = json!(h.files.iter().map(|f| f.size).sum::<u64>());
+                    }
                     let _ = swarm
                         .behaviour_mut()
                         .gossipsub
@@ -3629,10 +3775,20 @@ fn files_done(dl: &Download) -> u64 {
 }
 
 /// Whether `path` already holds exactly the file `meta` describes.
+///
+/// A size match alone proves nothing: two takes of the same length, or a stem
+/// re-rendered in place, collide constantly, so an entry the host has not
+/// hashed yet is always re-downloaded rather than assumed identical. (Hashes
+/// are empty only while the owner's first hashing pass is still running, or for
+/// a file that changed under the walk; the dedup path below already refuses to
+/// reuse bytes on an empty hash for the same reason.)
 fn file_matches(path: &Path, meta: &FileMeta) -> bool {
+    if meta.hash.is_empty() {
+        return false;
+    }
     match fs::metadata(path) {
         Ok(m) if m.is_file() && m.len() == meta.size => {
-            meta.hash.is_empty() || blake3_file(path).ok().as_deref() == Some(meta.hash.as_str())
+            blake3_file(path).ok().as_deref() == Some(meta.hash.as_str())
         }
         _ => false,
     }

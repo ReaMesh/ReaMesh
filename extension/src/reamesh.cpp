@@ -229,6 +229,17 @@ struct DeferredItem {
   std::chrono::steady_clock::time_point since;
 };
 
+// An incoming track's receives whose source track doesn't exist here yet.
+// AUXRECV crosses the wire with the source track as a GUID, and a unit whose
+// source is missing locally has to be dropped from the splice, but the owner
+// only re-sends `recv` when the field itself changes, so a dropped unit would
+// stay missing for the rest of the session. Park it and retry, like the media
+// items above.
+struct DeferredRecv {
+  std::string wire;  // AUXRECV units in their source-GUID form
+  std::chrono::steady_clock::time_point since;
+};
+
 enum class Mode { Idle, Hosting, Browsing, Downloading, ClientActive };
 
 static reaper_plugin_info_t* g_rec = nullptr;
@@ -245,6 +256,12 @@ static bool g_applyingRemote = false;  // echo-suppression / reentrancy guard
 // True only while Main_openProject runs on a finished download; published to
 // the app so its download stepper can show the "opening in REAPER" phase.
 static bool g_openingProject = false;
+// Set while ctlTick() is called from inside a long main-thread operation purely
+// to publish an interim state (see openDownloadedProject). Companion-app
+// commands must NOT be dispatched from there: a `leave` landing mid-open would
+// shut the handle down and drop us to Idle, and the caller would then carry on
+// against a torn-down session. The commands stay queued for the next real tick.
+static bool g_ctlPublishOnly = false;
 static unsigned g_lastPeerCount = 0;
 // Media items locally tinted dark grey to signal "another peer is editing this"
 // (their editing lock is live, per reamesh_locked_entities). Maps each tinted
@@ -274,6 +291,8 @@ static bool g_tintEnabled = true;
 // like a log entry ({code, params, text}); JSON null when there is none.
 static json g_lastError;
 static std::vector<DeferredItem> g_deferredItems;
+// Track GUID -> receives waiting for their source track to show up.
+static std::map<std::string, DeferredRecv> g_deferredRecv;
 static std::chrono::steady_clock::time_point g_lastCapture{};
 static std::chrono::steady_clock::time_point g_lastFullScan{};
 // Client only: cumulative count of own proposals the owner overrode, as
@@ -419,10 +438,17 @@ static std::string_view ltrim(std::string_view s) {
 // same bucket: which envelope is armed/visible is the local user's automation
 // workflow, not document state (REAPER falls back to defaults when an applied
 // envelope block carries neither).
+//
+// Every prefix here ends in a space (or is matched whole): chunks carry base64
+// plugin-state lines, and base64's alphabet includes upper-case letters but
+// never a space, so an unanchored prefix like "FLOAT" would also swallow a
+// payload line that happens to begin "FLOATxxxx…", silently truncating the FX
+// state that then goes on the wire.
 static bool isVolatileChunkLine(std::string_view trimmed) {
   return trimmed.rfind("SEL ", 0) == 0 || trimmed.rfind("SHOW ", 0) == 0 ||
          trimmed.rfind("LASTSEL ", 0) == 0 || trimmed.rfind("DOCKED ", 0) == 0 ||
-         trimmed.rfind("FLOAT", 0) == 0 || trimmed.rfind("WNDRECT ", 0) == 0 ||
+         trimmed.rfind("FLOATPOS ", 0) == 0 || trimmed == "FLOAT" ||
+         trimmed.rfind("WNDRECT ", 0) == 0 ||
          trimmed.rfind("ARM ", 0) == 0 || trimmed.rfind("VIS ", 0) == 0;
 }
 
@@ -1106,7 +1132,19 @@ static void applyProjectNotes(const std::string& notes) {
 
 // All 64 track-group names as one '\n'-joined field (names can't contain
 // newlines; the Project Settings field is single-line).
+//
+// Reading them is 64 GetSetProjectInfo_String round trips, and
+// snapshotProject() runs several times a second (capture, remote apply, tint
+// reconcile, deferred flush), far too often for a field that changes maybe
+// once a session. Cache it against the project change counter: nothing can
+// have edited a group name while that stands still, and applyGroupNames
+// invalidates explicitly for the remote-apply path.
+static std::string g_groupNamesCache;
+static int g_groupNamesAt = -1;
+
 static std::string captureGroupNames() {
+  const int cc = GetProjectStateChangeCount(nullptr);
+  if (cc == g_groupNamesAt) return g_groupNamesCache;
   std::string out;
   for (int i = 1; i <= 64; ++i) {
     char desc[32];
@@ -1114,10 +1152,15 @@ static std::string captureGroupNames() {
     if (i > 1) out += '\n';
     out += captureProjectString(desc);
   }
+  g_groupNamesAt = cc;
+  g_groupNamesCache = out;
   return out;
 }
 
 static void applyGroupNames(const std::string& s) {
+  // Writing project info does not reliably bump the change counter, so drop
+  // the cache by hand or the next capture would re-read the stale value.
+  g_groupNamesAt = -1;
   size_t pos = 0;
   for (int i = 1; i <= 64 && pos <= s.size(); ++i) {
     size_t eol = s.find('\n', pos);
@@ -1646,10 +1689,17 @@ static void applyTrackFields(MediaTrack* tr, const json& fields) {
   setNum("freemode", "I_FREEMODE");
   setNum("numlanes", "I_NUMFIXEDLANES");
   setNum("lanesettings", "C_LANESETTINGS");
-  if (fields.contains("lanenames") && fields["lanenames"].is_string()) {
+  if (fields.contains("lanenames") && fields["lanenames"].is_string() &&
+      !fields["lanenames"].get<std::string>().empty()) {
     const std::string names = fields["lanenames"].get<std::string>();
+    // Capture only fills this on a fixed-lane track, one entry per lane, so
+    // clamp to the lane count that was just applied. Unclamped, an ordinary
+    // track's empty field still ran one iteration and wiped the receiving
+    // user's P_LANENAME:0, and a shrunk lane set left the dropped lanes' names
+    // standing.
+    const int lanes = (int)GetMediaTrackInfo_Value(tr, "I_NUMFIXEDLANES");
     size_t pos = 0;
-    for (int lane = 0; pos <= names.size(); ++lane) {
+    for (int lane = 0; lane < lanes && pos <= names.size(); ++lane) {
       size_t eol = names.find('\n', pos);
       if (eol == std::string::npos) eol = names.size();
       std::string n = names.substr(pos, eol - pos);
@@ -1777,30 +1827,44 @@ static void applyItem(const std::string& guid, const json& fields) {
   UpdateItemInProject(item);
 }
 
-// Name the peer currently holding the editing lock on `(section, id)`: the
+// Names the peer currently holding the editing lock on `(section, id)`: the
 // best available answer to "who made this change" (authoritative updates carry
 // no author; the active editor holds the lock while their edit lands).
-static std::string lockHolderName(const char* section, const std::string& id) {
-  if (!g_handle) return "";
-  char* raw = reamesh_locked_entities(g_handle);
-  std::string payload = raw ? raw : "[]";
-  reamesh_free_string(raw);
-  json arr = json::parse(payload, nullptr, false);
-  if (!arr.is_array()) return "";
-  for (const auto& e : arr) {
-    if (e.is_object() && jsonStr(e, "section") == section && jsonStr(e, "id") == id) {
-      json peers = handleJson(reamesh_peers, json::array());
-      return peerNameById(peers, jsonStr(e, "holder"));
+//
+// The lock table and the roster are the same for every entity in a changeset,
+// and each is an FFI call plus a full JSON parse, so one instance of this is
+// kept per applyChangeset and loaded lazily: a bootstrap apply touches
+// hundreds of entities but almost never needs a holder name for any of them.
+struct LockHolders {
+  json locks;
+  json peers;
+  bool loaded = false;
+
+  std::string name(const char* section, const std::string& id) {
+    if (!g_handle) return "";
+    if (!loaded) {
+      loaded = true;
+      locks = handleJson(reamesh_locked_entities, json::array());
+      peers = handleJson(reamesh_peers, json::array());
     }
+    if (!locks.is_array()) return "";
+    for (const auto& e : locks)
+      if (e.is_object() && jsonStr(e, "section") == section && jsonStr(e, "id") == id)
+        return peerNameById(peers, jsonStr(e, "holder"));
+    return "";
   }
-  return "";
-}
+};
 
 // Report plugins introduced by remote changes, for example "Dan added Pro-Q 3
 // to Drums". This keeps later plugin loads as visible as the initial join. One
 // event per plugin, collapsed to a single summary when a whole chain lands at
 // once (pasting a track with 15 plugins is one notice, not fifteen).
-static void notePluginAdds(const std::string& trackName, const std::string& by,
+//
+// `byFn` resolves the lock holder's name and is only called once there is
+// something to narrate: it is by far the most expensive thing here, and the
+// common case (a changeset that adds no plugins) must not pay for it.
+static void notePluginAdds(const std::string& trackName,
+                           const std::function<std::string()>& byFn,
                            const std::vector<std::string>& oldPlugs,
                            const std::vector<std::string>& newPlugs) {
   std::set<std::string> oldSet(oldPlugs.begin(), oldPlugs.end());
@@ -1808,6 +1872,7 @@ static void notePluginAdds(const std::string& trackName, const std::string& by,
   for (const std::string& p : newPlugs)
     if (!oldSet.count(p)) added.push_back(p);
   if (added.empty()) return;
+  const std::string by = byFn();
   if (added.size() > 5) {
     json params = {{"count", added.size()}};
     if (!trackName.empty()) params["track"] = trackName;
@@ -1825,6 +1890,45 @@ static void notePluginAdds(const std::string& trackName, const std::string& by,
     if (!trackName.empty()) text += " to " + trackName;
     activityEvent("plugin_added", params, text);
   }
+}
+
+// Splice a track's receives into its live chunk. The wire form carries the
+// source track as a GUID (indices are per-peer and move on every reorder), so
+// each unit is resolved to a local track index here; a unit whose source track
+// doesn't exist locally is dropped from the splice, and `false` comes back so
+// the caller can park the field for a retry. Dropping it outright would lose
+// the routing for good: the owner's doc still holds the identical `recv`
+// string, so no later diff would ever re-send it.
+// `wrote` (optional) reports whether the track's chunk actually changed, so a
+// retry that resolved nothing new costs no re-baseline.
+static bool applyRecvField(const std::string& guid, const std::string& wire,
+                           bool* wrote = nullptr) {
+  MediaTrack* tr = findTrackByGuid(guid);
+  if (!tr) return false;
+  bool complete = true;
+  std::string local = transformRecvUnits(wire, [&complete](const std::string& tok) -> std::string {
+    MediaTrack* src = findTrackByGuid(tok);
+    if (!src) {
+      complete = false;
+      return "";
+    }
+    const int n = (int)GetMediaTrackInfo_Value(src, "IP_TRACKNUMBER");
+    if (n <= 0) {
+      complete = false;
+      return "";
+    }
+    return std::to_string(n - 1);
+  });
+  std::string cur = objectStateChunk(tr);
+  if (cur.empty()) return false;
+  TrackBlocksPatch patch;
+  patch.recv = &local;
+  std::string next = replaceTrackBlocks(cur, patch);
+  if (next != cur) {
+    setObjectStateChunk(tr, next);
+    if (wrote) *wrote = true;
+  }
+  return complete;
 }
 
 // No-FX mode: drop fx-chain fields from track applies and take-FX blocks from
@@ -1850,6 +1954,10 @@ static json filterChangesetNoFx(json cs) {
 }
 
 static void applyChangeset(const json& changeset) {
+  // One lazily-loaded lock table + roster for the whole changeset (see
+  // LockHolders); resolving a holder per entity was an FFI call and a full
+  // JSON parse each time.
+  LockHolders holders;
   if (changeset.contains("tracks") && changeset["tracks"].is_object()) {
     const json& tracks = changeset["tracks"];
 
@@ -1905,8 +2013,8 @@ static void applyChangeset(const json& changeset) {
                       : (base != g_snapshot.tracks.end() ? base->second.recfx : "");
         std::string nm = fields.value("name", std::string());
         if (nm.empty()) nm = trackNameByGuid(guid);
-        notePluginAdds(nm, lockHolderName("tracks", guid), collectPlugins(oldTxt),
-                       collectPlugins(newTxt));
+        notePluginAdds(nm, [&] { return holders.name("tracks", guid); },
+                       collectPlugins(oldTxt), collectPlugins(newTxt));
       }
       applyTrackFields(tr, fields);
       if (created) {
@@ -1925,24 +2033,13 @@ static void applyChangeset(const json& changeset) {
 
     // Receives last, after every track in the changeset exists and the order
     // is settled: the wire form carries source-track GUIDs, resolved to local
-    // indices here. A receive whose source track is missing on this side is
-    // dropped (it re-applies the next time the field changes or full state is
-    // rebroadcast).
+    // indices here. A receive whose source track isn't here yet is parked and
+    // retried by processDeferredRecv: nothing would ever re-send it otherwise.
     for (const auto& [guid, wire] : pendingRecv) {
-      MediaTrack* tr = findTrackByGuid(guid);
-      if (!tr) continue;
-      std::string local = transformRecvUnits(wire, [](const std::string& tok) -> std::string {
-        MediaTrack* src = findTrackByGuid(tok);
-        if (!src) return "";
-        const int n = (int)GetMediaTrackInfo_Value(src, "IP_TRACKNUMBER");
-        return n > 0 ? std::to_string(n - 1) : "";
-      });
-      std::string cur = objectStateChunk(tr);
-      if (cur.empty()) continue;
-      TrackBlocksPatch patch;
-      patch.recv = &local;
-      std::string next = replaceTrackBlocks(cur, patch);
-      if (next != cur) setObjectStateChunk(tr, next);
+      if (applyRecvField(guid, wire))
+        g_deferredRecv.erase(guid);
+      else
+        g_deferredRecv[guid] = {wire, std::chrono::steady_clock::now()};
     }
   }
 
@@ -1962,7 +2059,7 @@ static void applyChangeset(const json& changeset) {
             base != g_snapshot.items.end() ? base->second.chunk : std::string();
         std::string trGuid = fields.value("track", std::string());
         if (trGuid.empty() && base != g_snapshot.items.end()) trGuid = base->second.track;
-        notePluginAdds(trackNameByGuid(trGuid), lockHolderName("items", guid),
+        notePluginAdds(trackNameByGuid(trGuid), [&] { return holders.name("items", guid); },
                        collectPlugins(oldTxt),
                        collectPlugins(fields["chunk"].get<std::string>()));
       }
@@ -2089,6 +2186,35 @@ static void processDeferredItems() {
   Main_OnCommand(40047, 0);  // Peaks: Build any missing peaks
   logEvent("media_applied", {{"count", ready.size()}},
            "applied " + std::to_string(ready.size()) + " item(s) after media arrived");
+}
+
+// Retry receives parked because their source track hadn't arrived yet. Same
+// shape as processDeferredItems: echo-suppressed, no undo point, re-baselined,
+// and given up on after 90s so a source track that is never coming can't leave
+// an entry behind forever.
+static void processDeferredRecv() {
+  if (g_deferredRecv.empty()) return;
+  const auto now = std::chrono::steady_clock::now();
+  bool changed = false;
+  g_applyingRemote = true;
+  PreventUIRefresh(1);
+  for (auto it = g_deferredRecv.begin(); it != g_deferredRecv.end();) {
+    const bool complete = applyRecvField(it->first, it->second.wire, &changed);
+    if (complete || now - it->second.since > std::chrono::seconds(90))
+      it = g_deferredRecv.erase(it);
+    else
+      ++it;
+  }
+  PreventUIRefresh(-1);
+  // Only a retry that actually spliced something needs the re-baseline; the
+  // common case is a parked entry still waiting, which writes nothing.
+  if (changed) {
+    TrackList_AdjustWindows(false);
+    UpdateArrange();
+    g_snapshot = snapshotProject();
+    g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+  }
+  g_applyingRemote = false;
 }
 
 // ---------- session lifecycle ----------
@@ -2529,7 +2655,9 @@ static void leaveSession(const char* code, json params, const std::string& text)
   g_sessionProjectPath.clear();
   g_snapshot = Snapshot{};
   g_deferredItems.clear();
+  g_deferredRecv.clear();
   g_lastChangeCount = -1;
+  g_groupNamesAt = -1;  // a new project invalidates the cached group names
   g_lastPeerCount = 0;
   g_lastReverts = 0;
   g_bootstrapSynced = false;
@@ -2954,12 +3082,14 @@ static void ctlTick() {
   // "REAPER isn't responding" so a stuck Downloading/Lobby screen explains
   // itself instead of looking hung.
   reamesh_ctl_heartbeat();
-  for (;;) {
-    char* raw = reamesh_ctl_poll();
-    if (!raw) break;
-    json cmd = json::parse(raw, nullptr, false);
-    reamesh_free_string(raw);
-    if (cmd.is_object()) ctlDispatch(cmd);
+  if (!g_ctlPublishOnly) {
+    for (;;) {
+      char* raw = reamesh_ctl_poll();
+      if (!raw) break;
+      json cmd = json::parse(raw, nullptr, false);
+      reamesh_free_string(raw);
+      if (cmd.is_object()) ctlDispatch(cmd);
+    }
   }
 
   json state;
@@ -3160,11 +3290,16 @@ static void openDownloadedProject(std::string path) {
   // the "opening" phase first so the app's stepper doesn't sit frozen on the
   // download bar meanwhile.
   g_openingProject = true;
+  // Publish only: dispatching queued commands here would let a `leave` tear
+  // the session down underneath the rest of this function.
+  g_ctlPublishOnly = true;
   ctlTick();
+  g_ctlPublishOnly = false;
   g_applyingRemote = true;
   Main_openProject(path.c_str());
   // The loaded project IS the owner's state; baseline it so the load is
   // never diffed as a burst of local edits.
+  g_groupNamesAt = -1;  // different project: the cached group names are stale
   g_snapshot = snapshotProject();
   g_lastChangeCount = GetProjectStateChangeCount(nullptr);
   g_itemTints.clear();  // fresh download: start with no lock tints
@@ -3311,6 +3446,7 @@ static void timerTick() {
       if (!g_noFx) captureLocalChanges();
       applyRemoteChanges();
       processDeferredItems();
+      processDeferredRecv();
       // Last: re-paint the local lock tints. After capture (so the grey is
       // already invisible to it via the re-baseline) and after the applies (so a
       // remotely-recolored locked item re-tints with its fresh real color).

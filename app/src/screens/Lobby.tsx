@@ -92,6 +92,20 @@ function usePassphraseCheck(
   };
 }
 
+/// Stop a pending join if the fire-and-forget command is refused without a
+/// response. Successful joins leave the lobby before this deadline.
+const JOIN_TIMEOUT_MS = 10_000;
+
+function useJoinPending(): [boolean, React.Dispatch<React.SetStateAction<boolean>>] {
+  const [joining, setJoining] = useState(false);
+  useEffect(() => {
+    if (!joining) return;
+    const id = setTimeout(() => setJoining(false), JOIN_TIMEOUT_MS);
+    return () => clearTimeout(id);
+  }, [joining]);
+  return [joining, setJoining];
+}
+
 // Read the clipboard for the Paste button. Returns "" if the webview denies
 // clipboard read (the user can still paste with the keyboard).
 async function readClipboard(): Promise<string> {
@@ -274,13 +288,8 @@ function SessionCard({
   const [pass, setPass] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [error, setError] = useState<"" | "bad" | "unknown">("");
-  // One-shot guard: the join command has gone out and the extension is already
-  // downloading. Without it a second click re-enters joinSessionById, which
-  // now finds the mode is no longer Browsing and logs "could not join (it may
-  // have just closed)", an alarming lie, while the download runs fine behind
-  // it. An open session has no passphrase check to disable the button, so this
-  // is the only thing standing between the user and that message.
-  const [joining, setJoining] = useState(false);
+  // Prevent a second join command while the first one starts downloading.
+  const [joining, setJoining] = useJoinPending();
   const { scope: shakeScope, shake } = useShake();
   // Highlight sessions discovered after the initial lobby render.
   // Skip the highlight for sessions present on mount or shortly afterward.
@@ -431,7 +440,7 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
   const [pass, setPass] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [error, setError] = useState<"" | "bad" | "unknown">("");
-  const [joining, setJoining] = useState(false);
+  const [joining, setJoining] = useJoinPending();
   const { scope: shakeScope, shake } = useShake();
   const ticket = decodeTicket(raw);
   const code = normalizeTicket(raw);

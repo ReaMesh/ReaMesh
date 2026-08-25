@@ -49,6 +49,7 @@ static const char* kTrackChunk =
     "    BYPASS 0 0 0\n"
     "    <VST \"VST: ReaEQ\" reaeq.dylib 0\n"
     "      base64data==\n"
+    "      FLOATSAREJUSTBASE64==\n"
     "    >\n"
     "    FLOATPOS 0 0 0 0\n"
     "  >\n"
@@ -77,6 +78,11 @@ int main() {
   assert(norm.find("BYPASS 0 0 0") != std::string::npos);
   assert(norm.find("NAME \"Drums\"") != std::string::npos);
   assert(norm.find("base64data==") != std::string::npos);
+  // Base64 plugin state can begin with any upper-case run, "FLOAT" included.
+  // The volatile-line prefixes must be anchored (trailing space, or matched
+  // whole) or a payload line like this is silently dropped and every peer
+  // splices a truncated FX state into its track.
+  assert(norm.find("FLOATSAREJUSTBASE64==") != std::string::npos);
   assert(norm.find("FILE \"Audio/kick.wav\"") != std::string::npos);
 
   // The same chunk with Windows line endings must normalize to exactly the

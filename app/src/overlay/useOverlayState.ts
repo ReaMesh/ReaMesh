@@ -2,7 +2,7 @@
 // overlay only sends `reveal_peer`; session controls stay in the main window.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ExtState } from "@/lib/types";
+import { normalizeState, type ExtState } from "@/lib/types";
 
 const RETRY_MS = 1500;
 
@@ -37,7 +37,10 @@ export function useOverlayState(port: number | null): {
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(String(ev.data)) as Record<string, unknown>;
-          if (msg.type === "state") setState(msg as unknown as ExtState);
+          // Same version-skew hardening the main window's socket applies: the
+          // frame comes from a separately-versioned process, and a `peers` that
+          // isn't an array would take the whole HUD down on render.
+          if (msg.type === "state") setState(normalizeState(msg));
         } catch {
           /* ignore malformed frames */
         }
