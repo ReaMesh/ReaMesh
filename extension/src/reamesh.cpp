@@ -2707,44 +2707,33 @@ static bool startBrowse() {
   return true;
 }
 
-// Join one of the announced sessions (Browsing -> Downloading).
-static bool joinSessionById(const std::string& sid, const std::string& sname,
-                            const std::string& passphrase) {
+// Join a session (Browsing -> Downloading): one of the announced sessions by
+// id, or (with a non-empty `ticket`) through a pasted invite ticket. For a
+// ticket the Rust side dials the ticket's addresses and joins once the host's
+// announce arrives over that connection; that is how a session outside
+// mDNS/multicast reach (VPN, strict LAN) is joined.
+static bool joinSession(const std::string& sid, const std::string& ticket,
+                        const std::string& sname, const std::string& passphrase) {
   if (g_mode != Mode::Browsing || !g_handle) return false;
-  if (!reamesh_join_session(g_handle, sid.c_str(), passphrase.c_str())) {
+  const bool ok = ticket.empty()
+                      ? reamesh_join_session(g_handle, sid.c_str(), passphrase.c_str())
+                      : reamesh_join_ticket(g_handle, ticket.c_str(), passphrase.c_str());
+  if (!ok) {
     // Flagged as the error, not just logged: the app's join button is
     // fire-and-forget, so this is the only thing that tells the user why it
     // came back (a double-click on a join already under way is guarded on the
     // app side, so a refusal here is a genuine one).
     g_lastError =
-        logEvent("join_unavailable", {{"name", sname}},
-                 "could not join \"" + sname + "\" (it may have just closed); try again");
+        ticket.empty()
+            ? logEvent("join_unavailable", {{"name", sname}},
+                       "could not join \"" + sname + "\" (it may have just closed); try again")
+            : logEvent("bad_ticket", json::object(),
+                       "that invite ticket doesn't look valid; copy it again from the host");
     return false;
   }
   // Rust resets its cumulative revert counter for the new session; match it
   // here so the first real override is detected as a delta rather than masked
   // by a count left over from a previous session (e.g. across an auto-rejoin).
-  g_lastReverts = 0;
-  g_mode = Mode::Downloading;
-  g_lastError = json();
-  g_joinPassphrase = passphrase;
-  g_joinTicket.clear();
-  logEvent("joining", {{"name", sname}}, "joining \"" + sname + "\", downloading the project");
-  return true;
-}
-
-// Join a session through a pasted invite ticket (Browsing -> Downloading).
-// The Rust side dials the ticket's addresses and joins once the host's
-// announce arrives over that connection; this is how a session outside
-// mDNS/multicast reach (VPN, strict LAN) is joined.
-static bool joinSessionByTicket(const std::string& ticket, const std::string& sname,
-                                const std::string& passphrase) {
-  if (g_mode != Mode::Browsing || !g_handle) return false;
-  if (!reamesh_join_ticket(g_handle, ticket.c_str(), passphrase.c_str())) {
-    g_lastError = logEvent("bad_ticket", json::object(),
-                           "that invite ticket doesn't look valid; copy it again from the host");
-    return false;
-  }
   g_lastReverts = 0;
   g_mode = Mode::Downloading;
   g_lastError = json();
@@ -2794,7 +2783,7 @@ static void reconnectTick() {
   if (!g_reconnect->ticket.empty()) {
     Reconnect rc = *g_reconnect;
     g_reconnect.reset();
-    joinSessionByTicket(rc.ticket, rc.sessionName, rc.passphrase);
+    joinSession("", rc.ticket, rc.sessionName, rc.passphrase);
     return;
   }
   json sessions = handleJson(reamesh_sessions, json::array());
@@ -2803,7 +2792,7 @@ static void reconnectTick() {
     if (s.is_object() && jsonStr(s, "session_id") == g_reconnect->sessionId) {
       Reconnect rc = *g_reconnect;
       g_reconnect.reset();
-      joinSessionById(rc.sessionId, rc.sessionName, rc.passphrase);
+      joinSession(rc.sessionId, "", rc.sessionName, rc.passphrase);
       return;
     }
   }
@@ -3042,14 +3031,9 @@ static void ctlDispatch(const json& cmd) {
     if (g_mode == Mode::Idle) startBrowse();
     // "Join without effects": strictly view-only, every FX chain stripped.
     g_noFx = cmdBool("nofx");
-    std::string name = jsonStr(cmd, "session_name");
-    std::string ticket = jsonStr(cmd, "ticket");
-    if (!ticket.empty()) {
-      joinSessionByTicket(ticket, name.empty() ? "session" : name, jsonStr(cmd, "passphrase"));
-    } else {
-      joinSessionById(jsonStr(cmd, "session_id"), name.empty() ? "session" : name,
-                      jsonStr(cmd, "passphrase"));
-    }
+    const std::string name = jsonStr(cmd, "session_name");
+    joinSession(jsonStr(cmd, "session_id"), jsonStr(cmd, "ticket"),
+                name.empty() ? "session" : name, jsonStr(cmd, "passphrase"));
   } else if (c == "open_confirm") {
     // The user read the "loads plugins that weren't listed" warning and chose
     // to continue: open the held-back download now.
@@ -3066,11 +3050,6 @@ static void ctlDispatch(const json& cmd) {
       stopFollowing();
       g_followPeer = pid;
     }
-  } else if (c == "reset_identity") {
-    const bool had = reamesh_identity_reset();
-    logEvent("identity_reset", {{"had", had}},
-             had ? "network identity reset; a fresh one is minted next session"
-                 : "no stored network identity to reset");
   } else if (c == "check") {
     // Passphrase pre-check: verify with the owner BEFORE the app shows the
     // trust dialog or starts downloading. Stays in Browsing; the result rides

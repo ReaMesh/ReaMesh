@@ -400,8 +400,6 @@ struct Shared {
     /// proposal), so drain_remote knows to diff even with an empty queue.
     dirty: AtomicBool,
     listen_addrs: Mutex<Vec<Multiaddr>>,
-    /// Peers currently subscribed to this session's gossipsub topic.
-    topic_peers: AtomicUsize,
     /// Sessions currently announced on the lobby (client side).
     sessions: Mutex<HashMap<String, SessionInfo>>,
     status: Mutex<StatusState>,
@@ -409,7 +407,8 @@ struct Shared {
     /// project dir on the owner, the downloaded copy on clients (set once the
     /// initial transfer completes).
     serve_dir: Mutex<Option<PathBuf>>,
-    /// Peer ids currently subscribed to the session topic (fetch candidates).
+    /// Peer ids currently subscribed to the session topic (fetch candidates;
+    /// its length is the peer count).
     session_peers: Mutex<Vec<PeerId>>,
     /// Access token every peer in this session shares (empty = open session).
     /// Requests carry it; serving peers refuse mismatches. Set on the owner at
@@ -596,17 +595,10 @@ pub fn set_presence(json: &str) {
 
 // ---------- persistent network identity ----------
 //
-// Historically every host/join/browse built its swarm with a fresh ed25519
-// keypair, so "who is this peer" changed constantly: nothing could be
-// remembered about a host across restarts, invite tickets died with the
-// hosting run's identity, and a future blocklist/kick had nothing to bind to.
-// When the extension registers a path here (per REAPER install, under the
-// resource dir), the keypair is persisted there and every later swarm start
-// reuses it. Deliberately opt-in: the in-process test suite spins up many
-// peers in one process, and they must NOT share one identity. A lasting
-// identity is also a lasting tracker broadcast on the LAN, so it is per-install
-// and resettable (`reset_identity` deletes the file; the next session start
-// mints a fresh one).
+// The extension registers a keypair path under the REAPER resource directory.
+// Swarm starts reuse that identity so hosts can be recognized across sessions.
+// Registration is optional: in-process tests need independent ephemeral peers.
+// Settings can delete the stored key; the next session creates a new identity.
 
 static IDENTITY_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
@@ -615,17 +607,6 @@ pub fn set_identity_path(path: &str) {
         return;
     }
     *IDENTITY_PATH.lock().unwrap() = Some(PathBuf::from(path));
-}
-
-/// Delete the persisted identity (if any). The current session keeps its
-/// identity until it ends; the next swarm start generates and persists a new
-/// keypair. Returns whether a stored identity existed.
-pub fn reset_identity() -> bool {
-    let path = IDENTITY_PATH.lock().unwrap().clone();
-    match path {
-        Some(p) => fs::remove_file(p).is_ok(),
-        None => false,
-    }
 }
 
 /// The keypair every swarm starts with: the persisted per-install identity
@@ -1078,7 +1059,6 @@ impl Reamesh {
             end_reason: None,
         };
         let r = Self::start(
-            Role::Owner,
             NetConfig {
                 role: Role::Owner,
                 hosting: Some(hosting),
@@ -1129,7 +1109,6 @@ impl Reamesh {
             end_reason: None,
         };
         Self::start(
-            Role::Client,
             NetConfig {
                 role: Role::Client,
                 hosting: None,
@@ -1139,7 +1118,8 @@ impl Reamesh {
         )
     }
 
-    fn start(role: Role, cfg: NetConfig, status: StatusState) -> anyhow::Result<Box<Self>> {
+    fn start(cfg: NetConfig, status: StatusState) -> anyhow::Result<Box<Self>> {
+        let role = cfg.role;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("reamesh-net")
@@ -1163,7 +1143,6 @@ impl Reamesh {
             inbound: Mutex::new(Vec::new()),
             dirty: AtomicBool::new(false),
             listen_addrs: Mutex::new(Vec::new()),
-            topic_peers: AtomicUsize::new(0),
             sessions: Mutex::new(HashMap::new()),
             status: Mutex::new(status),
             serve_dir: Mutex::new(None),
@@ -1325,15 +1304,10 @@ impl Reamesh {
                 drop(ds);
                 // Wrap the changeset in an authenticated envelope: the owner
                 // only admits proposals carrying the session token, so topic
-                // membership alone can't write to the doc. `age_ms` is how long
-                // ago (on this clock) the edit was made; the owner re-anchors it
-                // to its own clock for skew-free tie-breaking. Proposals are
-                // sent the instant an edit is captured, so it is ~0 here, but
-                // carrying it keeps the comparison correct under any delay.
+                // membership alone can't write to the doc.
                 let envelope = json!({
                     "auth": self.shared.auth_token.lock().unwrap().clone(),
                     "cs": parsed,
-                    "age_ms": now.elapsed().as_millis() as u64,
                 });
                 let _ = self
                     .cmd_tx
@@ -1850,7 +1824,7 @@ impl Reamesh {
 
     /// Number of peers currently subscribed to this session's topic.
     pub fn connected_peers(&self) -> usize {
-        self.shared.topic_peers.load(Ordering::Relaxed)
+        self.shared.session_peers.lock().unwrap().len()
     }
 
     pub fn listen_addrs(&self) -> Vec<String> {
@@ -2005,10 +1979,20 @@ type HashCache = HashMap<String, (u64, Option<SystemTime>, String)>;
 /// whose size and mtime are unchanged. Runs on a background thread (never on
 /// the REAPER main thread); the result replaces the served manifest via
 /// `Command::ManifestReady`. A file that changed size since the walk (the user
-/// is still editing) keeps an empty hash; the transfer path treats that as
-/// "download unconditionally, skip resume and verify".
-fn hash_manifest(dir: &Path, mut files: Vec<FileMeta>, cache: &mut HashCache) -> Vec<FileMeta> {
+/// is still editing) keeps an empty hash: the transfer path treats that as
+/// "download unconditionally, skip resume and verify". `cancelled` is polled
+/// between files so a session that ends mid-pass (minutes, on a multi-GB
+/// project) stops the pass instead of letting the thread outlive the session.
+fn hash_manifest(
+    dir: &Path,
+    mut files: Vec<FileMeta>,
+    cache: &mut HashCache,
+    cancelled: &dyn Fn() -> bool,
+) -> Vec<FileMeta> {
     for meta in &mut files {
+        if cancelled() {
+            break;
+        }
         let full = dir.join(&meta.path);
         let Ok(m) = fs::metadata(&full) else { continue };
         if m.len() != meta.size {
@@ -2059,7 +2043,10 @@ fn manifest_worker(
     let mut walked = files;
     let mut last_sent: Option<Vec<FileMeta>> = None;
     loop {
-        let hashed = hash_manifest(&dir, walked.clone(), &mut cache);
+        let hashed = hash_manifest(&dir, walked.clone(), &mut cache, &|| cmd_tx.is_closed());
+        if cmd_tx.is_closed() {
+            return;
+        }
         if last_sent.as_ref() != Some(&hashed) {
             if cmd_tx.send(Command::ManifestReady(hashed.clone())).is_err() {
                 return;
@@ -2130,34 +2117,48 @@ fn zstd_decode_bounded(data: &[u8], limit: usize) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Newest modification time anywhere under `dir` (the directory's own stamp
-/// when it is empty or unreadable). Bounded so a huge staging root can't turn
-/// the sweep into a full-disk walk, and a tree too big to walk within the
-/// budget reports `None` ("unknown"), never an age derived from a partial walk
-/// that could brand a live project copy stale.
-fn newest_mtime(dir: &Path) -> Option<SystemTime> {
-    let mut newest = fs::metadata(dir).and_then(|m| m.modified()).ok();
-    let mut stack = vec![dir.to_path_buf()];
-    let mut budget = 50_000u32;
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&d) else { continue };
+/// Entry budget of a bounded directory walk: enough for any real project
+/// tree, small enough that a huge staging root can't turn a sweep into a
+/// full-disk walk.
+const WALK_BUDGET: u32 = 50_000;
+
+/// Depth-first walk of everything under `root`, calling `visit` with each
+/// entry and its metadata (unreadable directories and entries are skipped).
+/// Returns `false` when the entry budget ran out: the walk was partial.
+fn walk_bounded(root: &Path, mut visit: impl FnMut(&fs::DirEntry, &fs::Metadata)) -> bool {
+    let mut stack = vec![root.to_path_buf()];
+    let mut budget = WALK_BUDGET;
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
             if budget == 0 {
-                return None;
+                return false;
             }
             budget -= 1;
-            let Ok(m) = entry.metadata() else { continue };
-            if m.is_dir() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
                 stack.push(entry.path());
             }
-            if let Ok(t) = m.modified()
-                && newest.is_none_or(|n| t > n)
-            {
-                newest = Some(t);
-            }
+            visit(&entry, &meta);
         }
     }
-    newest
+    true
+}
+
+/// Newest modification time anywhere under `dir` (the directory's own stamp
+/// when it is empty or unreadable). A tree too big to walk within the budget
+/// reports `None` ("unknown"), never an age derived from a partial walk that
+/// could brand a live project copy stale.
+fn newest_mtime(dir: &Path) -> Option<SystemTime> {
+    let mut newest = fs::metadata(dir).and_then(|m| m.modified()).ok();
+    let complete = walk_bounded(dir, |_, meta| {
+        if let Ok(t) = meta.modified()
+            && newest.is_none_or(|n| t > n)
+        {
+            newest = Some(t);
+        }
+    });
+    if complete { newest } else { None }
 }
 
 /// Delete staging subdirectories nothing has touched for `STAGING_MAX_AGE`.
@@ -2409,6 +2410,25 @@ struct Probe {
 /// Deadline for a passphrase pre-check. Expiry reports a timeout,
 /// not an incorrect passphrase.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Fire the lone manifest request a passphrase pre-check consists of. The
+/// owner answers `Manifest` iff the token derived from its salt and this
+/// passphrase is right (`Error` otherwise). The reply is matched by request id
+/// and verifies the passphrase without any download or
+/// topic subscription. Shared by the discovered-session and the ticket check.
+fn send_probe(
+    swarm: &mut Swarm<Behaviour>,
+    owner: &PeerId,
+    salt: &str,
+    session_id: String,
+    passphrase: &str,
+) -> Probe {
+    let req = swarm.behaviour_mut().xfer.send_request(
+        owner,
+        XferRequest::Manifest { auth: auth_token(salt, passphrase) },
+    );
+    Probe { req, session_id, started: Instant::now() }
+}
 
 fn fetch_send(
     swarm: &mut Swarm<Behaviour>,
@@ -2964,18 +2984,10 @@ async fn run_network(
                     }
                 }
                 Some(Command::ProbeAuth { session_id, passphrase }) => {
-                    // Lone manifest request: the owner accepts iff the derived
-                    // token is right, so the response answers "is this passphrase
-                    // correct?" without any download or topic subscription.
                     let info = shared.sessions.lock().unwrap().get(&session_id).cloned();
                     match info.and_then(|i| i.owner.parse::<PeerId>().ok().map(|o| (o, i.salt))) {
                         Some((owner, salt)) => {
-                            let token = auth_token(&salt, &passphrase);
-                            let req = swarm
-                                .behaviour_mut()
-                                .xfer
-                                .send_request(&owner, XferRequest::Manifest { auth: token });
-                            probe = Some(Probe { req, session_id, started: Instant::now() });
+                            probe = Some(send_probe(&mut swarm, &owner, &salt, session_id, &passphrase));
                         }
                         None => {
                             // Session gone or unparseable owner -> can't verify.
@@ -3112,33 +3124,26 @@ async fn run_network(
                 // id signed by anyone else is ignored: fail closed rather
                 // than join an impostor.
                 if let Some(pj) = &mut pending_join {
-                    let announced_by_pinned_owner = shared
+                    // The salt from the pinned owner's own announce, once it
+                    // has landed; an announce signed by anyone else never
+                    // matches, so it can't be a stand-in.
+                    let pinned_salt = shared
                         .sessions
                         .lock()
                         .unwrap()
                         .get(&pj.info.session_id)
-                        .is_some_and(|i| i.owner == pj.info.peer.to_string());
-                    if announced_by_pinned_owner {
+                        .filter(|i| i.owner == pj.info.peer.to_string())
+                        .map(|i| i.salt.clone());
+                    if let Some(salt) = pinned_salt {
                         let pj = pending_join.take().unwrap();
                         if pj.probe_only {
-                            // Same lone manifest request as Command::ProbeAuth.
-                            let salt = shared
-                                .sessions
-                                .lock()
-                                .unwrap()
-                                .get(&pj.info.session_id)
-                                .map(|i| i.salt.clone())
-                                .unwrap_or_default();
-                            let token = auth_token(&salt, &pj.passphrase);
-                            let req = swarm
-                                .behaviour_mut()
-                                .xfer
-                                .send_request(&pj.info.peer, XferRequest::Manifest { auth: token });
-                            probe = Some(Probe {
-                                req,
-                                session_id: pj.info.session_id,
-                                started: Instant::now(),
-                            });
+                            probe = Some(send_probe(
+                                &mut swarm,
+                                &pj.info.peer,
+                                &salt,
+                                pj.info.session_id,
+                                &pj.passphrase,
+                            ));
                         } else if let Some(dl) = start_join(
                             &mut swarm,
                             &shared,
@@ -3188,7 +3193,6 @@ async fn run_network(
                         .filter(|(_, topics)| topics.iter().any(|th| **th == hash))
                         .map(|(p, _)| *p)
                         .collect();
-                    shared.topic_peers.store(peers.len(), Ordering::Relaxed);
                     *shared.session_peers.lock().unwrap() = peers;
                 }
                 // Client fallback: the owner vanished from the session topic
@@ -3312,7 +3316,7 @@ async fn run_network(
                     }
                 }
                 // Owner: full-state anti-entropy.
-                if need_full_sync && shared.topic_peers.load(Ordering::Relaxed) > 0 {
+                if need_full_sync && !shared.session_peers.lock().unwrap().is_empty() {
                     if let Some(t) = sess_topic.clone() {
                         let mut data = vec![TAG_AUTHORITATIVE];
                         {
@@ -3796,24 +3800,13 @@ impl Download {
 /// might match one, so a re-download reuses bytes already on disk.
 fn build_reuse_index(root: &Path) -> HashMap<u64, Vec<PathBuf>> {
     let mut idx: HashMap<u64, Vec<PathBuf>> = HashMap::new();
-    let mut stack = vec![root.to_path_buf()];
-    let mut budget = 50_000u32; // bound the scan on huge staging roots
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&dir) else { continue };
-        for entry in rd.flatten() {
-            if budget == 0 {
-                return idx;
-            }
-            budget -= 1;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_dir() {
-                stack.push(entry.path());
-            } else if meta.is_file() && !name.starts_with(".reamesh-part-") {
-                idx.entry(meta.len()).or_default().push(entry.path());
-            }
+    // A partial index (budget exhausted on a huge staging root) is still a
+    // valid index: it just reuses less.
+    walk_bounded(root, |entry, meta| {
+        if meta.is_file() && !entry.file_name().to_string_lossy().starts_with(".reamesh-part-") {
+            idx.entry(meta.len()).or_default().push(entry.path());
         }
-    }
+    });
     idx
 }
 
@@ -4689,14 +4682,6 @@ pub extern "C" fn reamesh_set_presence(json: *const c_char) {
 pub extern "C" fn reamesh_identity_init(path: *const c_char) {
     let Some(p) = cstr_arg(path) else { return };
     set_identity_path(&p);
-}
-
-/// Delete the persisted network identity. The current session (if any) keeps
-/// its identity until it ends; the next session start mints and persists a
-/// fresh one. Returns whether a stored identity existed and was removed.
-#[unsafe(no_mangle)]
-pub extern "C" fn reamesh_identity_reset() -> bool {
-    std::panic::catch_unwind(reset_identity).unwrap_or(false)
 }
 
 /// Set the session-meta blob (JSON: track count + plugin list) the hosted

@@ -263,7 +263,6 @@ const en = {
   pluginsAdded: "{count} plugins were added",
   pluginNotInstalledHere: "Not installed here; it'll show as offline.",
   followEnded: "Stopped following: they left the session.",
-  identityReset: "Network identity reset. Takes effect next session.",
   nofxOpen: "Opening without effects (view-only).",
   verifyHold: "The downloaded project loads plugins the host didn't list.",
 
@@ -548,7 +547,6 @@ const de: Record<MsgKey, string> = {
   pluginsAdded: "{count} Plugins wurden hinzugefügt",
   pluginNotInstalledHere: "Hier nicht installiert. Es erscheint als offline.",
   followEnded: "Folgen beendet. Die Person hat die Session verlassen.",
-  identityReset: "Netzwerk-Identität zurückgesetzt, gilt ab der nächsten Session.",
   nofxOpen: "Öffne ohne Effekte (nur ansehen).",
   verifyHold: "Das heruntergeladene Projekt lädt Plugins, die der Host nicht angegeben hat.",
 

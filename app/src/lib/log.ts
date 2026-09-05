@@ -43,7 +43,6 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   peer_notes_changed: "peerNotesChanged",
   marker_shared: "logMarkerShared",
   follow_ended: "followEnded",
-  identity_reset: "identityReset",
   nofx_open: "nofxOpen",
   verify_hold: "verifyHold",
 };

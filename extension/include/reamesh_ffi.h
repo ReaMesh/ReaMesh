@@ -179,13 +179,6 @@ void reamesh_set_presence(const char *json);
 void reamesh_identity_init(const char *path);
 
 /**
- * Delete the persisted network identity. The current session (if any) keeps
- * its identity until it ends; the next session start mints and persists a
- * fresh one. Returns whether a stored identity existed and was removed.
- */
-bool reamesh_identity_reset(void);
-
-/**
  * Set the session-meta blob (JSON: track count + plugin list) the hosted
  * session's manifest carries, so joiners can see what a join loads before
  * downloading. Owner handles only (a no-op elsewhere beyond local storage).
