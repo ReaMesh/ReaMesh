@@ -386,6 +386,64 @@ fn authenticated_client_proposal_propagates() {
     let _ = fs::remove_dir_all(staging);
 }
 
+/// The extension captures (push_local) BEFORE it drains (drain_remote) on every
+/// tick, so a client proposal the owner admitted in between lands in the doc
+/// while the owner's own edit is still on its way in. The owner's push must
+/// not re-baseline that admitted edit away: its REAPER would then never apply
+/// it while every other peer (and the doc) has it: a silent split brain.
+#[test]
+fn admitted_proposal_survives_owner_push_before_drain() {
+    let project = temp_dir("proj-pushdrain");
+    let staging = temp_dir("staging-pushdrain");
+    make_project(&project);
+    let (owner, client) = establish("pushdrain-test", &project, &staging);
+
+    owner.push_local(
+        r#"{"tracks":{"{T12}":{"present":true,"index":0,"name":"Gtr","vol":1.0,"pan":0.0}}}"#,
+    );
+    let mut client_state = serde_json::Map::new();
+    assert!(wait_until(Duration::from_secs(10), || {
+        drain_into(&client, &mut client_state);
+        client_state.contains_key("{T12}")
+    }));
+    // Creating the track locked every field for the owner; wait that out.
+    std::thread::sleep(Duration::from_millis(3200));
+
+    // The client renames the track. Wait until the owner's DOC holds the
+    // admitted value: deliberately WITHOUT draining the owner, whose REAPER
+    // has not ticked yet.
+    client.push_local(r#"{"tracks":{"{T12}":{"name":"Lead Gtr"}}}"#);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            field(&owner.snapshot_json(), "{T12}", "name") == "Lead Gtr"
+        }),
+        "the client's proposal never reached the owner's doc"
+    );
+
+    // The owner's next tick: capture a local edit to a DIFFERENT field first
+    // (the lock on `name` is the client's; `pan` is free)...
+    owner.push_local(r#"{"tracks":{"{T12}":{"pan":0.25}}}"#);
+    // ...then drain. The admitted rename must be in what the owner applies.
+    let mut owner_state = serde_json::Map::new();
+    drain_into(&owner, &mut owner_state);
+    assert_eq!(
+        owner_state.get("{T12}").map(|t| t["name"].clone()),
+        Some(serde_json::json!("Lead Gtr")),
+        "the owner's own push swallowed the admitted client edit"
+    );
+    // The owner's own pan edit is re-baselined and must not echo back.
+    assert_ne!(
+        owner_state.get("{T12}").map(|t| t["pan"].clone()),
+        Some(serde_json::json!(0.25)),
+        "the owner's own edit echoed back from drain_remote"
+    );
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
 #[test]
 fn owner_wins_live_conflict() {
     let project = temp_dir("proj-conflict");

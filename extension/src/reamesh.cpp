@@ -256,12 +256,6 @@ static bool g_applyingRemote = false;  // echo-suppression / reentrancy guard
 // True only while Main_openProject runs on a finished download; published to
 // the app so its download stepper can show the "opening in REAPER" phase.
 static bool g_openingProject = false;
-// Set while ctlTick() is called from inside a long main-thread operation purely
-// to publish an interim state (see openDownloadedProject). Companion-app
-// commands must NOT be dispatched from there: a `leave` landing mid-open would
-// shut the handle down and drop us to Idle, and the caller would then carry on
-// against a torn-down session. The commands stay queued for the next real tick.
-static bool g_ctlPublishOnly = false;
 static unsigned g_lastPeerCount = 0;
 // Media items locally tinted dark grey to signal "another peer is editing this"
 // (their editing lock is live, per reamesh_locked_entities). Maps each tinted
@@ -1135,16 +1129,24 @@ static void applyProjectNotes(const std::string& notes) {
 //
 // Reading them is 64 GetSetProjectInfo_String round trips, and
 // snapshotProject() runs several times a second (capture, remote apply, tint
-// reconcile, deferred flush), far too often for a field that changes maybe
-// once a session. Cache it against the project change counter: nothing can
-// have edited a group name while that stands still, and applyGroupNames
-// invalidates explicitly for the remote-apply path.
+// reconcile, deferred flush): far too often for a field that changes maybe
+// once a session. Cache it against the project change counter (an undoable
+// edit invalidates it) AND let it age out on the rescan cadence: the counter
+// is only ever a latency optimization here (see captureLocalChanges: the 2s
+// rescan exists precisely for edits that don't bump it), so a rename made
+// through a path that adds no undo point must still be picked up within the
+// same window it always was. applyGroupNames invalidates explicitly for the
+// remote-apply path.
 static std::string g_groupNamesCache;
 static int g_groupNamesAt = -1;
+static std::chrono::steady_clock::time_point g_groupNamesWhen{};
+static constexpr std::chrono::seconds GROUP_NAMES_MAX_AGE{2};
 
 static std::string captureGroupNames() {
   const int cc = GetProjectStateChangeCount(nullptr);
-  if (cc == g_groupNamesAt) return g_groupNamesCache;
+  const auto now = std::chrono::steady_clock::now();
+  if (cc == g_groupNamesAt && now - g_groupNamesWhen < GROUP_NAMES_MAX_AGE)
+    return g_groupNamesCache;
   std::string out;
   for (int i = 1; i <= 64; ++i) {
     char desc[32];
@@ -1153,6 +1155,7 @@ static std::string captureGroupNames() {
     out += captureProjectString(desc);
   }
   g_groupNamesAt = cc;
+  g_groupNamesWhen = now;
   g_groupNamesCache = out;
   return out;
 }
@@ -1689,26 +1692,30 @@ static void applyTrackFields(MediaTrack* tr, const json& fields) {
   setNum("freemode", "I_FREEMODE");
   setNum("numlanes", "I_NUMFIXEDLANES");
   setNum("lanesettings", "C_LANESETTINGS");
-  if (fields.contains("lanenames") && fields["lanenames"].is_string() &&
-      !fields["lanenames"].get<std::string>().empty()) {
-    const std::string names = fields["lanenames"].get<std::string>();
-    // Capture only fills this on a fixed-lane track, one entry per lane, so
-    // clamp to the lane count that was just applied. Unclamped, an ordinary
-    // track's empty field still ran one iteration and wiped the receiving
-    // user's P_LANENAME:0, and a shrunk lane set left the dropped lanes' names
-    // standing.
+  if (fields.contains("lanenames") && fields["lanenames"].is_string()) {
+    // Mirror capture exactly: it fills this only on a fixed-lane track, one
+    // entry per lane, so a lone lane whose name was just cleared legitimately
+    // arrives as "" and must still be applied. Gate on the same condition
+    // (freemode/lane count as just applied above) rather than on the string
+    // being non-empty, and clamp to the lane count: unclamped, an ordinary
+    // track's empty field wiped the receiving user's P_LANENAME:0, and a shrunk
+    // lane set left the dropped lanes' names standing.
+    const int freemode = (int)GetMediaTrackInfo_Value(tr, "I_FREEMODE");
     const int lanes = (int)GetMediaTrackInfo_Value(tr, "I_NUMFIXEDLANES");
-    size_t pos = 0;
-    for (int lane = 0; lane < lanes && pos <= names.size(); ++lane) {
-      size_t eol = names.find('\n', pos);
-      if (eol == std::string::npos) eol = names.size();
-      std::string n = names.substr(pos, eol - pos);
-      char key[32];
-      snprintf(key, sizeof(key), "P_LANENAME:%d", lane);
-      std::vector<char> buf(n.begin(), n.end());
-      buf.push_back('\0');
-      GetSetMediaTrackInfo_String(tr, key, buf.data(), true);
-      pos = eol + 1;
+    if (freemode == 2 && lanes > 0) {
+      const std::string names = fields["lanenames"].get<std::string>();
+      size_t pos = 0;
+      for (int lane = 0; lane < lanes && pos <= names.size(); ++lane) {
+        size_t eol = names.find('\n', pos);
+        if (eol == std::string::npos) eol = names.size();
+        std::string n = names.substr(pos, eol - pos);
+        char key[32];
+        snprintf(key, sizeof(key), "P_LANENAME:%d", lane);
+        std::vector<char> buf(n.begin(), n.end());
+        buf.push_back('\0');
+        GetSetMediaTrackInfo_String(tr, key, buf.data(), true);
+        pos = eol + 1;
+      }
     }
   }
   if (fields.contains("laneplays") && fields["laneplays"].is_string()) {
@@ -1921,6 +1928,14 @@ static bool applyRecvField(const std::string& guid, const std::string& wire,
   });
   std::string cur = objectStateChunk(tr);
   if (cur.empty()) return false;
+  // Already spliced (a processDeferredRecv retry, or the same value sent again)?
+  // Decide in NORMALIZED form: `local` came off the wire LF-only with the send
+  // envelopes' ARM/VIS lines stripped, while REAPER re-serializes the track with
+  // the platform's line ending and puts those lines back. A raw byte compare of
+  // the re-spliced chunk against the live one therefore never matches (always
+  // on Windows, and on every platform once a receive carries a send envelope),
+  // and each retry would rebuild the whole track: every tick, for up to 90s.
+  if (extractTrackBlocks(normalizeChunk(cur)).recv == local) return complete;
   TrackBlocksPatch patch;
   patch.recv = &local;
   std::string next = replaceTrackBlocks(cur, patch);
@@ -2192,9 +2207,16 @@ static void processDeferredItems() {
 // shape as processDeferredItems: echo-suppressed, no undo point, re-baselined,
 // and given up on after 90s so a source track that is never coming can't leave
 // an entry behind forever.
+static std::chrono::steady_clock::time_point g_lastRecvRetry{};
+
 static void processDeferredRecv() {
   if (g_deferredRecv.empty()) return;
   const auto now = std::chrono::steady_clock::now();
+  // Once a second is plenty: every retry serializes the parked track's chunk
+  // (and resolves each unit's source by a GUID scan), and a source track can
+  // only ever show up through a remote apply, never between two timer ticks.
+  if (now - g_lastRecvRetry < std::chrono::seconds(1)) return;
+  g_lastRecvRetry = now;
   bool changed = false;
   g_applyingRemote = true;
   PreventUIRefresh(1);
@@ -2690,8 +2712,13 @@ static bool joinSessionById(const std::string& sid, const std::string& sname,
                             const std::string& passphrase) {
   if (g_mode != Mode::Browsing || !g_handle) return false;
   if (!reamesh_join_session(g_handle, sid.c_str(), passphrase.c_str())) {
-    logEvent("join_unavailable", {{"name", sname}},
-             "could not join \"" + sname + "\" (it may have just closed); try again");
+    // Flagged as the error, not just logged: the app's join button is
+    // fire-and-forget, so this is the only thing that tells the user why it
+    // came back (a double-click on a join already under way is guarded on the
+    // app side, so a refusal here is a genuine one).
+    g_lastError =
+        logEvent("join_unavailable", {{"name", sname}},
+                 "could not join \"" + sname + "\" (it may have just closed); try again");
     return false;
   }
   // Rust resets its cumulative revert counter for the new session; match it
@@ -3076,22 +3103,13 @@ static void ctlDispatch(const json& cmd) {
   }
 }
 
-static void ctlTick() {
-  // Alive beacon for the control server's watchdog: when this stops beating
-  // (a modal REAPER dialog blocks the main thread), the server tells the app
-  // "REAPER isn't responding" so a stuck Downloading/Lobby screen explains
-  // itself instead of looking hung.
-  reamesh_ctl_heartbeat();
-  if (!g_ctlPublishOnly) {
-    for (;;) {
-      char* raw = reamesh_ctl_poll();
-      if (!raw) break;
-      json cmd = json::parse(raw, nullptr, false);
-      reamesh_free_string(raw);
-      if (cmd.is_object()) ctlDispatch(cmd);
-    }
-  }
-
+// Compose the extension's state and publish it to the companion app when it
+// changed. Kept apart from the command drain (ctlTick) so a long main-thread
+// operation can publish an interim state on its own: openDownloadedProject
+// does, right before Main_openProject blocks, without dispatching queued
+// commands from inside itself: a `leave` landing there would tear the session
+// down underneath the rest of that function.
+static void ctlPublishState() {
   json state;
   // Each peer's beacon carries the GUID of the track they're focused on;
   // resolve it against THIS instance's tracks so the roster shows a
@@ -3233,6 +3251,22 @@ static void ctlTick() {
   }
 }
 
+static void ctlTick() {
+  // Alive beacon for the control server's watchdog: when this stops beating
+  // (a modal REAPER dialog blocks the main thread), the server tells the app
+  // "REAPER isn't responding" so a stuck Downloading/Lobby screen explains
+  // itself instead of looking hung.
+  reamesh_ctl_heartbeat();
+  for (;;) {
+    char* raw = reamesh_ctl_poll();
+    if (!raw) break;
+    json cmd = json::parse(raw, nullptr, false);
+    reamesh_free_string(raw);
+    if (cmd.is_object()) ctlDispatch(cmd);
+  }
+  ctlPublishState();
+}
+
 // ---------- timer ----------
 
 // Publish the focused track GUID and current timeline position with the user's
@@ -3259,9 +3293,6 @@ static void pushLocalPresence() {
   // reporting "frozen" while the user simply sits still.
   reamesh_set_presence(p.dump().c_str());
 }
-
-// Forward-declared: pollDownload publishes an interim state through ctlTick.
-static void ctlTick();
 
 // Open the finished download in REAPER (Downloading -> ClientActive). In
 // no-FX mode a stripped sibling copy is written and opened instead: the
@@ -3290,11 +3321,9 @@ static void openDownloadedProject(std::string path) {
   // the "opening" phase first so the app's stepper doesn't sit frozen on the
   // download bar meanwhile.
   g_openingProject = true;
-  // Publish only: dispatching queued commands here would let a `leave` tear
+  // Publish only (no command drain): a `leave` dispatched from here would tear
   // the session down underneath the rest of this function.
-  g_ctlPublishOnly = true;
-  ctlTick();
-  g_ctlPublishOnly = false;
+  ctlPublishState();
   g_applyingRemote = true;
   Main_openProject(path.c_str());
   // The loaded project IS the owner's state; baseline it so the load is

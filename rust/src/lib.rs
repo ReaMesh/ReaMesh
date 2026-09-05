@@ -1284,12 +1284,18 @@ impl Reamesh {
                     self.shared.dirty.store(true, Ordering::SeqCst);
                 }
                 if !kept.is_empty() {
-                    if let Some(update) =
-                        apply_changeset_to_doc(&mut ds, &JsonValue::Object(kept))
-                    {
-                        // Re-baseline so this local change never re-surfaces from
-                        // drain_remote.
-                        ds.last_state = snapshot(&ds.doc);
+                    let kept = JsonValue::Object(kept);
+                    if let Some(update) = apply_changeset_to_doc(&mut ds, &kept) {
+                        // Re-baseline ONLY the fields this push wrote, so they
+                        // never re-surface from drain_remote, and nothing else.
+                        // The doc may also hold client proposals the network
+                        // task admitted since the last drain (the extension
+                        // captures before it drains on every tick); a full
+                        // snapshot here folded those into last_state too, so
+                        // the owner's own REAPER never applied an edit every
+                        // other peer (and the doc) already had.
+                        let after = snapshot(&ds.doc);
+                        rebaseline_fields(&mut ds.last_state, &after, &kept);
                         drop(ds);
                         let _ = self.cmd_tx.send(Command::PublishAuthoritative(update));
                     }
@@ -1909,6 +1915,36 @@ fn apply_changeset_to_doc(ds: &mut DocState, changeset: &JsonValue) -> Option<Ve
     changed.then(|| txn.encode_update_v1())
 }
 
+/// Copy just the fields named by `changeset` (any subset of sections) from
+/// `from` into `into`, leaving every other field of `into` untouched. This is
+/// how the owner re-baselines its own push: the fields it wrote are marked
+/// seen, while anything else that changed in the doc meanwhile (an admitted
+/// client proposal) still surfaces from the next drain_remote.
+fn rebaseline_fields(into: &mut StateMap, from: &StateMap, changeset: &JsonValue) {
+    for section in SECTIONS {
+        let Some(entities) = changeset.get(section).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (id, fields) in entities {
+            let Some(fields) = fields.as_object() else { continue };
+            for key in fields.keys() {
+                let Some(v) = from
+                    .get(section)
+                    .and_then(|s| s.get(id))
+                    .and_then(|f| f.get(key))
+                else {
+                    continue;
+                };
+                into.entry(section.to_string())
+                    .or_default()
+                    .entry(id.clone())
+                    .or_default()
+                    .insert(key.clone(), v.clone());
+            }
+        }
+    }
+}
+
 // ---------- session id / manifest helpers ----------
 
 fn new_session_id() -> String {
@@ -1979,7 +2015,17 @@ fn hash_manifest(dir: &Path, mut files: Vec<FileMeta>, cache: &mut HashCache) ->
             continue; // changed under the walk: leave it unhashed
         }
         let mtime = m.modified().ok();
-        if let Some((size, stamp, hash)) = cache.get(&meta.path)
+        // (size, mtime) can't tell two same-length writes apart when they land
+        // inside the filesystem's mtime granularity (a second on HFS+/ext3, two
+        // on FAT): a stale hash there would fail every later joiner's verify
+        // for the rest of the session. So the cache is only trusted for files
+        // that have sat still for a couple of refresh intervals; whatever the
+        // host is actively saving is simply re-hashed.
+        let settled = mtime
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= 2 * MANIFEST_REFRESH);
+        if settled
+            && let Some((size, stamp, hash)) = cache.get(&meta.path)
             && *size == meta.size
             && *stamp == mtime
             && !hash.is_empty()
@@ -2086,7 +2132,9 @@ fn zstd_decode_bounded(data: &[u8], limit: usize) -> std::io::Result<Vec<u8>> {
 
 /// Newest modification time anywhere under `dir` (the directory's own stamp
 /// when it is empty or unreadable). Bounded so a huge staging root can't turn
-/// the sweep into a full-disk walk.
+/// the sweep into a full-disk walk, and a tree too big to walk within the
+/// budget reports `None` ("unknown"), never an age derived from a partial walk
+/// that could brand a live project copy stale.
 fn newest_mtime(dir: &Path) -> Option<SystemTime> {
     let mut newest = fs::metadata(dir).and_then(|m| m.modified()).ok();
     let mut stack = vec![dir.to_path_buf()];
@@ -2095,7 +2143,7 @@ fn newest_mtime(dir: &Path) -> Option<SystemTime> {
         let Ok(rd) = fs::read_dir(&d) else { continue };
         for entry in rd.flatten() {
             if budget == 0 {
-                return newest;
+                return None;
             }
             budget -= 1;
             let Ok(m) = entry.metadata() else { continue };
