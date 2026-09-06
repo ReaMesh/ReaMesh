@@ -67,7 +67,7 @@ int main() {
   printf("hosting...\n");
   ReameshHandle* owner = reamesh_host("Smoke", proj.c_str(), "Smoke.rpp", "");
   printf("browsing...\n");
-  ReameshHandle* client = reamesh_join(staging.c_str());
+  ReameshHandle* client = reamesh_join(staging.c_str(), nullptr);
   if (!owner || !client) {
     fprintf(stderr, "FAIL: init returned null\n");
     return 1;

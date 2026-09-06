@@ -44,6 +44,8 @@
 #define REAPERAPI_WANT_PreventUIRefresh
 #define REAPERAPI_WANT_guidToString
 #define REAPERAPI_WANT_SetOnlyTrackSelected
+#define REAPERAPI_WANT_SetTrackSelected
+#define REAPERAPI_WANT_CountSelectedTracks
 #define REAPERAPI_WANT_ReorderSelectedTracks
 #define REAPERAPI_WANT_TrackList_AdjustWindows
 #define REAPERAPI_WANT_UpdateArrange
@@ -331,6 +333,8 @@ static std::chrono::steady_clock::time_point g_lastMetaCheck{};
 
 // Defined in the control-server section below; used before that point.
 static std::string jsonStr(const json& j, const char* key);
+static bool jsonBool(const json& j, const char* key, bool dflt);
+static double jsonNum(const json& j, const char* key, double dflt);
 static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback);
 static void openDownloadedProject(std::string path);
 
@@ -437,11 +441,13 @@ static std::string_view ltrim(std::string_view s) {
 // plugin-state lines, and base64's alphabet includes upper-case letters but
 // never a space, so an unanchored prefix like "FLOAT" would also swallow a
 // payload line that happens to begin "FLOATxxxx…", silently truncating the FX
-// state that then goes on the wire.
+// state that then goes on the wire. (A currently floating FX window is written
+// as `FLOAT x y w h`, a closed one as `FLOATPOS x y w h`: both per-user.)
 static bool isVolatileChunkLine(std::string_view trimmed) {
   return trimmed.rfind("SEL ", 0) == 0 || trimmed.rfind("SHOW ", 0) == 0 ||
          trimmed.rfind("LASTSEL ", 0) == 0 || trimmed.rfind("DOCKED ", 0) == 0 ||
-         trimmed.rfind("FLOATPOS ", 0) == 0 || trimmed == "FLOAT" ||
+         trimmed.rfind("FLOATPOS ", 0) == 0 || trimmed.rfind("FLOAT ", 0) == 0 ||
+         trimmed == "FLOAT" ||
          trimmed.rfind("WNDRECT ", 0) == 0 ||
          trimmed.rfind("ARM ", 0) == 0 || trimmed.rfind("VIS ", 0) == 0;
 }
@@ -725,6 +731,10 @@ static std::string transformRecvUnits(
 }
 
 // All quoted FILE references in an item chunk (media sources).
+static std::string rppQuotedToken(std::string_view line, size_t from);
+static int colorToWire(int native);
+static int colorFromWire(int wire);
+
 static std::vector<std::string> chunkFilePaths(const std::string& chunk) {
   std::vector<std::string> out;
   size_t pos = 0;
@@ -733,10 +743,10 @@ static std::vector<std::string> chunkFilePaths(const std::string& chunk) {
     if (eol == std::string::npos) eol = chunk.size();
     std::string_view t = ltrim(std::string_view(chunk.data() + pos, eol - pos));
     if (t.rfind("FILE ", 0) == 0) {
-      size_t q1 = t.find('"');
-      size_t q2 = (q1 == std::string_view::npos) ? std::string_view::npos : t.find('"', q1 + 1);
-      if (q2 != std::string_view::npos)
-        out.emplace_back(t.substr(q1 + 1, q2 - q1 - 1));
+      // REAPER quotes a path with ", or with ' / ` when the path itself
+      // contains quotes: rppQuotedToken understands all three.
+      std::string path = rppQuotedToken(t, 5);
+      if (!path.empty()) out.push_back(std::move(path));
     }
     pos = eol + 1;
   }
@@ -908,8 +918,8 @@ static std::string trackNameByGuid(const std::string& guid) {
 static std::string peerNameById(const json& peers, const std::string& id) {
   if (id.empty() || !peers.is_array()) return "";
   for (const auto& p : peers)
-    if (p.is_object() && p.value("id", std::string()) == id)
-      return p.value("name", std::string());
+    if (p.is_object() && jsonStr(p, "id") == id)
+      return jsonStr(p, "name");
   return "";
 }
 
@@ -996,8 +1006,10 @@ static std::string captureMarkers() {
       continue;
     }
     char buf[160];
+    // Colors cross the wire platform-neutral, like track colors: macOS and
+    // Windows pack native ints with opposite byte order.
     snprintf(buf, sizeof(buf), "%s\t%d\t%.17g\t%.17g\t%d\t", isrgn ? "R" : "M", num, pos, rgnend,
-             color);
+             colorToWire(color));
     out += buf;
     out += sanitizeMarkerName(name);
     out += '\n';
@@ -1049,7 +1061,7 @@ static void applyMarkers(const std::string& s) {
     double mpos = strtod(f[2].c_str(), nullptr);
     double rgnend = strtod(f[3].c_str(), nullptr);
     int color = atoi(f[4].c_str());
-    AddProjectMarker2(nullptr, isrgn, mpos, rgnend, name.c_str(), num, color);
+    AddProjectMarker2(nullptr, isrgn, mpos, rgnend, name.c_str(), num, colorFromWire(color));
   }
 }
 
@@ -1526,7 +1538,7 @@ static void internalizeExternalMedia() {
 // Defined below, near the tint helpers (needs applyItem / lockedItemsByOthers).
 static void revertLockedItemEdits(Snapshot& snap);
 
-static void captureLocalChanges() {
+static void captureLocalChanges(bool force) {
   // Client: stay silent until the owner's first authoritative state has landed
   // and re-baselined us (see g_bootstrapSynced). A short grace opens the gate
   // even if that state never arrives (the download already equalled the doc),
@@ -1557,7 +1569,7 @@ static void captureLocalChanges() {
   const bool rescanDue = now - g_lastFullScan >= rescanGap;
   if (!counterMoved && !rescanDue) return;
   // Chunk serialization isn't free; cap capture rate (sync target is ~1s).
-  if (!rescanDue && now - g_lastCapture < minGap) return;
+  if (!force && !rescanDue && now - g_lastCapture < minGap) return;
   g_lastCapture = now;
   g_lastFullScan = now;
   g_lastChangeCount = cc;
@@ -1780,13 +1792,25 @@ static void applyReorder(const std::map<std::string, double>& desiredIndex) {
     if (a.index != b.index) return a.index < b.index;
     return a.guid < b.guid;  // deterministic tie-break on all peers
   });
+  // ReorderSelectedTracks works on the selection, which is per-user state
+  // (and what the presence beacon reports as this user's focus): remember it
+  // and put it back once the tracks are in place.
+  std::vector<std::string> selected;
+  for (int i = 0, n = CountSelectedTracks(nullptr); i < n; ++i)
+    selected.push_back(trackGuid(GetSelectedTrack(nullptr, i)));
+  bool moved = false;
   for (int i = 0; i < (int)order.size(); ++i) {
     if (trackGuid(GetTrack(nullptr, i)) == order[i].guid) continue;
     MediaTrack* want = findTrackByGuid(order[i].guid);
     if (!want) continue;
     SetOnlyTrackSelected(want);
     ReorderSelectedTracks(i, 0);
+    moved = true;
   }
+  if (!moved) return;
+  for (int i = 0, n = CountTracks(nullptr); i < n; ++i) SetTrackSelected(GetTrack(nullptr, i), false);
+  for (const std::string& guid : selected)
+    if (MediaTrack* tr = findTrackByGuid(guid)) SetTrackSelected(tr, true);
 }
 
 // Media files this item needs that are missing from the project folder.
@@ -1812,7 +1836,7 @@ static void applyItem(const std::string& guid, const json& fields) {
   // item's restore color current when its real color changes mid-lock.
   g_itemTints.erase(guid);
   MediaItem* item = findItemByGuid(guid);
-  if (fields.value("present", true) == false) {
+  if (!jsonBool(fields, "present", true)) {
     if (item) DeleteTrackMediaItem(GetMediaItem_Track(item), item);
     return;
   }
@@ -1979,7 +2003,7 @@ static void applyChangeset(const json& changeset) {
     // Deletions first so insertion indices below land in a settled list.
     for (auto it = tracks.begin(); it != tracks.end(); ++it) {
       const json& fields = it.value();
-      if (fields.is_object() && fields.value("present", true) == false) {
+      if (fields.is_object() && !jsonBool(fields, "present", true)) {
         if (MediaTrack* tr = findTrackByGuid(it.key())) {
           std::string nm = trackNameByGuid(it.key());  // name before it's gone
           DeleteTrack(tr);
@@ -1996,12 +2020,12 @@ static void applyChangeset(const json& changeset) {
     for (auto it = tracks.begin(); it != tracks.end(); ++it) {
       const std::string& guid = it.key();
       const json& fields = it.value();
-      if (!fields.is_object() || fields.value("present", true) == false) continue;
+      if (!fields.is_object() || !jsonBool(fields, "present", true)) continue;
 
       MediaTrack* tr = findTrackByGuid(guid);
       bool created = false;
       if (!tr) {
-        int idx = (int)fields.value("index", (double)CountTracks(nullptr));
+        int idx = (int)jsonNum(fields, "index", (double)CountTracks(nullptr));
         idx = std::clamp(idx, 0, CountTracks(nullptr));
         InsertTrackAtIndex(idx, false);
         tr = GetTrack(nullptr, idx);
@@ -2026,14 +2050,14 @@ static void applyChangeset(const json& changeset) {
         newTxt += (fields.contains("recfx") && fields["recfx"].is_string())
                       ? fields["recfx"].get<std::string>()
                       : (base != g_snapshot.tracks.end() ? base->second.recfx : "");
-        std::string nm = fields.value("name", std::string());
+        std::string nm = jsonStr(fields, "name");
         if (nm.empty()) nm = trackNameByGuid(guid);
         notePluginAdds(nm, [&] { return holders.name("tracks", guid); },
                        collectPlugins(oldTxt), collectPlugins(newTxt));
       }
       applyTrackFields(tr, fields);
       if (created) {
-        std::string nm = fields.value("name", std::string());
+        std::string nm = jsonStr(fields, "name");
         if (nm.empty())
           activityEvent("peer_track_added", json::object(), "a track was added");
         else
@@ -2068,23 +2092,25 @@ static void applyChangeset(const json& changeset) {
       // Take-FX plugins arriving inside an item chunk get the same narration
       // as track-chain arrivals.
       if (fields.contains("chunk") && fields["chunk"].is_string() &&
-          fields.value("present", true)) {
+          jsonBool(fields, "present", true)) {
         auto base = g_snapshot.items.find(guid);
         const std::string oldTxt =
             base != g_snapshot.items.end() ? base->second.chunk : std::string();
-        std::string trGuid = fields.value("track", std::string());
+        std::string trGuid = jsonStr(fields, "track");
         if (trGuid.empty() && base != g_snapshot.items.end()) trGuid = base->second.track;
         notePluginAdds(trackNameByGuid(trGuid), [&] { return holders.name("items", guid); },
                        collectPlugins(oldTxt),
                        collectPlugins(fields["chunk"].get<std::string>()));
       }
 
+      // A tombstone or retarget to available media supersedes a parked copy;
+      // otherwise old fields could reappear when the media arrives.
+      std::erase_if(g_deferredItems, [&](const DeferredItem& d) { return d.guid == guid; });
       std::vector<std::string> missing = missingMediaIn(fields);
       if (!missing.empty()) {
         // Media hasn't arrived yet: fetch it from the peers and apply the
         // item once it exists. Latest fields win for the same item.
         for (const std::string& rel : missing) reamesh_fetch_file(g_handle, rel.c_str());
-        std::erase_if(g_deferredItems, [&](const DeferredItem& d) { return d.guid == guid; });
         g_deferredItems.push_back(
             {guid, fields, std::move(missing), std::chrono::steady_clock::now()});
         logEvent("waiting_media", json::object(), "waiting for media of an incoming item...");
@@ -2128,6 +2154,20 @@ static void applyChangeset(const json& changeset) {
   }
 }
 
+// Capture before re-baselining. Every site that writes to the project under
+// g_applyingRemote and then re-baselines g_snapshot (remote apply, deferred
+// item/receive flush, lock-tint paint) would otherwise fold in whatever local
+// edit the capture throttle skipped since the last capture, and that edit
+// would never be proposed, because the next diff compares it against itself.
+// So the pending local delta is captured first, throttle or not. Gated on the
+// change counter, so it costs nothing while the user isn't touching anything.
+static void flushLocalEdits() {
+  if (g_mode != Mode::Hosting && g_mode != Mode::ClientActive) return;
+  if (g_noFx || g_applyingRemote) return;
+  if (GetProjectStateChangeCount(nullptr) == g_lastChangeCount) return;
+  captureLocalChanges(/*force=*/true);
+}
+
 static void applyRemoteChanges() {
   char* raw = reamesh_drain_remote(g_handle);
   std::string payload = raw ? raw : "[]";
@@ -2136,6 +2176,7 @@ static void applyRemoteChanges() {
 
   json changesets = json::parse(payload, nullptr, /*allow_exceptions=*/false);
   if (!changesets.is_array() || changesets.empty()) return;
+  flushLocalEdits();
 
   // Echo suppression: the setters below bump GetProjectStateChangeCount; with
   // the flag set and the re-baseline at the end, the capture loop never sees
@@ -2148,8 +2189,16 @@ static void applyRemoteChanges() {
   // as a normal local change next tick and synced back out; there is no
   // re-application loop because we re-baseline below.)
   PreventUIRefresh(1);
-  for (const auto& cs : changesets)
-    applyChangeset(g_noFx ? filterChangesetNoFx(cs) : cs);
+  for (const auto& cs : changesets) {
+    // A changeset is peer-authored JSON: a shape the apply code doesn't expect
+    // drops that changeset, never unwinds through REAPER's timer.
+    try {
+      applyChangeset(g_noFx ? filterChangesetNoFx(cs) : cs);
+    } catch (const std::exception& e) {
+      logEvent("bad_changeset", {{"error", e.what()}},
+               std::string("dropped a malformed incoming edit: ") + e.what());
+    }
+  }
   PreventUIRefresh(-1);
   TrackList_AdjustWindows(false);
   UpdateArrange();
@@ -2188,9 +2237,17 @@ static void processDeferredItems() {
   });
 
   if (ready.empty()) return;
+  flushLocalEdits();
   g_applyingRemote = true;
   PreventUIRefresh(1);
-  for (const DeferredItem& d : ready) applyItem(d.guid, d.fields);
+  for (const DeferredItem& d : ready) {
+    try {
+      applyItem(d.guid, d.fields);
+    } catch (const std::exception& e) {
+      logEvent("bad_changeset", {{"error", e.what()}},
+               std::string("dropped a malformed incoming edit: ") + e.what());
+    }
+  }
   PreventUIRefresh(-1);
   UpdateArrange();
   g_snapshot = snapshotProject();
@@ -2216,6 +2273,7 @@ static void processDeferredRecv() {
   // (and resolves each unit's source by a GUID scan), and a source track can
   // only ever show up through a remote apply, never between two timer ticks.
   if (now - g_lastRecvRetry < std::chrono::seconds(1)) return;
+  flushLocalEdits();
   g_lastRecvRetry = now;
   bool changed = false;
   g_applyingRemote = true;
@@ -2258,6 +2316,8 @@ static std::string fileStem(const std::string& path) {
 
 // Defined in the control-server section below; needed by the reconnect logic.
 static std::string jsonStr(const json& j, const char* key);
+static bool jsonBool(const json& j, const char* key, bool dflt);
+static double jsonNum(const json& j, const char* key, double dflt);
 static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback);
 
 // ---------- item-tint lock signal (local view transform only) ----------
@@ -2321,6 +2381,7 @@ static std::set<std::string> lockedItemsByOthers() {
 static void restoreAllItemTints() {
   if (g_itemTints.empty()) return;
   const bool inSession = g_mode == Mode::Hosting || g_mode == Mode::ClientActive;
+  if (inSession) flushLocalEdits();
   g_applyingRemote = true;
   for (const auto& [guid, rec] : g_itemTints)
     if (MediaItem* it = findItemByGuid(guid))
@@ -2353,6 +2414,7 @@ static void reconcileItemTints() {
   const auto now = std::chrono::steady_clock::now();
   bool changed = false;
 
+  flushLocalEdits();
   g_applyingRemote = true;
   // Tint items newly locked by a peer (or freshly un-tinted by a remote apply,
   // which dropped their record so we re-stash the current real color), and
@@ -2495,7 +2557,7 @@ static json selfPeerEntry() {
   json peers = handleJson(reamesh_peers, json::array());
   if (peers.is_array())
     for (const auto& p : peers)
-      if (p.is_object() && p.value("is_self", false)) return p;
+      if (p.is_object() && jsonBool(p, "is_self", false)) return p;
   return json::object();
 }
 
@@ -2529,7 +2591,7 @@ static void drainSharedMarkers() {
     const std::string name = jsonStr(m, "name");
     const std::string by = jsonStr(m, "by");
     if (name.empty()) continue;
-    insertSharedMarker(name, m.value("pos", 0.0), by, jsonStr(m, "color"));
+    insertSharedMarker(name, jsonNum(m, "pos", 0.0), by, jsonStr(m, "color"));
     logEvent("marker_received", {{"name", name}, {"by", by}},
              by.empty() ? "marker \"" + name + "\" was shared"
                         : by + " shared marker \"" + name + "\"");
@@ -2696,7 +2758,18 @@ static bool startBrowse() {
   if (g_mode == Mode::Browsing) return true;
   if (g_mode != Mode::Idle) return false;
   std::string staging = std::string(GetResourcePath()) + "/ReaMesh";
-  g_handle = reamesh_join(staging.c_str());
+  // Every project open in this REAPER (all tabs), so the staging sweep can
+  // never remove a downloaded copy that is still open here.
+  std::string open;
+  for (int i = 0;; ++i) {
+    char buf[4096] = {0};
+    if (!EnumProjects(i, buf, sizeof(buf))) break;
+    if (buf[0]) {
+      open += buf;
+      open += '\n';
+    }
+  }
+  g_handle = reamesh_join(staging.c_str(), open.c_str());
   if (!g_handle) {
     g_lastError = logEvent("browse_failed", json::object(), "could not start session discovery");
     return false;
@@ -2921,6 +2994,16 @@ static std::string jsonStr(const json& j, const char* key) {
   auto it = j.find(key);
   return (it != j.end() && it->is_string()) ? it->get<std::string>() : "";
 }
+// Typed reads of peer-authored JSON. nlohmann's value<T>() throws on a
+// mismatched type, and nothing in the apply path may throw on REAPER's timer.
+static bool jsonBool(const json& j, const char* key, bool dflt) {
+  auto it = j.find(key);
+  return (it != j.end() && it->is_boolean()) ? it->get<bool>() : dflt;
+}
+static double jsonNum(const json& j, const char* key, double dflt) {
+  auto it = j.find(key);
+  return (it != j.end() && it->is_number()) ? it->get<double>() : dflt;
+}
 
 // ---------- companion app control server ----------
 //
@@ -3029,11 +3112,13 @@ static void ctlDispatch(const json& cmd) {
     g_hostWarning = json();
   } else if (c == "join") {
     if (g_mode == Mode::Idle) startBrowse();
-    // "Join without effects": strictly view-only, every FX chain stripped.
-    g_noFx = cmdBool("nofx");
     const std::string name = jsonStr(cmd, "session_name");
-    joinSession(jsonStr(cmd, "session_id"), jsonStr(cmd, "ticket"),
-                name.empty() ? "session" : name, jsonStr(cmd, "passphrase"));
+    // "Join without effects": strictly view-only, every FX chain stripped.
+    // Adopted only once the join is under way: a join refused because one is
+    // already in progress must not flip the flag of the session it refused for.
+    if (joinSession(jsonStr(cmd, "session_id"), jsonStr(cmd, "ticket"),
+                    name.empty() ? "session" : name, jsonStr(cmd, "passphrase")))
+      g_noFx = cmdBool("nofx");
   } else if (c == "open_confirm") {
     // The user read the "loads plugins that weren't listed" warning and chose
     // to continue: open the held-back download now.
@@ -3451,7 +3536,7 @@ static void timerTick() {
       // application re-baselines. A no-FX client NEVER captures: it is
       // view-only, and proposing anything from a stripped project would sooner
       // or later wipe the host's plugins.
-      if (!g_noFx) captureLocalChanges();
+      if (!g_noFx) captureLocalChanges(/*force=*/false);
       applyRemoteChanges();
       processDeferredItems();
       processDeferredRecv();

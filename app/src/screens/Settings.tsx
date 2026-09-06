@@ -53,13 +53,23 @@ export function Settings({ onBack }: { onBack: () => void }) {
       title: t("locateReaperFolder"),
     });
     if (typeof dir === "string") {
-      await setReaperPath(dir);
+      try {
+        await setReaperPath(dir);
+      } catch (e) {
+        toast.error(String(e));
+        return;
+      }
       await refreshStatus();
     }
   };
 
   const useDefault = async () => {
-    await setReaperPath(null);
+    try {
+      await setReaperPath(null);
+    } catch (e) {
+      toast.error(String(e));
+      return;
+    }
     await refreshStatus();
   };
 

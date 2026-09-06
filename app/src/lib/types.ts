@@ -101,7 +101,14 @@ export interface ExtState {
   /** Result of a passphrase pre-check: `ok` is null while in flight, then a
    *  boolean. `null` (the whole field) when no check is active. A successful
    *  check also carries the join `preview`. */
-  probe?: { session_id: string; ok: boolean | null; preview?: SessionPreview | null } | null;
+  /** `reason` says why `ok` is false: "rejected" is the only wrong-passphrase
+   *  case; "timeout" / "unreachable" / "gone" mean the host didn't answer. */
+  probe?: {
+    session_id: string;
+    ok: boolean | null;
+    preview?: SessionPreview | null;
+    reason?: string;
+  } | null;
   /** Pre-host warning: hosting would copy this much external media into the
    *  project folder (and/or the project lives in a cloud-synced folder). The
    *  app confirms before re-sending `host` with confirm:true. */

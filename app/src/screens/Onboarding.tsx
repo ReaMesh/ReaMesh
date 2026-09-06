@@ -27,7 +27,12 @@ function LocateStep({ status }: { status: ReaperStatus }) {
       title: t("locateReaperFolder"),
     });
     if (typeof dir === "string") {
-      await setReaperPath(dir);
+      try {
+        await setReaperPath(dir);
+      } catch (e) {
+        toast.error(String(e));
+        return;
+      }
       await refreshStatus();
     }
   };

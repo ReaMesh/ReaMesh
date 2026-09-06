@@ -47,5 +47,9 @@ export function getProfile(): Profile {
 }
 
 export function saveProfile(p: Profile) {
-  localStorage.setItem(KEY, JSON.stringify(p));
+  try {
+    localStorage.setItem(KEY, JSON.stringify(p));
+  } catch {
+    // storage unavailable/full: the in-memory profile still reaches the extension
+  }
 }

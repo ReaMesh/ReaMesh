@@ -33,12 +33,11 @@ export function getReaperPath(): string | null {
 }
 
 export async function setReaperPath(path: string | null): Promise<void> {
+  // Mirror only what the backend actually stored: a failed write must not
+  // leave the UI believing in a custom folder the backend never adopted.
+  // Callers surface the error.
+  await invoke("set_reaper_path", { path });
   cachedPath = path;
-  try {
-    await invoke("set_reaper_path", { path });
-  } catch {
-    /* ignore */
-  }
 }
 
 // undefined = not checked yet; null = backend unavailable (plain-browser dev),

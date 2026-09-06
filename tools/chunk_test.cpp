@@ -52,6 +52,7 @@ static const char* kTrackChunk =
     "      FLOATSAREJUSTBASE64==\n"
     "    >\n"
     "    FLOATPOS 0 0 0 0\n"
+    "    FLOAT 120 80 600 400\n"
     "  >\n"
     "  <ITEM\n"
     "    POSITION 1\n"
@@ -72,6 +73,7 @@ int main() {
   assert(norm.find("LASTSEL") == std::string::npos);
   assert(norm.find("DOCKED") == std::string::npos);
   assert(norm.find("FLOATPOS") == std::string::npos);
+  assert(norm.find("FLOAT 120") == std::string::npos);  // a floating FX window is per-user too
   assert(norm.find("ARM ") == std::string::npos);
   assert(norm.find("VIS ") == std::string::npos);
   assert(norm.find("ACT 1 -1") != std::string::npos);   // envelope active state stays

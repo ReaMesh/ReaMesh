@@ -17,7 +17,7 @@ import { FirewallBlocked } from "@/components/FirewallNotice";
 import { TrustDialog } from "@/components/TrustDialog";
 import { FOUND_COLOR, inkFor } from "@/lib/colors";
 import { send, sendProfile } from "@/lib/connection";
-import { rememberHostPass } from "@/lib/hostPass";
+import { stageHostPass } from "@/lib/hostPass";
 import { recordHostJoin } from "@/lib/knownHosts";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
@@ -73,7 +73,9 @@ function usePassphraseCheck(
       return;
     }
     if (!sawPending.current) return; // ignore a stale prior result
-    finish(probe.ok ? "ok" : "bad");
+    // Only a refused token is a wrong passphrase; a host that never answered
+    // (timeout, unreachable, gone) must not be reported as one.
+    finish(probe.ok ? "ok" : probe.reason === "rejected" ? "bad" : "unknown");
   }, [probe, checking, sid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -388,31 +390,31 @@ function SessionCard({
         />
       </div>
       {session.contested && <ContestedWarning />}
-      {session.auth && (
-        <>
-          <div ref={shakeScope}>
-            <PasswordInput
-              value={pass}
-              aria-label={t("password")}
-              placeholder={t("password")}
-              className={cn(
-                "h-8 border-0 bg-secondary text-[13px]",
-                error && "ring-1 ring-red-500/70",
-              )}
-              onChange={(e) => {
-                setPass(e.target.value);
-                setError("");
-              }}
-              onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
-            />
-          </div>
-          {error && (
-            <ErrorLine>
-              {error === "bad" ? t("wrongPassword") : t("checkNoAnswer")}
-            </ErrorLine>
-          )}
-        </>
-      )}
+      {/* Always mounted (empty:hidden when idle) so a failed probe on an open
+          session still gets its "no answer" line and the shake. */}
+      <div ref={shakeScope} className="space-y-2 empty:hidden">
+        {session.auth && (
+          <PasswordInput
+            value={pass}
+            aria-label={t("password")}
+            placeholder={t("password")}
+            className={cn(
+              "h-8 border-0 bg-secondary text-[13px]",
+              error && "ring-1 ring-red-500/70",
+            )}
+            onChange={(e) => {
+              setPass(e.target.value);
+              setError("");
+            }}
+            onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
+          />
+        )}
+        {error && (
+          <ErrorLine>
+            {error === "bad" ? t("wrongPassword") : t("checkNoAnswer")}
+          </ErrorLine>
+        )}
+      </div>
 
       {/* Confirm the files, plugins, and claimed host before joining. */}
       <TrustDialog
@@ -605,31 +607,29 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
                   </span>
                 </div>
               )}
-              {ticket?.auth && (
-                <>
-                  <div ref={shakeScope}>
-                    <PasswordInput
-                      value={pass}
-                      aria-label={t("password")}
-                      placeholder={t("password")}
-                      className={cn(
-                        "h-8 border-0 bg-secondary text-[13px]",
-                        error && "ring-1 ring-red-500/70",
-                      )}
-                      onChange={(e) => {
-                        setPass(e.target.value);
-                        setError("");
-                      }}
-                      onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
-                    />
-                  </div>
-                  {error && (
-                    <ErrorLine>
-                      {error === "bad" ? t("wrongPassword") : t("checkNoAnswer")}
-                    </ErrorLine>
-                  )}
-                </>
-              )}
+              <div ref={shakeScope} className="space-y-2 empty:hidden">
+                {ticket?.auth && (
+                  <PasswordInput
+                    value={pass}
+                    aria-label={t("password")}
+                    placeholder={t("password")}
+                    className={cn(
+                      "h-8 border-0 bg-secondary text-[13px]",
+                      error && "ring-1 ring-red-500/70",
+                    )}
+                    onChange={(e) => {
+                      setPass(e.target.value);
+                      setError("");
+                    }}
+                    onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
+                  />
+                )}
+                {error && (
+                  <ErrorLine>
+                    {error === "bad" ? t("wrongPassword") : t("checkNoAnswer")}
+                  </ErrorLine>
+                )}
+              </div>
             </div>
           </motion.div>
         )}
@@ -688,9 +688,8 @@ function HostCard({
     // Do not enter a pending state if there is no socket to send through.
     if (port === null) return;
     setPending(true);
-    // Keep our own passphrase so the Session screen can re-reveal it if the
-    // host forgets it; the extension never echoes it back.
-    rememberHostPass(port, pass);
+    // Stage the passphrase locally; commit it only after hosting starts.
+    stageHostPass(port, pass);
     send(confirm ? { cmd: "host", passphrase: pass, confirm: true } : { cmd: "host", passphrase: pass }, port);
   };
   const dismissWarning = () => send({ cmd: "host_dismiss" }, port ?? undefined);

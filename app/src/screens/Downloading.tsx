@@ -336,15 +336,15 @@ export function Downloading({
         {t("cancel")}
       </Button>
 
-      {/* The received project loads plugins the host's list didn't mention (or
-          the host listed nothing); the extension holds the open until the
-          user decides. This is what makes the join preview a verified claim
-          rather than a reassuring picture. */}
-      <Dialog
-        open={!!state.verify}
-        onOpenChange={(open) => !open && send({ cmd: "leave" }, port ?? undefined)}
-      >
-        <DialogContent className="max-w-[360px] gap-4 rounded-2xl">
+      {/* Hold projects with unlisted plugins until the user decides. */}
+      {/* The dialog closes only through its explicit actions. */}
+      <Dialog open={!!state.verify}>
+        <DialogContent
+          className="max-w-[360px] gap-4 rounded-2xl"
+          showCloseButton={false}
+          onEscapeKeyDown={(e) => e.preventDefault()}
+          onInteractOutside={(e) => e.preventDefault()}
+        >
           <DialogHeader>
             <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-amber-500/15 sm:mx-0">
               <ShieldAlert className="size-5 text-amber-500" aria-hidden="true" />

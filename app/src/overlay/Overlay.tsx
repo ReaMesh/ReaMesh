@@ -249,7 +249,11 @@ export function Overlay({ port }: { port: number | null }) {
   // Temporarily let the HUD take focus while the marker field is open, then
   // return focus to REAPER. Focus the field only after the native call finishes.
   const markerInput = useRef<HTMLInputElement>(null);
+  const markerWasOpen = useRef(false);
   useEffect(() => {
+    // Do not hand focus to REAPER just because the HUD mounted.
+    if (!markerOpen && !markerWasOpen.current) return;
+    markerWasOpen.current = markerOpen;
     let alive = true;
     invoke("set_overlay_interactive", { on: markerOpen })
       .then(() => {

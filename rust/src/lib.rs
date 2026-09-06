@@ -37,7 +37,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, AtomicU64};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -73,6 +73,16 @@ const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 /// the link stays full instead of idling one round-trip per chunk. With 4 MiB
 /// chunks this bounds in-flight buffers at 64 MiB.
 const DOWNLOAD_WINDOW: usize = 16;
+/// Where the window starts (and its floor after a timeout). In-flight responses
+/// share one connection and complete together, so a window sized for the LAN
+/// would make every piece time out on a slower link; it grows toward
+/// DOWNLOAD_WINDOW as pieces prove to come back quickly.
+const DOWNLOAD_WINDOW_MIN: usize = 4;
+/// Minimum gap between two full-state broadcasts. A subscription to the
+/// (publicly announced) session topic needs no passphrase, so a peer flapping
+/// its subscription must not be able to make the owner rebroadcast the whole
+/// doc every tick.
+const FULL_SYNC_MIN_GAP: Duration = Duration::from_secs(3);
 /// Soft editing lock (Word/Docs style): whoever edits a field holds it
 /// exclusively for this long after their LAST touch. While a field is held,
 /// edits to it from anyone else are rejected and snap back with a "X is editing
@@ -329,7 +339,8 @@ struct DocState {
     /// owner's own id for owner-held fields).
     locks: HashMap<FieldKey, Lock>,
     /// Client only: (section, id, field) -> (proposed value, when proposed).
-    pending: HashMap<FieldKey, (JsonValue, Instant)>,
+    /// Proposed value, when it was sent, and how often it has been re-sent.
+    pending: HashMap<FieldKey, (JsonValue, Instant, u8)>,
 }
 
 #[derive(Clone, Debug)]
@@ -461,7 +472,12 @@ struct Shared {
     /// host-reported session meta (track count + plugin list): everything the
     /// trust dialog shows. All of it is *host-reported*: the UI labels it as a
     /// claim, and the post-download verify checks the plugin part for real.
-    probe_result: Mutex<Option<(String, Option<bool>, JsonValue)>>,
+    probe_result: Mutex<Option<(String, Option<bool>, JsonValue, &'static str)>>,
+    /// Client: sequence of the last proposal sent (see next_proposal_seq).
+    proposal_seq: AtomicU64,
+    /// Owner: the last admitted sequence per proposer: anything not newer is
+    /// a replay.
+    proposal_seqs: Mutex<HashMap<String, u64>>,
     /// The session meta blob for the current session: what this owner set via
     /// `set_session_meta`, or (on a client) what the owner's manifest claimed.
     /// The extension reads it back after the download to verify the received
@@ -788,7 +804,12 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Cryptographically-random lower-case hex string of `n_bytes` bytes.
+/// Validate a peer-supplied session id before using it in paths or lobby entries.
+/// Accept only a bounded ASCII identifier.
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 fn random_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
     if let Err(e) = getrandom::getrandom(&mut buf) {
@@ -919,7 +940,7 @@ fn parse_ticket(ticket: &str) -> Option<TicketInfo> {
         return None;
     }
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
-    let session_id = s("sid").filter(|x| !x.is_empty())?;
+    let session_id = s("sid").filter(|x| valid_session_id(x))?;
     let session_name = s("name").unwrap_or_default();
     let peer = s("peer")?.parse::<PeerId>().ok()?;
     let addrs: Vec<Multiaddr> = v
@@ -1084,14 +1105,22 @@ impl Reamesh {
     /// Joined sessions are downloaded into a fresh subdirectory of
     /// `staging_dir`.
     pub fn join(staging_dir: &str) -> anyhow::Result<Box<Self>> {
+        Self::join_keeping(staging_dir, &[])
+    }
+
+    /// `join`, telling the staging sweep which project files are open in this
+    /// REAPER: a downloaded copy that is still open is never swept, however
+    /// long it has sat untouched.
+    pub fn join_keeping(staging_dir: &str, open_projects: &[PathBuf]) -> anyhow::Result<Box<Self>> {
         // Sweep stale project copies off disk before another one lands. This
         // runs on REAPER's main thread, and removing gigabytes of media is not
         // something to block it on, so it goes to its own thread.
         {
             let root = PathBuf::from(staging_dir);
+            let keep = open_projects.to_vec();
             std::thread::Builder::new()
                 .name("reamesh-prune".into())
-                .spawn(move || prune_staging(&root))
+                .spawn(move || prune_staging(&root, &keep))
                 .ok();
         }
         let status = StatusState {
@@ -1156,6 +1185,8 @@ impl Reamesh {
             peer_locks_at: Mutex::new(None),
             force_revert: Mutex::new(Vec::new()),
             probe_result: Mutex::new(None),
+            proposal_seq: AtomicU64::new(0),
+            proposal_seqs: Mutex::new(HashMap::new()),
             session_meta: Mutex::new(String::new()),
             marker_inbox: Mutex::new(Vec::new()),
         });
@@ -1295,25 +1326,47 @@ impl Reamesh {
                                 let norm = any_to_json(&json_to_any(value));
                                 ds.pending.insert(
                                     (section.into(), id.clone(), key.clone()),
-                                    (norm, now),
+                                    (norm, now, 0),
                                 );
                             }
                         }
                     }
                 }
                 drop(ds);
-                // Wrap the changeset in an authenticated envelope: the owner
-                // only admits proposals carrying the session token, so topic
-                // membership alone can't write to the doc.
-                let envelope = json!({
-                    "auth": self.shared.auth_token.lock().unwrap().clone(),
-                    "cs": parsed,
-                });
-                let _ = self
-                    .cmd_tx
-                    .send(Command::PublishProposal(envelope.to_string().into_bytes()));
+                self.publish_proposal(&parsed);
             }
         }
+    }
+
+    /// Send a changeset to the owner as a proposal, wrapped in an authenticated
+    /// envelope: the owner only admits proposals carrying the session token, so
+    /// topic membership alone can't write to the doc.
+    fn publish_proposal(&self, cs: &JsonValue) {
+        let envelope = json!({
+            "auth": self.shared.auth_token.lock().unwrap().clone(),
+            "cs": cs,
+            "seq": self.next_proposal_seq(),
+        });
+        let _ = self
+            .cmd_tx
+            .send(Command::PublishProposal(envelope.to_string().into_bytes()));
+    }
+
+    /// Per-proposal sequence number: strictly increasing within this process
+    /// and anchored to wall-clock microseconds so it keeps increasing across a
+    /// rejoin. The owner refuses anything not newer than the last it admitted
+    /// from us, which is what stops a topic member from replaying a captured
+    /// proposal once gossipsub's duplicate cache has forgotten it (the
+    /// envelope, sealed or not, is otherwise byte-for-byte replayable).
+    fn next_proposal_seq(&self) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let prev = self.shared.proposal_seq.load(Ordering::Relaxed);
+        let next = now.max(prev + 1);
+        self.shared.proposal_seq.store(next, Ordering::Relaxed);
+        next
     }
 
     /// Merge authoritative updates received since the last call into the doc
@@ -1406,7 +1459,8 @@ impl Reamesh {
         let locks = self.shared.peer_locks.lock().unwrap();
         let locks_at = *self.shared.peer_locks_at.lock().unwrap();
         let pending = &mut ds.pending;
-        pending.retain(|(section, id, field), (proposed, when)| {
+        let mut resend = JsonMap::new();
+        pending.retain(|(section, id, field), (proposed, when, retries)| {
             let doc_val = new_state
                 .get(section)
                 .and_then(|s| s.get(id))
@@ -1433,6 +1487,15 @@ impl Reamesh {
                     let who = holder.filter(|h| **h != own_id).cloned().unwrap_or_default();
                     count_revert(section, id, &who);
                     put(&mut diff, section, id, field, dv.clone());
+                } else if !held_by_other && *retries < 2 {
+                    // Nothing in the doc to snap back to: the proposal itself
+                    // was lost on the way (a gossip drop, a mesh the owner had
+                    // not joined yet), not refused. Re-send it rather than
+                    // quietly keeping an entity no other peer will ever see.
+                    *retries += 1;
+                    *when = now;
+                    put(&mut resend, section, id, field, proposed.clone());
+                    return true;
                 }
                 false
             } else {
@@ -1442,6 +1505,9 @@ impl Reamesh {
             }
         });
         drop(locks);
+        if !resend.is_empty() {
+            self.publish_proposal(&JsonValue::Object(resend));
+        }
         // Drop empty entities, then empty sections.
         for (_, section) in diff.iter_mut() {
             if let Some(s) = section.as_object_mut() {
@@ -1584,7 +1650,7 @@ impl Reamesh {
             return false;
         };
         *self.shared.probe_result.lock().unwrap() =
-            Some((info.session_id.clone(), None, JsonValue::Null));
+            Some((info.session_id.clone(), None, JsonValue::Null, ""));
         self.cmd_tx
             .send(Command::JoinTicket {
                 info,
@@ -1608,7 +1674,7 @@ impl Reamesh {
         }
         // Mark the probe in flight so the app can show "checking…".
         *self.shared.probe_result.lock().unwrap() =
-            Some((session_id.to_string(), None, JsonValue::Null));
+            Some((session_id.to_string(), None, JsonValue::Null, ""));
         self.cmd_tx
             .send(Command::ProbeAuth {
                 session_id: session_id.to_string(),
@@ -1675,8 +1741,11 @@ impl Reamesh {
             .map(|(s, i, by)| json!({ "section": s, "id": i, "by": by }))
             .collect();
         let probe = match &*self.shared.probe_result.lock().unwrap() {
-            Some((sid, ok, preview)) => {
-                json!({ "session_id": sid, "ok": ok, "preview": preview })
+            // `reason` says why a probe came back false: "rejected" (wrong
+            // passphrase: the only one the app may call that), "timeout",
+            // "unreachable" or "gone" (the session vanished from the lobby).
+            Some((sid, ok, preview, reason)) => {
+                json!({ "session_id": sid, "ok": ok, "preview": preview, "reason": reason })
             }
             None => JsonValue::Null,
         };
@@ -2170,16 +2239,18 @@ fn newest_mtime(dir: &Path) -> Option<SystemTime> {
 /// ever removes any of it, so a few evenings of sessions used to leave tens of
 /// gigabytes behind with no way for the user to find or clear them.
 ///
-/// Age is the newest mtime found anywhere inside, so a live session, or one
-/// another REAPER instance on this machine is still serving from, is never
-/// touched.
-fn prune_staging(root: &Path) {
+/// Age is the newest mtime found anywhere inside. Never remove a live session,
+/// a directory served by another local REAPER instance, or a project in `keep`.
+fn prune_staging(root: &Path, keep: &[PathBuf]) {
     let Ok(rd) = fs::read_dir(root) else { return };
     for entry in rd.flatten() {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
         let path = entry.path();
+        if keep.iter().any(|k| k.starts_with(&path)) {
+            continue;
+        }
         let stale = newest_mtime(&path)
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age > STAGING_MAX_AGE);
@@ -2301,6 +2372,8 @@ struct FileDl {
     file: Option<fs::File>,
     remaining: u64, // chunks not yet written
     tries: u32,     // hash-mismatch re-downloads
+    /// Set after a checksum mismatch: pieces of this file go to the owner only.
+    owner_only: bool,
 }
 
 /// One outstanding chunk: which file index, at what byte offset.
@@ -2327,7 +2400,9 @@ struct Download {
     manifest_req: Option<request_response::OutboundRequestId>,
     files: Vec<FileDl>,
     queue: VecDeque<Piece>,
-    inflight: HashMap<request_response::OutboundRequestId, Piece>,
+    inflight: HashMap<request_response::OutboundRequestId, (Piece, Instant)>,
+    /// Current pipelining depth (see DOWNLOAD_WINDOW_MIN).
+    window: usize,
     peers: Vec<PeerId>,
     next_peer: usize,
     total: u64,
@@ -2371,6 +2446,10 @@ impl Download {
 /// destination path existing means the file is whole.
 struct Fetch {
     rel: String,
+    /// The request currently in flight. A response to any other request (a
+    /// stall retry that was superseded) is dropped: appended at the current
+    /// offset it would silently corrupt the file.
+    req: Option<request_response::OutboundRequestId>,
     candidates: Vec<PeerId>,
     idx: usize,
     tmp: PathBuf,
@@ -2438,6 +2517,7 @@ fn fetch_send(
     let Some(peer) = fetch.peer() else { return false };
     fetch.last_activity = Instant::now();
     let id = swarm.behaviour_mut().xfer.send_request(&peer, fetch.request());
+    fetch.req = Some(id);
     fetch_reqs.insert(id, fetch.rel.clone());
     true
 }
@@ -2467,6 +2547,7 @@ fn start_fetch(
         dest.file_name().unwrap_or_default().to_string_lossy()
     ));
     let mut fetch = Fetch {
+        req: None,
         rel,
         candidates,
         idx: 0,
@@ -2489,9 +2570,13 @@ fn handle_fetch_response(
     fetches: &mut FetchMap,
     fetch_reqs: &mut FetchReqs,
     rel: &str,
+    request_id: request_response::OutboundRequestId,
     response: Option<XferResponse>,
 ) {
     let Some(fetch) = fetches.get_mut(rel) else { return };
+    if fetch.req != Some(request_id) {
+        return; // a superseded retry answering late; only the live request counts
+    }
 
     match response {
         Some(XferResponse::FileChunk { size, compressed, data }) => {
@@ -2659,6 +2744,20 @@ fn admit_proposal(shared: &Shared, payload: &[u8], proposer: &str) -> Option<Vec
         return None;
     }
     let parsed = envelope.get("cs")?;
+    // Replay guard: a proposal must be newer than the last one admitted from
+    // this proposer. gossipsub's duplicate cache forgets a message after a
+    // couple of minutes, after which any topic member could re-forward a
+    // captured (still validly signed and sealed) proposal as that client's edit.
+    let seq = envelope.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    {
+        let mut seqs = shared.proposal_seqs.lock().unwrap();
+        let last = seqs.get(proposer).copied().unwrap_or(0);
+        if seq <= last {
+            eprintln!("[reamesh] proposal from {proposer} rejected: sequence {seq} not after {last}");
+            return None;
+        }
+        seqs.insert(proposer.to_string(), seq);
+    }
 
     let mut ds = shared.doc.lock().unwrap();
     let now = Instant::now();
@@ -2826,7 +2925,7 @@ fn start_join(
     let dir = staging.join(format!(
         "{}-{}",
         sanitize_dir_name(&info.session_name),
-        &session_id[..session_id.len().min(8)]
+        session_id.chars().take(8).collect::<String>()
     ));
     let sid = session_id.to_string();
     let name = info.session_name.clone();
@@ -2866,6 +2965,7 @@ fn start_join(
         files: Vec::new(),
         queue: VecDeque::new(),
         inflight: HashMap::new(),
+        window: DOWNLOAD_WINDOW_MIN,
         peers: vec![owner],
         next_peer: 0,
         total: 0,
@@ -2933,6 +3033,7 @@ async fn run_network(
     // full-state update. yrs updates are idempotent, so over-sending is
     // harmless.
     let mut need_full_sync = false;
+    let mut last_full_sync: Option<Instant> = None;
     // Session messages that failed to publish (nobody connected yet); retried
     // on the tick. Bounded so a long-dead session can't grow without limit.
     let mut retry_pubs: Vec<Vec<u8>> = Vec::new();
@@ -2992,7 +3093,7 @@ async fn run_network(
                         None => {
                             // Session gone or unparseable owner -> can't verify.
                             *shared.probe_result.lock().unwrap() =
-                                Some((session_id, Some(false), JsonValue::Null));
+                                Some((session_id, Some(false), JsonValue::Null, "gone"));
                         }
                     }
                 }
@@ -3115,7 +3216,7 @@ async fn run_network(
                 if probe.as_ref().is_some_and(|p| p.started.elapsed() > PROBE_TIMEOUT) {
                     let p = probe.take().unwrap();
                     *shared.probe_result.lock().unwrap() =
-                        Some((p.session_id, Some(false), JsonValue::Null));
+                        Some((p.session_id, Some(false), JsonValue::Null, "timeout"));
                 }
                 // Ticket join/check in flight: once the *pinned* owner's
                 // announce lands in the session table, proceed exactly like a
@@ -3170,7 +3271,7 @@ async fn run_network(
                             // Unreachable reports false, like an unanswered
                             // probe: a definite answer beats a hang.
                             *shared.probe_result.lock().unwrap() =
-                                Some((pj.info.session_id, Some(false), JsonValue::Null));
+                                Some((pj.info.session_id, Some(false), JsonValue::Null, "unreachable"));
                         } else {
                             set_status(&shared, |s| {
                                 s.state = "failed".into();
@@ -3316,7 +3417,10 @@ async fn run_network(
                     }
                 }
                 // Owner: full-state anti-entropy.
-                if need_full_sync && !shared.session_peers.lock().unwrap().is_empty() {
+                if need_full_sync
+                    && last_full_sync.is_none_or(|t| t.elapsed() >= FULL_SYNC_MIN_GAP)
+                    && !shared.session_peers.lock().unwrap().is_empty()
+                {
                     if let Some(t) = sess_topic.clone() {
                         let mut data = vec![TAG_AUTHORITATIVE];
                         {
@@ -3327,6 +3431,7 @@ async fn run_network(
                         }
                         if publish_session(&mut swarm, &shared, &t, &data) {
                             need_full_sync = false;
+                            last_full_sync = Some(Instant::now());
                         }
                     }
                 }
@@ -3345,7 +3450,10 @@ async fn run_network(
                 // Nudge stalled mid-session file fetches.
                 let stalled: Vec<String> = fetches
                     .values()
-                    .filter(|f| f.last_activity.elapsed() > Duration::from_secs(3))
+                    // Generous: a 4 MiB chunk over a VPN can legitimately take
+                    // seconds, and a retry that overtakes it is only wasted
+                    // bandwidth now (responses are keyed to the live request).
+                    .filter(|f| f.last_activity.elapsed() > Duration::from_secs(10))
                     .map(|f| f.rel.clone())
                     .collect();
                 for rel in stalled {
@@ -3439,6 +3547,10 @@ async fn run_network(
                         // everything.
                         if hosting.is_some() {
                             need_full_sync = true;
+                            // A (re)joining peer starts its proposal sequence
+                            // afresh: its own clock anchors it, and a clock
+                            // that went backwards must not lock it out.
+                            shared.proposal_seqs.lock().unwrap().remove(&peer_id.to_string());
                         }
                     }
                 }
@@ -3478,7 +3590,7 @@ async fn run_network(
                                 last_seen: Instant::now(),
                                 contested: false,
                             };
-                            if signer_is_owner && !info.session_id.is_empty() {
+                            if signer_is_owner && valid_session_id(&info.session_id) {
                                 let mut sessions = shared.sessions.lock().unwrap();
                                 match sessions.get_mut(&info.session_id) {
                                     // Pin the first-seen owner. Binding the
@@ -3730,7 +3842,7 @@ async fn run_network(
                                     _ => (false, JsonValue::Null),
                                 };
                                 *shared.probe_result.lock().unwrap() =
-                                    Some((p.session_id, Some(ok), preview));
+                                    Some((p.session_id, Some(ok), preview, if ok { "" } else { "rejected" }));
                             } else if download.as_ref().is_some_and(|dl| dl.manifest_req == Some(request_id)) {
                                 // A manifest only arrives once the owner accepted
                                 // our session token: this is the moment we become
@@ -3753,7 +3865,7 @@ async fn run_network(
                             } else if download.as_ref().is_some_and(|dl| dl.inflight.contains_key(&request_id)) {
                                 handle_download_piece(&mut swarm, &shared, &mut download, &verify_tx, request_id, Some(response));
                             } else if let Some(rel) = fetch_reqs.remove(&request_id) {
-                                handle_fetch_response(&mut swarm, &mut fetches, &mut fetch_reqs, &rel, Some(response));
+                                handle_fetch_response(&mut swarm, &mut fetches, &mut fetch_reqs, &rel, request_id, Some(response));
                             }
                         }
                     }
@@ -3764,7 +3876,7 @@ async fn run_network(
                         // Report an unreachable host separately from a rejected passphrase.
                         let p = probe.take().unwrap();
                         *shared.probe_result.lock().unwrap() =
-                            Some((p.session_id, Some(false), JsonValue::Null));
+                            Some((p.session_id, Some(false), JsonValue::Null, "unreachable"));
                     } else if download.as_ref().is_some_and(|dl| dl.manifest_req == Some(request_id)) {
                         // Manifest never arrived; re-request on the next tick.
                         if let Some(dl) = &mut download {
@@ -3774,7 +3886,7 @@ async fn run_network(
                     } else if download.as_ref().is_some_and(|dl| dl.inflight.contains_key(&request_id)) {
                         handle_download_piece(&mut swarm, &shared, &mut download, &verify_tx, request_id, None);
                     } else if let Some(rel) = fetch_reqs.remove(&request_id) {
-                        handle_fetch_response(&mut swarm, &mut fetches, &mut fetch_reqs, &rel, None);
+                        handle_fetch_response(&mut swarm, &mut fetches, &mut fetch_reqs, &rel, request_id, None);
                     }
                 }
                 _ => {}
@@ -3868,7 +3980,7 @@ fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()
                     .unwrap_or(false));
         if reused {
             dl.done += meta.size;
-            dl.files.push(FileDl { meta, tmp: dest.clone(), dest, file: None, remaining: 0, tries: 0 });
+            dl.files.push(FileDl { meta, tmp: dest.clone(), dest, file: None, remaining: 0, tries: 0, owner_only: false });
             continue;
         }
 
@@ -3892,13 +4004,13 @@ fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()
         if remaining == 0 {
             drop(f); // empty file: complete immediately
             fs::rename(&tmp, &dest)?;
-            dl.files.push(FileDl { meta, tmp, dest, file: None, remaining: 0, tries: 0 });
+            dl.files.push(FileDl { meta, tmp, dest, file: None, remaining: 0, tries: 0, owner_only: false });
             continue;
         }
         for p in pieces {
             dl.queue.push_back(p);
         }
-        dl.files.push(FileDl { meta, tmp, dest, file: Some(f), remaining, tries: 0 });
+        dl.files.push(FileDl { meta, tmp, dest, file: Some(f), remaining, tries: 0, owner_only: false });
     }
     Ok(())
 }
@@ -3906,15 +4018,25 @@ fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()
 /// Fill the in-flight window: pull pending pieces and dispatch each to the
 /// next serving peer in the rotation.
 fn download_pump(swarm: &mut Swarm<Behaviour>, dl: &mut Download) {
-    while dl.inflight.len() < DOWNLOAD_WINDOW {
+    while dl.inflight.len() < dl.window {
         let Some(piece) = dl.queue.pop_front() else { break };
-        let Some(peer) = dl.next_peer() else {
-            dl.queue.push_front(piece);
-            break;
+        // A file that failed verification is re-fetched from the owner alone:
+        // another client may still be serving a copy the host has since
+        // rewritten in place.
+        let peer = if dl.files[piece.file].owner_only {
+            dl.owner
+        } else {
+            match dl.next_peer() {
+                Some(p) => p,
+                None => {
+                    dl.queue.push_front(piece);
+                    break;
+                }
+            }
         };
         let req = dl.request(piece);
         let id = swarm.behaviour_mut().xfer.send_request(&peer, req);
-        dl.inflight.insert(id, piece);
+        dl.inflight.insert(id, (piece, Instant::now()));
     }
 }
 
@@ -3997,13 +4119,10 @@ fn download_tick(swarm: &mut Swarm<Behaviour>, shared: &Shared, download: &mut O
     if dl.last_progress.elapsed() > DOWNLOAD_STALL_TIMEOUT {
         return download_fail(download, shared, "the download stalled".into());
     }
-    if dl.last_activity.elapsed() > Duration::from_secs(5) && !dl.inflight.is_empty() {
-        let lost: Vec<Piece> = dl.inflight.drain().map(|(_, p)| p).collect();
-        for p in lost {
-            dl.queue.push_back(p);
-        }
-        dl.last_activity = Instant::now();
-    }
+    // No blanket "nothing for 5s → requeue everything": on a link where the
+    // whole window takes longer than that, it discarded every response as
+    // stale and never progressed. A request that really dies comes back as an
+    // OutboundFailure (timeout / connection closed) and is requeued there.
     download_pump(swarm, dl);
 }
 
@@ -4090,8 +4209,18 @@ fn handle_download_piece(
     response: Option<XferResponse>,
 ) {
     let Some(dl) = download.as_mut() else { return };
-    let Some(piece) = dl.inflight.remove(&request_id) else { return };
+    let Some((piece, sent)) = dl.inflight.remove(&request_id) else { return };
     dl.last_activity = Instant::now();
+    // Adapt the window to the link: a piece that came back quickly means there
+    // is headroom for more in flight; a failed one (timeout, peer gone) means
+    // the window may have been too wide for the link.
+    if response.is_some() {
+        if sent.elapsed() < Duration::from_secs(3) && dl.window < DOWNLOAD_WINDOW {
+            dl.window += 1;
+        }
+    } else {
+        dl.window = (dl.window / 2).max(DOWNLOAD_WINDOW_MIN);
+    }
 
     // Decode/validate. On anything wrong (peer can't serve it, corrupt,
     // stale), requeue the piece and keep the window full.
@@ -4218,6 +4347,7 @@ fn handle_verify_result(
             return download_fail(download, shared, format!("checksum mismatch for {p}"));
         }
         eprintln!("[reamesh] checksum mismatch for {}, re-downloading", fd.meta.path);
+        fd.owner_only = true;
         match fs::OpenOptions::new().read(true).write(true).truncate(true).open(&fd.tmp) {
             Ok(f) => {
                 let _ = f.set_len(fd.meta.size);
@@ -4418,11 +4548,19 @@ pub extern "C" fn reamesh_host(
 /// into fresh subdirectories of `staging_dir` (created as needed). Returns
 /// null on failure. Release with `reamesh_shutdown`.
 #[unsafe(no_mangle)]
-pub extern "C" fn reamesh_join(staging_dir: *const c_char) -> *mut Reamesh {
+pub extern "C" fn reamesh_join(
+    staging_dir: *const c_char,
+    open_projects: *const c_char,
+) -> *mut Reamesh {
     let Some(dir) = cstr_arg(staging_dir) else {
         return std::ptr::null_mut();
     };
-    std::panic::catch_unwind(|| match Reamesh::join(&dir) {
+    // Newline-separated project files open in this REAPER (may be null): the
+    // staging sweep leaves any copy holding one of them alone.
+    let keep: Vec<PathBuf> = cstr_arg(open_projects)
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+        .unwrap_or_default();
+    std::panic::catch_unwind(|| match Reamesh::join_keeping(&dir, &keep) {
         Ok(r) => Box::into_raw(r),
         Err(e) => {
             eprintln!("[reamesh] join failed: {e}");
