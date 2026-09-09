@@ -129,7 +129,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
     // Style WebView2's scrollbar on Windows; keep the native macOS overlay.
     <div className={cn("flex flex-1 flex-col overflow-y-auto", isWindows && "scroll-slim")}>
       <div className="w-full space-y-6 px-6 py-5">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center justify-between gap-2">
           <Button
             variant="ghost"
             size="sm"
@@ -177,8 +177,8 @@ export function Settings({ onBack }: { onBack: () => void }) {
             {t("reaperFolder")}
           </h3>
           <div className="space-y-3 rounded-xl bg-card p-3.5">
-            <div className="flex items-center justify-between gap-2">
-              <p className="break-all rounded-md bg-secondary/60 px-2.5 py-1.5 text-[12px] leading-relaxed text-foreground/80">
+            <div className="flex items-center gap-2">
+              <p className="min-w-0 flex-1 break-all rounded-md bg-secondary/60 px-2.5 py-1.5 text-[12px] leading-relaxed text-foreground/80">
                 {status?.resourcePath ?? t("notFoundBadge")}
               </p>
               {status && !status.reaperFound && (
@@ -189,27 +189,25 @@ export function Settings({ onBack }: { onBack: () => void }) {
                   {t("notFoundBadge")}
                 </Badge>
               )}
-            </div>
-            <div className="flex gap-2">
               <Button
                 variant="outline"
                 size="sm"
-                className="h-7 flex-1 text-[12px]"
+                className="h-7 shrink-0 text-[12px]"
                 onClick={pickFolder}
               >
                 {t("change")}
               </Button>
-              {hasCustom && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 flex-1 text-[12px]"
-                  onClick={useDefault}
-                >
-                  {t("useDefault")}
-                </Button>
-              )}
             </div>
+            {hasCustom && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-full text-[12px] text-muted-foreground hover:text-foreground"
+                onClick={useDefault}
+              >
+                {t("useDefault")}
+              </Button>
+            )}
             {/* Explain when the selected folder does not look like REAPER. */}
             {status && status.reaperFound && !status.isReaperDir && (
               <p
