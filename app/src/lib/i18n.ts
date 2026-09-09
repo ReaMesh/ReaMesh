@@ -166,6 +166,10 @@ const en = {
   // Settings
   back: "Back",
   settings: "Settings",
+  minimizeWindow: "Minimize",
+  maximizeWindow: "Maximize",
+  restoreWindow: "Restore",
+  closeWindow: "Close",
   reaperFolder: "REAPER folder",
   notFoundBadge: "Not found",
   useDefault: "Use default",
@@ -453,6 +457,10 @@ const de: Record<MsgKey, string> = {
 
   back: "Zurück",
   settings: "Einstellungen",
+  minimizeWindow: "Minimieren",
+  maximizeWindow: "Maximieren",
+  restoreWindow: "Wiederherstellen",
+  closeWindow: "Schließen",
   reaperFolder: "REAPER-Ordner",
   notFoundBadge: "Nicht gefunden",
   useDefault: "Standard verwenden",

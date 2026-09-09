@@ -24,7 +24,6 @@ import { t } from "@/lib/i18n";
 import { getProfile, saveProfile, PALETTE, type Profile } from "@/lib/profile";
 import { decodeTicket, normalizeTicket } from "@/lib/ticket";
 import { initials, type ExtState, type SessionAd } from "@/lib/types";
-import { topRightGutter } from "@/components/TitleBar";
 import { cn, focusRing } from "@/lib/utils";
 
 /// Shortest passphrase accepted by the host form. This is only a minimum for
@@ -214,10 +213,7 @@ function ProfileRow({
   onChange: (p: Profile) => void;
 }) {
   return (
-    // Extra right padding on Windows: this is the lobby's topmost card, and
-    // the Settings gear floats over its top-right corner. Padding rather than
-    // a narrower card, so the card's edge still lines up with the ones below.
-    <div className={cn("flex items-center gap-3.5 rounded-xl bg-card p-3.5", topRightGutter)}>
+    <div className="flex items-center gap-3.5 rounded-xl bg-card p-3.5">
       <div
         className="flex size-11 shrink-0 items-center justify-center rounded-full text-sm font-semibold transition-colors duration-300 ease-out"
         style={{ backgroundColor: profile.color, color: inkFor(profile.color) }}

@@ -16,6 +16,7 @@ import { startScanning, send, useActiveInstance } from "@/lib/connection";
 import { openOverlay, closeOverlay, setSessionState } from "@/lib/overlay";
 import { loadReaperPath, refreshStatus, useReaperStatus } from "@/lib/install";
 import { t, useLang } from "@/lib/i18n";
+import { isWindows } from "@/lib/platform";
 import { localizeLogEntry } from "@/lib/log";
 import { pluginStatus, useInstalledPlugins } from "@/lib/plugins";
 import { displayName, type ExtState, type LogEntry, type Mode } from "@/lib/types";
@@ -325,6 +326,21 @@ export default function App() {
     };
   }, []);
 
+  // Windows has no application menu, so Ctrl+, opens Settings from the keyboard
+  // (the macOS menu item already carries Cmd+,).
+  useEffect(() => {
+    if (!isWindows) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && !e.altKey && !e.shiftKey && e.key === ",") {
+        e.preventDefault();
+        setSettingsOpen(true);
+        refreshStatus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   // The lobby needs discovery running; the extension's browse is idempotent.
   // Addressed to the instance this render is for, never to whatever
   // `activePort` happens to be when the effect runs.
@@ -406,8 +422,6 @@ export default function App() {
   }
 
   return (
-    // `relative` anchors the Windows title bar layer, which floats the
-    // Settings gear over the top-right corner instead of taking a strip.
     <div className="relative flex h-full flex-col">
       <TitleBar
         onOpenSettings={() => {
