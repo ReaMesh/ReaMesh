@@ -2618,7 +2618,7 @@ static void followTick() {
     // The peer left (or went stale): stop following rather than freezing on
     // their last known state.
     g_followPeer.clear();
-    activityEvent("follow_ended", json::object(), "stopped following: they left the session");
+    activityEvent("follow_ended", json::object(), "you stopped following because they left the session");
     return;
   }
   const bool tPlaying = target->value("playing", false);
@@ -2801,7 +2801,7 @@ static bool joinSession(const std::string& sid, const std::string& ticket,
             ? logEvent("join_unavailable", {{"name", sname}},
                        "could not join \"" + sname + "\" (it may have just closed); try again")
             : logEvent("bad_ticket", json::object(),
-                       "that invite ticket doesn't look valid; copy it again from the host");
+                       "that invite code doesn't look valid. Copy it again from the host");
     return false;
   }
   // Rust resets its cumulative revert counter for the new session; match it
@@ -2812,7 +2812,7 @@ static bool joinSession(const std::string& sid, const std::string& ticket,
   g_lastError = json();
   g_joinPassphrase = passphrase;
   g_joinTicket = ticket;
-  logEvent("joining", {{"name", sname}}, "joining \"" + sname + "\", downloading the project");
+  logEvent("joining", {{"name", sname}}, "joining \"" + sname + "\". The project is downloading");
   return true;
 }
 
@@ -2834,7 +2834,7 @@ static void beginReconnect(const json& st) {
     return;
   }
   logEvent("reconnecting", {{"name", rc.sessionName}},
-           "lost the host, trying to reconnect to \"" + rc.sessionName + "\"");
+           "connection to the host lost. Reconnecting to \"" + rc.sessionName + "\"");
   g_reconnect = std::move(rc);
 }
 
@@ -2973,8 +2973,8 @@ static void onHost(const std::string& passphrase) {
   g_lastPeerCount = 0;
   logEvent("hosting", {{"name", name}},
            passphrase.empty()
-               ? "hosting \"" + name + "\", sharing all files under " + dir
-               : "hosting \"" + name + "\" (passphrase-protected), sharing " + dir);
+               ? "hosting \"" + name + "\". Sharing all files in " + dir
+               : "hosting \"" + name + "\" with a passphrase. Sharing " + dir);
   // Inventory the served .rpp (track count + plugin list) so joiners see what
   // a join loads before downloading; kept fresh as the file changes.
   g_metaRppMtime = {};
@@ -3234,7 +3234,7 @@ static void ctlPublishState() {
       // one notice (de-dupes identical text within a few seconds).
       if (events.empty()) {
         activityEvent("edit_locked", {{"count", delta}},
-                      "your edit snapped back; someone else is editing it");
+                      "that edit was undone because someone else is editing the same thing");
       } else {
         for (const auto& [nm, by] : events) {
           json params = json::object();
@@ -3375,11 +3375,11 @@ static void openDownloadedProject(std::string path) {
         o.close();
         path = fsUtf8(stripped);
         logEvent("nofx_open", json::object(),
-                 "opening without effects (view-only, nothing third-party loads)");
+                 "opening a view-only copy without effects. No third-party code is loaded");
       }
     }
   }
-  logEvent("download_complete", json::object(), "download complete, opening " + path);
+  logEvent("download_complete", json::object(), "download complete. Opening " + path);
   // Main_openProject blocks the main thread for seconds on a big project and
   // the next state publish only happens afterwards (mode=client): publish
   // the "opening" phase first so the app's stepper doesn't sit frozen on the
@@ -3415,8 +3415,8 @@ static void openDownloadedProject(std::string path) {
   muteActivity(std::chrono::seconds(6));
   g_sessionProjectPath = currentProjectPath();
   logEvent("connected", json::object(),
-           g_noFx ? "connected without effects (view-only)"
-                  : "connected: your edits are proposals; the session owner wins conflicts");
+           g_noFx ? "connected without effects in view-only mode"
+                  : "connected. You can edit live, but the session owner wins conflicts");
 }
 
 static void pollDownload() {
@@ -3440,7 +3440,7 @@ static void pollDownload() {
         g_pendingOpenPath = path;
         g_pendingVerify = std::move(verify);
         logEvent("verify_hold", {{"count", g_pendingVerify["extras"].size()}},
-                 "the received project loads plugins the host didn't list; waiting for you");
+                 "the downloaded project uses plugins missing from the host's list. Waiting for you");
         return;
       }
     }
@@ -3503,7 +3503,7 @@ static void timerTick() {
       // Switching projects ends the session: its doc is bound to the shared
       // project file.
       if (currentProjectPath() != g_sessionProjectPath) {
-        leaveSession("project_changed", json::object(), "project changed; session ended");
+        leaveSession("project_changed", json::object(), "project changed, so the session ended");
         return;
       }
       // The owner stopping the session (farewell broadcast, or the

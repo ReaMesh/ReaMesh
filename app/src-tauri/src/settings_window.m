@@ -178,8 +178,8 @@ static ReaMeshSettingsController *gController = nil;
     y += 26;
 
     NSTextField *intro = [self
-        labelWithString:L(@"Choose what the overlay shows over REAPER while you're in a session.",
-                          @"Wähle, was das Overlay während einer Session über REAPER anzeigt.")
+        labelWithString:L(@"Choose what appears in the overlay while you're in a session.",
+                          @"Wähle aus, was während einer Session im Overlay zu sehen ist.")
                   frame:NSMakeRect(kMargin, y, w, 32)];
     intro.textColor = [NSColor secondaryLabelColor];
     intro.font = [NSFont systemFontOfSize:11];
@@ -191,7 +191,7 @@ static ReaMeshSettingsController *gController = nil;
     int32_t mask = self.cb.get_overlay(self.cb.ctx);
     NSArray *rows = @[
         @[ @(kReaMeshOverlayRoster), L(@"Participants", @"Teilnehmer") ],
-        @[ @(kReaMeshOverlayTint), L(@"Locked-item tint", @"Sperrtönung für Items") ],
+        @[ @(kReaMeshOverlayTint), L(@"Tint locked items", @"Gesperrte Items einfärben") ],
     ];
     for (NSArray *row in rows) {
         int32_t bit = (int32_t)[row[0] integerValue];
@@ -288,7 +288,7 @@ static ReaMeshSettingsController *gController = nil;
 
     if (!st.reaper_found) {
         NSButton *dl = [NSButton buttonWithTitle:L(@"Don't have REAPER? Download it",
-                                                   @"Kein REAPER? Hier herunterladen")
+                                                   @"REAPER noch nicht installiert? Jetzt herunterladen")
                                           target:self
                                           action:@selector(openDownload:)];
         dl.bezelStyle = NSBezelStyleInline;
@@ -360,10 +360,10 @@ static ReaMeshSettingsController *gController = nil;
     y += 30;
 
     NSTextField *help = [self
-        labelWithString:L(@"REAPER loads the extension at startup, so restart it "
-                          @"after installing or updating.",
-                          @"REAPER lädt die Erweiterung beim Start, also starte es "
-                          @"nach Installation oder Update neu.")
+        labelWithString:L(@"REAPER only loads the extension when it starts. Restart REAPER "
+                          @"after installing or updating it.",
+                          @"REAPER lädt die Erweiterung nur beim Start. Öffne REAPER nach "
+                          @"einer Installation oder einem Update neu.")
                   frame:NSMakeRect(kMargin, y, w, 40)];
     help.textColor = [NSColor secondaryLabelColor];
     help.font = [NSFont systemFontOfSize:11];
@@ -393,7 +393,7 @@ static ReaMeshSettingsController *gController = nil;
     panel.canChooseDirectories = YES;
     panel.canChooseFiles = NO;
     panel.allowsMultipleSelection = NO;
-    panel.title = L(@"Locate your REAPER folder", @"Wähle deinen REAPER-Ordner");
+    panel.title = L(@"Choose your REAPER folder", @"REAPER-Ordner auswählen");
     [panel beginSheetModalForWindow:self.window
                   completionHandler:^(NSModalResponse result) {
         if (result == NSModalResponseOK && panel.URLs.count > 0) {
@@ -420,8 +420,8 @@ static ReaMeshSettingsController *gController = nil;
     if (ok) {
         alert.messageText = L(@"Extension installed", @"Erweiterung installiert");
         alert.informativeText =
-            L(@"Restart REAPER (or start it) to load the latest ReaMesh extension.",
-              @"Starte REAPER (neu), um die aktuelle ReaMesh-Erweiterung zu laden.");
+            L(@"Start or restart REAPER to load the latest ReaMesh extension.",
+              @"Starte REAPER oder öffne es neu, um die aktuelle ReaMesh-Erweiterung zu laden.");
     } else {
         alert.alertStyle = NSAlertStyleWarning;
         alert.messageText = L(@"Installation failed", @"Installation fehlgeschlagen");

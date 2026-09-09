@@ -1009,10 +1009,10 @@ fn confirm_quit_while_hosting(app: &AppHandle, hosting: bool) -> bool {
     app.dialog()
         .message(tr(
             lang,
-            "Quitting will stop your session and disconnect everyone connected to you.",
-            "Beim Beenden wird deine Session gestoppt und alle Verbundenen werden getrennt.",
+            "If you quit, the session ends and everyone connected to you is disconnected.",
+            "Wenn du ReaMesh beendest, endet die Session und alle Teilnehmenden verlieren die Verbindung.",
         ))
-        .title(tr(lang, "Stop hosting and quit?", "Hosting beenden und schließen?"))
+        .title(tr(lang, "Stop hosting and quit?", "Hosting beenden und ReaMesh schließen?"))
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::OkCancelCustom(
             tr(lang, "Stop hosting", "Hosting beenden").into(),
@@ -1028,10 +1028,10 @@ fn confirm_quit_as_client(app: &AppHandle) -> bool {
     app.dialog()
         .message(tr(
             lang,
-            "Quitting leaves the session you are in. The project stays open in REAPER, but it will stop syncing.",
-            "Beim Beenden verlässt du die Session. Das Projekt bleibt in REAPER offen, wird aber nicht mehr synchronisiert.",
+            "If you quit, you leave the session. The project stays open in REAPER, but changes will no longer sync.",
+            "Wenn du ReaMesh beendest, verlässt du die Session. Das Projekt bleibt in REAPER geöffnet, aber Änderungen werden nicht mehr synchronisiert.",
         ))
-        .title(tr(lang, "Leave the session and quit?", "Session verlassen und beenden?"))
+        .title(tr(lang, "Leave the session and quit?", "Session verlassen und ReaMesh schließen?"))
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::OkCancelCustom(
             tr(lang, "Leave session", "Session verlassen").into(),
