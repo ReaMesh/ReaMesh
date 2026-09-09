@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Copy, Minus, Settings2, Square, X } from "lucide-react";
+import { Copy, Minus, Settings, Square, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useConnections, setActivePort } from "@/lib/connection";
 import { t } from "@/lib/i18n";
@@ -63,7 +63,7 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
               focusRing,
             )}
           >
-            <Settings2 className="size-4" aria-hidden="true" />
+            <Settings className="size-4" aria-hidden="true" />
           </button>
           <WindowControls />
         </div>
