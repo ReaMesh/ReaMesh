@@ -48,7 +48,7 @@ use libp2p::swarm::NetworkBehaviour;
 use libp2p::swarm::SwarmEvent;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::dial_opts::DialOpts;
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, gossipsub, mdns, noise, tcp, yamux};
+use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, gossipsub, mdns, noise, ping, tcp, yamux};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use yrs::updates::decoder::Decode;
@@ -135,6 +135,18 @@ const TAG_MARKER: u8 = b'M';
 /// REAPER's main thread is stuck (modal dialog, plugin hang): the beacon
 /// carries that as `frozen` so peers' rosters can say so.
 const MAIN_THREAD_STALE: Duration = Duration::from_secs(4);
+
+/// How often each connected peer is pinged for a round-trip time. The
+/// companion app turns a sustained high RTT into a "slow connection" notice;
+/// ping cost is one tiny stream per interval, so a short interval is cheap.
+const PING_INTERVAL: Duration = Duration::from_secs(5);
+/// A ping that takes this long counts as a (very) slow link, not a dead one:
+/// liveness is the topic subscription's business, so a timeout records a
+/// pessimistic sample instead of dropping the peer.
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
+/// Smoothed round-trip samples older than this are forgotten (the peer's
+/// connection went quiet or away).
+const RTT_STALE: Duration = Duration::from_secs(60);
 /// Session farewell: published by the owner right before it stops hosting so
 /// clients end cleanly instead of waiting out a silence.
 const TAG_SESSION_END: u8 = b'E';
@@ -429,6 +441,10 @@ struct Shared {
     /// Latest *authenticated* presence beacon per peer id string (display
     /// name + color). Beacons whose MAC doesn't verify never land here.
     peers_info: Mutex<HashMap<String, PeerPresence>>,
+    /// Smoothed round-trip time (ms) per connected peer id string, from the
+    /// libp2p ping behaviour, plus when the last sample landed. Surfaced per
+    /// roster entry as `rtt` so the app can say "slow connection to X".
+    peer_rtt: Mutex<HashMap<String, (f64, Instant)>>,
     /// Peer id string of the session owner (self when hosting).
     owner_peer: Mutex<String>,
     /// Client only: how many of this peer's edits were snapped back because
@@ -1178,6 +1194,7 @@ impl Reamesh {
             session_peers: Mutex::new(Vec::new()),
             auth_token: Mutex::new(String::new()),
             peers_info: Mutex::new(HashMap::new()),
+            peer_rtt: Mutex::new(HashMap::new()),
             owner_peer: Mutex::new(String::new()),
             reverts: AtomicUsize::new(0),
             reverts_detail: Mutex::new(VecDeque::new()),
@@ -1806,6 +1823,7 @@ impl Reamesh {
                      playing: bool,
                      follow: &str,
                      frozen: bool,
+                     rtt: u64,
                      is_self: bool| {
             json!({
                 "id": id,
@@ -1818,6 +1836,9 @@ impl Reamesh {
                 "playing": playing,
                 "follow": follow,
                 "frozen": frozen,
+                // Smoothed round trip to this peer in whole ms (rounded up so a
+                // real sub-ms LAN sample is 1, never the "unknown" 0).
+                "rtt": rtt,
                 "is_self": is_self,
                 "is_owner": id == owner,
             })
@@ -1832,8 +1853,11 @@ impl Reamesh {
             me.playing,
             &me.follow,
             false, // if our own main thread were frozen, nobody would be asking
+            0,     // no round trip to ourselves
             true,
         )];
+        let mut rtts = self.shared.peer_rtt.lock().unwrap();
+        rtts.retain(|_, (_, at)| at.elapsed() < RTT_STALE);
         let mut infos = self.shared.peers_info.lock().unwrap();
         let now = Instant::now();
         infos.retain(|_, p| now.duration_since(p.last_seen) < PRESENCE_STALE);
@@ -1863,6 +1887,7 @@ impl Reamesh {
                     info.playing,
                     &info.follow,
                     info.frozen,
+                    rtts.get(&id).map(|(ms, _)| ms.ceil() as u64).unwrap_or(0),
                     false,
                 ));
             }
@@ -2296,6 +2321,9 @@ struct Behaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: Toggle<mdns::tokio::Behaviour>,
     xfer: request_response::cbor::Behaviour<XferRequest, XferResponse>,
+    /// Round-trip probe to every connected peer: the only latency signal the
+    /// app has (gossip carries no timestamps), see `Shared::peer_rtt`.
+    ping: ping::Behaviour,
 }
 
 fn session_topic(session_id: &str) -> gossipsub::IdentTopic {
@@ -2348,7 +2376,12 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
                 request_response::Config::default()
                     .with_request_timeout(Duration::from_secs(30)),
             );
-            Ok(Behaviour { gossipsub, mdns, xfer })
+            let ping = ping::Behaviour::new(
+                ping::Config::new()
+                    .with_interval(PING_INTERVAL)
+                    .with_timeout(PING_TIMEOUT),
+            );
+            Ok(Behaviour { gossipsub, mdns, xfer, ping })
         })
         .map_err(|e| anyhow::anyhow!("behaviour: {e}"))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(3600)))
@@ -3503,6 +3536,29 @@ async fn run_network(
                 }
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     eprintln!("[reamesh] outgoing connection error (peer {peer_id:?}): {error}");
+                }
+                SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                    // Last connection to this peer gone: its round trip is no
+                    // longer a fact about anything.
+                    shared.peer_rtt.lock().unwrap().remove(&peer_id.to_string());
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { peer, result, .. })) => {
+                    let sample_ms = match result {
+                        Ok(rtt) => Some(rtt.as_secs_f64() * 1000.0),
+                        // A timed-out ping is a pessimistic sample, not a
+                        // vanished peer (liveness is the topic's business).
+                        Err(ping::Failure::Timeout) => Some(PING_TIMEOUT.as_secs_f64() * 1000.0),
+                        // Unsupported / stream errors: nothing to learn.
+                        Err(_) => None,
+                    };
+                    if let Some(ms) = sample_ms {
+                        let mut rtts = shared.peer_rtt.lock().unwrap();
+                        let e = rtts.entry(peer.to_string()).or_insert((ms, Instant::now()));
+                        // EWMA so a single slow sample doesn't flash a notice and a
+                        // single fast one doesn't clear a genuinely slow link.
+                        e.0 = e.0 * 0.6 + ms * 0.4;
+                        e.1 = Instant::now();
+                    }
                 }
                 SwarmEvent::IncomingConnectionError { error, .. } => {
                     eprintln!("[reamesh] incoming connection error: {error}");

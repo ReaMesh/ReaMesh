@@ -100,6 +100,13 @@ const en = {
   // Join-without-effects session badge
   nofxBadge: "Effects off",
   nofxBadgeHint: "You joined without effects. The project is view-only, and your edits aren't shared.",
+  // Slow-link notice (ping round trip to the host / slowest guest is high).
+  slowLinkTitle: "Slow connection to {who}",
+  slowLinkHost: "the host",
+  slowLinkBody:
+    "Edits take a moment longer to arrive on both sides. Nothing gets lost; live editing just feels less immediate.",
+  slowLinkBodyDownload: "The download will take longer than usual. It continues in the background.",
+  slowLinkRtt: "Round trip: {ms} ms",
 
   // Session
   sessionFallback: "Session",
@@ -396,6 +403,12 @@ const de: Record<MsgKey, string> = {
 
   nofxBadge: "Effekte aus",
   nofxBadgeHint: "Du bist ohne Effekte beigetreten. Das Projekt ist schreibgeschützt und deine Änderungen werden nicht geteilt.",
+  slowLinkTitle: "Langsame Verbindung zu {who}",
+  slowLinkHost: "dem Host",
+  slowLinkBody:
+    "Änderungen brauchen in beide Richtungen etwas länger. Es geht nichts verloren, die Live-Bearbeitung fühlt sich nur weniger direkt an.",
+  slowLinkBodyDownload: "Der Download dauert länger als üblich. Er läuft im Hintergrund weiter.",
+  slowLinkRtt: "Antwortzeit: {ms} ms",
 
   sessionFallback: "Session",
   hostingBadge: "Hosting",

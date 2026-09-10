@@ -22,6 +22,7 @@ import { formatBytes, useTransfer } from "@/lib/format";
 import { resolveLang, t } from "@/lib/i18n";
 import { parseFxName } from "@/lib/plugins";
 import type { ExtState } from "@/lib/types";
+import { LinkNotice } from "@/components/LinkNotice";
 
 // The beacon covers three stages: connecting, downloading, and opening the
 // project in REAPER. Phase 3 is the brief completion state owned by App.
@@ -323,6 +324,10 @@ export function Downloading({
         </div>
         <CurrentFile path={phase === 1 ? state.current_file : undefined} />
       </div>
+
+      {/* The host answers pings from the manifest on, so a slow VPN hop shows
+          here before the first minute of "why is this taking so long". */}
+      {phase === 1 && <LinkNotice peers={state.peers} hosting={false} downloading />}
 
       <Button
         variant="ghost"

@@ -18,6 +18,7 @@ import { send } from "@/lib/connection";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
 import { t } from "@/lib/i18n";
 import { displayName, type ExtState, type Peer } from "@/lib/types";
+import { LinkNotice } from "@/components/LinkNotice";
 import { cn, focusRing } from "@/lib/utils";
 
 // Forward the ref so popLayout can measure and remove an exiting row from flow.
@@ -279,6 +280,9 @@ export function Session({
           {hosting ? t("hostingBadge") : t("connectedBadge")}
         </Badge>
       </div>
+
+      {/* Explain lag before someone blames the app for it. */}
+      <LinkNotice peers={state.peers} hosting={hosting} />
 
       <div className="flex min-h-0 flex-col gap-2">
         <h3 className="px-1 text-[12px] font-medium text-muted-foreground">
