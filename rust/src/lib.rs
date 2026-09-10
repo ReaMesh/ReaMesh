@@ -36,6 +36,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, AtomicU64};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
@@ -856,27 +857,42 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 // ---------- join-by-ticket ----------
 //
 // Discovery is normally mDNS + the lobby topic, which never leaves the local
-// subnet. A *ticket* is a copyable invite that carries everything a client
-// needs to reach the host directly instead: the host's peer id and listen
-// addresses, plus the session id/name and whether it takes a passphrase. Over
-// a VPN (Tailscale etc.) or a multicast-blocking LAN, pasting the ticket is
-// what stands in for the announcement being overheard: the client dials the
+// subnet. An invite *ticket* is a `reamesh://` link that carries everything a
+// client needs to reach the host directly instead: the host's peer id and
+// where it listens, plus the session id/name and whether it takes a
+// passphrase. Over a VPN (Tailscale etc.) or a multicast-blocking LAN, the
+// link stands in for the announcement being overheard: the client dials the
 // addresses, the (signed) lobby announce then arrives over that direct
 // connection, and the join proceeds exactly like a discovered one: same
-// manifest auth, same download, same session topic. The ticket is only valid
+// manifest auth, same download, same session topic. The link is only valid
 // while that hosting run lives (id and ports change on re-host), like a
 // meeting link.
 
-/// Ticket wire format: this prefix + unpadded base64url JSON
-/// `{"v":1,"sid","name","peer","addrs":[..],"auth"}`. Plain base64url (not
-/// binary) so the companion app can decode it in the webview to show the
-/// session name and passphrase flag before anything touches the network.
-const TICKET_PREFIX: &str = "RM1:";
-/// Hard cap on pasted-ticket length before any decoding.
+/// Ticket wire format, a deep link the companion app registers as its own:
+///
+/// `reamesh://join/<sid>?n=<name>&s=1&p=<peer>&a=<ip>,<ip>&t=<tcp>&q=<quic>`
+///
+/// - `n` session name, percent-encoded (absent when empty)
+/// - `s` `1` when the session takes a passphrase (absent otherwise); read by
+///   the companion app to ask for one before joining, not by this side
+/// - `p` the host's peer id (base58)
+/// - `a` the host's dialable IPs, comma-separated
+/// - `t` the host's TCP port, `q` its QUIC (UDP) port; at least one
+///
+/// The swarm listens on `0.0.0.0` once per transport, so every interface
+/// shares the same two ports: naming the IPs and the ports separately is what
+/// keeps the link short (the previous base64-JSON form spelled out every
+/// `/ip4/../tcp/..` multiaddr and ran to several hundred characters). It stays
+/// a plain readable URL, not binary, so the companion app can parse it in the
+/// webview to show the session name and passphrase flag before anything
+/// touches the network.
+const TICKET_PREFIX: &str = "reamesh://join/";
+/// Hard cap on pasted-ticket length before any parsing.
 const TICKET_MAX_LEN: usize = 8 * 1024;
-/// Cap on the addresses a ticket may carry (a host has a handful of
-/// interfaces; hundreds would be a dial-storm request, not an invite).
-const TICKET_MAX_ADDRS: usize = 16;
+/// Cap on the IPs a ticket may carry (a host has a handful of interfaces;
+/// hundreds would be a dial-storm request, not an invite). Each IP expands to
+/// at most two dial addresses (TCP + QUIC).
+const TICKET_MAX_IPS: usize = 8;
 /// How long a ticket join keeps dialing + waiting for the host's announce
 /// before it fails. Longer than MANIFEST_TIMEOUT: this leg spans WAN/VPN
 /// connection setup, not just one request round-trip.
@@ -889,51 +905,43 @@ const TICKET_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// so a slow-but-alive host still gets the full window to send its announce.
 const TICKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 
-const B64URL_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-/// Unpadded base64url (RFC 4648 §5), implemented locally to avoid a dependency
-/// for one wire format.
-fn base64url_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
-        for i in 0..=chunk.len() {
-            out.push(B64URL_ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+/// Percent-encode everything but the RFC 3986 unreserved characters, so a
+/// session name survives inside a URL query (and never contains whitespace,
+/// which chat clients would wrap on).
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
     out
 }
 
-fn base64url_decode(s: &str) -> Option<Vec<u8>> {
-    let val = |c: u8| -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-            b'-' => Some(62),
-            b'_' => Some(63),
-            _ => None,
-        }
-    };
+/// Percent-decode; `None` on a malformed escape or invalid UTF-8. A `+` is
+/// left alone (this is a URI, not a form body), matching the app's
+/// `decodeURIComponent`.
+fn percent_decode(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
-    if bytes.len() % 4 == 1 {
-        return None; // no unpadded encoding has this length
-    }
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let mut n: u32 = 0;
-        for (i, &c) in chunk.iter().enumerate() {
-            n |= val(c)? << (18 - 6 * i as u32);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
         }
-        let all = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
-        out.extend_from_slice(&all[..chunk.len() - 1]);
     }
-    Some(out)
+    String::from_utf8(out).ok()
 }
 
-/// Everything a "join by ticket" needs, decoded from the pasted string.
+/// Everything a "join by ticket" needs, decoded from the pasted link.
 #[derive(Clone, Debug)]
 struct TicketInfo {
     session_id: String,
@@ -945,33 +953,131 @@ struct TicketInfo {
     addrs: Vec<Multiaddr>,
 }
 
+/// An address worth putting in a ticket: loopback and unspecified are
+/// meaningless off-machine (a same-host client re-derives loopback itself, see
+/// `dial_ticket`), and link-local (169.254/16, fe80::/10) can't be dialed
+/// without a scope the link doesn't carry.
+fn dialable_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified() && !v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            !v6.is_loopback() && !v6.is_unspecified() && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
+/// What a ticket says about where the host listens, from the swarm's listen
+/// addresses: the dialable IPs plus the TCP and QUIC ports (0 = that transport
+/// isn't listening). Both transports listen on `0.0.0.0`, so every interface
+/// reports the same port per transport; the first seen is taken.
+fn ticket_endpoints(listen: &[Multiaddr]) -> (Vec<IpAddr>, u16, u16) {
+    let mut ips: Vec<IpAddr> = Vec::new();
+    let (mut tcp, mut quic) = (0u16, 0u16);
+    for addr in listen {
+        let Some(ip) = addr_ip(addr) else { continue };
+        if !dialable_ip(&ip) {
+            continue;
+        }
+        let is_quic = addr.iter().any(|p| matches!(p, Protocol::QuicV1));
+        for p in addr.iter() {
+            match p {
+                Protocol::Tcp(port) if tcp == 0 => tcp = port,
+                Protocol::Udp(port) if quic == 0 && is_quic => quic = port,
+                _ => {}
+            }
+        }
+        if !ips.contains(&ip) && ips.len() < TICKET_MAX_IPS {
+            ips.push(ip);
+        }
+    }
+    (ips, tcp, quic)
+}
+
+/// Build a ticket from its parts (see `TICKET_PREFIX` for the format).
+/// `peer` is the host's peer id in its base58 display form.
+fn encode_ticket(
+    sid: &str,
+    name: &str,
+    peer: &str,
+    ips: &[IpAddr],
+    tcp: u16,
+    quic: u16,
+    auth: bool,
+) -> String {
+    let mut params: Vec<String> = Vec::with_capacity(6);
+    if !name.is_empty() {
+        params.push(format!("n={}", percent_encode(name)));
+    }
+    if auth {
+        params.push("s=1".into());
+    }
+    params.push(format!("p={peer}"));
+    let ips: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
+    params.push(format!("a={}", ips.join(",")));
+    if tcp != 0 {
+        params.push(format!("t={tcp}"));
+    }
+    if quic != 0 {
+        params.push(format!("q={quic}"));
+    }
+    format!("{TICKET_PREFIX}{sid}?{}", params.join("&"))
+}
+
 fn parse_ticket(ticket: &str) -> Option<TicketInfo> {
     let t = ticket.trim();
     if t.len() > TICKET_MAX_LEN {
         return None;
     }
-    let bytes = base64url_decode(t.strip_prefix(TICKET_PREFIX)?)?;
-    let v: JsonValue = serde_json::from_slice(&bytes).ok()?;
-    if v.get("v").and_then(|x| x.as_u64()) != Some(1) {
+    // The scheme may come back capitalised from a chat client or the OS; the
+    // rest is case-sensitive (peer ids are base58).
+    if !t.get(..TICKET_PREFIX.len())?.eq_ignore_ascii_case(TICKET_PREFIX) {
         return None;
     }
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
-    let session_id = s("sid").filter(|x| valid_session_id(x))?;
-    let session_name = s("name").unwrap_or_default();
-    let peer = s("peer")?.parse::<PeerId>().ok()?;
-    let addrs: Vec<Multiaddr> = v
-        .get("addrs")?
-        .as_array()?
-        .iter()
-        .take(TICKET_MAX_ADDRS)
-        .filter_map(|a| a.as_str().and_then(|x| x.parse().ok()))
-        .collect();
-    if addrs.is_empty() {
+    let rest = t.get(TICKET_PREFIX.len()..)?;
+    let (sid, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let sid = sid.trim_end_matches('/');
+    if !valid_session_id(sid) {
         return None;
     }
-    // The ticket also carries an "auth" flag; it is read by the companion app
-    // (to ask for a passphrase before joining), not by this side.
-    Some(TicketInfo { session_id, session_name, peer, addrs })
+    let mut name = String::new();
+    let mut peer: Option<PeerId> = None;
+    let mut ips: Vec<IpAddr> = Vec::new();
+    let (mut tcp, mut quic) = (0u16, 0u16);
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k {
+            // A garbled name is cosmetic: show nothing rather than refuse.
+            "n" => name = percent_decode(v).unwrap_or_default(),
+            "p" => peer = Some(v.parse().ok()?),
+            "a" => {
+                ips = v
+                    .split(',')
+                    .filter_map(|ip| ip.parse().ok())
+                    .take(TICKET_MAX_IPS)
+                    .collect()
+            }
+            "t" => tcp = v.parse().ok().filter(|p| *p != 0)?,
+            "q" => quic = v.parse().ok().filter(|p| *p != 0)?,
+            // `s` (the auth flag) is the companion app's business; anything a
+            // later version adds is ignored rather than refused.
+            _ => {}
+        }
+    }
+    let peer = peer?;
+    if ips.is_empty() || (tcp == 0 && quic == 0) {
+        return None;
+    }
+    let mut addrs = Vec::with_capacity(ips.len() * 2);
+    for ip in ips {
+        let base = Multiaddr::from(ip);
+        if tcp != 0 {
+            addrs.push(base.clone().with(Protocol::Tcp(tcp)));
+        }
+        if quic != 0 {
+            addrs.push(base.clone().with(Protocol::Udp(quic)).with(Protocol::QuicV1));
+        }
+    }
+    Some(TicketInfo { session_id: sid.to_string(), session_name: name, peer, addrs })
 }
 
 /// The first IP protocol component of a multiaddr, if any.
@@ -1592,11 +1698,11 @@ impl Reamesh {
             .is_ok()
     }
 
-    /// Invite ticket for the session this peer is hosting: a copyable string
-    /// carrying the host's peer id + listen addresses and the session id/name/
-    /// auth flag, so a peer that can't overhear the LAN announcement (VPN,
-    /// multicast-blocked network) can still reach it. Empty until at least one
-    /// non-loopback listen address is known, and always empty on clients.
+    /// Invite ticket for the session this peer is hosting: a `reamesh://` link
+    /// carrying the host's peer id + dialable IPs/ports and the session id/
+    /// name/auth flag, so a peer that can't overhear the LAN announcement
+    /// (VPN, multicast-blocked network) can still reach it. Empty until at
+    /// least one dialable listen address is known, and always empty on clients.
     pub fn session_ticket(&self) -> String {
         if self.role != Role::Owner {
             return String::new();
@@ -1608,31 +1714,12 @@ impl Reamesh {
         let (Some(sid), Some(name)) = (sid, name) else {
             return String::new();
         };
-        // Loopback/unspecified addresses are meaningless off-machine; a
-        // same-host client re-derives loopback itself (see dial_ticket).
-        let addrs: Vec<String> = self
-            .shared
-            .listen_addrs
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|a| addr_ip(a).is_some_and(|ip| !ip.is_loopback() && !ip.is_unspecified()))
-            .take(TICKET_MAX_ADDRS)
-            .map(|a| a.to_string())
-            .collect();
-        if addrs.is_empty() {
+        let (ips, tcp, quic) = ticket_endpoints(&self.shared.listen_addrs.lock().unwrap());
+        if ips.is_empty() || (tcp == 0 && quic == 0) {
             return String::new();
         }
         let auth = !self.shared.auth_token.lock().unwrap().is_empty();
-        let payload = json!({
-            "v": 1,
-            "sid": sid,
-            "name": name,
-            "peer": self.local_peer_id,
-            "addrs": addrs,
-            "auth": auth,
-        });
-        format!("{TICKET_PREFIX}{}", base64url_encode(payload.to_string().as_bytes()))
+        encode_ticket(&sid, &name, &self.local_peer_id, &ips, tcp, quic, auth)
     }
 
     /// Join a session through a pasted ticket (client only): dial the ticket's
@@ -4680,7 +4767,8 @@ pub extern "C" fn reamesh_check_passphrase(
 }
 
 /// Invite ticket for the session this owner handle is hosting: a copyable
-/// string a remote peer pastes to join without LAN discovery (works across
+/// `reamesh://` link a remote peer opens or pastes to join without LAN
+/// discovery (works across
 /// VPNs like Tailscale and on multicast-blocking networks). Empty until the
 /// host's listen addresses are known, and always empty on client handles.
 /// Valid only for this hosting run. Free the result with
@@ -5053,57 +5141,88 @@ mod tests {
     }
 
     #[test]
-    fn base64url_roundtrips_all_lengths() {
-        for len in 0..64usize {
-            let data: Vec<u8> = (0..len).map(|i| (i * 37 + len) as u8).collect();
-            let enc = base64url_encode(&data);
-            assert!(
-                enc.bytes().all(|c| B64URL_ALPHABET.contains(&c)),
-                "encoding must stay in the url-safe alphabet"
-            );
-            assert_eq!(base64url_decode(&enc).unwrap(), data, "len {len}");
-        }
-        // Invalid input is rejected, not mangled.
-        assert!(base64url_decode("a").is_none()); // impossible length
-        assert!(base64url_decode("ab=d").is_none()); // padding/invalid char
-        assert!(base64url_decode("a+cd").is_none()); // standard-b64 char
+    fn percent_coding_roundtrips() {
+        let s = "Late Night Mix & friends / 100% ünïcödé ~._-";
+        let enc = percent_encode(s);
+        assert!(enc.chars().all(|c| c.is_ascii_alphanumeric() || "%-._~".contains(c)));
+        assert_eq!(percent_decode(&enc).unwrap(), s);
+        // `+` is not a space here (URI, not a form body).
+        assert_eq!(percent_decode("a+b").unwrap(), "a+b");
+        // Malformed escapes and invalid UTF-8 are refused, not mangled.
+        assert!(percent_decode("%").is_none());
+        assert!(percent_decode("%2").is_none());
+        assert!(percent_decode("%zz").is_none());
+        assert!(percent_decode("%ff%fe").is_none());
+    }
+
+    #[test]
+    fn ticket_endpoints_skip_undialable_addresses() {
+        let listen: Vec<Multiaddr> = [
+            "/ip4/127.0.0.1/tcp/54001",
+            "/ip4/0.0.0.0/tcp/54001",
+            "/ip4/169.254.3.4/tcp/54001",
+            "/ip6/fe80::1/tcp/54001",
+            "/ip6/::1/tcp/54001",
+            "/ip4/192.168.1.7/tcp/54001",
+            "/ip4/127.0.0.1/udp/54002/quic-v1",
+            "/ip4/192.168.1.7/udp/54002/quic-v1",
+            "/ip4/100.101.102.103/udp/54002/quic-v1",
+        ]
+        .iter()
+        .map(|a| a.parse().unwrap())
+        .collect();
+        let (ips, tcp, quic) = ticket_endpoints(&listen);
+        assert_eq!(ips, vec![IpAddr::from([192, 168, 1, 7]), IpAddr::from([100, 101, 102, 103])]);
+        assert_eq!((tcp, quic), (54001, 54002));
+        // Nothing dialable at all: no ticket.
+        let lo: Vec<Multiaddr> = vec!["/ip4/127.0.0.1/tcp/1".parse().unwrap()];
+        assert!(ticket_endpoints(&lo).0.is_empty());
     }
 
     #[test]
     fn ticket_roundtrips_and_rejects_garbage() {
-        let peer = "12D3KooWQYhTNQdmr3ArTeUHRYzFg94BKyTkoWBDWez9kSCVe2Xo";
-        let payload = json!({
-            "v": 1,
-            "sid": "abc123-9f",
-            "name": "Late Night Mix",
-            "peer": peer,
-            "addrs": ["/ip4/192.168.1.7/tcp/54001", "/ip4/100.101.102.103/udp/54002/quic-v1"],
-            "auth": true,
-        });
-        let ticket = format!("{TICKET_PREFIX}{}", base64url_encode(payload.to_string().as_bytes()));
+        let peer_str = "12D3KooWQYhTNQdmr3ArTeUHRYzFg94BKyTkoWBDWez9kSCVe2Xo";
+        let peer: PeerId = peer_str.parse().unwrap();
+        let ips = [IpAddr::from([192, 168, 1, 7]), IpAddr::from([100, 101, 102, 103])];
+        let ticket = encode_ticket("abc123-9f", "Late Night Mix & more", peer_str, &ips, 54001, 54002, true);
+        assert!(ticket.starts_with("reamesh://join/abc123-9f?"), "{ticket}");
+        assert!(ticket.contains("n=Late%20Night%20Mix%20%26%20more"), "{ticket}");
+        assert!(ticket.contains("&s=1&"), "{ticket}");
+        assert!(ticket.contains("&a=192.168.1.7,100.101.102.103&"), "{ticket}");
+        assert!(!ticket.contains(char::is_whitespace));
         let info = parse_ticket(&ticket).expect("well-formed ticket must parse");
         assert_eq!(info.session_id, "abc123-9f");
-        assert_eq!(info.session_name, "Late Night Mix");
-        assert_eq!(info.peer.to_string(), peer);
-        assert_eq!(info.addrs.len(), 2);
-        // Surrounding whitespace from a sloppy paste is tolerated.
+        assert_eq!(info.session_name, "Late Night Mix & more");
+        assert_eq!(info.peer, peer);
+        // Every IP expands to one address per transport.
+        assert_eq!(info.addrs.len(), 4);
+        assert!(info.addrs.contains(&"/ip4/192.168.1.7/tcp/54001".parse().unwrap()));
+        assert!(info.addrs.contains(&"/ip4/100.101.102.103/udp/54002/quic-v1".parse().unwrap()));
+        // Surrounding whitespace from a sloppy paste, a capitalised scheme and
+        // a trailing slash after the id are tolerated.
         assert!(parse_ticket(&format!("  {ticket}\n")).is_some());
+        assert!(parse_ticket(&ticket.replacen("reamesh", "ReaMesh", 1)).is_some());
+        assert!(parse_ticket(&ticket.replacen("abc123-9f?", "abc123-9f/?", 1)).is_some());
+        // Open session, TCP only, no name: the optional parts are absent.
+        let open = encode_ticket("abc", "", peer_str, &ips[..1], 54001, 0, false);
+        assert!(!open.contains("n=") && !open.contains("s=") && !open.contains("q="), "{open}");
+        assert_eq!(parse_ticket(&open).unwrap().addrs.len(), 1);
+        // An unknown parameter (a future version) is ignored, not refused.
+        assert!(parse_ticket(&format!("{ticket}&x=1")).is_some());
         // Garbage in all its forms is rejected.
         assert!(parse_ticket("").is_none());
-        assert!(parse_ticket("RM1:").is_none());
-        assert!(parse_ticket("RM1:!!!!").is_none());
-        assert!(parse_ticket("RM2:aGVsbG8").is_none()); // wrong prefix
-        assert!(parse_ticket(&"x".repeat(TICKET_MAX_LEN + 1)).is_none());
-        // Wrong version, bad peer id, or no usable address.
-        let mut bad = payload.clone();
-        bad["v"] = json!(2);
-        assert!(parse_ticket(&format!("{TICKET_PREFIX}{}", base64url_encode(bad.to_string().as_bytes()))).is_none());
-        let mut bad = payload.clone();
-        bad["peer"] = json!("not-a-peer-id");
-        assert!(parse_ticket(&format!("{TICKET_PREFIX}{}", base64url_encode(bad.to_string().as_bytes()))).is_none());
-        let mut bad = payload;
-        bad["addrs"] = json!(["not an address"]);
-        assert!(parse_ticket(&format!("{TICKET_PREFIX}{}", base64url_encode(bad.to_string().as_bytes()))).is_none());
+        assert!(parse_ticket("reamesh://join/").is_none());
+        assert!(parse_ticket("reamesh://join/abc").is_none()); // no peer, no address
+        assert!(parse_ticket(&ticket.replacen("reamesh://join/", "https://join/", 1)).is_none());
+        assert!(parse_ticket(&ticket.replacen("reamesh://join/", "reamesh://host/", 1)).is_none());
+        assert!(parse_ticket(&format!("reamesh://join/{}", "x".repeat(TICKET_MAX_LEN))).is_none());
+        assert!(parse_ticket("reamesh://join/é").is_none()); // non-ASCII never panics
+        assert!(parse_ticket(&ticket.replace("abc123-9f", "../etc")).is_none()); // hostile id
+        assert!(parse_ticket(&ticket.replace(peer_str, "not-a-peer-id")).is_none());
+        assert!(parse_ticket(&ticket.replace("a=192.168.1.7,100.101.102.103", "a=nope")).is_none());
+        assert!(parse_ticket(&ticket.replace("&t=54001&q=54002", "")).is_none()); // no port
+        assert!(parse_ticket(&ticket.replace("t=54001", "t=70000")).is_none());
+        assert!(parse_ticket(&ticket.replace("t=54001", "t=0")).is_none());
     }
 
     #[test]

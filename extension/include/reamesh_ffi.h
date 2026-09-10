@@ -69,7 +69,8 @@ bool reamesh_check_passphrase(struct ReameshHandle *handle,
 
 /**
  * Invite ticket for the session this owner handle is hosting: a copyable
- * string a remote peer pastes to join without LAN discovery (works across
+ * `reamesh://` link a remote peer opens or pastes to join without LAN
+ * discovery (works across
  * VPNs like Tailscale and on multicast-blocking networks). Empty until the
  * host's listen addresses are known, and always empty on client handles.
  * Valid only for this hosting run. Free the result with

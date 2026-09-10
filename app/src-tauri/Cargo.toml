@@ -22,6 +22,13 @@ cc = "1"
 tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+# `reamesh://` invite links: the OS opens the app with the link (registered by
+# the installer / the bundle's Info.plist). Single-instance is what makes a
+# second launch on Windows hand its argv (the link) to the running app instead
+# of opening another window; its `deep-link` feature raises that as the same
+# open-url event the plugin fires everywhere else.
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Local WebSocket client for leaving the session before exit (ws://127.0.0.1).

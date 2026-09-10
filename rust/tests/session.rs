@@ -180,12 +180,16 @@ fn ticket_join_works_without_lan_discovery() {
         }),
         "host never produced a ticket"
     );
-    assert!(ticket.starts_with("RM1:"), "unexpected ticket format: {ticket}");
+    assert!(ticket.starts_with("reamesh://join/"), "unexpected ticket format: {ticket}");
+    // A dialable IP and at least one port must be in there; the loopback the
+    // host also listens on must not be.
+    assert!(ticket.contains("&a=") && (ticket.contains("&t=") || ticket.contains("&q=")), "{ticket}");
+    assert!(!ticket.contains("127.0.0.1"), "loopback leaked into the ticket: {ticket}");
 
     let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
     assert_eq!(client.session_ticket(), "", "clients must not mint tickets");
     // Garbage is refused outright.
-    assert!(!client.join_ticket("RM1:garbage!", "hunter2"));
+    assert!(!client.join_ticket("reamesh://join/garbage!", "hunter2"));
     assert!(!client.join_ticket("", "hunter2"));
 
     // Deliberately no interconnect(): the ticket alone must reach the host.

@@ -1155,6 +1155,19 @@ fn confirm_leave_then_exit(app: AppHandle, hosting: bool, port: u16) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Single-instance goes first (plugins run in registration order). A
+        // second launch, which is how Windows delivers a clicked `reamesh://`
+        // link, hands its argv to the running app and exits; the deep-link
+        // plugin's feature turns that argv into the same open-url event the
+        // webview listens for everywhere. Bring the window forward so the
+        // invite is actually seen.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -1185,6 +1198,17 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             build_menu(app.handle())?;
+            // Windows: point the `reamesh://` scheme at this executable so a
+            // dev build or an unpackaged run handles invite links too (the
+            // installer registers it as well). macOS registers through the
+            // bundle's Info.plist, which the bundler writes from tauri.conf.json.
+            #[cfg(windows)]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Err(e) = app.deep_link().register_all() {
+                    eprintln!("[reamesh] deep link registration: {e}");
+                }
+            }
             // Keep the bundled extension installed/updated automatically unless
             // the user opted into the manual workflow.
             maybe_auto_install(app.handle());

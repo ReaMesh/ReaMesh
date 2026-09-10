@@ -111,7 +111,7 @@ function PeerRow({
   );
 }
 
-// Copy the ticket text to the clipboard: the async clipboard API where the
+// Copy the invite link to the clipboard: the async clipboard API where the
 // webview grants it, with the hidden-textarea fallback where it doesn't.
 async function copyText(text: string): Promise<boolean> {
   try {
@@ -134,12 +134,10 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
-// One-line copy control for the session's invite code, in the same quiet style
-// as the password reveal below it. The code lets someone outside mDNS reach
-// (VPN, strict LAN) join this session by pasting it in their Lobby.
+// Copy an invite link for hosts outside mDNS reach, such as peers on a VPN.
 function InviteTicket({ ticket }: { ticket: string }) {
   const [copied, setCopied] = useState(false);
-  // Reveal the code for manual selection if clipboard access fails.
+  // Reveal the link for manual selection if clipboard access fails.
   const [reveal, setReveal] = useState(false);
   useEffect(() => {
     if (!copied) return;
@@ -317,7 +315,7 @@ export function Session({
           button stays pinned to the bottom. */}
       <div className="min-h-0 flex-1" />
 
-      {/* Invite code + password reminder: two quiet host-only lines, kept
+      {/* Invite link + password reminder: two quiet host-only lines, kept
           tight together (and away from the Leave button) as one group. */}
       {(hostPass || (hosting && !!state.ticket)) && (
         <div className="flex flex-col gap-1">

@@ -311,6 +311,7 @@ const en = {
   peopleList: "People in this session",
   reaperInstances: "REAPER instances",
   copyInviteFailed: "Couldn't copy the code. Select and copy it manually:",
+  inviteWaitsInLobby: "Invite code received. It will be waiting in the lobby once you leave this session.",
 
   // Crash fallback
   crashTitle: "ReaMesh hit a problem",
@@ -601,6 +602,7 @@ const de: Record<MsgKey, string> = {
   peopleList: "Personen in dieser Session",
   reaperInstances: "REAPER-Instanzen",
   copyInviteFailed: "Der Code konnte nicht kopiert werden. Markiere und kopiere ihn manuell:",
+  inviteWaitsInLobby: "Einladungscode erhalten. Er wartet in der Lobby, sobald du diese Session verlässt.",
 
   crashTitle: "Bei ReaMesh ist ein Fehler aufgetreten",
   crashBody:

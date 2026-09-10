@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { RefreshCw, TriangleAlert } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { TitleBar } from "@/components/TitleBar";
@@ -13,12 +14,14 @@ import { Onboarding } from "@/screens/Onboarding";
 import { Session } from "@/screens/Session";
 import { Settings } from "@/screens/Settings";
 import { startScanning, send, useActiveInstance } from "@/lib/connection";
+import { offerInvite } from "@/lib/invite";
 import { openOverlay, closeOverlay, setSessionState } from "@/lib/overlay";
 import { loadReaperPath, refreshStatus, useReaperStatus } from "@/lib/install";
 import { t, useLang } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
 import { localizeLogEntry } from "@/lib/log";
 import { pluginStatus, useInstalledPlugins } from "@/lib/plugins";
+import { isInviteLink } from "@/lib/ticket";
 import { displayName, type ExtState, type LogEntry, type Mode } from "@/lib/types";
 import { cn, focusRing } from "@/lib/utils";
 
@@ -250,6 +253,27 @@ export default function App() {
   useEffect(() => {
     if (state) lastLive.current = { mode: state.mode };
   }, [state]);
+
+  // `reamesh://` invite links the OS hands the app (clicked in a chat or a
+  // browser), at launch or into the running instance. The Lobby's invite field
+  // picks them up from lib/invite; while a session is up they wait there, and
+  // the user is told so. Outside Tauri (plain-browser dev) the plugin call
+  // rejects and nothing is wired.
+  const modeRef = useRef<Mode | undefined>(undefined);
+  modeRef.current = state?.mode;
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    onOpenUrl((urls) => {
+      const link = urls.find(isInviteLink);
+      if (!link) return;
+      offerInvite(link);
+      const m = modeRef.current;
+      if (m === "hosting" || m === "client" || m === "downloading") toast(t("inviteWaitsInLobby"));
+    })
+      .then((f) => (unlisten = f))
+      .catch(() => {});
+    return () => unlisten?.();
+  }, []);
   const reaperClosed = !state && lastLive.current != null;
   const closedWasSession =
     reaperClosed &&

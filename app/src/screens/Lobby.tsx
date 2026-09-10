@@ -18,6 +18,7 @@ import { TrustDialog } from "@/components/TrustDialog";
 import { FOUND_COLOR, inkFor } from "@/lib/colors";
 import { send, sendProfile } from "@/lib/connection";
 import { stageHostPass } from "@/lib/hostPass";
+import { takeInvite, useInviteSeq } from "@/lib/invite";
 import { recordHostJoin } from "@/lib/knownHosts";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
@@ -33,7 +34,7 @@ const MIN_PASSPHRASE = 3;
 /// Deadline for a passphrase pre-check.
 ///
 /// The extension has one probe slot, so a later check can replace an earlier
-/// one. The deadline also covers stale sessions and rejected invite codes.
+/// one. The deadline also covers stale sessions and rejected invite links.
 const CHECK_TIMEOUT_MS = 12_000;
 /// Ticket checks legitimately take longer: the extension is dialing a host that
 /// may be across a VPN, and only fast-fails after its own connect timeout.
@@ -429,9 +430,11 @@ function SessionCard({
 }
 
 // Ticket parsing lives in lib/ticket.ts (unit-tested; mirrors the extension's
-// parse_ticket so the app never accepts a code the extension would refuse).
+// parse_ticket so the app never accepts a link the extension would refuse).
 
-// Join hosts that are not discoverable through mDNS by pasting an invite code.
+// Join hosts that are not discoverable through mDNS through an invite link:
+// pasted here, or opened from a chat/browser (the OS hands it to the app, see
+// lib/invite).
 function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number | null }) {
   const [open, setOpen] = useState(false);
   const [raw, setRaw] = useState("");
@@ -469,14 +472,33 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
   );
 
   // Probe first to verify the passphrase and load the join preview.
-  const beginJoin = () => {
-    if (!ticket || checking || joining) return;
-    if (ticket.auth && !pass) return;
+  const startCheck = (code: string, pass: string) => {
     setError("");
     begin();
     send({ cmd: "check", ticket: code, passphrase: pass }, port ?? undefined);
   };
+  const beginJoin = () => {
+    if (!ticket || checking || joining) return;
+    if (ticket.auth && !pass) return;
+    startCheck(code, pass);
+  };
   const busy = checking || joining;
+
+  // A link the OS opened the app with: fill it in and, when the session takes
+  // no passphrase, go straight on to the host check (and so the trust dialog);
+  // a protected one waits here for the passphrase. Also runs on mount, for a
+  // link that arrived while another screen was up.
+  const inviteSeq = useInviteSeq();
+  useEffect(() => {
+    const link = takeInvite();
+    if (!link) return;
+    const info = decodeTicket(link);
+    setOpen(true);
+    setRaw(link);
+    setPass("");
+    setError("");
+    if (info && !info.auth && !joining) startCheck(normalizeTicket(link), "");
+  }, [inviteSeq]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Collapse back to the one-line link, clearing whatever was typed so it
   // reopens fresh.
@@ -565,7 +587,6 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
                       e.key === "Enter" && ticket && (!ticket.auth || pass) && beginJoin()
                     }
                   />
-                  {/* Paste from clipboard: the common gesture for a copied code. */}
                   <button
                     type="button"
                     title={t("pasteInvite")}
@@ -631,7 +652,7 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
         )}
       </AnimatePresence>
 
-      {/* Use the same confirmation for discovered and invite-code sessions. */}
+      {/* Use the same confirmation for discovered and invite-link sessions. */}
       <TrustDialog
         open={confirmOpen}
         onOpenChange={setConfirmOpen}

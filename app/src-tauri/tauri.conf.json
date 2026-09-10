@@ -28,6 +28,13 @@
       "csp": null
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["reamesh"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "icon": [
