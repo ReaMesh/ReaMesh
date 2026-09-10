@@ -12,6 +12,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Hint, HintProvider } from "@/components/Hint";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { Rolling, TrackNumber } from "@/components/Rolling";
 import { send } from "@/lib/connection";
@@ -51,63 +52,67 @@ function PeerRow({
     );
   }, [flash, peer.color, flashScope, animateFlash]);
   return (
-    <motion.div
-      ref={ref}
-      layout
-      initial={{ opacity: 0, x: -10 }}
-      animate={{ opacity: 1, x: 0 }}
-      exit={{ opacity: 0, x: 10 }}
-      transition={{ type: "spring", stiffness: 350, damping: 28 }}
-      onClick={clickable ? reveal : undefined}
-      onKeyDown={
-        clickable
-          ? (e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                reveal();
+    <Hint label={clickable ? t("revealPeerTrack", { name: displayName(peer) }) : undefined}>
+      <motion.div
+        ref={ref}
+        layout
+        initial={{ opacity: 0, x: -10 }}
+        animate={{ opacity: 1, x: 0 }}
+        exit={{ opacity: 0, x: 10 }}
+        transition={{ type: "spring", stiffness: 350, damping: 28 }}
+        onClick={clickable ? reveal : undefined}
+        onKeyDown={
+          clickable
+            ? (e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  reveal();
+                }
               }
-            }
-          : undefined
-      }
-      role={clickable ? "button" : undefined}
-      tabIndex={clickable ? 0 : undefined}
-      title={clickable ? t("revealPeerTrack", { name: displayName(peer) }) : undefined}
-      className={cn(
-        "relative flex items-center gap-3 rounded-lg px-2 py-1.5",
-        clickable && "cursor-pointer transition-colors hover:bg-secondary/60",
-      )}
-    >
-      <span
-        ref={flashScope}
-        aria-hidden
-        className="pointer-events-none absolute inset-0 rounded-lg"
-      />
-      <PeerAvatar peer={peer} />
-      <span className="min-w-0 flex-1 truncate text-[13px] font-medium">
-        {displayName(peer)}
-      </span>
-      {peer.frozen && !peer.is_self && (
-        // The peer is online, but their REAPER has stopped responding.
-        <span title={t("reaperNotRespondingPeer")} className="flex shrink-0 items-center">
-          <Snowflake className="size-3.5 text-sky-300" aria-hidden="true" />
-          <span className="sr-only">{t("reaperNotRespondingPeer")}</span>
+            : undefined
+        }
+        role={clickable ? "button" : undefined}
+        tabIndex={clickable ? 0 : undefined}
+        className={cn(
+          "relative flex items-center gap-3 rounded-lg px-2 py-1.5",
+          clickable && "cursor-pointer transition-colors hover:bg-secondary/60",
+        )}
+      >
+        <span
+          ref={flashScope}
+          aria-hidden
+          className="pointer-events-none absolute inset-0 rounded-lg"
+        />
+        <PeerAvatar peer={peer} />
+        <span className="min-w-0 flex-1 truncate text-[13px] font-medium">
+          {displayName(peer)}
         </span>
-      )}
-      {peer.is_owner && (
-        // `title` on a bare span is name-prohibited by accname, so the crown
-        // needs real text for the host to be identifiable non-visually.
-        <span title={t("sessionHost")} className="flex shrink-0 items-center">
-          <Crown className="size-3.5 text-amber-400" aria-hidden="true" />
-          <span className="sr-only">{t("sessionHost")}</span>
-        </span>
-      )}
-      {peer.is_self && (
-        <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
-          {t("youBadge")}
-        </Badge>
-      )}
-      <TrackNumber track={peer.track} />
-    </motion.div>
+        {peer.frozen && !peer.is_self && (
+          // The peer is online, but their REAPER has stopped responding.
+          <Hint label={t("reaperNotRespondingPeer")}>
+            <span className="flex shrink-0 items-center">
+              <Snowflake className="size-3.5 text-sky-300" aria-hidden="true" />
+              <span className="sr-only">{t("reaperNotRespondingPeer")}</span>
+            </span>
+          </Hint>
+        )}
+        {peer.is_owner && (
+          // The crown needs real text for the host to be identifiable non-visually.
+          <Hint label={t("sessionHost")}>
+            <span className="flex shrink-0 items-center">
+              <Crown className="size-3.5 text-amber-400" aria-hidden="true" />
+              <span className="sr-only">{t("sessionHost")}</span>
+            </span>
+          </Hint>
+        )}
+        {peer.is_self && (
+          <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
+            {t("youBadge")}
+          </Badge>
+        )}
+        <TrackNumber track={peer.track} />
+      </motion.div>
+    </Hint>
   );
 }
 
@@ -163,38 +168,38 @@ function InviteTicket({ ticket }: { ticket: string }) {
     );
   }
   return (
-    <button
-      onClick={async () => {
-        if (await copyText(ticket)) setCopied(true);
-        else setReveal(true);
-      }}
-      title={t("inviteTicketHint")}
-      className={cn(
-        "flex shrink-0 items-center gap-1.5 self-start rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground",
-        focusRing,
-      )}
-    >
-      {/* Morph, don't cut: the checkmark springs in over the ticket icon. */}
-      <span className="relative size-3 shrink-0">
-        <AnimatePresence initial={false}>
-          <motion.span
-            key={copied ? "check" : "ticket"}
-            className="absolute inset-0 grid place-items-center"
-            initial={{ scale: 0.4, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-            exit={{ scale: 0.4, opacity: 0 }}
-            transition={{ type: "spring", stiffness: 500, damping: 30 }}
-          >
-            {copied ? (
-              <Check className="size-3" aria-hidden="true" />
-            ) : (
-              <Ticket className="size-3" aria-hidden="true" />
-            )}
-          </motion.span>
-        </AnimatePresence>
-      </span>
-      <span>{copied ? t("inviteCopied") : t("copyInvite")}</span>
-    </button>
+    <Hint label={t("inviteTicketHint")} side="top">
+      <button
+        onClick={async () => {
+          if (await copyText(ticket)) setCopied(true);
+          else setReveal(true);
+        }}
+        className={cn(
+          "flex shrink-0 items-center gap-1.5 self-start rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground",
+          focusRing,
+        )}
+      >
+        <span className="relative size-3 shrink-0">
+          <AnimatePresence initial={false}>
+            <motion.span
+              key={copied ? "check" : "ticket"}
+              className="absolute inset-0 grid place-items-center"
+              initial={{ scale: 0.4, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.4, opacity: 0 }}
+              transition={{ type: "spring", stiffness: 500, damping: 30 }}
+            >
+              {copied ? (
+                <Check className="size-3" aria-hidden="true" />
+              ) : (
+                <Ticket className="size-3" aria-hidden="true" />
+              )}
+            </motion.span>
+          </AnimatePresence>
+        </span>
+        <span>{copied ? t("inviteCopied") : t("copyInvite")}</span>
+      </button>
+    </Hint>
   );
 }
 
@@ -259,6 +264,7 @@ export function Session({
   }, [confirmStop, others]);
 
   return (
+    <HintProvider>
     <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
       <div className="flex items-center gap-3">
         <h2 className="min-w-0 flex-1 truncate text-[15px] font-semibold tracking-tight">
@@ -266,13 +272,14 @@ export function Session({
         </h2>
         {/* Explain why edits are not sent in view-only mode. */}
         {state.nofx && (
-          <Badge
-            variant="outline"
-            className="shrink-0 border-amber-500/40 text-amber-500"
-            title={t("nofxBadgeHint")}
-          >
-            {t("nofxBadge")}
-          </Badge>
+          <Hint label={t("nofxBadgeHint")}>
+            <Badge
+              variant="outline"
+              className="shrink-0 border-amber-500/40 text-amber-500"
+            >
+              {t("nofxBadge")}
+            </Badge>
+          </Hint>
         )}
         <Badge variant={hosting ? "default" : "secondary"} className="shrink-0">
           {hosting ? t("hostingBadge") : t("connectedBadge")}
@@ -356,5 +363,6 @@ export function Session({
         </DialogContent>
       </Dialog>
     </div>
+    </HintProvider>
   );
 }

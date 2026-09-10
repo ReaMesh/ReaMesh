@@ -8,9 +8,10 @@
 
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
-import { ChevronUp, Crown, Eye, Flag, Footprints, Snowflake, X } from "lucide-react";
+import { ChevronUp, Crown, Eye, Flag, Pin, PinOff, Snowflake } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { currentMonitor, getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { Hint, HintProvider } from "@/components/Hint";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { TrackNumber } from "@/components/Rolling";
 import { t, useLang } from "@/lib/i18n";
@@ -30,7 +31,6 @@ function PeerRow({
   onReveal,
   pickMode = false,
   onPick,
-  isFollowTarget = false,
   followerCount = 0,
 }: {
   peer: Peer;
@@ -38,8 +38,6 @@ function PeerRow({
   /** Follow-mode picking: clicking any other person starts following them. */
   pickMode?: boolean;
   onPick?: (peer: Peer) => void;
-  /** This row is the peer this user is currently following. */
-  isFollowTarget?: boolean;
   /** On the self row: how many peers are following this user. */
   followerCount?: number;
 }) {
@@ -65,91 +63,89 @@ function PeerRow({
       { duration: 0.5, ease: "easeOut" },
     );
   };
+  const followingYou =
+    followerCount === 1
+      ? t("followingYouOne")
+      : t("followingYouMany", { count: followerCount });
   return (
-    <motion.div
-      layout
-      initial={{ opacity: 0, x: -8 }}
-      animate={{ opacity: 1, x: 0 }}
-      exit={{ opacity: 0, x: 8 }}
-      transition={{ type: "spring", stiffness: 350, damping: 28 }}
-      onClick={clickable ? activate : undefined}
-      onKeyDown={
-        clickable
-          ? (e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                activate();
-              }
-            }
-          : undefined
-      }
-      role={clickable ? "button" : undefined}
-      tabIndex={clickable ? 0 : undefined}
-      title={
+    <Hint
+      label={
         pickable
           ? t("followingName", { name: displayName(peer) })
           : clickable
             ? t("revealPeerTrack", { name: displayName(peer) })
             : undefined
       }
-      className={`relative flex items-center gap-2 rounded-md px-1.5 py-1 ${
-        clickable ? "cursor-pointer transition-colors hover:bg-white/5" : ""
-      } ${pickable ? "ring-1 ring-inset ring-white/15" : ""}`}
     >
-      {clickable && (
-        <span
-          ref={flashScope}
-          aria-hidden
-          className="pointer-events-none absolute inset-0 rounded-md"
-        />
-      )}
-      <PeerAvatar peer={peer} size="sm" />
-      <span className="min-w-0 flex-1 truncate text-[12px] font-medium">
-        {displayName(peer)}
-      </span>
-      {peer.frozen && !peer.is_self && (
-        // The peer is online, but their REAPER has stopped responding.
-        <span title={t("reaperNotRespondingPeer")} className="shrink-0">
-          <Snowflake className="size-3 text-sky-300" />
-          <span className="sr-only">{t("reaperNotRespondingPeer")}</span>
+      <motion.div
+        layout
+        initial={{ opacity: 0, x: -8 }}
+        animate={{ opacity: 1, x: 0 }}
+        exit={{ opacity: 0, x: 8 }}
+        transition={{ type: "spring", stiffness: 350, damping: 28 }}
+        onClick={clickable ? activate : undefined}
+        onKeyDown={
+          clickable
+            ? (e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  activate();
+                }
+              }
+            : undefined
+        }
+        role={clickable ? "button" : undefined}
+        tabIndex={clickable ? 0 : undefined}
+        className={`relative flex items-center gap-2 rounded-md px-1.5 py-1 ${
+          clickable ? "cursor-pointer transition-colors hover:bg-white/5" : ""
+        } ${pickable ? "ring-1 ring-inset ring-white/15" : ""}`}
+      >
+        {clickable && (
+          <span
+            ref={flashScope}
+            aria-hidden
+            className="pointer-events-none absolute inset-0 rounded-md"
+          />
+        )}
+        <PeerAvatar peer={peer} size="sm" />
+        <span className="min-w-0 flex-1 truncate text-[12px] font-medium">
+          {displayName(peer)}
         </span>
-      )}
-      {isFollowTarget && (
-        <span title={t("followingName", { name: displayName(peer) })} className="shrink-0">
-          <Footprints className="size-3 text-found" />
-        </span>
-      )}
-      {peer.is_self && followerCount > 0 && (
-        // The being-followed indicator: someone's transport now mirrors yours.
-        <span
-          title={
-            followerCount === 1
-              ? t("followingYouOne")
-              : t("followingYouMany", { count: followerCount })
-          }
-          className="flex shrink-0 items-center gap-0.5 text-found"
-        >
-          <Eye className="size-3" />
-          {followerCount > 1 && <span className="text-[9px]">{followerCount}</span>}
-          <span className="sr-only">
-            {followerCount === 1
-              ? t("followingYouOne")
-              : t("followingYouMany", { count: followerCount })}
+        {peer.frozen && !peer.is_self && (
+          // The peer is online, but their REAPER has stopped responding.
+          <Hint label={t("reaperNotRespondingPeer")}>
+            <span className="flex shrink-0 items-center">
+              <Snowflake className="size-3 text-sky-300" aria-hidden="true" />
+              <span className="sr-only">{t("reaperNotRespondingPeer")}</span>
+            </span>
+          </Hint>
+        )}
+        {peer.is_self && followerCount > 0 && (
+          // The being-followed indicator: someone's transport now mirrors yours.
+          <Hint label={followingYou}>
+            <span className="flex shrink-0 items-center gap-0.5 text-found">
+              <Eye className="size-3" aria-hidden="true" />
+              {followerCount > 1 && <span className="text-[9px]">{followerCount}</span>}
+              <span className="sr-only">{followingYou}</span>
+            </span>
+          </Hint>
+        )}
+        {peer.is_owner && (
+          <Hint label={t("sessionHost")}>
+            <span className="flex shrink-0 items-center">
+              <Crown className="size-3 text-amber-400" aria-hidden="true" />
+              <span className="sr-only">{t("sessionHost")}</span>
+            </span>
+          </Hint>
+        )}
+        {peer.is_self && (
+          <span className="shrink-0 text-[9px] text-muted-foreground">
+            {t("youBadge")}
           </span>
-        </span>
-      )}
-      {peer.is_owner && (
-        <span title={t("sessionHost")} className="shrink-0">
-          <Crown className="size-3 text-amber-400" />
-        </span>
-      )}
-      {peer.is_self && (
-        <span className="shrink-0 text-[9px] text-muted-foreground">
-          {t("youBadge")}
-        </span>
-      )}
-      <TrackNumber track={peer.track} />
-    </motion.div>
+        )}
+        <TrackNumber track={peer.track} />
+      </motion.div>
+    </Hint>
   );
 }
 
@@ -305,6 +301,9 @@ export function Overlay({ port }: { port: number | null }) {
   };
 
   return (
+    // The card is the tooltip boundary: the OS window hugs it exactly, so a
+    // bubble outside the card would be clipped (see Hint.tsx).
+    <HintProvider boundary={cardRef}>
     <div
       ref={cardRef}
       style={{ width: WIDTH }}
@@ -376,7 +375,6 @@ export function Overlay({ port }: { port: number | null }) {
                         onReveal={reveal}
                         pickMode={pickMode}
                         onPick={pickFollow}
-                        isFollowTarget={!!followingId && p.id === followingId}
                         followerCount={followerCount}
                       />
                     ))}
@@ -388,44 +386,48 @@ export function Overlay({ port }: { port: number | null }) {
             {/* Markers and follow mode share this expandable area. */}
             <div className="border-t border-white/10 px-1.5 py-1">
               <div className="flex h-6 items-center gap-1">
-                <button
-                  type="button"
-                  onClick={openMarker}
-                  aria-expanded={markerOpen}
-                  aria-label={t("shareMarkerTitle")}
-                  title={t("shareMarkerTitle")}
-                  className={`grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
-                    markerOpen ? "bg-white/10 text-foreground" : "text-muted-foreground"
-                  }`}
-                >
-                  <Flag className="size-3.5" aria-hidden="true" />
-                </button>
-                {followTarget ? (
+                <Hint label={t("shareMarkerTitle")}>
                   <button
                     type="button"
-                    onClick={stopFollowing}
-                    aria-label={t("stopFollowing")}
-                    title={t("stopFollowing")}
-                    className="flex h-6 min-w-0 items-center gap-1 rounded-md px-1.5 text-found transition-colors outline-none hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                  >
-                    <X className="size-3.5 shrink-0" aria-hidden="true" />
-                    <span className="min-w-0 truncate text-[11px] font-medium">
-                      {t("followingName", { name: displayName(followTarget) })}
-                    </span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={openPick}
-                    aria-expanded={pickMode}
-                    aria-label={t("followMode")}
-                    title={t("followMode")}
+                    onClick={openMarker}
+                    aria-expanded={markerOpen}
+                    aria-label={t("shareMarkerTitle")}
                     className={`grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
-                      pickMode ? "bg-white/10 text-foreground" : "text-muted-foreground"
+                      markerOpen ? "bg-white/10 text-foreground" : "text-muted-foreground"
                     }`}
                   >
-                    <Footprints className="size-3.5" aria-hidden="true" />
+                    <Flag className="size-3.5" aria-hidden="true" />
                   </button>
+                </Hint>
+                {followTarget ? (
+                  // Pinned to someone: the whole label is the unpin button.
+                  <Hint label={t("stopFollowing")}>
+                    <button
+                      type="button"
+                      onClick={stopFollowing}
+                      aria-label={t("stopFollowing")}
+                      className="flex h-6 min-w-0 items-center gap-1 rounded-md px-1.5 text-found transition-colors outline-none hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                    >
+                      <PinOff className="size-3.5 shrink-0" aria-hidden="true" />
+                      <span className="min-w-0 truncate text-[11px] font-medium">
+                        {t("followingName", { name: displayName(followTarget) })}
+                      </span>
+                    </button>
+                  </Hint>
+                ) : (
+                  <Hint label={t("followMode")}>
+                    <button
+                      type="button"
+                      onClick={openPick}
+                      aria-expanded={pickMode}
+                      aria-label={t("followMode")}
+                      className={`grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
+                        pickMode ? "bg-white/10 text-foreground" : "text-muted-foreground"
+                      }`}
+                    >
+                      <Pin className="size-3.5" aria-hidden="true" />
+                    </button>
+                  </Hint>
                 )}
               </div>
               <AnimatePresence initial={false} mode="wait">
@@ -485,5 +487,6 @@ export function Overlay({ port }: { port: number | null }) {
         )}
       </AnimatePresence>
     </div>
+    </HintProvider>
   );
 }

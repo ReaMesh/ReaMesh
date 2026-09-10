@@ -29,7 +29,8 @@ export function PeerAvatar({
       // limited to the app's palette (the beacon carries any hex, and the
       // extension derives an arbitrary hue from the peer id when it's unset).
       style={{ backgroundColor: peer.color, color: inkFor(peer.color) }}
-      title={displayName(peer)}
+      role="img"
+      aria-label={displayName(peer)}
     >
       {initials(displayName(peer))}
     </div>
