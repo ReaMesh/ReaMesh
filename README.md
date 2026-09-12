@@ -118,6 +118,7 @@ cargo test --manifest-path rust/Cargo.toml -- --test-threads=1
 cd app
 bun install
 bun run build
+bun run test
 ```
 
 Rust session tests use real sockets and must run serially. There are also
@@ -134,3 +135,21 @@ Rust session tests use real sockets and must run serially. There are also
 
 The extension and Rust core communicate through a C ABI. The companion app
 talks to the extension over a localhost WebSocket.
+
+## Contributing
+
+Bug reports and pull requests are welcome. For larger changes, open an issue
+first so we can discuss the approach. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for development guidelines. Report security issues privately using the process
+in [SECURITY.md](SECURITY.md).
+
+## License and trademark
+
+ReaMesh is licensed under [GPL-3.0-only](LICENSE). Third-party licenses are
+listed in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+The ReaMesh name and logo aren't covered by the GPL. Modified versions must use
+a different name and logo and must not present themselves as the ReaMesh project.
+References such as "based on ReaMesh" are fine.
+
+REAPER is a trademark of Cockos Incorporated. ReaMesh is not affiliated with Cockos.

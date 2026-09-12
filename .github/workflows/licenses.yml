@@ -1,0 +1,29 @@
+# Dependency-licence gate. ReaMesh is GPL-3.0; keeping strong-copyleft
+# dependencies out of the shipped program keeps its own licensing in the
+# maintainer's hands, so every push and PR checks the Rust crates
+# (cargo-deny, allow-list in deny.toml) and the bun packages
+# (tools/check-npm-licenses.ts). Cheap: no compilation, lockfiles only.
+name: licenses
+on:
+  push:
+  pull_request:
+
+jobs:
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Rust crates (core)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          arguments: --manifest-path rust/Cargo.toml --config deny.toml
+      - name: Rust crates (companion app backend)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          arguments: --manifest-path app/src-tauri/Cargo.toml --config deny.toml
+      - name: npm packages (companion app)
+        run: bun install --frozen-lockfile && bun ../tools/check-npm-licenses.ts .
+        working-directory: app

@@ -1,0 +1,44 @@
+# cargo-deny configuration: dependency-licence policy for both Rust crates.
+#
+#   cargo deny --manifest-path rust/Cargo.toml --config deny.toml check licenses
+#   cargo deny --manifest-path app/src-tauri/Cargo.toml --config deny.toml check licenses
+#
+# ReaMesh is GPL-3.0. Its own licensing stays in the maintainer's hands only
+# while no *dependency* is strong-copyleft, so anything GPL/LGPL/AGPL/SSPL-only
+# is refused here. Weak file-level copyleft (MPL-2.0) is fine: it binds those
+# files, not the program that links them.
+
+[graph]
+all-features = false
+
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "CC0-1.0",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "OpenSSL",
+]
+# cargo-deny picks the most permissive alternative of an OR expression, so
+# "MIT OR Apache-2.0 OR LGPL-2.1-or-later" (r-efi) resolves to MIT and passes.
+confidence-threshold = 0.8
+# One config serves two crates with different dependency sets, so an entry
+# unused by one of them is expected, not a mistake.
+unused-allowed-license = "allow"
+
+[licenses.private]
+# Our own unpublished crates: don't fail on them.
+ignore = true

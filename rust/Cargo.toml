@@ -2,6 +2,10 @@
 name = "reamesh"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/ReaMesh/ReaMesh"
+description = "Peer-to-peer real-time collaboration core for REAPER (yrs + libp2p)"
+publish = false
 
 [lib]
 crate-type = ["staticlib", "rlib"]
