@@ -6,7 +6,7 @@
 // The OS window is sized to hug the card exactly (see the ResizeObserver
 // below) so its transparent area never swallows clicks meant for REAPER.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
 import { ChevronUp, Crown, Eye, Flag, Pin, PinOff, Snowflake } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
@@ -226,6 +226,25 @@ export function Overlay({ port }: { port: number | null }) {
   const peers = state?.peers ?? [];
   const reveal = (peer: Peer) => send({ cmd: "reveal_peer", peer_id: peer.id });
 
+  // Window drag by hand instead of `data-tauri-drag-region`: Tauri's injected
+  // drag script also maximizes the window on a double-click, and on macOS tao
+  // maximizes an undecorated window with an *animated* setFrame: that runs an
+  // NSAnimation on a background thread, fights the native panel's follow
+  // repositioning and the ResizeObserver above, and aborted the app (KVO
+  // "not registered" thrown from NSAnimationManager's display-link tick).
+  // The overlay capability also denies internal-toggle-maximize as a guard.
+  // Same semantics as the bare attribute: only a direct left-click on the
+  // handle itself drags, so the buttons inside keep working.
+  const dragWindow = (e: ReactMouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || e.target !== e.currentTarget) return;
+    e.preventDefault();
+    try {
+      getCurrentWindow().startDragging().catch(() => {});
+    } catch {
+      // Plain-browser development has no Tauri window API.
+    }
+  };
+
   // ---- roster bar: shared markers + follow mode ----
   const self = peers.find((p) => p.is_self);
   const followingId = self?.follow || "";
@@ -310,11 +329,11 @@ export function Overlay({ port }: { port: number | null }) {
       className="overflow-hidden rounded-xl border border-white/10 bg-background/80 text-foreground opacity-90 backdrop-blur-xl transition-opacity duration-200 hover:opacity-100"
     >
       <div
-        data-tauri-drag-region
+        onMouseDown={dragWindow}
         className="flex h-9 items-center gap-2 px-2.5"
       >
         <div
-          data-tauri-drag-region
+          onMouseDown={dragWindow}
           className="flex min-w-0 flex-1 items-center"
         >
           <AnimatePresence initial={false}>

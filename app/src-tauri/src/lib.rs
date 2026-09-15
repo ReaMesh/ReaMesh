@@ -799,6 +799,13 @@ fn ensure_hud_overlay(app: &AppHandle, port: u16, pid: u32) -> Result<(), String
     let win = tauri::WebviewWindowBuilder::new(app, "overlay", tauri::WebviewUrl::App(url.into()))
         .title("ReaMesh overlay")
         .inner_size(OVERLAY_WIDTH, 120.0)
+        // Resizable so the webview can fit the window to the card. It must
+        // never be *maximized* though: tao maximizes an undecorated macOS
+        // window with `setFrame:display:animate:YES`, an NSAnimation on a
+        // background thread that fights the native panel's follow logic and
+        // aborted the app. The overlay capability denies
+        // internal-toggle-maximize and the HUD drags itself without
+        // `data-tauri-drag-region` (whose double-click would trigger it).
         .resizable(true)
         .decorations(false)
         .transparent(true)

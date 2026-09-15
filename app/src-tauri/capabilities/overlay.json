@@ -1,11 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "overlay",
-  "description": "Capability for the floating presence overlay window: it drags itself and resizes to fit the HUD card.",
+  "description": "Capability for the floating presence overlay window: it drags itself and resizes to fit the HUD card. Maximize is denied on purpose: core:default grants internal-toggle-maximize (the drag-region double-click), and on macOS tao maximizes an undecorated window with an animated setFrame: that runs an NSAnimation on a background thread, which corrupted the panel's animation bookkeeping and aborted the app (KVO 'not registered' in NSAnimationManager).",
   "windows": ["overlay"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
-    "core:window:allow-set-size"
+    "core:window:allow-set-size",
+    "core:window:deny-internal-toggle-maximize"
   ]
 }
