@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "app.reamesh.companion",
   "build": {
-    "beforeDevCommand": "bun run dev",
+    "beforeDevCommand": "bun scripts/check-extension.ts --warn && bun run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bun run build",
+    "beforeBuildCommand": "bun scripts/check-extension.ts && bun run build",
     "frontendDist": "../dist"
   },
   "app": {

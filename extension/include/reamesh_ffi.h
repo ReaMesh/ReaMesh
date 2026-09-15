@@ -33,10 +33,8 @@ struct ReameshHandle *reamesh_host(const char *session_name,
 
 /**
  * Start browsing for sessions on the LAN. Downloaded projects are written
- * into fresh subdirectories of `staging_dir` (created as needed). Stale
- * copies there are swept, except any holding one of `open_projects`, the
- * project files currently open in this REAPER, newline-separated (may be
- * null). Returns null on failure. Release with `reamesh_shutdown`.
+ * into fresh subdirectories of `staging_dir` (created as needed). Returns
+ * null on failure. Release with `reamesh_shutdown`.
  */
 struct ReameshHandle *reamesh_join(const char *staging_dir, const char *open_projects);
 
