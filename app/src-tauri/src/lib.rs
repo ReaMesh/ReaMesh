@@ -1154,19 +1154,23 @@ fn confirm_leave_then_exit(app: AppHandle, hosting: bool, port: u16) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        // Single-instance goes first (plugins run in registration order). A
-        // second launch, which is how Windows delivers a clicked `reamesh://`
-        // link, hands its argv to the running app and exits; the deep-link
-        // plugin's feature turns that argv into the same open-url event the
-        // webview listens for everywhere. Bring the window forward so the
-        // invite is actually seen.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.unminimize();
-                let _ = win.set_focus();
-            }
-        }))
+    let builder = tauri::Builder::default();
+    // Single-instance goes first (plugins run in registration order). A
+    // second launch, which is how Windows delivers a clicked `reamesh://`
+    // link, hands its argv to the running app and exits; the deep-link
+    // plugin's feature turns that argv into the same open-url event the
+    // webview listens for everywhere. Bring the window forward so the
+    // invite is actually seen. Release builds only: `tauri dev` shares the
+    // bundle identifier with the installed app, so the lock would make the
+    // dev build forward to it and exit silently.
+    #[cfg(not(debug_assertions))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.unminimize();
+            let _ = win.set_focus();
+        }
+    }));
+    builder
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
