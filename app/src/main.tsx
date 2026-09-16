@@ -56,6 +56,40 @@ if (import.meta.env.DEV && params.get("mock") === "onboarding") {
     },
   };
 }
+// Mock a fully installed setup for browser previews of the in-session screens
+// (with a fake control server on a ctl port). `plugins` = comma-separated
+// display names the fake `installed_plugins` scan reports.
+if (import.meta.env.DEV && params.get("mock") === "tauri") {
+  let cbId = 0;
+  const plugins = (params.get("plugins") ?? "").split(",").filter(Boolean);
+  // deno-lint-ignore no-explicit-any
+  (window as unknown as { __TAURI_INTERNALS__: any }).__TAURI_INTERNALS__ = {
+    transformCallback: () => ++cbId,
+    unregisterCallback: () => {},
+    convertFileSrc: (p: string) => p,
+    invoke: async (cmd: string) => {
+      switch (cmd) {
+        case "reaper_status":
+          return {
+            reaperFound: true,
+            isReaperDir: true,
+            resourcePath: "/Users/you/Library/Application Support/REAPER",
+            userPlugins: "/Users/you/Library/Application Support/REAPER/UserPlugins",
+            installed: true,
+            upToDate: true,
+          };
+        case "installed_plugins":
+          return plugins;
+        case "get_reaper_path":
+          return null;
+        case "get_language":
+          return params.get("lang") ?? "system";
+        default:
+          return undefined;
+      }
+    },
+  };
+}
 const root = ReactDOM.createRoot(document.getElementById("root") as HTMLElement);
 
 // Both windows render localized strings; sync the language preference with the
