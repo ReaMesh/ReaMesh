@@ -51,6 +51,12 @@ static const NSTimeInterval kDragPause = 0.25; // suspend follow during a drag
 @property (assign) CGWindowID cachedWindowID; // REAPER's main window, re-resolved when stale
 @property (assign) NSTimeInterval nextWindowScan; // throttle for failed full scans
 @property (strong) NSTimer *visibilityTimer; // always-running show/hide supervisor (followLink suspends while hidden)
+@property (strong) NSTimer *fadeTimer; // self-driven alpha fade (see fadeToAlpha:)
+@property (assign) CGFloat fadeFrom;
+@property (assign) CGFloat fadeTo;
+@property (assign) NSTimeInterval fadeStart;
+@property (assign) NSTimeInterval fadeDuration;
+@property (copy) void (^fadeCompletion)(void);
 @end
 
 static ReaMeshOverlayController *gOverlay = nil;
@@ -203,6 +209,57 @@ static ReaMeshOverlayController *gOverlay = nil;
 
 #pragma mark - Visibility / fade
 
+// The fade is driven by our own timer, deliberately NOT by
+// `panel.animator.alphaValue` / NSAnimationContext. AppKit runs that kind of
+// window animation through NSAnimationManager, which KVO-observes the
+// window's alphaValue and unregisters on a later display-link tick. When
+// REAPER quits mid-session the sequence is: REAPER loses frontmost → fade-out
+// starts → the control socket drops within the same ~150ms → the app closes
+// the HUD (detach + close). The display-link tick then tried to remove its
+// observer from a window that was already torn down and threw
+// "Cannot remove an observer <NSAnimationManager> for the key path
+// alphaValue … not registered", which aborts the app (no ObjC unwinding
+// through tao's run loop). A timer we own is cancelled synchronously in
+// detach, so nothing about the fade can outlive the window.
+- (void)cancelFade {
+    [self.fadeTimer invalidate];
+    self.fadeTimer = nil;
+    self.fadeCompletion = nil;
+}
+
+- (void)fadeToAlpha:(CGFloat)target
+           duration:(NSTimeInterval)duration
+         completion:(void (^)(void))completion {
+    [self cancelFade];
+    self.fadeFrom = self.panel.alphaValue; // reverse mid-fade without a jump
+    self.fadeTo = target;
+    self.fadeStart = [NSDate timeIntervalSinceReferenceDate];
+    self.fadeDuration = duration;
+    self.fadeCompletion = completion;
+    self.fadeTimer = [NSTimer timerWithTimeInterval:(1.0 / 60.0)
+                                             target:self
+                                           selector:@selector(fadeTick:)
+                                           userInfo:nil
+                                            repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:self.fadeTimer forMode:NSRunLoopCommonModes];
+    [self fadeTick:self.fadeTimer];
+}
+
+- (void)fadeTick:(NSTimer *)t {
+    if (!self.panel) { [self cancelFade]; return; }
+    NSTimeInterval elapsed = [NSDate timeIntervalSinceReferenceDate] - self.fadeStart;
+    CGFloat p = self.fadeDuration > 0 ? (CGFloat)(elapsed / self.fadeDuration) : 1.0;
+    if (p < 0) p = 0;
+    if (p > 1) p = 1;
+    CGFloat eased = p * p * (3 - 2 * p); // smoothstep, close to AppKit's ease-in-out
+    [self.panel setAlphaValue:self.fadeFrom + (self.fadeTo - self.fadeFrom) * eased];
+    if (p >= 1) {
+        void (^done)(void) = self.fadeCompletion;
+        [self cancelFade];
+        if (done) done();
+    }
+}
+
 - (void)updateVisibility {
     // Show only while REAPER is frontmost AND its window is actually on screen.
     // The on-screen half is what handles minimize: a minimized REAPER stays
@@ -220,19 +277,14 @@ static ReaMeshOverlayController *gOverlay = nil;
     self.visible = want;
     if (want) {
         [self reposition]; // place before it's seen
-        [self.panel setAlphaValue:0.0];
+        if (![self.panel isVisible]) [self.panel setAlphaValue:0.0];
         [self.panel orderFront:nil];
-        [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
-            ctx.duration = 0.18;
-            [self.panel.animator setAlphaValue:1.0];
-        }];
+        [self fadeToAlpha:1.0 duration:0.18 completion:nil];
     } else {
-        [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
-            ctx.duration = 0.15;
-            ctx.completionHandler = ^{
-                if (!self.visible) [self.panel orderOut:nil];
-            };
-            [self.panel.animator setAlphaValue:0.0];
+        __weak ReaMeshOverlayController *weakSelf = self;
+        [self fadeToAlpha:0.0 duration:0.15 completion:^{
+            ReaMeshOverlayController *me = weakSelf;
+            if (me && !me.visible) [me.panel orderOut:nil];
         }];
     }
 }
@@ -352,6 +404,7 @@ static ReaMeshOverlayController *gOverlay = nil;
                                                   repeats:YES];
     [[NSRunLoop mainRunLoop] addTimer:self.visibilityTimer forMode:NSRunLoopCommonModes];
 
+    [self cancelFade];
     self.visible = NO;
     [panel setAlphaValue:0.0];
     [panel orderOut:nil];
@@ -365,9 +418,13 @@ static ReaMeshOverlayController *gOverlay = nil;
     self.followTimer = nil;
     [self.visibilityTimer invalidate];
     self.visibilityTimer = nil;
+    [self cancelFade]; // must precede close: no fade state may outlive the window
+    self.visible = NO;
     [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
     if (self.panel) {
         NSPanel *panel = self.panel;
+        [panel setAlphaValue:0.0];
+        [panel orderOut:nil];
         panel.delegate = self.prevDelegate;
         self.prevDelegate = nil;
         // Undo the panel-ization before Tauri/tao closes its own window. The
