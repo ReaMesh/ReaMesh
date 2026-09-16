@@ -143,11 +143,11 @@ export function TrustDialog({
   const tracks = preview?.meta?.tracks;
   const plugins = preview?.meta?.plugins;
 
-  // One line of facts: "Host: Anna · joined 3× before", then
-  // "12 tracks · 34 files · 1.2 GB". Missing pieces just drop out.
+  // One line of facts: "Host: Anna · joined 3× before" (a first join says
+  // nothing), then "12 tracks · 34 files · 1.2 GB". Missing pieces drop out.
   const hostLine = [
     hostName ? t("trustHost", { host: hostName }) : null,
-    hostPeerId ? (seen === 0 ? t("hostFirstTime") : t("hostSeenBefore", { count: seen })) : null,
+    hostPeerId && seen > 0 ? t("hostSeenBefore", { count: seen }) : null,
   ].filter(Boolean);
   const stats = [
     typeof tracks === "number" && tracks > 0 ? t("previewTracks", { count: tracks }) : null,
