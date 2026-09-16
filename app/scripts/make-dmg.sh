@@ -120,4 +120,28 @@ if [ -n "$SIGN_ID" ]; then
   echo "signed $OUT with: $SIGN_ID"
 fi
 
+# 7. Launchers next to the image, so the output folder is self-contained even
+#    after a cargo clean (target/ is gitignored). Each just forwards to the
+#    matching script in app/scripts/:
+#      bundle_dmg.sh → make-dmg.sh   package the already-built ReaMesh.app
+#      make_dmg.sh   → build-dmg.sh  build a fresh ReaMesh.app, then package it
+#      sign_dmg.sh   → sign-dmg.sh   Developer-ID-sign the newest DMG
+#    bundle_dmg.sh is Tauri's own create-dmg script when the dmg target is
+#    bundled, so it is only written here when missing.
+write_launcher() { # <file> <target script> <one-line description>
+  cat > "$1" <<LAUNCHER
+#!/usr/bin/env bash
+# $3
+# Forwards to app/scripts/$2 (run with --help where supported).
+set -euo pipefail
+APP_DIR="\$( cd "\$( dirname "\${BASH_SOURCE[0]}" )/../../../../.." && pwd )"
+[ -f "\$APP_DIR/scripts/$2" ] || { echo "error: cannot find scripts/$2 (expected the app dir at \$APP_DIR)" >&2; exit 1; }
+exec bash "\$APP_DIR/scripts/$2" "\$@"
+LAUNCHER
+  chmod +x "$1"
+}
+write_launcher "$OUT_DIR/make_dmg.sh" build-dmg.sh "Builds a fresh ReaMesh.app (bun run tauri build), then packages it into ReaMesh_<version>.dmg in this folder."
+write_launcher "$OUT_DIR/sign_dmg.sh" sign-dmg.sh "Signs the newest ReaMesh_*.dmg in this folder with your Apple Developer ID (--identity, --notarize, --profile, --force)."
+[ -f "$OUT_DIR/bundle_dmg.sh" ] || write_launcher "$OUT_DIR/bundle_dmg.sh" make-dmg.sh "Packages the already-built ReaMesh.app (../macos) into ReaMesh_<version>.dmg in this folder, without rebuilding."
+
 echo "built $OUT"
