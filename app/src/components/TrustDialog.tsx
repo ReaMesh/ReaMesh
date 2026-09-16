@@ -1,6 +1,5 @@
-// Summarize the download, claimed host, and plugins before joining. The user
-// can join normally or open a view-only copy without third-party effects. The
-// extension checks the claimed plugin list again before opening the project.
+// Show the host, project size, and local plugin availability before joining.
+// The extension verifies the manifest's plugin list against the downloaded project.
 
 import { useMemo, useState } from "react";
 import { ShieldAlert } from "lucide-react";
@@ -26,6 +25,9 @@ const STATUS_DOT: Record<PluginStatus, string> = {
   unknown: "bg-muted-foreground/50",
 };
 
+// Sort missing plugins first.
+const STATUS_ORDER: Record<PluginStatus, number> = { missing: 0, unknown: 1, have: 2 };
+
 function statusLabel(s: PluginStatus): string {
   return s === "have" ? t("pluginInstalled") : s === "missing" ? t("pluginMissing") : t("pluginUnknown");
 }
@@ -35,11 +37,9 @@ function PluginList({ plugins }: { plugins: string[] }) {
   const [copied, setCopied] = useState(false);
   const rows = useMemo(
     () =>
-      plugins.map((raw) => ({
-        raw,
-        parsed: parseFxName(raw),
-        status: pluginStatus(raw, installed),
-      })),
+      plugins
+        .map((raw) => ({ raw, parsed: parseFxName(raw), status: pluginStatus(raw, installed) }))
+        .sort((a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status]),
     [plugins, installed],
   );
   const missing = rows.filter((r) => r.status === "missing");
@@ -55,11 +55,36 @@ function PluginList({ plugins }: { plugins: string[] }) {
     }
   };
 
+  const summary = !anyKnown
+    ? t("pluginsUnknown", { total: rows.length })
+    : missing.length > 0
+      ? t("pluginsMissingSummary", { missing: missing.length, total: rows.length })
+      : t("pluginsAllInstalled", { total: rows.length });
+
   return (
-    <div className="space-y-2">
-      <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-        {t("pluginsTitle")}
-      </p>
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <p
+          className={cn(
+            "text-[12px] font-medium",
+            missing.length > 0 ? "text-amber-500" : "text-muted-foreground",
+          )}
+        >
+          {summary}
+        </p>
+        {missing.length > 0 && (
+          <button
+            type="button"
+            onClick={copyMissing}
+            className={cn(
+              "shrink-0 rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground",
+              focusRing,
+            )}
+          >
+            {copied ? t("missingCopied") : t("copyMissing")}
+          </button>
+        )}
+      </div>
       <div className="scroll-slim max-h-36 space-y-0.5 overflow-y-auto rounded-lg bg-secondary/50 p-1.5">
         {rows.map((r) => (
           <div key={r.raw} className="flex items-center gap-2 px-1 py-0.5" title={r.raw}>
@@ -82,37 +107,6 @@ function PluginList({ plugins }: { plugins: string[] }) {
           </div>
         ))}
       </div>
-      <div className="flex items-center justify-between gap-2">
-        <p
-          className={cn(
-            "text-[11px]",
-            missing.length > 0 ? "text-amber-500" : "text-muted-foreground",
-          )}
-        >
-          {!anyKnown
-            ? t("pluginsUnknown")
-            : missing.length > 0
-              ? t("pluginsMissingSummary", { missing: missing.length, total: rows.length })
-              : t("pluginsAllInstalled", { total: rows.length })}
-        </p>
-        {missing.length > 0 && (
-          <button
-            type="button"
-            onClick={copyMissing}
-            className={cn(
-              "shrink-0 rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground",
-              focusRing,
-            )}
-          >
-            {copied ? t("missingCopied") : t("copyMissing")}
-          </button>
-        )}
-      </div>
-      {missing.length > 0 && (
-        <p className="text-[11px] leading-relaxed text-muted-foreground">
-          {t("missingPluginNote")}
-        </p>
-      )}
     </div>
   );
 }
@@ -148,10 +142,17 @@ export function TrustDialog({
   const totalFiles = preview?.files ?? files ?? 0;
   const tracks = preview?.meta?.tracks;
   const plugins = preview?.meta?.plugins;
+
+  // One line of facts: "Host: Anna · joined 3× before", then
+  // "12 tracks · 34 files · 1.2 GB". Missing pieces just drop out.
+  const hostLine = [
+    hostName ? t("trustHost", { host: hostName }) : null,
+    hostPeerId ? (seen === 0 ? t("hostFirstTime") : t("hostSeenBefore", { count: seen })) : null,
+  ].filter(Boolean);
   const stats = [
     typeof tracks === "number" && tracks > 0 ? t("previewTracks", { count: tracks }) : null,
     totalBytes > 0
-      ? t("filesAndSize", { count: totalFiles, size: formatBytes(totalBytes) })
+      ? t("previewFiles", { count: totalFiles, size: formatBytes(totalBytes) })
       : null,
   ].filter(Boolean);
 
@@ -162,35 +163,20 @@ export function TrustDialog({
           <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-amber-500/15 sm:mx-0">
             <ShieldAlert className="size-5 text-amber-500" />
           </div>
-          <DialogTitle className="text-[15px]">{t("trustTitle")}</DialogTitle>
+          <DialogTitle className="text-[15px]">{t("trustTitle", { name })}</DialogTitle>
           <DialogDescription className="text-[13px] leading-relaxed">
-            {t("trustBody", { name })}
-            {hostName && (
-              <span className="block pt-2">{t("trustHostClaims", { host: hostName })}</span>
-            )}
-            {hostPeerId && (
-              <span className="block pt-1 text-[12px]">
-                {seen === 0
-                  ? t("hostFirstTime")
-                  : seen === 1
-                    ? t("hostSeenOnce")
-                    : t("hostSeenBefore", { count: seen })}
-              </span>
-            )}
+            {t("trustBody")}
           </DialogDescription>
         </DialogHeader>
 
-        {(stats.length > 0 || (plugins && plugins.length > 0)) && (
-          <div className="space-y-3">
-            {stats.length > 0 && (
-              <p className="text-[12px] text-muted-foreground">{stats.join(" · ")}</p>
-            )}
-            {plugins && plugins.length > 0 && <PluginList plugins={plugins} />}
-            <p className="text-[10px] leading-relaxed text-muted-foreground/80">
-              {t("reportedByHost")}
-            </p>
+        {(hostLine.length > 0 || stats.length > 0) && (
+          <div className="space-y-0.5 text-[12px] text-muted-foreground">
+            {hostLine.length > 0 && <p>{hostLine.join(" · ")}</p>}
+            {stats.length > 0 && <p>{stats.join(" · ")}</p>}
           </div>
         )}
+
+        {plugins && plugins.length > 0 && <PluginList plugins={plugins} />}
 
         <DialogFooter className="flex-col gap-2 sm:flex-col sm:gap-2">
           <div className="flex w-full gap-2">
