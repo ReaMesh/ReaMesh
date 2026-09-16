@@ -74,8 +74,10 @@ fn origin_allowed(origin: Option<&str>) -> bool {
             "tauri://localhost"          // macOS / Linux bundled app
                 | "https://tauri.localhost" // Windows bundled app, useHttpsScheme = true
                 | "http://tauri.localhost"  // Windows bundled app, Tauri v2 default
-                | "http://localhost:1420"   // `tauri dev`
+                | "http://localhost:1420"   // `tauri dev` / `bun run dev:a`
                 | "http://127.0.0.1:1420"
+                | "http://localhost:1421"   // `bun run dev:b` (second dev instance)
+                | "http://127.0.0.1:1421"
         ),
     }
 }
@@ -317,6 +319,8 @@ mod tests {
         assert!(origin_allowed(Some("https://tauri.localhost")));
         assert!(origin_allowed(Some("http://tauri.localhost")));
         assert!(origin_allowed(Some("http://localhost:1420")));
+        assert!(origin_allowed(Some("http://localhost:1421")));
+        assert!(origin_allowed(Some("http://127.0.0.1:1421")));
     }
 
     #[test]
@@ -324,5 +328,6 @@ mod tests {
         assert!(!origin_allowed(Some("https://evil.example")));
         assert!(!origin_allowed(Some("http://evil.example")));
         assert!(!origin_allowed(Some("null")));
+        assert!(!origin_allowed(Some("http://localhost:1422")));
     }
 }
