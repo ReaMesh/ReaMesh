@@ -26,14 +26,14 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { BanList } from "@/components/BanList";
 import { Hint, HintProvider } from "@/components/Hint";
 import { PeerAvatar } from "@/components/PeerAvatar";
-import { Rolling, TrackNumber } from "@/components/Rolling";
+import { TrackNumber } from "@/components/TrackNumber";
 import { send } from "@/lib/connection";
 import { formatBytes, useTransfer } from "@/lib/format";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
 import { resolveLang, t } from "@/lib/i18n";
 import { displayName, type ExtState, type Peer } from "@/lib/types";
 import { LinkNotice } from "@/components/LinkNotice";
-import { cn, focusRing } from "@/lib/utils";
+import { cn, focusRing, noContextMenu } from "@/lib/utils";
 
 // Forward the ref so popLayout can measure and remove an exiting row from flow.
 function PeerRow({
@@ -416,18 +416,14 @@ export function Session({
 
       <div className="flex min-h-0 flex-col gap-2">
         <h3 className="px-1 text-[12px] font-medium text-muted-foreground">
-          {/* The count rolls slot-machine style when someone joins/leaves. */}
-          <Rolling
-            text={
-              state.peers.length === 1
-                ? t("justYou")
-                : t("peopleInSession", { count: state.peers.length })
-            }
-          />
+          {state.peers.length === 1
+            ? t("justYou")
+            : t("peopleInSession", { count: state.peers.length })}
         </h3>
         <ScrollArea
           className="min-h-0 rounded-xl bg-card p-2"
           aria-label={t("peopleList")}
+          onContextMenu={noContextMenu}
         >
           {/* Animate later roster changes, but not the initial peer list. */}
           <AnimatePresence mode="popLayout" initial={false}>

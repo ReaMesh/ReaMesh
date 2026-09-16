@@ -2,7 +2,6 @@ import { MotionConfig } from "motion/react";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import "./index.css";
-import "slot-text/style.css";
 import { initLanguage } from "./lib/i18n";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 

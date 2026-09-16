@@ -13,11 +13,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { currentMonitor, getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { Hint, HintProvider } from "@/components/Hint";
 import { PeerAvatar } from "@/components/PeerAvatar";
-import { TrackNumber } from "@/components/Rolling";
+import { TrackNumber } from "@/components/TrackNumber";
 import { formatBytes, useTransfer } from "@/lib/format";
 import { resolveLang, t, useLang } from "@/lib/i18n";
 import { displayName, type ExtState, type Peer } from "@/lib/types";
 import { useOverlaySettings } from "@/lib/overlaySettings";
+import { noContextMenu } from "@/lib/utils";
 import { useOverlayState } from "./useOverlayState";
 
 const WIDTH = 232;
@@ -378,6 +379,7 @@ export function Overlay({ port }: { port: number | null }) {
       ref={cardRef}
       style={{ width: WIDTH }}
       className="overflow-hidden rounded-xl border border-white/10 bg-background/80 text-foreground opacity-90 backdrop-blur-xl transition-opacity duration-200 hover:opacity-100"
+      onContextMenu={noContextMenu}
     >
       <div
         onMouseDown={dragWindow}

@@ -14,3 +14,9 @@ export function cn(...inputs: ClassValue[]) {
  *  visible. `focus-visible` (not `focus`) keeps it off mouse clicks. */
 export const focusRing =
   "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
+
+/** Swallow the webview's native context menu (Back / Reload / Inspect…) on
+ *  chrome that has nothing to offer a right-click, such as the rosters. */
+export function noContextMenu(e: { preventDefault(): void }) {
+  e.preventDefault();
+}
