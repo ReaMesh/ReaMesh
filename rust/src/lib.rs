@@ -649,12 +649,101 @@ pub fn set_presence(json: &str) {
 // Settings can delete the stored key; the next session creates a new identity.
 
 static IDENTITY_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// Held for the life of the process: the advisory lock marking our identity
+/// slot as in use (see `claim_identity_slot`).
+static IDENTITY_LOCK: Mutex<Option<fs::File>> = Mutex::new(None);
+/// How many concurrent instances sharing one resource dir get distinct
+/// identities before the last one falls back to the base path unlocked.
+const IDENTITY_SLOTS: usize = 8;
 
 pub fn set_identity_path(path: &str) {
     if path.is_empty() {
         return;
     }
-    *IDENTITY_PATH.lock().unwrap() = Some(PathBuf::from(path));
+    let (slot, lock) = claim_identity_slot(Path::new(path));
+    *IDENTITY_LOCK.lock().unwrap() = lock;
+    *IDENTITY_PATH.lock().unwrap() = Some(slot);
+}
+
+/// The identity file the n-th concurrent instance uses: `base` itself for the
+/// first, `<stem>.2<ext>`, `<stem>.3<ext>`, … for the others.
+fn identity_slot_path(base: &Path, n: usize) -> PathBuf {
+    if n <= 1 {
+        return base.to_path_buf();
+    }
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("reamesh-identity");
+    let ext = base
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    base.with_file_name(format!("{stem}.{n}{ext}"))
+}
+
+/// Claim an identity slot for this process. REAPER instances sharing a
+/// resource directory need distinct keypairs because libp2p cannot connect
+/// a peer to itself. Each slot has a separate .lock file held for the process
+/// lifetime; keeping the key file unlocked permits Windows reads.
+/// The first instance uses the base path, then .2, .3, and so on. If locking
+/// is unsupported or all slots are busy, fall back to the unlocked base path.
+fn claim_identity_slot(base: &Path) -> (PathBuf, Option<fs::File>) {
+    if let Some(parent) = base.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    for n in 1..=IDENTITY_SLOTS {
+        let slot = identity_slot_path(base, n);
+        let mut lock_name = slot
+            .file_name()
+            .map(|s| s.to_os_string())
+            .unwrap_or_default();
+        lock_name.push(".lock");
+        let lock_path = slot.with_file_name(lock_name);
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "[reamesh] could not open identity lock {}: {e}; using {} unlocked",
+                    lock_path.display(),
+                    base.display()
+                );
+                return (base.to_path_buf(), None);
+            }
+        };
+        match file.try_lock() {
+            Ok(()) => {
+                if n > 1 {
+                    eprintln!(
+                        "[reamesh] identity slot {n}: another instance holds the primary identity, using {}",
+                        slot.display()
+                    );
+                }
+                return (slot, Some(file));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => continue,
+            Err(std::fs::TryLockError::Error(e)) => {
+                eprintln!(
+                    "[reamesh] identity lock unsupported at {}: {e}; using {} unlocked",
+                    lock_path.display(),
+                    base.display()
+                );
+                return (base.to_path_buf(), None);
+            }
+        }
+    }
+    eprintln!(
+        "[reamesh] all {IDENTITY_SLOTS} identity slots are in use; using {} unlocked",
+        base.display()
+    );
+    (base.to_path_buf(), None)
 }
 
 /// The keypair every swarm starts with: the persisted per-install identity
@@ -5291,6 +5380,40 @@ mod tests {
         assert!(parse_ticket(&ticket.replace("&t=54001&q=54002", "")).is_none()); // no port
         assert!(parse_ticket(&ticket.replace("t=54001", "t=70000")).is_none());
         assert!(parse_ticket(&ticket.replace("t=54001", "t=0")).is_none());
+    }
+
+    #[test]
+    fn concurrent_instances_claim_distinct_identity_slots() {
+        let dir = std::env::temp_dir().join(format!(
+            "reamesh-idslot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let base = dir.join("reamesh-identity.key");
+        // Two "instances" (two independent lock handles) get two slots…
+        let (p1, l1) = claim_identity_slot(&base);
+        let (p2, l2) = claim_identity_slot(&base);
+        assert_eq!(p1, base);
+        assert_eq!(p2, dir.join("reamesh-identity.2.key"));
+        assert!(l1.is_some() && l2.is_some());
+        // …with distinct keypairs, so they are distinct peers.
+        let k1 = load_or_create_identity_at(&p1);
+        let k2 = load_or_create_identity_at(&p2);
+        assert_ne!(k1.public().to_peer_id(), k2.public().to_peer_id());
+        // Releasing the primary lock hands the primary identity to the next
+        // instance (a restarted first REAPER keeps its old peer id).
+        drop(l1);
+        let (p3, _l3) = claim_identity_slot(&base);
+        assert_eq!(p3, base);
+        assert_eq!(
+            load_or_create_identity_at(&p3).public().to_peer_id(),
+            k1.public().to_peer_id()
+        );
+        drop(l2);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
