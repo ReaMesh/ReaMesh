@@ -1342,6 +1342,50 @@ fn presence_names_propagate() {
 }
 
 #[test]
+fn presence_selection_and_fx_propagate() {
+    let project = temp_dir("proj-presence-detail");
+    let staging = temp_dir("staging-presence-detail");
+    make_project(&project);
+    let (owner, client) = establish("presence-detail-test", &project, &staging);
+
+    // Live presence is process-global, so both in-process peers beacon the
+    // same detail; what matters is that each side learns the *other's*
+    // selection + FX window from the wire, sanitized, not from local state.
+    let fx = serde_json::json!({"track": "{T-1}", "item": "{I-1}", "take": 0, "fx": 2, "float": true});
+    reamesh::set_presence(
+        &serde_json::json!({ "sel": ["{I-1}", "{I-2}"], "fx": fx, "focus": "{T-1}" }).to_string(),
+    );
+    let seen = wait_until(Duration::from_secs(10), || {
+        let check = |peer: &Reamesh| {
+            let v: Value = serde_json::from_str(&peer.peers_json()).unwrap();
+            v.as_array().unwrap().iter().any(|p| {
+                p["is_self"] == false
+                    && p["sel"] == serde_json::json!(["{I-1}", "{I-2}"])
+                    && p["fx"] == fx
+            })
+        };
+        check(&owner) && check(&client)
+    });
+    assert!(seen, "selection/fx detail never arrived: {}", owner.peers_json());
+
+    // Clearing the detail clears it on the other side too (a closed FX
+    // window must not stay "open" in a follower).
+    reamesh::set_presence(&serde_json::json!({ "focus": "{T-1}" }).to_string());
+    let cleared = wait_until(Duration::from_secs(10), || {
+        let v: Value = serde_json::from_str(&client.peers_json()).unwrap();
+        v.as_array().unwrap().iter().any(|p| {
+            p["is_self"] == false && p["sel"] == serde_json::json!([]) && p["fx"].is_null()
+        })
+    });
+    assert!(cleared, "cleared detail never propagated: {}", client.peers_json());
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
 fn followed_peer_beacons_fast() {
     let project = temp_dir("proj-followfast");
     let staging = temp_dir("staging-followfast");

@@ -572,6 +572,12 @@ struct PeerPresence {
     /// Peer id this peer is following ("" = nobody): the followed person's
     /// roster shows "someone is following you" from this.
     follow: String,
+    /// GUIDs of the media items this peer has selected (capped, see
+    /// `PRESENCE_SEL_MAX`); a follower mirrors the selection.
+    sel: Vec<String>,
+    /// The FX window this peer is editing in (see `LivePresence::fx`), Null
+    /// when none is open; a follower opens the same one.
+    fx: JsonValue,
     /// This peer's REAPER main thread has stopped feeding presence while its
     /// network thread still beacons: i.e. their REAPER isn't responding.
     frozen: bool,
@@ -680,6 +686,15 @@ struct LivePresence {
     /// Peer id this user is currently *following* ("" = nobody). Broadcast so
     /// the followed person's roster can show "someone is following you".
     follow: String,
+    /// GUIDs of the selected media items, so a follower sees the same items
+    /// selected as the person they follow (what they are about to edit).
+    sel: Vec<String>,
+    /// The FX window this user is editing in: `{"track": <track guid>,
+    /// "fx": <index>, "float": bool}` for a track FX, plus `"item": <item
+    /// guid>, "take": <index>` for a take FX; Null when no FX window is open.
+    /// A follower opens (and switches) the same window. The extension composes
+    /// it from REAPER's focused-FX state; `sanitize_fx` bounds what is kept.
+    fx: JsonValue,
 }
 
 static LIVE: Mutex<LivePresence> = Mutex::new(LivePresence {
@@ -689,7 +704,58 @@ static LIVE: Mutex<LivePresence> = Mutex::new(LivePresence {
     v1: 0.0,
     playing: false,
     follow: String::new(),
+    sel: Vec::new(),
+    fx: JsonValue::Null,
 });
+
+/// Most selected-item GUIDs a presence beacon carries. A followed peer beacons
+/// ten times a second, so the list is bounded; a bigger selection mirrors as
+/// its first entries. Applied both to what the extension feeds us and to what
+/// arrives from a peer (untrusted).
+const PRESENCE_SEL_MAX: usize = 256;
+
+/// Bound a beacon's `sel` field: at most `PRESENCE_SEL_MAX` GUID-sized strings.
+fn sanitize_sel(v: Option<&JsonValue>) -> Vec<String> {
+    v.and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|g| g.as_str())
+                .filter(|g| !g.is_empty())
+                .take(PRESENCE_SEL_MAX)
+                .map(|g| g.chars().take(64).collect())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Bound a beacon's `fx` field to the known keys with their expected types
+/// (`track`/`item` GUID strings, `take`/`fx` integers, `float` bool). Anything
+/// else, or a missing track, collapses to Null (= no FX window).
+fn sanitize_fx(v: Option<&JsonValue>) -> JsonValue {
+    let Some(o) = v.and_then(|x| x.as_object()) else {
+        return JsonValue::Null;
+    };
+    let s = |k: &str| -> Option<String> {
+        o.get(k)
+            .and_then(|x| x.as_str())
+            .filter(|x| !x.is_empty())
+            .map(|x| x.chars().take(64).collect())
+    };
+    let Some(track) = s("track") else {
+        return JsonValue::Null;
+    };
+    let n = |k: &str| o.get(k).and_then(|x| x.as_i64()).unwrap_or(0).clamp(0, i32::MAX as i64);
+    let mut out = json!({
+        "track": track,
+        "fx": n("fx"),
+        "float": o.get("float").and_then(|x| x.as_bool()).unwrap_or(false),
+    });
+    if let Some(item) = s("item") {
+        out["item"] = json!(item);
+        out["take"] = json!(n("take"));
+    }
+    out
+}
 
 /// Last time the extension's main-thread tick fed us presence. The network
 /// thread keeps beaconing while REAPER's main thread is stuck, so the gap
@@ -738,6 +804,8 @@ pub fn set_presence(json: &str) {
         .chars()
         .take(128)
         .collect();
+    p.sel = sanitize_sel(v.get("sel"));
+    p.fx = sanitize_fx(v.get("fx"));
 }
 
 // ---------- persistent network identity ----------
@@ -2180,6 +2248,8 @@ impl Reamesh {
                      view: (f64, f64),
                      playing: bool,
                      follow: &str,
+                     sel: &[String],
+                     fx: &JsonValue,
                      frozen: bool,
                      rtt: u64,
                      age: u64,
@@ -2194,6 +2264,8 @@ impl Reamesh {
                 "v1": view.1,
                 "playing": playing,
                 "follow": follow,
+                "sel": sel,
+                "fx": fx,
                 "frozen": frozen,
                 // Smoothed round trip to this peer in whole ms (rounded up so a
                 // real sub-ms LAN sample is 1, never the "unknown" 0).
@@ -2212,6 +2284,8 @@ impl Reamesh {
             (me.v0, me.v1),
             me.playing,
             &me.follow,
+            &me.sel,
+            &me.fx,
             false, // if our own main thread were frozen, nobody would be asking
             0,     // no round trip to ourselves
             0,     // our own presence is never stale
@@ -2251,6 +2325,8 @@ impl Reamesh {
                     (info.v0, info.v1),
                     info.playing,
                     &info.follow,
+                    &info.sel,
+                    &info.fx,
                     info.frozen,
                     rtts.get(&id).map(|(ms, _)| ms.ceil() as u64).unwrap_or(0),
                     now.duration_since(info.last_seen).as_millis() as u64,
@@ -3138,7 +3214,9 @@ fn handle_fetch_response(
 }
 
 /// Publish our presence beacon on the session topic: name, color, focused
-/// track, timeline position, view span, transport state and who we follow.
+/// track, timeline position, view span, transport state, who we follow, the
+/// selected items and the open FX window (the last two are what a follower
+/// mirrors to see what this user is editing).
 /// Called from the network thread's beacon timer (see `PRESENCE_INTERVAL` /
 /// `PRESENCE_FAST_INTERVAL` for the cadence).
 fn publish_presence(swarm: &mut Swarm<Behaviour>, shared: &Shared, topic: &gossipsub::IdentTopic) {
@@ -3161,6 +3239,8 @@ fn publish_presence(swarm: &mut Swarm<Behaviour>, shared: &Shared, topic: &gossi
             "v1": live.v1,
             "playing": live.playing,
             "follow": live.follow,
+            "sel": live.sel,
+            "fx": live.fx,
             // This beacon is sent by the *network* thread; the main-thread
             // presence feed going quiet while it still runs is exactly
             // "REAPER isn't responding".
@@ -4368,6 +4448,8 @@ async fn run_network(
                                             v1: v.get("v1").and_then(|x| x.as_f64()).unwrap_or(0.0),
                                             playing: v.get("playing").and_then(|x| x.as_bool()).unwrap_or(false),
                                             follow: get("follow"),
+                                            sel: sanitize_sel(v.get("sel")),
+                                            fx: sanitize_fx(v.get("fx")),
                                             frozen: v.get("frozen").and_then(|x| x.as_bool()).unwrap_or(false),
                                             last_seen: Instant::now(),
                                             beacons,
@@ -5935,6 +6017,33 @@ mod tests {
         assert_ne!(a, presence_mac("token-a", "12D3KooPeerTwo"));
         // Open sessions (empty token) still MAC: deterministic too.
         assert_eq!(presence_mac("", "p"), presence_mac("", "p"));
+    }
+
+    #[test]
+    fn presence_detail_is_bounded_and_typed() {
+        // `sel`: only non-empty strings, GUID-sized, at most PRESENCE_SEL_MAX.
+        let mut big: Vec<JsonValue> = (0..PRESENCE_SEL_MAX + 10)
+            .map(|i| json!(format!("{{guid-{i}}}")))
+            .collect();
+        big.push(json!(7));
+        big.push(json!(""));
+        let sel = sanitize_sel(Some(&json!(big)));
+        assert_eq!(sel.len(), PRESENCE_SEL_MAX);
+        assert_eq!(sel[0], "{guid-0}");
+        assert!(sanitize_sel(Some(&json!("not-an-array"))).is_empty());
+        assert!(sanitize_sel(None).is_empty());
+
+        // `fx`: a track FX keeps track/fx/float, a take FX adds item/take;
+        // unknown keys are dropped, wrong types fall back, no track = Null.
+        let track = sanitize_fx(Some(&json!({"track": "{t}", "fx": 3, "float": true, "junk": 1})));
+        assert_eq!(track, json!({"track": "{t}", "fx": 3, "float": true}));
+        let take = sanitize_fx(Some(&json!({"track": "{t}", "item": "{i}", "take": 1, "fx": "x"})));
+        assert_eq!(take, json!({"track": "{t}", "item": "{i}", "take": 1, "fx": 0, "float": false}));
+        assert_eq!(sanitize_fx(Some(&json!({"fx": 1}))), JsonValue::Null);
+        assert_eq!(sanitize_fx(Some(&json!([1, 2]))), JsonValue::Null);
+        assert_eq!(sanitize_fx(None), JsonValue::Null);
+        // A negative index can't address anything: clamped to 0.
+        assert_eq!(sanitize_fx(Some(&json!({"track": "{t}", "fx": -5})))["fx"], 0);
     }
 
     #[test]

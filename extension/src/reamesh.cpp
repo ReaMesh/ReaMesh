@@ -49,6 +49,18 @@
 #define REAPERAPI_WANT_ReorderSelectedTracks
 #define REAPERAPI_WANT_TrackList_AdjustWindows
 #define REAPERAPI_WANT_UpdateArrange
+#define REAPERAPI_WANT_CountSelectedMediaItems
+#define REAPERAPI_WANT_GetSelectedMediaItem
+#define REAPERAPI_WANT_SetMediaItemSelected
+#define REAPERAPI_WANT_GetFocusedFX2
+#define REAPERAPI_WANT_GetTrackMediaItem
+#define REAPERAPI_WANT_GetMediaItemTake
+#define REAPERAPI_WANT_TrackFX_GetFloatingWindow
+#define REAPERAPI_WANT_TrackFX_Show
+#define REAPERAPI_WANT_TrackFX_GetCount
+#define REAPERAPI_WANT_TakeFX_GetFloatingWindow
+#define REAPERAPI_WANT_TakeFX_Show
+#define REAPERAPI_WANT_TakeFX_GetCount
 #define REAPERAPI_WANT_Main_OnCommand
 #define REAPERAPI_WANT_EnumProjects
 #define REAPERAPI_WANT_Main_SaveProject
@@ -121,6 +133,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <thread>
 #include <vector>
 
@@ -352,6 +365,28 @@ static std::string g_followPeer;
 static std::string g_followLastFocus;   // last focus GUID acted on
 static double g_followLastPlay = -1.0;  // last beacon position acted on
 static double g_followV0 = 0.0, g_followV1 = 0.0;  // last adopted view span
+static std::string g_followLastSel;     // last mirrored item selection (joined GUIDs)
+static std::string g_followLastFx;      // last mirrored FX-window descriptor (dumped JSON)
+// The FX window follow mode opened on this REAPER, so it can be closed (or
+// switched) when the followed peer moves on. Only what follow mode itself
+// opened is ever closed: the user's own windows are theirs.
+struct FollowFx {
+  std::string track;  // track GUID
+  std::string item;   // item GUID for a take FX, "" for a track FX
+  int take = 0;       // take index (take FX)
+  int fx = 0;         // FX index (raw REAPER index: may carry the input-FX / container bits)
+  bool flt = false;   // floating window (else the chain window)
+  bool valid = false;
+};
+static FollowFx g_followFxOpen;
+// Presence detail this user beacons for followers: the selected item GUIDs and
+// the FX window being edited in. Sampled at most every 100ms (the fast beacon
+// cadence) because a selection walk isn't free on a big project and the beacon
+// leaves no faster than that anyway.
+static constexpr size_t kPresenceSelMax = 256;
+static json g_presSel = json::array();
+static json g_presFx;  // null = no FX window open
+static std::chrono::steady_clock::time_point g_presSampled{};
 // Last re-seek of a rolling transport (steady_clock), so drift correction
 // can never turn into a stutter: re-seeks are audible, one per second at most.
 static std::chrono::steady_clock::time_point g_followLastSeek{};
@@ -2924,6 +2959,9 @@ static void drainSharedMarkers() {
 // overridden (it starts again: following means following), and only real
 // drift (> kFollowDriftSec, at most once a second) re-seeks a rolling
 // transport, since a re-seek is audible.
+static void followMirrorSelection(const json& target);
+static void followMirrorFx(const json& target);
+
 static void followTick() {
   if (g_followPeer.empty()) return;
   json peers = handleJson(reamesh_peers, json::array());
@@ -2989,6 +3027,97 @@ static void followTick() {
     g_followV0 = tv0;
     g_followV1 = tv1;
   }
+  followMirrorSelection(*target);
+  followMirrorFx(*target);
+}
+
+// Mirror the followed peer's item selection: their beacon carries the GUIDs
+// of the items they have selected, so what they are about to edit is what
+// the follower sees highlighted. Applied only when the list changes (the
+// follower's own clicks stand until the followed peer selects again), and
+// only for items that exist locally: a GUID the follower doesn't have yet
+// (media still streaming in, an item deferred on missing media) is skipped.
+// Selection is per-user state and never captured, so this can't sync back.
+static void followMirrorSelection(const json& target) {
+  const json* sel = target.contains("sel") && target["sel"].is_array() ? &target["sel"] : nullptr;
+  std::string key;
+  if (sel)
+    for (const auto& g : *sel)
+      if (g.is_string()) key += g.get<std::string>() + '\n';
+  if (key == g_followLastSel) return;
+  g_followLastSel = key;
+  std::unordered_set<std::string> want;
+  if (sel)
+    for (const auto& g : *sel)
+      if (g.is_string()) want.insert(g.get<std::string>());
+  PreventUIRefresh(1);
+  const int n = CountMediaItems(nullptr);
+  for (int i = 0; i < n; ++i) {
+    MediaItem* item = GetMediaItem(nullptr, i);
+    SetMediaItemSelected(item, want.count(itemGuid(item)) > 0);
+  }
+  PreventUIRefresh(-1);
+  UpdateArrange();
+}
+
+static FollowFx parseFollowFx(const json& fx) {
+  FollowFx f;
+  if (!fx.is_object()) return f;
+  f.track = jsonStr(fx, "track");
+  if (f.track.empty()) return f;
+  f.item = jsonStr(fx, "item");
+  f.take = fx.contains("take") && fx["take"].is_number_integer() ? fx["take"].get<int>() : 0;
+  f.fx = fx.contains("fx") && fx["fx"].is_number_integer() ? fx["fx"].get<int>() : 0;
+  f.flt = fx.contains("float") && fx["float"].is_boolean() && fx["float"].get<bool>();
+  f.valid = f.take >= 0 && f.fx >= 0;
+  return f;
+}
+
+// Show (open the chain window on that effect, or float it) or hide the FX
+// window a beacon describes. Returns whether the target FX resolved locally.
+// A plain index is bounds-checked against the local chain; an index carrying
+// REAPER's input-FX / container bits is passed through as REAPER encodes it.
+static bool followFxShow(const FollowFx& f, bool show) {
+  if (!f.valid) return false;
+  const bool plain = (f.fx & 0x3000000) == 0;
+  const int flag = show ? (f.flt ? 3 : 1) : (f.flt ? 2 : 0);
+  MediaTrack* tr = findTrackByGuid(f.track);
+  if (!tr) return false;
+  if (f.item.empty()) {
+    if (plain && f.fx >= TrackFX_GetCount(tr)) return false;
+    TrackFX_Show(tr, f.fx, flag);
+    return true;
+  }
+  MediaItem* item = findItemByGuid(f.item);
+  if (!item) return false;
+  MediaItem_Take* take = GetMediaItemTake(item, f.take);
+  if (!take) return false;
+  if (plain && f.fx >= TakeFX_GetCount(take)) return false;
+  TakeFX_Show(take, f.fx, flag);
+  return true;
+}
+
+// Mirror the FX window the followed peer is editing in (their beacon's `fx`:
+// the focused FX, whether it sits in the chain window or floats). Opening the
+// same effect here shows *what* they are working on, not just where. When
+// they switch effects inside one chain window the local chain window just
+// selects the new effect (no close/reopen flicker); a move to another
+// track/take or to a floating window closes what follow mode opened first,
+// and a beacon without `fx` (they closed the window) closes it too. A no-FX
+// join has no effects to show, so it only ever mirrors the selection.
+static void followMirrorFx(const json& target) {
+  const json fx = target.contains("fx") && target["fx"].is_object() ? target["fx"] : json();
+  const std::string key = fx.is_null() ? std::string() : fx.dump();
+  if (key == g_followLastFx) return;
+  g_followLastFx = key;
+  if (g_noFx) return;
+  const FollowFx next = parseFollowFx(fx);
+  const bool sameChain = next.valid && g_followFxOpen.valid && !next.flt && !g_followFxOpen.flt &&
+                         next.track == g_followFxOpen.track && next.item == g_followFxOpen.item &&
+                         next.take == g_followFxOpen.take;
+  if (!sameChain) followFxShow(g_followFxOpen, false);
+  g_followFxOpen = FollowFx{};
+  if (followFxShow(next, true)) g_followFxOpen = next;
 }
 
 static void stopFollowing() {
@@ -2997,6 +3126,11 @@ static void stopFollowing() {
   g_followLastPlay = -1.0;
   g_followV0 = g_followV1 = 0.0;
   g_followLastSeek = {};
+  g_followLastSel.clear();
+  g_followLastFx.clear();
+  // Whatever follow mode opened stays open: the user keeps the view they had
+  // when they stopped, exactly like the track focus and arrange span do.
+  g_followFxOpen = FollowFx{};
 }
 
 // Read a whole file as UTF-8 text ("" on failure).
@@ -3588,6 +3722,8 @@ static void ctlPublishState() {
       p.erase("v1");
       p.erase("playing");
       p.erase("age");
+      p.erase("sel");
+      p.erase("fx");
       if (guid.empty()) continue;
       if (MediaTrack* tr = findTrackByGuid(guid)) {
         int n = static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"));
@@ -3742,9 +3878,55 @@ static void ctlTick() {
 
 // ---------- timer ----------
 
+// Sample the presence detail followers mirror: the selected item GUIDs (capped
+// at kPresenceSelMax) and the FX window this user is editing in. The focused
+// FX is REAPER's own notion (GetFocusedFX2: the FX whose window last had
+// focus, as long as it is still open), reported as track GUID + raw FX index,
+// or item GUID + take + index for a take FX, plus whether it floats or sits
+// in the chain window. Master-track FX are out of scope like the master track
+// itself. Rate-limited to the fast beacon cadence.
+static void samplePresenceDetail() {
+  const auto now = std::chrono::steady_clock::now();
+  if (now - g_presSampled < std::chrono::milliseconds(100)) return;
+  g_presSampled = now;
+
+  json sel = json::array();
+  const int n = CountSelectedMediaItems(nullptr);
+  for (int i = 0; i < n && sel.size() < kPresenceSelMax; ++i)
+    if (MediaItem* item = GetSelectedMediaItem(nullptr, i)) sel.push_back(itemGuid(item));
+  g_presSel = std::move(sel);
+
+  json fx;
+  int trackNo = 0, itemNo = -1, fxNo = 0;
+  const int what = GetFocusedFX2(&trackNo, &itemNo, &fxNo) & 3;
+  if (what && trackNo > 0) {
+    if (MediaTrack* tr = GetTrack(nullptr, trackNo - 1)) {
+      if (what == 1) {
+        fx = {{"track", trackGuid(tr)},
+              {"fx", fxNo},
+              {"float", TrackFX_GetFloatingWindow(tr, fxNo) != nullptr}};
+      } else if (itemNo >= 0) {
+        if (MediaItem* item = GetTrackMediaItem(tr, itemNo)) {
+          // Take FX index: low word = FX index in the chain, high word = take.
+          const int takeIdx = (fxNo >> 16) & 0xFFFF, idx = fxNo & 0xFFFF;
+          if (MediaItem_Take* take = GetMediaItemTake(item, takeIdx))
+            fx = {{"track", trackGuid(tr)},
+                  {"item", itemGuid(item)},
+                  {"take", takeIdx},
+                  {"fx", idx},
+                  {"float", TakeFX_GetFloatingWindow(take, idx) != nullptr}};
+        }
+      }
+    }
+  }
+  g_presFx = std::move(fx);
+}
+
 // Publish the focused track GUID and current timeline position with the user's
 // presence. Peers resolve the GUID against their own project. Track and item
-// selections stay local; item locks are shown with the local grey tint instead.
+// selections stay local state (never synced); item locks are shown with the
+// local grey tint instead. The selected items and the open FX window do ride
+// the beacon, but only so a *follower* can mirror them.
 static void pushLocalPresence() {
   MediaTrack* focusTr = GetSelectedTrack(nullptr, 0);
   std::string focus = focusTr ? trackGuid(focusTr) : std::string();
@@ -3759,8 +3941,18 @@ static void pushLocalPresence() {
   double v0 = 0, v1 = 0;
   GetSet_ArrangeView2(nullptr, false, 0, 0, &v0, &v1);
 
+  // The selection + FX-window detail belongs to the shared project only: while
+  // browsing or downloading, whatever is open is the user's previous project.
+  if (g_mode == Mode::Hosting || g_mode == Mode::ClientActive) {
+    samplePresenceDetail();
+  } else {
+    g_presSel = json::array();
+    g_presFx = json();
+    g_presSampled = {};
+  }
   json p = {{"focus", focus}, {"play", play},          {"v0", v0},
-            {"v1", v1},       {"playing", playing},    {"follow", g_followPeer}};
+            {"v1", v1},       {"playing", playing},    {"follow", g_followPeer},
+            {"sel", g_presSel}, {"fx", g_presFx}};
   // Deliberately UNCONDITIONAL (no change-gate): every call also proves the
   // main thread is alive, which is what keeps this peer's beacon from
   // reporting "frozen" while the user simply sits still.
