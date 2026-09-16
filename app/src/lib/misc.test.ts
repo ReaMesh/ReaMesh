@@ -76,6 +76,15 @@ describe("knownHosts", () => {
 });
 
 describe("localizeLogEntry", () => {
+  it("renders progressive-join events by code", () => {
+    expect(
+      localizeLogEntry({ code: "progressive_open", params: { count: 12 }, text: "fallback" }),
+    ).toContain("12");
+    expect(
+      localizeLogEntry({ code: "loading_readonly", text: "fallback" }),
+    ).not.toBe("fallback");
+    expect(localizeLogEntry({ code: "media_ready", text: "fallback" })).not.toBe("fallback");
+  });
   it("renders plugin arrivals with whatever context is known", () => {
     expect(
       localizeLogEntry({

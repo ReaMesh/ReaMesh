@@ -419,7 +419,6 @@ function SessionCard({
         onOpenChange={setConfirmOpen}
         name={session.session_name}
         hostName={session.owner_name}
-        hostPeerId={session.owner}
         bytes={session.bytes}
         files={session.files}
         preview={probe?.session_id === session.session_id ? probe?.preview : undefined}
@@ -657,7 +656,6 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
         open={confirmOpen}
         onOpenChange={setConfirmOpen}
         name={name}
-        hostPeerId={ticket?.peer}
         preview={ticket && probe?.session_id === ticket.sid ? probe?.preview : undefined}
         onJoin={join}
       />

@@ -289,6 +289,33 @@ static json g_lastError;
 static std::vector<DeferredItem> g_deferredItems;
 // Track GUID -> receives waiting for their source track to show up.
 static std::map<std::string, DeferredRecv> g_deferredRecv;
+// ---- progressive join ----
+// A client opens the downloaded project as soon as the .rpp and the small files
+// are here; media keeps downloading behind it. Every item whose media is still
+// missing at open time is rewritten to an EMPTY source first (blankMissingSources),
+// so REAPER never sees a missing file (no "files not found" dialog, no offline
+// items) and the whole arrangement is visible at once, just without waveforms.
+// The owner's bootstrap state then re-delivers each such item; missing media
+// parks it in g_deferredItems and the real chunk replaces the placeholder as
+// soon as its file lands. Until then the placeholder is a PURE LOCAL STAND-IN:
+// pinned out of the capture diff (pinPlaceholderItems), tinted grey like a
+// peer-locked item, and guarded twice more (guardMediaBlanking here, and the
+// Rust push/admit checks) so an empty source can never travel to the owner and
+// wipe media out of an item there.
+static std::set<std::string> g_placeholders;  // item GUIDs still standing in for media
+// True while this client is still receiving the project it joined: the
+// background download is running, or placeholders are still waiting for their
+// media. Published as state.loading; local edits snap back meanwhile
+// (revertWhileLoading) and editing unlocks once everything is here.
+static bool g_mediaLoading = false;
+// Mirror of status.background (the Rust download still streaming media).
+static bool g_downloadBackground = false;
+// After the download finished, placeholders get this long to resolve through
+// the deferred-item path before we stop holding the editing gate for them.
+// They stay pinned out of the diff either way (see pinPlaceholderItems).
+static constexpr std::chrono::seconds PLACEHOLDER_GRACE{20};
+static std::chrono::steady_clock::time_point g_placeholderGraceSince{};
+static bool g_placeholdersGivenUp = false;
 static std::chrono::steady_clock::time_point g_lastCapture{};
 static std::chrono::steady_clock::time_point g_lastFullScan{};
 // Client only: cumulative count of own proposals the owner overrode, as
@@ -878,6 +905,141 @@ static std::string stripFxBlocks(const std::string& text, bool takeFxOnly) {
     pos = eol + 1;
   }
   return out;
+}
+
+// ---------- progressive join: placeholder rewrite (pure text helper) ----------
+//
+// Rewrite every take source in an RPP-syntax text whose media is not present
+// (per `present(path)`, path as written in the FILE line) to `<SOURCE EMPTY>`,
+// keeping the item itself (position, length, name, fades, color, takes) intact.
+// The result is a project REAPER opens without any missing file. Returns the
+// GUIDs (IGUID) of the items that were rewritten. Output is LF-normalized.
+// Unit-tested by tools/chunk_test.cpp.
+struct BlankResult {
+  std::string text;
+  std::set<std::string> guids;
+};
+
+static BlankResult blankMissingSources(const std::string& text,
+                                       const std::function<bool(const std::string&)>& present) {
+  BlankResult r;
+  r.text.reserve(text.size());
+  // Block stack: depth and, for each open block, whether it is an <ITEM and
+  // (for the outermost <SOURCE of a take) whether we are buffering it.
+  struct Open { std::string tag; };
+  std::vector<Open> stack;
+  int itemDepth = -1;             // stack size at which the current item opened
+  std::string itemGuid;           // IGUID of the current item
+  std::vector<std::string> itemGuidStack;
+  // The outermost <SOURCE block directly under an item is buffered whole, then
+  // emitted verbatim or replaced.
+  std::string sourceBuf;
+  size_t sourceDepth = 0;         // stack size at which that source opened (0 = not buffering)
+  std::string sourceIndent;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t eol = text.find('\n', pos);
+    if (eol == std::string::npos) eol = text.size();
+    std::string_view line(text.data() + pos, eol - pos);
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    std::string_view t = ltrim(line);
+    const bool opens = !t.empty() && t.front() == '<';
+    const bool closes = (t == ">");
+    pos = eol + 1;
+
+    if (sourceDepth) {
+      sourceBuf.append(line);
+      sourceBuf.push_back('\n');
+      if (opens) {
+        stack.push_back({std::string(blockTag(t))});
+      } else if (closes) {
+        stack.pop_back();
+        if (stack.size() + 1 == sourceDepth) {
+          // The take's whole source is buffered: keep it, or blank it.
+          bool missing = false;
+          for (std::string f : chunkFilePaths(sourceBuf)) {
+            std::replace(f.begin(), f.end(), '\\', '/');
+            if (!present(f)) { missing = true; break; }
+          }
+          if (missing) {
+            r.text += sourceIndent + "<SOURCE EMPTY\n" + sourceIndent + ">\n";
+            if (!itemGuid.empty()) r.guids.insert(itemGuid);
+          } else {
+            r.text += sourceBuf;
+          }
+          sourceBuf.clear();
+          sourceDepth = 0;
+        }
+      }
+      continue;
+    }
+
+    if (opens) {
+      const std::string tag(blockTag(t));
+      if (tag == "SOURCE" && itemDepth >= 0 && (int)stack.size() == itemDepth + 1) {
+        // Outermost source of a take (a SECTION source nests its inner WAVE
+        // source, which the buffered walk below swallows along with it).
+        sourceDepth = stack.size() + 1;
+        sourceIndent.assign(line.substr(0, line.size() - t.size()));
+        sourceBuf.assign(line);
+        sourceBuf.push_back('\n');
+        stack.push_back({tag});
+        continue;
+      }
+      if (tag == "ITEM") {
+        itemGuidStack.push_back(itemGuid);
+        itemDepth = (int)stack.size();
+        itemGuid.clear();
+      }
+      stack.push_back({tag});
+    } else if (closes) {
+      if (!stack.empty()) {
+        const bool closingItem = stack.back().tag == "ITEM";
+        stack.pop_back();
+        if (closingItem) {
+          itemGuid = itemGuidStack.empty() ? std::string() : itemGuidStack.back();
+          if (!itemGuidStack.empty()) itemGuidStack.pop_back();
+          // Back to the enclosing item, if any (items don't nest, but be safe).
+          itemDepth = -1;
+          for (int i = (int)stack.size() - 1; i >= 0; --i)
+            if (stack[i].tag == "ITEM") { itemDepth = i; break; }
+        }
+      }
+    } else if (itemDepth >= 0 && (int)stack.size() == itemDepth + 1 && t.rfind("IGUID ", 0) == 0) {
+      std::string_view g = ltrim(t.substr(6));
+      itemGuid.assign(g.substr(0, g.find_first_of(" \t")));
+    }
+    r.text.append(line);
+    r.text.push_back('\n');
+  }
+  // Unterminated source at EOF (malformed text): emit what we have verbatim.
+  r.text += sourceBuf;
+  return r;
+}
+
+// Does an item chunk carry a file-backed source? (MIDI, empty and section-less
+// items don't.) Used by the placeholder bookkeeping and the media-blanking guard.
+static bool chunkHasFileSource(const std::string& chunk) {
+  size_t pos = 0;
+  while (pos < chunk.size()) {
+    size_t eol = chunk.find('\n', pos);
+    if (eol == std::string::npos) eol = chunk.size();
+    if (ltrim(std::string_view(chunk.data() + pos, eol - pos)).rfind("FILE ", 0) == 0) return true;
+    pos = eol + 1;
+  }
+  return false;
+}
+
+static bool chunkHasEmptySource(const std::string& chunk) {
+  size_t pos = 0;
+  while (pos < chunk.size()) {
+    size_t eol = chunk.find('\n', pos);
+    if (eol == std::string::npos) eol = chunk.size();
+    if (ltrim(std::string_view(chunk.data() + pos, eol - pos)).rfind("<SOURCE EMPTY", 0) == 0)
+      return true;
+    pos = eol + 1;
+  }
+  return false;
 }
 
 // ---------- shared (non-synced) flag markers ----------
@@ -1546,6 +1708,62 @@ static void internalizeExternalMedia() {
 
 // Defined below, near the tint helpers (needs applyItem / lockedItemsByOthers).
 static void revertLockedItemEdits(Snapshot& snap);
+// Defined below, after applyChangeset.
+static void revertWhileLoading(const json& changeset, const Snapshot& base);
+
+// Progressive-join placeholders never enter the diff, in either direction: a
+// standing placeholder is pinned to its baseline (no chunk/track delta, and no
+// tombstone if the user deleted it locally), and one the baseline doesn't know
+// is dropped from the snapshot (never proposed as a creation).
+static void pinPlaceholderItems(Snapshot& snap) {
+  for (const std::string& guid : g_placeholders) {
+    auto base = g_snapshot.items.find(guid);
+    if (base == g_snapshot.items.end()) {
+      snap.items.erase(guid);
+      continue;
+    }
+    snap.items[guid] = base->second;
+  }
+}
+
+// Last local line of defence before a changeset leaves this REAPER: no item
+// chunk may replace a file-backed source with an empty one (that is exactly
+// what a leaked placeholder looks like, and no REAPER editing gesture produces
+// it), and nothing about a standing placeholder is proposed at all. Judged
+// against `base`, the pre-capture baseline. Returns the filtered changeset
+// ("" when nothing is left). The Rust side repeats the check on both ends.
+static std::string guardMediaBlanking(const std::string& changeset, const Snapshot& base) {
+  json cs = json::parse(changeset, nullptr, false);
+  if (!cs.is_object() || !cs.contains("items") || !cs["items"].is_object()) return changeset;
+  json& items = cs["items"];
+  bool blocked = false;
+  for (auto it = items.begin(); it != items.end();) {
+    const std::string& guid = it.key();
+    json& fields = it.value();
+    bool drop = g_placeholders.count(guid) > 0;
+    if (!drop && fields.is_object() && fields.contains("chunk") && fields["chunk"].is_string()) {
+      const std::string& chunk = fields["chunk"].get_ref<const std::string&>();
+      auto b = base.items.find(guid);
+      const bool hadFile = b != base.items.end() && chunkHasFileSource(b->second.chunk);
+      if (hadFile && chunkHasEmptySource(chunk) && !chunkHasFileSource(chunk)) {
+        fields.erase("chunk");
+        blocked = true;
+        drop = fields.empty();
+      }
+    }
+    if (drop) {
+      blocked = true;
+      it = items.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (!blocked) return changeset;
+  activityEvent("placeholder_blocked", json::object(),
+                "kept an item that is still waiting for its media out of the sync");
+  if (items.empty()) cs.erase("items");
+  return cs.empty() ? std::string() : cs.dump();
+}
 
 static void captureLocalChanges(bool force) {
   // Client: stay silent until the owner's first authoritative state has landed
@@ -1632,8 +1850,22 @@ static void captureLocalChanges(bool force) {
   // state without proposing the edit. Keeping the authoritative baseline
   // also prevents the local lock tint from entering the diff.
   revertLockedItemEdits(snap);
+  pinPlaceholderItems(snap);
 
   std::string changeset = diffSnapshots(g_snapshot, snap);
+  if (!changeset.empty()) changeset = guardMediaBlanking(changeset, g_snapshot);
+  // Progressive join, still loading: the project is view-only until every
+  // media file is here. Snap the edit back to the baseline right away (the
+  // same move a rejected lock makes) instead of proposing it, and keep the
+  // baseline as it was: it IS the authoritative state.
+  if (!changeset.empty() && g_mode == Mode::ClientActive && g_mediaLoading) {
+    json cs = json::parse(changeset, nullptr, false);
+    if (cs.is_object()) revertWhileLoading(cs, g_snapshot);
+    g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+    activityEvent("loading_readonly", json::object(),
+                  "the project is still loading. Editing unlocks once everything is here");
+    return;
+  }
   g_snapshot = std::move(snap);
   // Feed the adaptive throttle (EMA, 30% weight on the fresh sample) with what
   // this capture actually cost.
@@ -1847,6 +2079,7 @@ static void applyItem(const std::string& guid, const json& fields) {
   MediaItem* item = findItemByGuid(guid);
   if (!jsonBool(fields, "present", true)) {
     if (item) DeleteTrackMediaItem(GetMediaItem_Track(item), item);
+    g_placeholders.erase(guid);  // the owner removed it: nothing left to stand in for
     return;
   }
   MediaTrack* tr = nullptr;
@@ -1862,7 +2095,12 @@ static void applyItem(const std::string& guid, const json& fields) {
   if (fields.contains("chunk") && fields["chunk"].is_string()) {
     // The chunk carries the originator's item GUID, so identity is stamped
     // onto newly created items as a side effect.
-    setObjectStateChunk(item, fields["chunk"].get<std::string>());
+    const std::string& chunk = fields["chunk"].get_ref<const std::string&>();
+    setObjectStateChunk(item, chunk);
+    // A file-backed chunk landing on a progressive-join placeholder is its
+    // media arriving: the stand-in is resolved. (A chunk without a FILE line
+    // may be the placeholder itself being re-applied by a local snap-back.)
+    if (!g_placeholders.empty() && chunkHasFileSource(chunk)) g_placeholders.erase(guid);
   }
   UpdateItemInProject(item);
 }
@@ -2122,7 +2360,11 @@ static void applyChangeset(const json& changeset) {
         for (const std::string& rel : missing) reamesh_fetch_file(g_handle, rel.c_str());
         g_deferredItems.push_back(
             {guid, fields, std::move(missing), std::chrono::steady_clock::now()});
-        logEvent("waiting_media", json::object(), "waiting for media of an incoming item...");
+        // A progressive-join placeholder waiting for its media is the expected
+        // case (hundreds at once on a big project): the overlay's progress
+        // strip narrates that; only a genuinely new item gets a log line.
+        if (!g_placeholders.count(guid))
+          logEvent("waiting_media", json::object(), "waiting for media of an incoming item...");
         continue;
       }
       applyItem(guid, fields);
@@ -2220,6 +2462,59 @@ static void applyRemoteChanges() {
   g_applyingRemote = false;
 }
 
+// Put every entity a local edit touched (per `changeset`, the capture diff)
+// back to the baseline `base`: tracks and items the baseline knows are
+// re-applied whole, ones it doesn't (created locally) are removed, and changed
+// project fields are restored. Echo-suppressed, no undo point, like a remote
+// apply. Used while a progressive join is still loading (view-only phase).
+static void revertWhileLoading(const json& changeset, const Snapshot& base) {
+  json revert = json::object();
+  if (changeset.contains("tracks") && changeset["tracks"].is_object()) {
+    json tracks = json::object();
+    for (auto it = changeset["tracks"].begin(); it != changeset["tracks"].end(); ++it) {
+      auto b = base.tracks.find(it.key());
+      tracks[it.key()] = b == base.tracks.end() ? json{{"present", false}} : trackToJson(b->second);
+    }
+    revert["tracks"] = std::move(tracks);
+  }
+  if (changeset.contains("items") && changeset["items"].is_object()) {
+    json items = json::object();
+    for (auto it = changeset["items"].begin(); it != changeset["items"].end(); ++it) {
+      auto b = base.items.find(it.key());
+      items[it.key()] = b == base.items.end()
+                            ? json{{"present", false}}
+                            : json{{"present", true}, {"track", b->second.track}, {"chunk", b->second.chunk}};
+    }
+    revert["items"] = std::move(items);
+  }
+  if (changeset.contains("project") && changeset["project"].is_object() &&
+      changeset["project"].contains("project") && changeset["project"]["project"].is_object()) {
+    json proj = json::object();
+    const json& changed = changeset["project"]["project"];
+    if (changed.contains("tempo")) proj["tempo"] = base.project.tempo;
+    if (changed.contains("markers")) proj["markers"] = base.project.markers;
+    if (changed.contains("notes")) proj["notes"] = base.project.notes;
+    if (changed.contains("title")) proj["title"] = base.project.title;
+    if (changed.contains("author")) proj["author"] = base.project.author;
+    if (changed.contains("groupnames")) proj["groupnames"] = base.project.groupnames;
+    if (changed.contains("timebase")) proj["timebase"] = base.project.timebase;
+    if (!proj.empty()) revert["project"] = json{{"project", std::move(proj)}};
+  }
+  if (revert.empty()) return;
+  g_applyingRemote = true;
+  PreventUIRefresh(1);
+  try {
+    applyChangeset(revert);
+  } catch (const std::exception& e) {
+    logEvent("bad_changeset", {{"error", e.what()}},
+             std::string("couldn't undo an edit made while loading: ") + e.what());
+  }
+  PreventUIRefresh(-1);
+  TrackList_AdjustWindows(false);
+  UpdateArrange();
+  g_applyingRemote = false;
+}
+
 // Retry items that were waiting for media files to arrive from the peers.
 static void processDeferredItems() {
   if (g_deferredItems.empty()) return;
@@ -2235,6 +2530,9 @@ static void processDeferredItems() {
       ready.push_back(std::move(d));
       return true;
     }
+    // While the progressive join's background download is still streaming,
+    // the file is simply queued: the give-up clock only starts once it ends.
+    if (g_downloadBackground) d.since = now;
     if (now - d.since > std::chrono::seconds(90)) {
       logEvent("media_timeout", {{"file", d.missing.front()}},
                "gave up waiting for media: " + d.missing.front());
@@ -2265,8 +2563,11 @@ static void processDeferredItems() {
   // The media behind these items was just fetched, so it has no local peaks
   // yet; queue a background build so the items don't render as flat blocks.
   Main_OnCommand(40047, 0);  // Peaks: Build any missing peaks
-  logEvent("media_applied", {{"count", ready.size()}},
-           "applied " + std::to_string(ready.size()) + " item(s) after media arrived");
+  // While a progressive join is still loading, items land in a steady trickle
+  // and the progress strip tells the story; a per-batch line would flood the feed.
+  if (!g_mediaLoading)
+    logEvent("media_applied", {{"count", ready.size()}},
+             "applied " + std::to_string(ready.size()) + " item(s) after media arrived");
 }
 
 // Retry receives parked because their source track hadn't arrived yet. Same
@@ -2418,7 +2719,9 @@ static void reconcileItemTints() {
   // When the tint is switched off in the app, paint nothing (the empty desired
   // set restores every item to its real colour); the lock still binds: only
   // the visual cue is gone.
-  const std::set<std::string> desired = g_tintEnabled ? lockedItemsByOthers() : std::set<std::string>{};
+  std::set<std::string> desired = g_tintEnabled ? lockedItemsByOthers() : std::set<std::string>{};
+  // Tint placeholders while their media is still downloading.
+  if (g_tintEnabled) desired.insert(g_placeholders.begin(), g_placeholders.end());
   const int tint = lockTintNative();
   const auto now = std::chrono::steady_clock::now();
   bool changed = false;
@@ -2436,7 +2739,8 @@ static void reconcileItemTints() {
       g_itemTints[guid] = {static_cast<int>(GetMediaItemInfo_Value(it, "I_CUSTOMCOLOR")), now, false};
       SetMediaItemInfo_Value(it, "I_CUSTOMCOLOR", static_cast<double>(tint));
       changed = true;
-    } else if (!rec->second.expired && now - rec->second.since > TINT_MAX_AGE) {
+    } else if (!rec->second.expired && now - rec->second.since > TINT_MAX_AGE &&
+               !g_placeholders.count(guid)) {  // a placeholder stays grey until its media lands
       // Safety net: this tint has been up too long with no refreshing update, so
       // it is almost certainly stuck. Restore the real colour and mark it expired
       // so we don't immediately re-grey it; a genuine resume re-tints because the
@@ -2769,6 +3073,11 @@ static void leaveSession(const char* code, json params, const std::string& text)
   g_snapshot = Snapshot{};
   g_deferredItems.clear();
   g_deferredRecv.clear();
+  g_placeholders.clear();
+  g_mediaLoading = false;
+  g_downloadBackground = false;
+  g_placeholdersGivenUp = false;
+  g_placeholderGraceSince = {};
   g_lastChangeCount = -1;
   g_groupNamesAt = -1;  // a new project invalidates the cached group names
   g_lastPeerCount = 0;
@@ -3335,6 +3644,11 @@ static void ctlPublishState() {
   state["verify"] = g_pendingVerify;
   // This client joined without effects (view-only).
   state["nofx"] = g_noFx;
+  // Progressive join: still receiving the project (media streaming in the
+  // background and/or placeholder items waiting for it). Edits snap back
+  // meanwhile; the byte/file counters above keep moving.
+  state["loading"] = g_mediaLoading;
+  state["placeholders"] = g_placeholders.size();
   state["sessions"] = handleJson(reamesh_sessions, json::array());
   state["peers"] = std::move(peers);
 
@@ -3396,18 +3710,68 @@ static void pushLocalPresence() {
 static void openDownloadedProject(std::string path) {
   g_pendingVerify = json();
   g_pendingOpenPath.clear();
-  if (g_noFx) {
-    const std::string text = readFileText(path);
-    if (!text.empty()) {
-      const fs::path stripped = fsPath(path).parent_path() / ".reamesh-nofx.rpp";
-      std::ofstream o(stripped, std::ios::binary | std::ios::trunc);
-      if (o) {
-        o << stripFxBlocks(text, /*takeFxOnly=*/false);
-        o.close();
-        path = fsUtf8(stripped);
-        logEvent("nofx_open", json::object(),
-                 "opening a view-only copy without effects. No third-party code is loaded");
-      }
+  // Progressive join: the download reported ready with media still streaming
+  // (status.background). Items whose media isn't here yet open as empty
+  // placeholders; see the g_placeholders notes.
+  const json st = handleJson(reamesh_status, json::object());
+  const bool progressive = jsonBool(st, "background", false);
+  g_downloadBackground = progressive;
+  g_placeholders.clear();
+  g_placeholdersGivenUp = false;
+  g_placeholderGraceSince = {};
+  std::string text;
+  bool rewritten = false;
+  if (g_noFx || progressive) text = readFileText(path);
+  if (g_noFx && !text.empty()) {
+    text = stripFxBlocks(text, /*takeFxOnly=*/false);
+    rewritten = true;
+  }
+  if (progressive && !text.empty()) {
+    const fs::path projDir = fsPath(path).parent_path();
+    BlankResult r = blankMissingSources(text, [&](const std::string& f) {
+      std::error_code ec;
+      const fs::path fp = fsPath(f);
+      return fs::exists(fp.is_absolute() ? fp : projDir / fp, ec);
+    });
+    if (!r.guids.empty()) {
+      text = std::move(r.text);
+      g_placeholders = std::move(r.guids);
+      rewritten = true;
+      logEvent("progressive_open", {{"count", g_placeholders.size()}},
+               "opening the project now; " + std::to_string(g_placeholders.size()) +
+                   " item(s) are waiting for their media");
+    }
+  }
+  // What REAPER opens vs. what we keep on disk. The downloaded original must
+  // stay byte-identical (this copy is served to other joiners and has to match
+  // the manifest hashes), so a rewritten text goes to a sibling in no-FX mode
+  // (where the project deliberately stays a view-only copy), and for a
+  // progressive open is written over the real path just for the duration of
+  // Main_openProject and restored right after: REAPER reads the file once,
+  // and the project keeps its real name.
+  std::string original;
+  bool restore = false;
+  if (rewritten && g_noFx) {
+    const fs::path stripped = fsPath(path).parent_path() / ".reamesh-nofx.rpp";
+    std::ofstream o(stripped, std::ios::binary | std::ios::trunc);
+    if (o) {
+      o << text;
+      o.close();
+      path = fsUtf8(stripped);
+      logEvent("nofx_open", json::object(),
+               "opening a view-only copy without effects. No third-party code is loaded");
+    } else {
+      g_placeholders.clear();  // opening the original: nothing stands in
+    }
+  } else if (rewritten) {
+    original = readFileText(path);
+    std::ofstream o(fsPath(path), std::ios::binary | std::ios::trunc);
+    if (o && !original.empty()) {
+      o << text;
+      o.close();
+      restore = true;
+    } else {
+      g_placeholders.clear();  // couldn't rewrite: REAPER opens the original as before
     }
   }
   logEvent("download_complete", json::object(), "download complete. Opening " + path);
@@ -3421,6 +3785,10 @@ static void openDownloadedProject(std::string path) {
   ctlPublishState();
   g_applyingRemote = true;
   Main_openProject(path.c_str());
+  if (restore) {
+    std::ofstream o(fsPath(path), std::ios::binary | std::ios::trunc);
+    if (o) o << original;
+  }
   // The loaded project IS the owner's state; baseline it so the load is
   // never diffed as a burst of local edits.
   g_groupNamesAt = -1;  // different project: the cached group names are stale
@@ -3443,6 +3811,7 @@ static void openDownloadedProject(std::string path) {
   // arriving as one changeset) as a flurry of "a track was added" events.
   g_bootstrapSynced = false;
   g_clientActiveSince = std::chrono::steady_clock::now();
+  g_mediaLoading = progressive || !g_placeholders.empty();
   muteActivity(std::chrono::seconds(6));
   g_sessionProjectPath = currentProjectPath();
   logEvent("connected", json::object(),
@@ -3509,6 +3878,37 @@ static void pollDownload() {
   }
 }
 
+// Progressive join: track whether this client is still receiving its project
+// (background download running, or placeholders waiting for media) and flip
+// the editing gate accordingly. Placeholders that outlive the download by
+// PLACEHOLDER_GRACE (their media never came) stop holding the gate but stay
+// pinned out of the sync for good.
+static void updateLoadingState(const json& st) {
+  const bool background = jsonBool(st, "background", false);
+  if (g_downloadBackground && !background)
+    logEvent("media_downloaded", json::object(), "all media files are downloaded");
+  g_downloadBackground = background;
+  const auto now = std::chrono::steady_clock::now();
+  bool waiting = !g_placeholders.empty() && !g_placeholdersGivenUp;
+  if (waiting && !background) {
+    if (g_placeholderGraceSince == std::chrono::steady_clock::time_point{})
+      g_placeholderGraceSince = now;
+    else if (now - g_placeholderGraceSince > PLACEHOLDER_GRACE) {
+      g_placeholdersGivenUp = true;
+      waiting = false;
+      logEvent("placeholders_unresolved", {{"count", g_placeholders.size()}},
+               std::to_string(g_placeholders.size()) +
+                   " item(s) never received their media and stay empty here");
+    }
+  } else {
+    g_placeholderGraceSince = {};
+  }
+  const bool loading = background || waiting;
+  if (g_mediaLoading && !loading)
+    logEvent("media_ready", json::object(), "everything is here. You can edit now");
+  g_mediaLoading = loading;
+}
+
 static void timerTick() {
   if (g_applyingRemote) return;
   // Companion-app commands and state mirroring run in every mode, including
@@ -3549,6 +3949,7 @@ static void timerTick() {
           else leaveSession("host_ended", json::object(), "the host ended the session");
           return;
         }
+        updateLoadingState(st);
       }
       unsigned peers = reamesh_peer_count(g_handle);
       if (peers != g_lastPeerCount) {

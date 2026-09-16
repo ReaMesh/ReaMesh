@@ -13,7 +13,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { formatBytes } from "@/lib/format";
-import { hostSeenCount } from "@/lib/knownHosts";
 import { t } from "@/lib/i18n";
 import { parseFxName, pluginStatus, useInstalledPlugins, type PluginStatus } from "@/lib/plugins";
 import type { SessionPreview } from "@/lib/types";
@@ -116,7 +115,6 @@ export function TrustDialog({
   onOpenChange,
   name,
   hostName,
-  hostPeerId,
   bytes,
   files,
   preview,
@@ -128,8 +126,6 @@ export function TrustDialog({
   name: string;
   /** The host's self-reported display name ("" / undefined = none claimed). */
   hostName?: string;
-  /** The host's peer id, for the "joined before" memory. */
-  hostPeerId?: string;
   /** Announce-level size info (fallback when the preview lacks it). */
   bytes?: number;
   files?: number;
@@ -137,18 +133,14 @@ export function TrustDialog({
   preview?: SessionPreview | null;
   onJoin: (nofx: boolean) => void;
 }) {
-  const seen = hostPeerId ? hostSeenCount(hostPeerId) : 0;
   const totalBytes = preview?.bytes ?? bytes ?? 0;
   const totalFiles = preview?.files ?? files ?? 0;
   const tracks = preview?.meta?.tracks;
   const plugins = preview?.meta?.plugins;
 
-  // One line of facts: "Host: Anna · joined 3× before" (a first join says
-  // nothing), then "12 tracks · 34 files · 1.2 GB". Missing pieces drop out.
-  const hostLine = [
-    hostName ? t("trustHost", { host: hostName }) : null,
-    hostPeerId && seen > 0 ? t("hostSeenBefore", { count: seen }) : null,
-  ].filter(Boolean);
+  // Two lines of facts: "Host: Anna", then "12 tracks · 34 files · 1.2 GB".
+  // Missing pieces drop out.
+  const hostLine = [hostName ? t("trustHost", { host: hostName }) : null].filter(Boolean);
   const stats = [
     typeof tracks === "number" && tracks > 0 ? t("previewTracks", { count: tracks }) : null,
     totalBytes > 0

@@ -214,6 +214,12 @@ function usePluginToasts(state: ExtState | undefined, port: number | undefined) 
       len: log.length,
     };
     for (const e of newEntries) {
+      // Progressive join: a snapped-back edit while loading, and the moment
+      // editing unlocks. The extension rate-limits the former.
+      if (e.code === "loading_readonly" || e.code === "media_ready") {
+        toast(localizeLogEntry(e));
+        continue;
+      }
       if (e.code !== "plugin_added" && e.code !== "plugins_added") continue;
       const plugin = e.code === "plugin_added" ? String(e.params?.plugin ?? "") : "";
       const missing = plugin ? pluginStatus(plugin, installed) === "missing" : false;

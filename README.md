@@ -59,7 +59,9 @@ Remote edits don't create undo points. Undoing an earlier local action can still
 roll back received changes because REAPER uses snapshots for undo. That rollback
 syncs too.
 
-When the host stops the session, everyone keeps their local project copy.
+Large projects can open while media is still downloading. Missing items appear
+as placeholders, and the project stays view-only until loading finishes. When
+the host stops the session, everyone keeps their local project copy.
 
 To use the project's effects, you'll need the plugins installed locally. The
 join preview checks for them in REAPER's plugin caches. You can also join without

@@ -832,6 +832,99 @@ fn mid_session_media_fetch() {
     let _ = fs::remove_dir_all(staging);
 }
 
+/// Progressive join: with enough media outstanding, the client reports `ready`
+/// (with `background: true`) once the project file and the small files are on
+/// disk, while the media keeps streaming; the flag drops when everything has
+/// landed, verified. The extension opens the project at the first `ready`
+/// with placeholder items and lets the deferred-item path fill them in.
+#[test]
+fn progressive_join_reports_ready_before_media() {
+    let project = temp_dir("proj-progressive");
+    let staging = temp_dir("staging-progressive");
+    make_project(&project);
+    // Well above PROGRESSIVE_MIN_BYTES (16 MiB), spread over three files that
+    // the .rpp uses in reverse order, so the timeline ordering is observable.
+    const BIG: usize = 24 * 1024 * 1024;
+    let stems: Vec<(String, Vec<u8>)> = (0..3u8)
+        .map(|k| {
+            let name = format!("Audio/stem{k}.wav");
+            (name, (0..BIG).map(|i| ((i as u64 * (k as u64 + 3)) % 253) as u8).collect())
+        })
+        .collect();
+    for (name, bytes) in &stems {
+        fs::write(project.join(name), bytes).unwrap();
+    }
+    fs::write(
+        project.join("Song.rpp"),
+        "<REAPER_PROJECT 0.1\n<TRACK\n  <ITEM\n    POSITION 30\n    <SOURCE WAVE\n      FILE \"Audio/stem0.wav\"\n    >\n  >\n  <ITEM\n    POSITION 10\n    <SOURCE WAVE\n      FILE \"Audio/stem2.wav\"\n    >\n  >\n>\n>\n",
+    )
+    .unwrap();
+
+    let owner = Reamesh::host("progressive-test", project.to_str().unwrap(), "Song.rpp", "")
+        .expect("host failed");
+    let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
+    let sid = session_id_of(&owner);
+    let discovered = wait_until(Duration::from_secs(20), || {
+        interconnect(&owner, &client);
+        client.sessions_json().contains(&sid)
+    });
+    assert!(discovered, "client never saw the session announcement");
+    assert!(client.join_session(&sid, ""), "join_session refused");
+
+    // Poll tightly: the early `ready` must show up while media is still missing.
+    let mut saw_early = false;
+    let mut first_media_seen: Option<String> = None;
+    let mut client_dir: Option<PathBuf> = None;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        assert_ne!(s["state"], "failed", "download failed: {}", s["message"]);
+        if s["state"] == "ready" {
+            let dir = PathBuf::from(s["project_path"].as_str().unwrap()).parent().unwrap().to_path_buf();
+            client_dir.get_or_insert(dir.clone());
+            let present: Vec<&str> = stems
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .filter(|n| dir.join(n).exists())
+                .collect();
+            if s["background"] == true {
+                saw_early = true;
+                // Ready came with the project file + small files, media pending.
+                assert!(dir.join("Song.rpp").exists());
+                assert!(dir.join("notes.txt").exists());
+                assert!(present.len() < stems.len(), "ready+background with all media present");
+                if first_media_seen.is_none() && present.len() == 1 {
+                    first_media_seen = Some(present[0].to_string());
+                }
+            } else {
+                break; // finished
+            }
+        }
+        assert!(Instant::now() < deadline, "download never finished: {}", client.status_json());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(saw_early, "never observed ready with background=true");
+    let dir = client_dir.unwrap();
+    for (name, bytes) in &stems {
+        assert_eq!(&fs::read(dir.join(name)).unwrap(), bytes, "{name} corrupted");
+    }
+    // Timeline order: the item at POSITION 10 (stem2) comes before the one at
+    // POSITION 30 (stem0); the unreferenced stem1 goes last.
+    if let Some(first) = first_media_seen {
+        assert_eq!(first, "Audio/stem2.wav", "media not delivered in timeline order");
+    }
+    // The final status is the ordinary completed one.
+    let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+    assert_eq!(s["state"], "ready");
+    assert_eq!(s["background"], false);
+    assert_eq!(s["files_done"], s["files_total"]);
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
 /// The passphrase pre-check verifies against the owner without joining: a wrong
 /// one reports `ok=false`, the right one `ok=true`, both via `status.probe`.
 /// This is what lets the app show an inline "wrong password" before any join.

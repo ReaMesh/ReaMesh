@@ -79,6 +79,13 @@ const DOWNLOAD_WINDOW: usize = 16;
 /// would make every piece time out on a slower link; it grows toward
 /// DOWNLOAD_WINDOW as pieces prove to come back quickly.
 const DOWNLOAD_WINDOW_MIN: usize = 4;
+/// Progressive join: once the project file and every non-media file have
+/// landed, and at least this much media is still outstanding, the download
+/// reports `ready` early (status `background: true`) so the extension can open
+/// the project with placeholder items while the media keeps streaming in
+/// behind it. Below this the whole download finishes first, as before: a
+/// sub-second flash of grey placeholders would only look like a glitch.
+const PROGRESSIVE_MIN_BYTES: u64 = 16 * 1024 * 1024;
 /// Minimum gap between two full-state broadcasts. A subscription to the
 /// (publicly announced) session topic needs no passphrase, so a peer flapping
 /// its subscription must not be able to make the owner rebroadcast the whole
@@ -315,6 +322,10 @@ struct StatusState {
     /// Relative path of the file whose chunk arrived most recently ("" outside
     /// a download): the companion app's download screen shows its name.
     current_file: String,
+    /// True while a progressive join is `ready` with media still downloading
+    /// in the background (see PROGRESSIVE_MIN_BYTES). The byte/file counters
+    /// keep moving meanwhile; it drops to false when the last file lands.
+    background: bool,
     project_path: Option<String>,
     session_id: Option<String>,
     session_name: Option<String>,
@@ -334,6 +345,7 @@ impl StatusState {
             "files_done": self.files_done,
             "files_total": self.files_total,
             "current_file": self.current_file,
+            "background": self.background,
             "project_path": self.project_path,
             "session_id": self.session_id,
             "session_name": self.session_name,
@@ -1299,6 +1311,7 @@ impl Reamesh {
             files_done: 0,
             files_total: 0,
             current_file: String::new(),
+            background: false,
             project_path: None,
             session_id: Some(session_id),
             session_name: Some(session_name.to_string()),
@@ -1357,6 +1370,7 @@ impl Reamesh {
             files_done: 0,
             files_total: 0,
             current_file: String::new(),
+            background: false,
             project_path: None,
             session_id: None,
             session_name: None,
@@ -1541,6 +1555,20 @@ impl Reamesh {
             Role::Client => {
                 let mut ds = self.shared.doc.lock().unwrap();
                 let now = Instant::now();
+                // Never propose an item chunk that would blank a file-backed
+                // source (a progressive-join placeholder leaking out). The
+                // extension already keeps placeholders out of its diff; this
+                // is the second line, judged against our view of the doc.
+                let mut parsed = parsed;
+                {
+                    let last = &ds.last_state;
+                    reject_media_blanking(&mut parsed, |id| {
+                        last.get(ITEMS_ROOT).and_then(|s| s.get(id)).and_then(|f| f.get("chunk")).cloned()
+                    }, "local");
+                }
+                if !SECTIONS.iter().any(|s| parsed.get(s).is_some()) {
+                    return;
+                }
                 for section in SECTIONS {
                     let Some(entities) = parsed.get(section).and_then(|t| t.as_object()) else {
                         continue;
@@ -2167,10 +2195,64 @@ impl Drop for Reamesh {
     }
 }
 
-/// Apply a parsed changeset (any subset of sections) into the doc. Returns
-/// the encoded yrs update when something actually changed. Does NOT touch
-/// `last_state`: callers decide whether the change should surface from
-/// drain_remote.
+/// Read one field from the document without taking a full snapshot.
+fn doc_field(doc: &Doc, section: &str, id: &str, field: &str) -> Option<JsonValue> {
+    let root = doc.get_or_insert_map(section);
+    let txn = doc.transact();
+    match root.get(&txn, id)? {
+        Out::YMap(entity) => match entity.get(&txn, field)? {
+            Out::Any(any) => Some(any_to_json(&any)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Would replacing `old_chunk` by `new_chunk` turn a file-backed media item
+/// into an empty one? That is what a progressive-join placeholder (`<SOURCE
+/// EMPTY>` standing in for media still downloading) looks like if it ever
+/// escaped onto the wire, and there is no editing gesture in REAPER that
+/// produces it: a take keeps its source until the item goes. MIDI/section/
+/// empty items never had a FILE line and are unaffected.
+fn blanks_media_source(old_chunk: &str, new_chunk: &str) -> bool {
+    let has_file = |c: &str| c.lines().any(|l| l.trim_start().starts_with("FILE "));
+    let has_empty = |c: &str| c.lines().any(|l| l.trim_start().starts_with("<SOURCE EMPTY"));
+    has_file(old_chunk) && has_empty(new_chunk) && !has_file(new_chunk)
+}
+
+/// Strip every item `chunk` field from `changeset` that would blank a media
+/// source (see `blanks_media_source`), judged against `current(id)`, the chunk
+/// the item has now. Entities and sections left empty are removed too.
+fn reject_media_blanking(
+    changeset: &mut JsonValue,
+    current: impl Fn(&str) -> Option<JsonValue>,
+    who: &str,
+) {
+    let Some(items) = changeset.get_mut(ITEMS_ROOT).and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    let mut dropped = Vec::new();
+    for (id, fields) in items.iter_mut() {
+        let Some(fields) = fields.as_object_mut() else { continue };
+        let Some(new_chunk) = fields.get("chunk").and_then(|v| v.as_str()) else { continue };
+        let Some(old) = current(id) else { continue };
+        let Some(old_chunk) = old.as_str() else { continue };
+        if blanks_media_source(old_chunk, new_chunk) {
+            eprintln!("[reamesh] refused item {id} from {who}: chunk would blank its media source");
+            fields.remove("chunk");
+            if fields.is_empty() {
+                dropped.push(id.clone());
+            }
+        }
+    }
+    for id in dropped {
+        items.remove(&id);
+    }
+    if items.is_empty() {
+        changeset.as_object_mut().map(|o| o.remove(ITEMS_ROOT));
+    }
+}
+
 fn apply_changeset_to_doc(ds: &mut DocState, changeset: &JsonValue) -> Option<Vec<u8>> {
     let roots: Vec<(&str, MapRef)> = SECTIONS
         .iter()
@@ -2619,6 +2701,11 @@ struct FileDl {
     tries: u32,     // hash-mismatch re-downloads
     /// Set after a checksum mismatch: pieces of this file go to the owner only.
     owner_only: bool,
+    /// Whole and verified at `dest` (dedup'd, empty, or renamed into place).
+    complete: bool,
+    /// Audio/video by extension: held back behind the project file and the
+    /// small files, then streamed in timeline order (progressive join).
+    media: bool,
 }
 
 /// One outstanding chunk: which file index, at what byte offset.
@@ -2663,6 +2750,12 @@ struct Download {
     /// blocking task (hashing a GB file would stall the event loop). The
     /// download only finalizes once this drops to zero.
     verifying: usize,
+    /// Media pieces held back until the project file is on disk, so they can
+    /// be queued in timeline order (see `release_media`).
+    media: Vec<Piece>,
+    media_released: bool,
+    /// Progressive join: `ready` was already reported with media outstanding.
+    early_ready: bool,
 }
 
 /// Chunk offsets for a file of `size` bytes.
@@ -3024,7 +3117,7 @@ fn admit_proposal(shared: &Shared, payload: &[u8], proposer: &str) -> Option<Vec
         eprintln!("[reamesh] proposal rejected: wrong or missing session token");
         return None;
     }
-    let parsed = envelope.get("cs")?;
+    let mut parsed = envelope.get("cs")?.clone();
     // Replay guard: a proposal must be newer than the last one admitted from
     // this proposer. gossipsub's duplicate cache forgets a message after a
     // couple of minutes, after which any topic member could re-forward a
@@ -3041,6 +3134,11 @@ fn admit_proposal(shared: &Shared, payload: &[u8], proposer: &str) -> Option<Vec
     }
 
     let mut ds = shared.doc.lock().unwrap();
+    // Third line of the placeholder guard (after the extension's diff pinning
+    // and the client's push_local check): a chunk that would blank a media
+    // source out of an item is refused here too, so no client build, however
+    // broken, can ever strip media from the host's project.
+    reject_media_blanking(&mut parsed, |id| doc_field(&ds.doc, ITEMS_ROOT, id, "chunk"), proposer);
     let now = Instant::now();
     let mut admitted = JsonMap::new();
     for section in SECTIONS {
@@ -3255,6 +3353,9 @@ fn start_join(
         started: Instant::now(),
         last_progress: Instant::now(),
         verifying: 0,
+        media: Vec::new(),
+        media_released: false,
+        early_ready: false,
     })
 }
 
@@ -3429,7 +3530,14 @@ async fn run_network(
                     });
                 }
                 Some(Command::FetchFile(rel)) => {
-                    start_fetch(&mut swarm, &shared, &mut fetches, &mut fetch_reqs, rel);
+                    // A file the running (progressive) download will deliver
+                    // anyway is not fetched a second time on the side.
+                    let in_download = download
+                        .as_ref()
+                        .is_some_and(|dl| dl.files.iter().any(|f| f.meta.path == rel && !f.complete));
+                    if !in_download {
+                        start_fetch(&mut swarm, &shared, &mut fetches, &mut fetch_reqs, rel);
+                    }
                 }
                 Some(Command::ManifestReady(files)) => {
                     if let Some(h) = hosting.as_mut() {
@@ -4278,9 +4386,10 @@ fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()
                             && fs::copy(src, &dest).is_ok()
                     })
                     .unwrap_or(false));
+        let media = is_media_path(&meta.path);
         if reused {
             dl.done += meta.size;
-            dl.files.push(FileDl { meta, tmp: dest.clone(), dest, file: None, remaining: 0, tries: 0, owner_only: false });
+            dl.files.push(FileDl { meta, tmp: dest.clone(), dest, file: None, remaining: 0, tries: 0, owner_only: false, complete: true, media });
             continue;
         }
 
@@ -4304,13 +4413,20 @@ fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()
         if remaining == 0 {
             drop(f); // empty file: complete immediately
             fs::rename(&tmp, &dest)?;
-            dl.files.push(FileDl { meta, tmp, dest, file: None, remaining: 0, tries: 0, owner_only: false });
+            dl.files.push(FileDl { meta, tmp, dest, file: None, remaining: 0, tries: 0, owner_only: false, complete: true, media });
             continue;
         }
+        // Media waits for the project file (release_media orders it by
+        // timeline position); everything else goes first, so the project can
+        // open as soon as the small stuff is here.
         for p in pieces {
-            dl.queue.push_back(p);
+            if media {
+                dl.media.push(p);
+            } else {
+                dl.queue.push_back(p);
+            }
         }
-        dl.files.push(FileDl { meta, tmp, dest, file: Some(f), remaining, tries: 0, owner_only: false });
+        dl.files.push(FileDl { meta, tmp, dest, file: Some(f), remaining, tries: 0, owner_only: false, complete: false, media });
     }
     Ok(())
 }
@@ -4380,9 +4496,121 @@ fn download_finalize(shared: &Shared, download: &mut Option<Download>) {
         s.files_done = files;
         s.files_total = files;
         s.current_file = String::new();
+        s.background = false;
         s.project_path = Some(path.to_string_lossy().into_owned());
     });
     *download = None;
+}
+
+/// Audio/video by extension. Only decides *ordering* within the download
+/// (project text and small files first, media behind them in timeline order)
+/// and what counts toward the progressive-join threshold; an unknown extension
+/// is simply treated as "small stuff" and downloaded up front.
+fn is_media_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [
+        ".wav", ".aif", ".aiff", ".aifc", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aac",
+        ".wv", ".w64", ".rf64", ".caf", ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v",
+        ".mpg", ".mpeg", ".wmv", ".wma", ".mid", ".midi",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+}
+
+/// Earliest timeline position each media file is used at, parsed from RPP
+/// text: every `FILE "…"` line is attributed to the most recent `POSITION`
+/// line (items serialize POSITION before their takes' sources). Paths come
+/// back '/'-separated so they compare equal to manifest paths. Files not
+/// referenced by any item (or referenced by absolute path) are absent.
+fn media_order_from_rpp(text: &str) -> HashMap<String, f64> {
+    let mut out: HashMap<String, f64> = HashMap::new();
+    let mut position = f64::MAX;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("POSITION ") {
+            if let Ok(p) = rest.trim().parse::<f64>() {
+                position = p;
+            }
+        } else if let Some(rest) = t.strip_prefix("FILE ") {
+            let rest = rest.trim_start();
+            let Some(q) = rest.chars().next().filter(|c| matches!(c, '"' | '\'' | '`')) else {
+                continue;
+            };
+            let body = &rest[1..];
+            let Some(end) = body.find(q) else { continue };
+            let path = body[..end].replace('\\', "/");
+            let path = path.strip_prefix("./").unwrap_or(&path).to_string();
+            let e = out.entry(path).or_insert(f64::MAX);
+            if position < *e {
+                *e = position;
+            }
+        }
+    }
+    out
+}
+
+/// Queue the held-back media pieces once the project file is on disk, in the
+/// order the timeline uses them (earliest first), so the arrangement fills in
+/// from the left and the start of the song is playable soonest. Media a
+/// manifest lists but no item references goes last.
+fn release_media(dl: &mut Download) {
+    if dl.media_released {
+        return;
+    }
+    let project_idx = dl.files.iter().position(|f| f.meta.path == dl.project_file);
+    if let Some(i) = project_idx {
+        if !dl.files[i].complete {
+            return; // wait for the project file
+        }
+    }
+    dl.media_released = true;
+    let order = fs::read_to_string(dl.dir.join(&dl.project_file))
+        .map(|t| media_order_from_rpp(&t))
+        .unwrap_or_default();
+    let mut media = std::mem::take(&mut dl.media);
+    let key = |p: &Piece| {
+        let pos = order.get(&dl.files[p.file].meta.path).copied().unwrap_or(f64::MAX);
+        (pos, p.file, p.offset)
+    };
+    media.sort_by(|a, b| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal));
+    dl.queue.extend(media);
+}
+
+/// Nothing left to request, receive or verify: the download can finalize.
+fn download_idle(dl: &Download) -> bool {
+    dl.media_released && dl.media.is_empty() && dl.queue.is_empty() && dl.inflight.is_empty()
+        && dl.verifying == 0
+}
+
+/// Bookkeeping after a file became whole (or right after the plan was built):
+/// release the media queue behind the project file, and report the
+/// progressive-join `ready` once everything but a substantial amount of media
+/// is in place. Idempotent.
+fn download_progress_check(shared: &Shared, dl: &mut Download) {
+    release_media(dl);
+    if dl.early_ready || !dl.media_released {
+        return;
+    }
+    let small_done = dl.files.iter().all(|f| f.media || f.complete);
+    let media_left: u64 = dl.files.iter().filter(|f| f.media && !f.complete).map(|f| f.meta.size).sum();
+    if !small_done || media_left < PROGRESSIVE_MIN_BYTES {
+        return;
+    }
+    dl.early_ready = true;
+    let path = dl.dir.join(&dl.project_file);
+    eprintln!(
+        "[reamesh] project ready, {} bytes of media still downloading: {}",
+        media_left,
+        path.display()
+    );
+    // Serve (and fetch into) this copy from now on; a missing file simply
+    // isn't served yet, requesters fall through to the other peers.
+    *shared.serve_dir.lock().unwrap() = Some(dl.dir.clone());
+    set_status(shared, |s| {
+        s.state = "ready".into();
+        s.background = true;
+        s.project_path = Some(path.to_string_lossy().into_owned());
+    });
 }
 
 /// Per-tick download upkeep: refresh the serving-peer set (swarming), recover
@@ -4492,9 +4720,13 @@ fn handle_download_manifest(
         }
     }
     // Everything may already have been present locally.
-    if let Some(dl) = download.as_ref() {
-        if dl.got_manifest && dl.queue.is_empty() && dl.inflight.is_empty() {
-            download_finalize(shared, download);
+    if let Some(dl) = download.as_mut() {
+        if dl.got_manifest {
+            download_progress_check(shared, dl);
+            download_pump(swarm, dl);
+            if download_idle(dl) {
+                download_finalize(shared, download);
+            }
         }
     }
 }
@@ -4588,6 +4820,8 @@ fn handle_download_piece(
                 let dest = fd.dest.display().to_string();
                 return download_fail(download, shared, format!("finalize {dest}: {e}"));
             }
+            fd.complete = true;
+            download_progress_check(shared, dl);
         } else {
             // Hash on a blocking task: a multi-GB file would otherwise stall
             // every in-flight response while the event loop grinds blake3.
@@ -4603,7 +4837,7 @@ fn handle_download_piece(
         }
     }
 
-    if dl.queue.is_empty() && dl.inflight.is_empty() && dl.verifying == 0 {
+    if download_idle(dl) {
         return download_finalize(shared, download);
     }
     download_pump(swarm, dl);
@@ -4640,6 +4874,8 @@ fn handle_verify_result(
             let dest = fd.dest.display().to_string();
             return download_fail(download, shared, format!("finalize {dest}: {e}"));
         }
+        fd.complete = true;
+        download_progress_check(shared, dl);
     } else {
         fd.tries += 1;
         if fd.tries > 3 {
@@ -4677,7 +4913,7 @@ fn handle_verify_result(
         });
     }
 
-    if dl.queue.is_empty() && dl.inflight.is_empty() && dl.verifying == 0 {
+    if download_idle(dl) {
         return download_finalize(shared, download);
     }
     download_pump(swarm, dl);
@@ -5231,6 +5467,52 @@ pub extern "C" fn reamesh_shutdown(handle: *mut Reamesh) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_order_follows_item_positions() {
+        let rpp = "<REAPER_PROJECT\n<TRACK\n  <ITEM\n    POSITION 12.5\n    <SOURCE WAVE\n      FILE \"Audio\\late.wav\"\n    >\n  >\n  <ITEM\n    POSITION 3\n    <SOURCE SECTION\n      <SOURCE WAVE\n        FILE 'Audio/early.wav'\n      >\n    >\n  >\n  <ITEM\n    POSITION 40\n    <SOURCE WAVE\n      FILE \"Audio/early.wav\"\n    >\n  >\n>\n>\n";
+        let order = media_order_from_rpp(rpp);
+        assert_eq!(order["Audio/early.wav"], 3.0); // earliest use wins
+        assert_eq!(order["Audio/late.wav"], 12.5); // backslashes normalized
+        assert!(!order.contains_key("Audio/unused.wav"));
+    }
+
+    #[test]
+    fn media_blanking_is_refused_only_for_file_to_empty() {
+        let wave = "<ITEM\n  POSITION 1\n  <SOURCE WAVE\n    FILE \"Audio/kick.wav\"\n  >\n>\n";
+        let empty = "<ITEM\n  POSITION 1\n  <SOURCE EMPTY\n  >\n>\n";
+        let midi = "<ITEM\n  POSITION 1\n  <SOURCE MIDI\n    E 0 90 3c 60\n  >\n>\n";
+        let moved = "<ITEM\n  POSITION 2\n  <SOURCE WAVE\n    FILE \"Audio/kick.wav\"\n  >\n>\n";
+        assert!(blanks_media_source(wave, empty));
+        assert!(!blanks_media_source(wave, moved)); // ordinary edit
+        assert!(!blanks_media_source(empty, wave)); // media arriving: the good direction
+        assert!(!blanks_media_source(midi, empty)); // never had a file
+        assert!(!blanks_media_source(empty, empty));
+
+        let mut cs = json!({
+            "items": {
+                "a": {"chunk": empty, "track": "t"},
+                "b": {"chunk": moved},
+                "c": {"chunk": empty}
+            },
+            "tracks": {"t": {"name": "Drums"}}
+        });
+        let current = |id: &str| match id {
+            "a" | "b" => Some(JsonValue::String(wave.to_string())),
+            "c" => Some(JsonValue::String(midi.to_string())),
+            _ => None,
+        };
+        reject_media_blanking(&mut cs, current, "test");
+        assert_eq!(cs["items"]["a"], json!({"track": "t"})); // chunk gone, move kept
+        assert_eq!(cs["items"]["b"]["chunk"], moved);
+        assert_eq!(cs["items"]["c"]["chunk"], empty); // MIDI → empty is not media blanking
+        assert_eq!(cs["tracks"]["t"]["name"], "Drums");
+
+        // A changeset that only carried the blanking collapses to nothing.
+        let mut lone = json!({"items": {"a": {"chunk": empty}}});
+        reject_media_blanking(&mut lone, current, "test");
+        assert!(lone.get("items").is_none());
+    }
 
     #[test]
     fn ct_eq_matches_only_identical_slices() {

@@ -46,6 +46,12 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   follow_ended: "followEnded",
   nofx_open: "nofxOpen",
   verify_hold: "verifyHold",
+  progressive_open: "logProgressiveOpen",
+  loading_readonly: "logLoadingReadonly",
+  media_downloaded: "logMediaDownloaded",
+  media_ready: "logMediaReady",
+  placeholders_unresolved: "logPlaceholdersUnresolved",
+  placeholder_blocked: "logPlaceholderBlocked",
 };
 
 export function localizeLogEntry(entry: LogEntry | string): string {

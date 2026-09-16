@@ -352,6 +352,108 @@ int main() {
   // The name must start with the prefix, not merely contain it.
   assert(!isSharedMarkerName("x \xE2\x9A\x91 y"));
 
+  // ---- progressive join: placeholder rewrite (blankMissingSources) ----
+  {
+    const std::string proj =
+        "<REAPER_PROJECT 0.1\n"
+        "  <TRACK {T1}\n"
+        "    NAME \"Drums\"\n"
+        "    <ITEM\n"
+        "      POSITION 1\n"
+        "      LENGTH 4\n"
+        "      IGUID {ITEM-MISSING}\n"
+        "      NAME \"kick\"\n"
+        "      GUID {TAKE-1}\n"
+        "      <SOURCE WAVE\n"
+        "        FILE \"Audio\\kick.wav\"\n"
+        "      >\n"
+        "    >\n"
+        "    <ITEM\n"
+        "      POSITION 5\n"
+        "      IGUID {ITEM-PRESENT}\n"
+        "      <SOURCE WAVE\n"
+        "        FILE \"Audio/snare.wav\"\n"
+        "      >\n"
+        "    >\n"
+        "    <ITEM\n"
+        "      POSITION 9\n"
+        "      IGUID {ITEM-MIDI}\n"
+        "      <SOURCE MIDI\n"
+        "        HASDATA 1 960 QN\n"
+        "        E 0 90 3c 60\n"
+        "      >\n"
+        "    >\n"
+        "    <ITEM\n"
+        "      POSITION 12\n"
+        "      IGUID {ITEM-SECTION}\n"
+        "      <SOURCE SECTION\n"
+        "        LENGTH 2\n"
+        "        <SOURCE WAVE\n"
+        "          FILE \"Audio/reversed.wav\"\n"
+        "        >\n"
+        "      >\n"
+        "      TAKE\n"
+        "      GUID {TAKE-2}\n"
+        "      <SOURCE WAVE\n"
+        "        FILE \"Audio/snare.wav\"\n"
+        "      >\n"
+        "    >\n"
+        "  >\n"
+        ">\n";
+    const auto present = [](const std::string& f) { return f == "Audio/snare.wav"; };
+    const BlankResult r = blankMissingSources(proj, present);
+    // Exactly the items with a missing file are reported, by IGUID.
+    assert((r.guids == std::set<std::string>{"{ITEM-MISSING}", "{ITEM-SECTION}"}));
+    // Missing sources became EMPTY; present ones (incl. the second take of the
+    // SECTION item) and MIDI survive verbatim; the item shells stay intact.
+    assert(r.text.find("kick.wav") == std::string::npos);
+    assert(r.text.find("reversed.wav") == std::string::npos);
+    assert(r.text.find("<SOURCE SECTION") == std::string::npos);
+    // A SECTION source and its nested WAVE collapse into ONE empty source.
+    assert(std::count(r.text.begin(), r.text.end(), '<') == std::count(proj.begin(), proj.end(), '<') - 1);
+    assert(r.text.find("      <SOURCE EMPTY\n      >\n") != std::string::npos);  // indentation kept
+    assert(r.text.find("FILE \"Audio/snare.wav\"") != std::string::npos);
+    assert(r.text.find("E 0 90 3c 60") != std::string::npos);
+    assert(r.text.find("NAME \"kick\"") != std::string::npos);
+    assert(r.text.find("POSITION 12") != std::string::npos);
+    assert(r.text.find("GUID {TAKE-2}") != std::string::npos);
+    // Balanced: every block still closes.
+    {
+      int depth = 0;
+      size_t pos = 0;
+      while (pos < r.text.size()) {
+        size_t eol = r.text.find('\n', pos);
+        if (eol == std::string::npos) eol = r.text.size();
+        std::string_view t = ltrim(std::string_view(r.text.data() + pos, eol - pos));
+        if (!t.empty() && t.front() == '<') ++depth;
+        else if (t == ">") --depth;
+        assert(depth >= 0);
+        pos = eol + 1;
+      }
+      assert(depth == 0);
+    }
+    // Nothing missing: byte-identical (LF) output, no GUIDs.
+    const BlankResult none = blankMissingSources(proj, [](const std::string&) { return true; });
+    assert(none.guids.empty());
+    assert(none.text == proj);
+    // Idempotent: a placeholder text has no files left to blank.
+    const BlankResult again = blankMissingSources(r.text, present);
+    assert(again.guids.empty());
+    assert(again.text == r.text);
+    // CRLF input rewrites to the same LF text.
+    std::string crlfProj;
+    for (char c : proj) {
+      if (c == '\n') crlfProj.push_back('\r');
+      crlfProj.push_back(c);
+    }
+    assert(blankMissingSources(crlfProj, present).text == r.text);
+    // The two source classifiers behind the guards.
+    assert(chunkHasFileSource("<ITEM\n  <SOURCE WAVE\n    FILE \"a.wav\"\n  >\n>\n"));
+    assert(!chunkHasFileSource("<ITEM\n  <SOURCE EMPTY\n  >\n>\n"));
+    assert(chunkHasEmptySource("<ITEM\n  <SOURCE EMPTY\n  >\n>\n"));
+    assert(!chunkHasEmptySource("<ITEM\n  <SOURCE MIDI\n  >\n>\n"));
+  }
+
   printf("chunk_test: all assertions passed\n");
   return 0;
 }

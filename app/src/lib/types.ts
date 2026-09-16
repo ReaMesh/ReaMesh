@@ -129,6 +129,13 @@ export interface ExtState {
   verify?: { extras: string[]; listed: boolean } | null;
   /** This client joined without effects (view-only, every FX chain stripped). */
   nofx?: boolean;
+  /** Progressive join: the project is open but still being received (media
+   *  downloading in the background and/or placeholder items waiting for it).
+   *  Edits snap back meanwhile; the download counters above keep moving. */
+  loading?: boolean;
+  /** Items currently shown as empty placeholders because their media hasn't
+   *  arrived yet (progressive join). */
+  placeholders?: number;
 }
 
 /** One running REAPER instance (= one control server port). */

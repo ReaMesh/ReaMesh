@@ -14,8 +14,9 @@ import { currentMonitor, getCurrentWindow, LogicalSize } from "@tauri-apps/api/w
 import { Hint, HintProvider } from "@/components/Hint";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { TrackNumber } from "@/components/Rolling";
-import { t, useLang } from "@/lib/i18n";
-import { displayName, type Peer } from "@/lib/types";
+import { formatBytes, useTransfer } from "@/lib/format";
+import { resolveLang, t, useLang } from "@/lib/i18n";
+import { displayName, type ExtState, type Peer } from "@/lib/types";
 import { useOverlaySettings } from "@/lib/overlaySettings";
 import { useOverlayState } from "./useOverlayState";
 
@@ -151,6 +152,50 @@ function PeerRow({
 
 const STACK_MAX = 4;
 
+/** Show background media-transfer progress while the project is open.
+ *  Hide the row once all files arrive and editing unlocks. */
+function LoadingStrip({ state }: { state: ExtState }) {
+  const lang = resolveLang();
+  const done = state.done_bytes || 0;
+  const total = state.total_bytes || 0;
+  const pct = total > 0 ? Math.min(100, Math.floor((done / total) * 100)) : 0;
+  const { rate } = useTransfer(done, total);
+  const filesTotal = state.files_total || 0;
+  const detail = [
+    filesTotal > 0 ? t("loadingFilesOf", { done: state.files_done || 0, total: filesTotal }) : null,
+    total > 0 ? `${formatBytes(done, lang)} / ${formatBytes(total, lang)}` : null,
+    rate > 0 ? `${formatBytes(rate, lang)}/s` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <div className="border-t border-white/10 px-2.5 pt-1.5 pb-2" role="status" aria-live="polite">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-[11px] font-medium">{t("loadingMedia")}</span>
+        <span className="text-[10px] tabular-nums text-muted-foreground">{pct}%</span>
+      </div>
+      <div
+        className="mt-1 h-1 overflow-hidden rounded-full bg-white/10"
+        role="progressbar"
+        aria-label={t("loadingMedia")}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={pct}
+      >
+        <motion.div
+          className="h-full rounded-full bg-found"
+          initial={false}
+          animate={{ width: `${pct}%` }}
+          transition={{ type: "spring", stiffness: 120, damping: 26 }}
+        />
+      </div>
+      <p className="mt-1 truncate text-[10px] text-muted-foreground">
+        {pct < 100 && detail ? detail : t("loadingEditsLocked")}
+      </p>
+    </div>
+  );
+}
+
 /** Overlapping identity avatars, shown only when collapsed. */
 function AvatarStack({ peers }: { peers: Peer[] }) {
   const extra = peers.length - STACK_MAX;
@@ -225,6 +270,12 @@ export function Overlay({ port }: { port: number | null }) {
 
   const peers = state?.peers ?? [];
   const reveal = (peer: Peer) => send({ cmd: "reveal_peer", peer_id: peer.id });
+  // Progressive join: media still arriving behind the open project.
+  const loading = !!state && state.mode === "client" && !!state.loading;
+  const loadPct =
+    loading && (state.total_bytes || 0) > 0
+      ? Math.min(100, ((state.done_bytes || 0) / (state.total_bytes || 1)) * 100)
+      : 0;
 
   // Window drag by hand instead of `data-tauri-drag-region`: Tauri's injected
   // drag script also maximizes the window on a double-click, and on macOS tao
@@ -330,8 +381,29 @@ export function Overlay({ port }: { port: number | null }) {
     >
       <div
         onMouseDown={dragWindow}
-        className="flex h-9 items-center gap-2 px-2.5"
+        className="relative flex h-9 items-center gap-2 px-2.5"
       >
+        {/* Collapsed, the strip below is hidden: a hairline along the header's
+            bottom edge keeps the download visible without taking any room. */}
+        <AnimatePresence initial={false}>
+          {collapsed && loading && (
+            <motion.div
+              key="hairline"
+              aria-hidden
+              className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-white/10"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+            >
+              <motion.div
+                className="h-full bg-found"
+                initial={false}
+                animate={{ width: `${loadPct}%` }}
+                transition={{ type: "spring", stiffness: 120, damping: 26 }}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
         <div
           onMouseDown={dragWindow}
           className="flex min-w-0 flex-1 items-center"
@@ -376,6 +448,20 @@ export function Overlay({ port }: { port: number | null }) {
             transition={{ type: "spring", stiffness: 400, damping: 38 }}
             style={{ overflow: "hidden" }}
           >
+            <AnimatePresence initial={false}>
+              {loading && state && (
+                <motion.div
+                  key="loading"
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: "auto", opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  transition={{ type: "spring", stiffness: 400, damping: 38 }}
+                  className="overflow-hidden"
+                >
+                  <LoadingStrip state={state} />
+                </motion.div>
+              )}
+            </AnimatePresence>
             {settings.roster && (
               <div
                 className="scroll-slim overflow-y-auto border-t border-white/10 px-1.5 py-1.5"

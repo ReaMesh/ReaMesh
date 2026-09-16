@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
-import { Check, Crown, Eye, EyeOff, Snowflake, Ticket, TriangleAlert } from "lucide-react";
+import { Check, Crown, Download, Eye, EyeOff, Snowflake, Ticket, TriangleAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -16,8 +16,9 @@ import { Hint, HintProvider } from "@/components/Hint";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { Rolling, TrackNumber } from "@/components/Rolling";
 import { send } from "@/lib/connection";
+import { formatBytes, useTransfer } from "@/lib/format";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
-import { t } from "@/lib/i18n";
+import { resolveLang, t } from "@/lib/i18n";
 import { displayName, type ExtState, type Peer } from "@/lib/types";
 import { LinkNotice } from "@/components/LinkNotice";
 import { cn, focusRing } from "@/lib/utils";
@@ -234,6 +235,58 @@ function HostPassword({ pass }: { pass: string }) {
   );
 }
 
+// Show background media-transfer progress until the project is fully received.
+function LoadingNotice({ state }: { state: ExtState }) {
+  const lang = resolveLang();
+  const done = state.done_bytes || 0;
+  const total = state.total_bytes || 0;
+  const pct = total > 0 ? Math.min(100, Math.floor((done / total) * 100)) : 0;
+  const { rate } = useTransfer(done, total);
+  const filesTotal = state.files_total || 0;
+  const detail = [
+    filesTotal > 0 ? t("loadingFilesOf", { done: state.files_done || 0, total: filesTotal }) : null,
+    total > 0 ? `${formatBytes(done, lang)} / ${formatBytes(total, lang)}` : null,
+    rate > 0 ? `${formatBytes(rate, lang)}/s` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <motion.div
+      layout
+      initial={{ opacity: 0, y: -4 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -4 }}
+      className="flex flex-col gap-1.5 rounded-xl bg-card px-3 py-2.5"
+      role="status"
+      aria-live="polite"
+    >
+      <div className="flex items-center gap-2 text-[12px]">
+        <Download className="size-3.5 shrink-0 text-found" aria-hidden="true" />
+        <span className="min-w-0 flex-1 truncate font-medium">{t("loadingMedia")}</span>
+        <span className="shrink-0 tabular-nums text-muted-foreground">{pct}%</span>
+      </div>
+      <div
+        className="h-1 overflow-hidden rounded-full bg-secondary"
+        role="progressbar"
+        aria-label={t("loadingMedia")}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={pct}
+      >
+        <motion.div
+          className="h-full rounded-full bg-found"
+          initial={false}
+          animate={{ width: `${pct}%` }}
+          transition={{ type: "spring", stiffness: 120, damping: 26 }}
+        />
+      </div>
+      <p className="truncate text-[11px] text-muted-foreground">
+        {pct < 100 && detail ? `${detail} · ${t("loadingEditsLocked")}` : t("loadingEditsLocked")}
+      </p>
+    </motion.div>
+  );
+}
+
 export function Session({
   state,
   port,
@@ -281,12 +334,23 @@ export function Session({
             </Badge>
           </Hint>
         )}
+        {/* Progressive join: still receiving the project; edits snap back. */}
+        {!hosting && state.loading && (
+          <Hint label={t("loadingBadgeHint")}>
+            <Badge variant="outline" className="shrink-0 border-found/40 text-found">
+              {t("loadingMediaShort")}
+            </Badge>
+          </Hint>
+        )}
         <Badge variant={hosting ? "default" : "secondary"} className="shrink-0">
           {hosting ? t("hostingBadge") : t("connectedBadge")}
         </Badge>
       </div>
 
-      {/* Explain lag before someone blames the app for it. */}
+      <AnimatePresence initial={false}>
+        {!hosting && state.loading && <LoadingNotice key="loading" state={state} />}
+      </AnimatePresence>
+
       <LinkNotice peers={state.peers} hosting={hosting} />
 
       <div className="flex min-h-0 flex-col gap-2">
