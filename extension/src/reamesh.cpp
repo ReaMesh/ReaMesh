@@ -3176,6 +3176,21 @@ static void beginReconnect(const json& st) {
   g_reconnect = std::move(rc);
 }
 
+// The session ended under us (status "ended"). A vanished host triggers an
+// automatic rejoin attempt; everything else sends the user back to the lobby
+// with a message that says why. Being kicked or banned is never retried:
+// the host asked us to go (a kicked user can still rejoin by hand).
+static void onSessionEnded(const json& st) {
+  const std::string why = jsonStr(st, "end_reason");
+  if (why == "host_lost") beginReconnect(st);
+  else if (why == "kicked")
+    leaveSession("kicked", json::object(), "the host removed you from the session");
+  else if (why == "banned")
+    leaveSession("banned", {{"minutes", 30}},
+                 "the host blocked you from this session for 30 minutes");
+  else leaveSession("host_ended", json::object(), "the host ended the session");
+}
+
 // Browsing-mode tick while an auto-rejoin is pending: rejoin as soon as the
 // session is announced again, give up (back to the plain lobby) on deadline.
 static void reconnectTick() {
@@ -3424,6 +3439,40 @@ static void revealPeer(const std::string& peerId) {
   UpdateArrange();
 }
 
+// Host-side moderation from the app's roster: kick (they may rejoin at once)
+// or ban (their device is kept out for 30 minutes; see reamesh_bans). The
+// name is resolved before the call because the peer is gone from the roster
+// the moment the core accepts it.
+static void moderatePeer(const std::string& peerId, bool ban) {
+  if (peerId.empty() || g_mode != Mode::Hosting || !g_handle) return;
+  std::string name;
+  json peers = handleJson(reamesh_peers, json::array());
+  if (peers.is_array())
+    for (const auto& p : peers)
+      if (p.is_object() && jsonStr(p, "id") == peerId) name = jsonStr(p, "name");
+  if (!reamesh_moderate(g_handle, peerId.c_str(), ban)) return;
+  const std::string who = name.empty() ? "a guest" : name;
+  if (ban)
+    logEvent("peer_banned", {{"name", name}}, "blocked " + who + " for 30 minutes");
+  else
+    logEvent("peer_kicked", {{"name", name}}, "removed " + who + " from the session");
+}
+
+static void unbanPeer(const std::string& peerId) {
+  if (peerId.empty()) return;
+  std::string name;
+  if (char* b = reamesh_bans()) {
+    json bans = json::parse(b, nullptr, false);
+    reamesh_free_string(b);
+    if (bans.is_array())
+      for (const auto& e : bans)
+        if (e.is_object() && jsonStr(e, "id") == peerId) name = jsonStr(e, "name");
+  }
+  if (!reamesh_unban(peerId.c_str())) return;
+  logEvent("peer_unbanned", {{"name", name}},
+           "unblocked " + (name.empty() ? std::string("a guest") : name));
+}
+
 static void ctlDispatch(const json& cmd) {
   const std::string c = jsonStr(cmd, "cmd");
   const auto cmdBool = [&](const char* key) {
@@ -3464,6 +3513,10 @@ static void ctlDispatch(const json& cmd) {
       openDownloadedProject(g_pendingOpenPath);
   } else if (c == "share_marker") {
     shareMarker(jsonStr(cmd, "name"));
+  } else if (c == "kick" || c == "ban") {
+    moderatePeer(jsonStr(cmd, "peer_id"), c == "ban");
+  } else if (c == "unban") {
+    unbanPeer(jsonStr(cmd, "peer_id"));
   } else if (c == "follow") {
     // "" stops following. Following yourself is meaningless: ignore it.
     const std::string pid = jsonStr(cmd, "peer_id");
@@ -3636,6 +3689,17 @@ static void ctlPublishState() {
     }
   }
   state["ticket"] = ticket;
+  // Live ban table ([{id,name,expires_at}]): process-global, so it is shown
+  // (and revocable) whether or not a session is running right now.
+  {
+    json bans = json::array();
+    if (char* b = reamesh_bans()) {
+      json parsed = json::parse(b, nullptr, false);
+      reamesh_free_string(b);
+      if (parsed.is_array()) bans = std::move(parsed);
+    }
+    state["bans"] = std::move(bans);
+  }
   // Pre-host media-copy warning ({files,bytes,free,cloud,enough} or null):
   // the app confirms before re-sending host with confirm:true.
   state["host_warning"] = g_hostWarning;
@@ -3853,7 +3917,10 @@ static void pollDownload() {
     // "Beitritt fehlgeschlagen: manifest timeout". `join_failed` with a
     // {reason} stays as the last-resort fallback for anything genuinely
     // unexpected.
-    if (msg.find("passphrase") != std::string::npos)
+    if (msg.find("banned from this session") != std::string::npos)
+      leaveSession("banned", {{"minutes", 30}},
+                   "the host has blocked you from this session");
+    else if (msg.find("passphrase") != std::string::npos)
       leaveSession("wrong_password", json::object(), "join failed: " + msg);
     else if (msg.find("ticket host unreachable") != std::string::npos)
       leaveSession("ticket_unreachable", json::object(),
@@ -3873,8 +3940,7 @@ static void pollDownload() {
     // The host went away while we were still downloading. Deliberate stop →
     // leave; vanished without a farewell → try to rejoin automatically (the
     // partial download dedups, so the retry is cheap).
-    if (jsonStr(st, "end_reason") == "host_lost") beginReconnect(st);
-    else leaveSession("host_ended", json::object(), "the host ended the session");
+    onSessionEnded(st);
   }
 }
 
@@ -3945,8 +4011,7 @@ static void timerTick() {
       if (g_mode == Mode::ClientActive) {
         json st = handleJson(reamesh_status, json::object());
         if (jsonStr(st, "state") == "ended") {
-          if (jsonStr(st, "end_reason") == "host_lost") beginReconnect(st);
-          else leaveSession("host_ended", json::object(), "the host ended the session");
+          onSessionEnded(st);
           return;
         }
         updateLoadingState(st);

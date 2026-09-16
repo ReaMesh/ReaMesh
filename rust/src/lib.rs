@@ -32,7 +32,7 @@
 
 mod ctl;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -170,6 +170,22 @@ const RTT_STALE: Duration = Duration::from_secs(60);
 /// Session farewell: published by the owner right before it stops hosting so
 /// clients end cleanly instead of waiting out a silence.
 const TAG_SESSION_END: u8 = b'E';
+/// Moderation: `'K'` + JSON `{"peer","ban"}`, owner -> all. The named peer
+/// ends its session (`end_reason` "kicked" or "banned"); everyone else drops
+/// it from their roster at once. A kick is a polite "leave now": the peer may
+/// rejoin immediately. A ban also puts the peer id on the ban table below.
+const TAG_KICK: u8 = b'K';
+/// Ban table: `'B'` + JSON `{"bans":[peer id...]}`, owner -> all, republished
+/// whenever the live set changes (a ban, a revoke, an expiry) and to every
+/// (re)joining peer. Every session member refuses file requests from, drops
+/// gossip of, and blacklists the listed peers, so a banned peer that ignores
+/// its 'K' still gets nothing: not the project (every peer serves files), not
+/// a roster entry, not an admitted edit.
+const TAG_BANS: u8 = b'B';
+/// How long a ban keeps a peer id (the lasting per-install identity, i.e.
+/// "this device") out. Process-global on the host, so it survives a re-host
+/// within the window; not persisted across a REAPER restart.
+pub const BAN_DURATION: Duration = Duration::from_secs(30 * 60);
 /// Sealed envelope: `'X'` + 24-byte nonce + XChaCha20-Poly1305 ciphertext of a
 /// whole tagged message (tag byte included, so even message *types* are
 /// hidden). In a passphrase-protected session every session-topic message is
@@ -528,6 +544,13 @@ struct Shared {
     /// extension to drain on its main-thread tick and drop into the project as
     /// local, non-synced markers.
     marker_inbox: Mutex<Vec<JsonValue>>,
+    /// Peer ids currently banned from this session: on the owner a mirror of
+    /// the process-global ban table (refreshed every tick; the tick's diff
+    /// against it is what triggers the blacklist + 'B' broadcast), on a
+    /// client what the owner last broadcast ('B'). Consulted by gossip
+    /// dispatch, the roster, and (on clients) file serving; the owner serves
+    /// against the live table itself.
+    banned: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -563,6 +586,70 @@ struct PeerPresence {
 /// per-session: it describes the user, not the session, and must survive
 /// host/join/leave cycles.
 static PROFILE: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+
+/// One banned peer: the display name it had when banned (for the host's ban
+/// list; "" if it never beaconed one) and when the ban lapses, both as a
+/// monotonic deadline (for pruning) and as wall-clock unix ms (for the UI: an
+/// absolute stamp keeps the composed app state from churning every tick).
+#[derive(Clone, Debug)]
+struct Ban {
+    name: String,
+    /// Identity color at ban time (the roster's, so the host recognises the
+    /// avatar in the ban list; the id-derived default if it never sent one).
+    color: String,
+    until: Instant,
+    until_unix_ms: u64,
+}
+
+/// Process-wide ban table, peer id -> ban. Global like PROFILE: a ban is about
+/// the *device* (its lasting peer id), not the session, and it must outlive a
+/// stop-hosting / re-host cycle inside its window. Expired entries are pruned
+/// on every read.
+static BANS: std::sync::LazyLock<Mutex<HashMap<String, Ban>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The live ban table (expired entries pruned), as `(peer id, ban)` pairs.
+fn live_bans() -> Vec<(String, Ban)> {
+    let mut bans = BANS.lock().unwrap();
+    let now = Instant::now();
+    bans.retain(|_, b| b.until > now);
+    let mut out: Vec<(String, Ban)> = bans.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    out.sort_by(|a, b| a.1.until.cmp(&b.1.until));
+    out
+}
+
+/// Peer ids currently banned (see `live_bans`).
+fn banned_ids() -> HashSet<String> {
+    live_bans().into_iter().map(|(id, _)| id).collect()
+}
+
+/// The live ban list for the companion app, as a JSON array of
+/// `{"id","name","color","expires_at"}` (`expires_at` = unix ms), soonest to lapse
+/// first. Independent of any session handle: the table is process-global.
+pub fn bans_json() -> String {
+    let arr: Vec<JsonValue> = live_bans()
+        .into_iter()
+        .map(|(id, b)| {
+            json!({ "id": id, "name": b.name, "color": b.color, "expires_at": b.until_unix_ms })
+        })
+        .collect();
+    json!(arr).to_string()
+}
+
+/// Revoke a ban early. Returns whether the peer was banned. The hosting
+/// network task notices the table change on its next tick and republishes it
+/// (so every session member un-blacklists the peer); nothing to do when not
+/// hosting: the entry is simply gone.
+pub fn unban(peer_id: &str) -> bool {
+    BANS.lock().unwrap().remove(peer_id).is_some()
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 pub fn set_profile(name: &str, color: &str) {
     let mut p = PROFILE.lock().unwrap();
@@ -1231,6 +1318,10 @@ enum Command {
     /// Share a flag marker with every session peer (one 'M' publish). The
     /// sharer's display name and color are stamped on from the live profile.
     ShareMarker { name: String, pos: f64 },
+    /// Owner-side moderation: tell `peer` to leave (one 'K' publish), and with
+    /// `ban` also keep it out for BAN_DURATION (the table itself is updated
+    /// synchronously by `Reamesh::moderate`; the task publishes the change).
+    Moderate { peer: String, ban: bool },
     Shutdown,
 }
 
@@ -1424,6 +1515,7 @@ impl Reamesh {
             reverts_detail: Mutex::new(VecDeque::new()),
             peer_locks: Mutex::new(HashMap::new()),
             peer_locks_at: Mutex::new(None),
+            banned: Mutex::new(HashSet::new()),
             force_revert: Mutex::new(Vec::new()),
             probe_result: Mutex::new(None),
             proposal_seq: AtomicU64::new(0),
@@ -1955,6 +2047,50 @@ impl Reamesh {
         self.cmd_tx.send(Command::ShareMarker { name, pos }).is_ok()
     }
 
+    /// Owner-side moderation: make `peer_id` leave the session now (`ban` =
+    /// false: a kick, it may rejoin at once) or keep it out for BAN_DURATION
+    /// (`ban` = true). The ban lands in the process-global table immediately
+    /// (so `bans_json` and file serving reflect it before the network task
+    /// runs); the task publishes the 'K' notice and the updated ban table.
+    /// Returns false on a client, for ourselves, or for an empty id.
+    pub fn moderate(&self, peer_id: &str, ban: bool) -> bool {
+        if self.role != Role::Owner || peer_id.is_empty() || peer_id == self.local_peer_id {
+            return false;
+        }
+        if peer_id.parse::<PeerId>().is_err() {
+            return false;
+        }
+        if ban {
+            let (name, color) = self
+                .shared
+                .peers_info
+                .lock()
+                .unwrap()
+                .get(peer_id)
+                .map(|p| (p.name.clone(), p.color.clone()))
+                .unwrap_or_default();
+            BANS.lock().unwrap().insert(
+                peer_id.to_string(),
+                Ban {
+                    name,
+                    color: if color.is_empty() { default_color(peer_id) } else { color },
+                    until: Instant::now() + BAN_DURATION,
+                    until_unix_ms: unix_ms_now() + BAN_DURATION.as_millis() as u64,
+                },
+            );
+            // Deliberately NOT mirrored into `shared.banned` here: the task's
+            // tick detects the table change against that mirror and that is
+            // what triggers the blacklist + 'B' broadcast. The owner's file
+            // serving reads the global table directly, so the refusal is
+            // immediate regardless.
+        }
+        // Gone from our roster right away, whatever it does about the notice.
+        self.shared.peers_info.lock().unwrap().remove(peer_id);
+        self.cmd_tx
+            .send(Command::Moderate { peer: peer_id.to_string(), ban })
+            .is_ok()
+    }
+
     /// Shared markers received from peers since the last call, as a JSON array
     /// of `{"name","pos","by","color"}` ("[]" when none).
     pub fn drain_markers(&self) -> String {
@@ -2100,7 +2236,11 @@ impl Reamesh {
             .collect();
         others.sort();
         others.dedup();
+        let banned = self.shared.banned.lock().unwrap();
         for id in others {
+            if banned.contains(&id) {
+                continue;
+            }
             if let Some(info) = infos.get(&id) {
                 arr.push(entry(
                     &id,
@@ -2119,6 +2259,15 @@ impl Reamesh {
             }
         }
         json!(arr).to_string()
+    }
+
+    /// Peer ids this peer currently treats as banned (a client: the owner's
+    /// last 'B' table; the owner: its tick mirror of the global table), sorted.
+    /// A test hook for the ban broadcast; the app reads `bans_json` instead.
+    pub fn banned_peers(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.shared.banned.lock().unwrap().iter().cloned().collect();
+        v.sort();
+        v
     }
 
     /// Number of verified presence beacons received from `peer_id` so far
@@ -3037,8 +3186,17 @@ fn serve_xfer(
     hosting: Option<&Hosting>,
     serve_dir: Option<&Path>,
     auth_token: &str,
+    banned: bool,
     req: &XferRequest,
 ) -> XferResponse {
+    // A banned peer gets a distinct answer (a probe/join reports "banned",
+    // not "wrong password"), and it gets it whether or not it still holds
+    // the right token: the ban outranks the passphrase.
+    if banned {
+        return XferResponse::Error {
+            message: BANNED_MESSAGE.into(),
+        };
+    }
     let presented = match req {
         XferRequest::Manifest { auth } | XferRequest::File { auth, .. } => auth.as_str(),
     };
@@ -3099,6 +3257,11 @@ fn serve_xfer(
         },
     }
 }
+
+/// The refusal a banned peer gets from every serving peer, and the status
+/// message its own join fails with. The extension maps it to a stable code;
+/// a probe maps it to reason "banned".
+const BANNED_MESSAGE: &str = "banned from this session by the host";
 
 /// Owner-side proposal admission under the soft editing lock. A field is
 /// admitted (and `proposer` becomes/refreshes its lock holder) unless someone
@@ -3213,6 +3376,34 @@ fn publish_session(
         .gossipsub
         .publish(topic.clone(), data)
         .is_ok()
+}
+
+/// The 'B' ban-table message for `live` (peer id strings).
+fn ban_table_msg(live: &HashSet<String>) -> Vec<u8> {
+    let mut ids: Vec<&String> = live.iter().collect();
+    ids.sort();
+    let mut data = vec![TAG_BANS];
+    data.extend_from_slice(json!({ "bans": ids }).to_string().as_bytes());
+    data
+}
+
+/// Bring gossipsub's blacklist in line with `want`: newly banned peers are
+/// blacklisted (their messages rejected, their future connections ignored by
+/// gossipsub), peers no longer banned are released. `current` tracks what is
+/// blacklisted now.
+fn sync_blacklist(
+    swarm: &mut Swarm<Behaviour>,
+    current: &mut HashSet<PeerId>,
+    want: &HashSet<String>,
+) {
+    let want: HashSet<PeerId> = want.iter().filter_map(|s| s.parse().ok()).collect();
+    for p in current.difference(&want) {
+        swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(p);
+    }
+    for p in want.difference(current) {
+        swarm.behaviour_mut().gossipsub.blacklist_peer(p);
+    }
+    *current = want;
 }
 
 /// An in-flight ticket join/check: dialing + waiting for the pinned owner's
@@ -3419,6 +3610,11 @@ async fn run_network(
     // Session messages that failed to publish (nobody connected yet); retried
     // on the tick. Bounded so a long-dead session can't grow without limit.
     let mut retry_pubs: Vec<Vec<u8>> = Vec::new();
+    // Peers currently blacklisted in gossipsub (both roles: mirrors
+    // `shared.banned`), and banned peers whose connections are to be dropped
+    // once their 'K' notice has had a moment to leave the socket.
+    let mut blacklisted: HashSet<PeerId> = HashSet::new();
+    let mut ban_disconnects: Vec<(PeerId, Instant)> = Vec::new();
     // Lock-table heartbeat (owner): the lock broadcast is normally edge-driven
     // (only on change), so a single dropped "lock released" packet would strand
     // a stale lock on a client, and its grey item tint with it. To self-heal,
@@ -3576,6 +3772,26 @@ async fn run_network(
                         None => eprintln!("[reamesh] dropped shared marker: not in a session"),
                     }
                 }
+                Some(Command::Moderate { peer, ban }) => {
+                    if hosting.is_none() {
+                        eprintln!("[reamesh] moderation ignored: not hosting");
+                    } else if let Some(t) = sess_topic.clone() {
+                        let mut data = vec![TAG_KICK];
+                        data.extend_from_slice(
+                            json!({ "peer": peer, "ban": ban }).to_string().as_bytes(),
+                        );
+                        if !publish_session(&mut swarm, &shared, &t, &data) && retry_pubs.len() < 256 {
+                            retry_pubs.push(data);
+                        }
+                        eprintln!("[reamesh] {} {peer}", if ban { "banned" } else { "kicked" });
+                        if ban && let Ok(pid) = peer.parse::<PeerId>() {
+                            // The tick mirrors the table into the blacklist
+                            // at once; the connection itself goes a moment
+                            // later so the notice above isn't cut off.
+                            ban_disconnects.push((pid, Instant::now() + Duration::from_millis(1500)));
+                        }
+                    }
+                }
                 Some(Command::Dial(addr)) => {
                     if let Err(e) = swarm.dial(addr) {
                         eprintln!("[reamesh] dial failed: {e}");
@@ -3703,11 +3919,53 @@ async fn run_network(
                 // topic ourselves.)
                 if let Some(t) = &sess_topic {
                     let hash = t.hash();
+                    // A banned peer that keeps its subscription is neither a
+                    // fetch candidate nor a counted member.
                     let peers: Vec<PeerId> = swarm.behaviour().gossipsub.all_peers()
                         .filter(|(_, topics)| topics.iter().any(|th| **th == hash))
                         .map(|(p, _)| *p)
+                        .filter(|p| !blacklisted.contains(p))
                         .collect();
                     *shared.session_peers.lock().unwrap() = peers;
+                }
+                // Owner: mirror the process-global ban table (a new ban, a
+                // revoke, an expiry) into the shared set, the gossipsub
+                // blacklist, and a 'B' broadcast whenever it changes.
+                if hosting.is_some() {
+                    let live = banned_ids();
+                    let changed = {
+                        let mut cur = shared.banned.lock().unwrap();
+                        if *cur != live {
+                            *cur = live.clone();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if changed {
+                        sync_blacklist(&mut swarm, &mut blacklisted, &live);
+                        let mut infos = shared.peers_info.lock().unwrap();
+                        infos.retain(|id, _| !live.contains(id));
+                        drop(infos);
+                        if let Some(t) = sess_topic.clone() {
+                            let data = ban_table_msg(&live);
+                            if !publish_session(&mut swarm, &shared, &t, &data) && retry_pubs.len() < 256 {
+                                retry_pubs.push(data);
+                            }
+                        }
+                    }
+                }
+                // Drop a banned peer's connections once its notice is out:
+                // gossipsub ignores a blacklisted peer from the next connect
+                // on, so this is what takes it out of the mesh for good.
+                if !ban_disconnects.is_empty() {
+                    let now = Instant::now();
+                    let (due, later): (Vec<_>, Vec<_>) =
+                        ban_disconnects.drain(..).partition(|(_, at)| *at <= now);
+                    ban_disconnects = later;
+                    for (pid, _) in due {
+                        let _ = swarm.disconnect_peer_id(pid);
+                    }
                 }
                 // Client fallback: the owner vanished from the session topic
                 // (crash, quit without the farewell reaching us): end the
@@ -3955,6 +4213,12 @@ async fn run_network(
                             // afresh: its own clock anchors it, and a clock
                             // that went backwards must not lock it out.
                             shared.proposal_seqs.lock().unwrap().remove(&peer_id.to_string());
+                            // ...and the current ban table, so it refuses the
+                            // same peers everyone else does.
+                            let live = shared.banned.lock().unwrap().clone();
+                            if !live.is_empty() && retry_pubs.len() < 256 {
+                                retry_pubs.push(ban_table_msg(&live));
+                            }
                         }
                     }
                 }
@@ -4036,6 +4300,12 @@ async fn run_network(
                         // authenticated author; one without a source can't be
                         // checked against anything below: drop it.
                         let Some(src) = message.source else { continue };
+                        // A banned peer's gossip is nothing to anyone (the
+                        // gossipsub blacklist drops most of it before it gets
+                        // here; this covers the tick between ban and mirror).
+                        if shared.banned.lock().unwrap().contains(&src.to_string()) {
+                            continue;
+                        }
                         // Confidentiality gate: in a passphrase-protected
                         // session every message must arrive sealed (and open
                         // against the sender's peer id). Drop plaintext from a
@@ -4200,6 +4470,80 @@ async fn run_network(
                                     }
                                 }
                             }
+                            (Some(&TAG_KICK), Role::Client) => {
+                                // Only the owner moderates.
+                                let from_owner =
+                                    src.to_string() == *shared.owner_peer.lock().unwrap();
+                                if from_owner
+                                    && let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..])
+                                {
+                                    let target = v.get("peer").and_then(|x| x.as_str()).unwrap_or("");
+                                    let ban = v.get("ban").and_then(|x| x.as_bool()).unwrap_or(false);
+                                    if target == swarm.local_peer_id().to_string() {
+                                        eprintln!(
+                                            "[reamesh] the host {} us",
+                                            if ban { "banned" } else { "removed" }
+                                        );
+                                        download_cleanup(&mut download);
+                                        // Leave the topic now (no more beacons,
+                                        // off every roster at once) rather than
+                                        // waiting for the extension's shutdown;
+                                        // a later rejoin re-subscribes when its
+                                        // manifest is accepted.
+                                        if let Some(t) = sess_topic.take() {
+                                            let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
+                                        }
+                                        set_status(&shared, |s| {
+                                            s.state = "ended".into();
+                                            s.message = Some(
+                                                if ban { BANNED_MESSAGE } else { "removed from the session by the host" }
+                                                    .into(),
+                                            );
+                                            s.end_reason = Some(if ban { "banned" } else { "kicked" }.into());
+                                        });
+                                    } else if !target.is_empty() {
+                                        // Someone else: off our roster now,
+                                        // not after the presence timeout.
+                                        shared.peers_info.lock().unwrap().remove(target);
+                                    }
+                                }
+                            }
+                            (Some(&TAG_BANS), Role::Client) => {
+                                let from_owner =
+                                    src.to_string() == *shared.owner_peer.lock().unwrap();
+                                if from_owner
+                                    && let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..])
+                                {
+                                    let live: HashSet<String> = v
+                                        .get("bans")
+                                        .and_then(|b| b.as_array())
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|x| x.as_str())
+                                                .map(|s| s.to_string())
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    // Never let a table ban *us* out of the
+                                    // roster maths: our own end comes via 'K'.
+                                    let me = swarm.local_peer_id().to_string();
+                                    let live: HashSet<String> =
+                                        live.into_iter().filter(|id| *id != me).collect();
+                                    let changed = {
+                                        let mut cur = shared.banned.lock().unwrap();
+                                        if *cur != live {
+                                            *cur = live.clone();
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    };
+                                    if changed {
+                                        sync_blacklist(&mut swarm, &mut blacklisted, &live);
+                                        shared.peers_info.lock().unwrap().retain(|id, _| !live.contains(id));
+                                    }
+                                }
+                            }
                             (Some(&TAG_LOCKS), Role::Client) => {
                                 // The owner is the sole lock arbiter; ignore any
                                 // table from a non-owner topic member.
@@ -4220,12 +4564,21 @@ async fn run_network(
                         }
                     }
                 }
-                SwarmEvent::Behaviour(BehaviourEvent::Xfer(request_response::Event::Message { message, .. })) => {
+                SwarmEvent::Behaviour(BehaviourEvent::Xfer(request_response::Event::Message { peer, message, .. })) => {
                     match message {
                         request_response::Message::Request { request, channel, .. } => {
                             let serve_dir = shared.serve_dir.lock().unwrap().clone();
                             let token = shared.auth_token.lock().unwrap().clone();
-                            let resp = serve_xfer(hosting.as_ref(), serve_dir.as_deref(), &token, &request);
+                            // The owner judges by the live table itself: its
+                            // `shared.banned` mirror refreshes on the tick, and
+                            // a revoke followed at once by a rejoin must not
+                            // be refused by a half-second-stale copy.
+                            let banned = if hosting.is_some() {
+                                banned_ids().contains(&peer.to_string())
+                            } else {
+                                shared.banned.lock().unwrap().contains(&peer.to_string())
+                            };
+                            let resp = serve_xfer(hosting.as_ref(), serve_dir.as_deref(), &token, banned, &request);
                             let _ = swarm.behaviour_mut().xfer.send_response(channel, resp);
                         }
                         request_response::Message::Response { request_id, response } => {
@@ -4249,8 +4602,13 @@ async fn run_network(
                                     }
                                     _ => (false, JsonValue::Null),
                                 };
+                                let reason = match &response {
+                                    _ if ok => "",
+                                    XferResponse::Error { message } if message == BANNED_MESSAGE => "banned",
+                                    _ => "rejected",
+                                };
                                 *shared.probe_result.lock().unwrap() =
-                                    Some((p.session_id, Some(ok), preview, if ok { "" } else { "rejected" }));
+                                    Some((p.session_id, Some(ok), preview, reason));
                             } else if download.as_ref().is_some_and(|dl| dl.manifest_req == Some(request_id)) {
                                 // A manifest only arrives once the owner accepted
                                 // our session token: this is the moment we become
@@ -5411,6 +5769,34 @@ pub extern "C" fn reamesh_drain_markers(handle: *mut Reamesh) -> *mut c_char {
             .unwrap_or_else(|_| "[]".to_string())
     };
     into_c_string(out)
+}
+
+/// Owner-side moderation: make `peer_id` leave the session (`ban` false: a
+/// kick, it may rejoin at once) or keep it out for 30 minutes (`ban` true).
+/// Returns whether the request was accepted (owner only, not for self).
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_moderate(handle: *mut Reamesh, peer_id: *const c_char, ban: bool) -> bool {
+    let (false, Some(p)) = (handle.is_null(), cstr_arg(peer_id)) else {
+        return false;
+    };
+    let r = unsafe { &*handle };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.moderate(&p, ban))).unwrap_or(false)
+}
+
+/// Lift a ban early. Returns whether the peer was banned. Independent of any
+/// session handle: the ban table is process-global (it outlives a re-host).
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_unban(peer_id: *const c_char) -> bool {
+    let Some(p) = cstr_arg(peer_id) else { return false };
+    std::panic::catch_unwind(|| unban(&p)).unwrap_or(false)
+}
+
+/// The live ban table as a JSON array of `{"id","name","color","expires_at"}`
+/// (`expires_at` = unix ms), soonest to lapse first; "[]" when none. Free
+/// with `reamesh_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_bans() -> *mut c_char {
+    into_c_string(std::panic::catch_unwind(bans_json).unwrap_or_else(|_| "[]".to_string()))
 }
 
 /// Start the localhost control server the companion app connects to

@@ -10,8 +10,8 @@ handles sessions, invitations and setup alongside REAPER.
 ## Getting started
 
 You'll need REAPER and the ReaMesh app on each computer. See
-[Releases](https://github.com/ReaMesh/ReaMesh/releases) for packaged builds,
-or [build from source](#building-from-source).
+[Releases](https://github.com/ReaMesh/ReaMesh/releases) for packaged builds, or
+[build from source](#building-from-source).
 
 1. Open ReaMesh and follow the setup to install its bundled REAPER extension.
    If your REAPER resource folder isn't found, select it manually.
@@ -46,7 +46,8 @@ does sync. Master-track state, hardware outputs, pooled automation items, marker
 ruler lanes and project extension state aren't synced.
 
 An optional floating roster shows who's connected. You can follow someone's
-playback and track focus or share a marker at your cursor.
+playback and track focus or share a marker at your cursor. Hosts can remove
+guests or block their peer identity for 30 minutes.
 
 ## Working together
 
@@ -142,8 +143,8 @@ talks to the extension over a localhost WebSocket.
 
 Bug reports and pull requests are welcome. For larger changes, open an issue
 first so we can discuss the approach. See [CONTRIBUTING.md](CONTRIBUTING.md)
-for development guidelines. Report security issues privately using the process
-in [SECURITY.md](SECURITY.md).
+for development guidelines.
+Report security issues privately using the process in [SECURITY.md](SECURITY.md).
 
 ## License and trademark
 

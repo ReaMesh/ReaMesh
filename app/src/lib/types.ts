@@ -59,6 +59,17 @@ export interface SessionAd {
   contested?: boolean;
 }
 
+/** One entry of the host's ban table. `expires_at` is unix ms (absolute, so
+ *  the state frame doesn't churn every tick); the app computes "N min left". */
+export interface BanEntry {
+  id: string;
+  /** Display name the peer had when it was blocked ("" if it never sent one). */
+  name: string;
+  /** Identity color (hex) at block time, so the avatar matches the roster's. */
+  color: string;
+  expires_at: number;
+}
+
 /** Structured activity-log entry / error from the extension. `code` (plus
  *  `params`) names the event so the app can render it in the user's language;
  *  `text` is the English fallback for unknown codes (and the whole message
@@ -105,7 +116,8 @@ export interface ExtState {
    *  boolean. `null` (the whole field) when no check is active. A successful
    *  check also carries the join `preview`. */
   /** `reason` says why `ok` is false: "rejected" is the only wrong-passphrase
-   *  case; "timeout" / "unreachable" / "gone" mean the host didn't answer. */
+   *  case; "banned" means the host blocked this device; "timeout" /
+   *  "unreachable" / "gone" mean the host didn't answer. */
   probe?: {
     session_id: string;
     ok: boolean | null;
@@ -136,6 +148,10 @@ export interface ExtState {
   /** Items currently shown as empty placeholders because their media hasn't
    *  arrived yet (progressive join). */
   placeholders?: number;
+  /** Devices this host has blocked (process-global in the extension, so the
+   *  list outlives a stop-hosting / re-host cycle). Absent from an older
+   *  extension. */
+  bans?: BanEntry[];
 }
 
 /** One running REAPER instance (= one control server port). */
@@ -162,6 +178,7 @@ export function normalizeState(msg: Record<string, unknown>): ExtState {
     peers: arr(msg.peers),
     sessions: arr(msg.sessions),
     log: arr(msg.log),
+    bans: arr(msg.bans),
   };
 }
 

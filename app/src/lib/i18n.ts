@@ -120,6 +120,32 @@ const en = {
   inviteTicketHint:
     "Send this code to anyone you want to invite. They can paste it in their lobby to join, even over a VPN such as Tailscale. The code works while you host this session.",
 
+  // Moderation (host only): kick = they may rejoin at once; block = their
+  // device is kept out for 30 minutes, revocable from the blocked list.
+  kickPeer: "Remove {name}",
+  banPeer: "Block {name}",
+  banTitle: "Block {name}?",
+  banBody:
+    "They'll be removed from the session, and this device can't rejoin for 30 minutes. You can unblock them earlier from the blocked list.",
+  banConfirm: "Block for 30 minutes",
+  blockedOne: "1 blocked device",
+  blockedMany: "{count} blocked devices",
+  blockedTitle: "Blocked devices",
+  blockedBody:
+    "Blocked devices can't join your sessions until the block expires. Unblocking lets them join again right away.",
+  blockExpiresIn: "{minutes} min left",
+  blockExpiresSoon: "less than a minute left",
+  unblock: "Unblock",
+  peerKicked: "You removed {name} from the session.",
+  peerKickedUnnamed: "You removed a guest from the session.",
+  peerBanned: "You blocked {name} for 30 minutes.",
+  peerBannedUnnamed: "You blocked a guest for 30 minutes.",
+  peerUnbanned: "You unblocked {name}.",
+  peerUnbannedUnnamed: "You unblocked a guest.",
+  kickedByHost: "The host removed you from the session. You can rejoin.",
+  bannedByHost: "The host blocked you from this session for {minutes} minutes.",
+  bannedFromSession: "The host has blocked you from this session.",
+
   // Downloading
   downloadingProject: "Downloading the project…",
   connectingToHost: "Contacting the host…",
@@ -428,6 +454,30 @@ const de: Record<MsgKey, string> = {
   inviteCopied: "Einladungscode kopiert",
   inviteTicketHint:
     "Schick diesen Code an alle, die du einladen möchtest. Sie können ihn in ihrer Lobby einfügen und auch über ein VPN wie Tailscale beitreten. Der Code gilt, solange du diese Session hostest.",
+
+  kickPeer: "{name} entfernen",
+  banPeer: "{name} blockieren",
+  banTitle: "{name} blockieren?",
+  banBody:
+    "Die Person wird aus der Session entfernt und kann mit diesem Gerät 30 Minuten lang nicht wieder beitreten. Du kannst die Blockierung in der Liste vorher aufheben.",
+  banConfirm: "30 Minuten blockieren",
+  blockedOne: "1 blockiertes Gerät",
+  blockedMany: "{count} blockierte Geräte",
+  blockedTitle: "Blockierte Geräte",
+  blockedBody:
+    "Blockierte Geräte können deinen Sessions nicht beitreten, bis die Blockierung abläuft. Nach dem Aufheben können sie sofort wieder beitreten.",
+  blockExpiresIn: "noch {minutes} Min.",
+  blockExpiresSoon: "weniger als eine Minute",
+  unblock: "Freigeben",
+  peerKicked: "Du hast {name} aus der Session entfernt.",
+  peerKickedUnnamed: "Du hast einen Gast aus der Session entfernt.",
+  peerBanned: "Du hast {name} für 30 Minuten blockiert.",
+  peerBannedUnnamed: "Du hast einen Gast für 30 Minuten blockiert.",
+  peerUnbanned: "Du hast {name} freigegeben.",
+  peerUnbannedUnnamed: "Du hast einen Gast freigegeben.",
+  kickedByHost: "Der Host hat dich aus der Session entfernt. Du kannst wieder beitreten.",
+  bannedByHost: "Der Host hat dich für {minutes} Minuten aus dieser Session ausgeschlossen.",
+  bannedFromSession: "Der Host hat dich aus dieser Session ausgeschlossen.",
 
   downloadingProject: "Projekt wird heruntergeladen…",
   connectingToHost: "Host wird kontaktiert…",

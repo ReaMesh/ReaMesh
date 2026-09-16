@@ -208,6 +208,26 @@ bool reamesh_share_marker(struct ReameshHandle *handle, const char *marker_json)
 char *reamesh_drain_markers(struct ReameshHandle *handle);
 
 /**
+ * Owner-side moderation: make `peer_id` leave the session (`ban` false: a
+ * kick, it may rejoin at once) or keep it out for 30 minutes (`ban` true).
+ * Returns whether the request was accepted (owner only, not for self).
+ */
+bool reamesh_moderate(struct ReameshHandle *handle, const char *peer_id, bool ban);
+
+/**
+ * Lift a ban early. Returns whether the peer was banned. Independent of any
+ * session handle: the ban table is process-global (it outlives a re-host).
+ */
+bool reamesh_unban(const char *peer_id);
+
+/**
+ * The live ban table as a JSON array of `{"id","name","color","expires_at"}`
+ * (`expires_at` = unix ms), soonest to lapse first; "[]" when none. Free
+ * with `reamesh_free_string`.
+ */
+char *reamesh_bans(void);
+
+/**
  * Start the localhost control server the companion app connects to
  * (idempotent). Returns the bound port, 0 if no port was available.
  */

@@ -1098,6 +1098,152 @@ fn owner_shutdown_ends_session_for_clients() {
 }
 
 #[test]
+fn moderation_kick_ends_client_and_allows_rejoin() {
+    let project = temp_dir("proj-kick");
+    let staging = temp_dir("staging-kick");
+    make_project(&project);
+    let (owner, client) = establish("kick-test", &project, &staging);
+    let sid = session_id_of(&owner);
+    let victim = client.local_peer_id().to_string();
+
+    // Nobody but the owner may moderate, and never itself.
+    assert!(!client.moderate(owner.local_peer_id(), false));
+    assert!(!owner.moderate(owner.local_peer_id(), false));
+
+    assert!(owner.moderate(&victim, false), "owner kick refused");
+    let ended = wait_until(Duration::from_secs(10), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        s["state"] == "ended" && s["end_reason"] == "kicked"
+    });
+    assert!(ended, "kicked client never ended: {}", client.status_json());
+    // Off the host's roster (the kicked peer left the topic on its own).
+    let gone = wait_until(Duration::from_secs(6), || {
+        let roster: Value = serde_json::from_str(&owner.peers_json()).unwrap();
+        owner.connected_peers() == 0 && roster.as_array().unwrap().len() == 1
+    });
+    assert!(gone, "kicked peer still on the roster: {}", owner.peers_json());
+    // A kick is not a ban (the table is process-global, so judge by our peer
+    // id rather than expecting it empty): the same device rejoins at once.
+    assert!(!reamesh::bans_json().contains(&victim));
+    assert!(client.join_session(&sid, ""), "rejoin refused");
+    let back = wait_until(Duration::from_secs(30), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        assert_ne!(s["state"], "failed", "rejoin failed: {}", s["message"]);
+        s["state"] == "ready"
+    });
+    assert!(back, "kicked client could not rejoin: {}", client.status_json());
+    let meshed = wait_until(Duration::from_secs(15), || owner.connected_peers() >= 1);
+    assert!(meshed, "rejoined client never reached the session topic");
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
+fn moderation_ban_refuses_rejoin_until_revoked() {
+    let project = temp_dir("proj-ban");
+    let staging = temp_dir("staging-ban");
+    make_project(&project);
+    reamesh::set_profile("Banned Bob", "#123456");
+    let (owner, client) = establish("ban-test", &project, &staging);
+    let sid = session_id_of(&owner);
+    let victim = client.local_peer_id().to_string();
+    // A second guest: the ban table must reach every member, not just the
+    // banned peer, because every member serves files and shows a roster.
+    let staging2 = temp_dir("staging-ban-bystander");
+    let bystander = Reamesh::join(staging2.to_str().unwrap()).expect("join failed");
+    assert!(wait_until(Duration::from_secs(20), || {
+        interconnect(&owner, &bystander);
+        interconnect(&client, &bystander);
+        bystander.sessions_json().contains(&sid)
+    }));
+    assert!(bystander.join_session(&sid, ""));
+    assert!(wait_until(Duration::from_secs(30), || {
+        let s: Value = serde_json::from_str(&bystander.status_json()).unwrap();
+        s["state"] == "ready"
+    }));
+    assert!(wait_until(Duration::from_secs(15), || owner.connected_peers() >= 2));
+    // Let the owner learn the client's name so the ban list can show it.
+    assert!(wait_until(Duration::from_secs(10), || {
+        let o: Value = serde_json::from_str(&owner.peers_json()).unwrap();
+        o.as_array().unwrap().iter().any(|p| p["id"] == victim.as_str() && p["name"] == "Banned Bob")
+    }));
+
+    assert!(owner.moderate(&victim, true), "owner ban refused");
+    let ended = wait_until(Duration::from_secs(10), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        s["state"] == "ended" && s["end_reason"] == "banned"
+    });
+    assert!(ended, "banned client never ended: {}", client.status_json());
+    // Off the host's roster and out of its member count; the bystander stays.
+    let gone = wait_until(Duration::from_secs(6), || {
+        let roster: Value = serde_json::from_str(&owner.peers_json()).unwrap();
+        owner.connected_peers() == 1
+            && roster.as_array().unwrap().len() == 2
+            && !roster.as_array().unwrap().iter().any(|p| p["id"] == victim.as_str())
+    });
+    assert!(gone, "banned peer still on the roster: {}", owner.peers_json());
+    // The owner broadcast the table: the other guest applies it too.
+    let learned = wait_until(Duration::from_secs(6), || {
+        bystander.banned_peers() == vec![victim.clone()]
+    });
+    assert!(learned, "bystander never received the ban table: {:?}", bystander.banned_peers());
+    assert_eq!(owner.banned_peers(), vec![victim.clone()]);
+
+    // The ban table names the device, with the name it had.
+    let bans: Value = serde_json::from_str(&reamesh::bans_json()).unwrap();
+    let entry = bans
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["id"] == victim.as_str())
+        .expect("banned peer listed");
+    assert_eq!(entry["name"], "Banned Bob");
+    assert_eq!(entry["color"], "#123456");
+    assert!(entry["expires_at"].as_u64().unwrap() > 0);
+
+    // A passphrase pre-check answers "banned", not "wrong password"...
+    assert!(client.check_passphrase(&sid, ""));
+    let probed = wait_until(Duration::from_secs(10), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        s["probe"]["ok"] == false && s["probe"]["reason"] == "banned"
+    });
+    assert!(probed, "probe from a banned peer: {}", client.status_json());
+    // ...and a join is refused outright.
+    assert!(client.join_session(&sid, ""));
+    let refused = wait_until(Duration::from_secs(15), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        s["state"] == "failed" && s["message"].as_str().unwrap_or("").contains("banned")
+    });
+    assert!(refused, "banned peer was served: {}", client.status_json());
+    assert_eq!(owner.connected_peers(), 1, "banned peer counted as a member");
+
+    // Revoking the ban lets the same device straight back in.
+    assert!(reamesh::unban(&victim));
+    assert!(!reamesh::unban(&victim), "unban of an unbanned peer reported true");
+    assert!(!reamesh::bans_json().contains(&victim));
+    let forgotten = wait_until(Duration::from_secs(6), || bystander.banned_peers().is_empty());
+    assert!(forgotten, "bystander kept a lifted ban: {:?}", bystander.banned_peers());
+    assert!(client.join_session(&sid, ""), "rejoin refused");
+    let back = wait_until(Duration::from_secs(30), || {
+        let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+        s["state"] == "ready"
+    });
+    assert!(back, "unbanned client could not rejoin: {}", client.status_json());
+    let meshed = wait_until(Duration::from_secs(15), || owner.connected_peers() >= 2);
+    assert!(meshed, "unbanned client never reached the session topic");
+
+    drop(bystander);
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+    let _ = fs::remove_dir_all(staging2);
+}
+
+#[test]
 fn client_leave_clears_owner_roster_quickly() {
     let project = temp_dir("proj-leave");
     let staging = temp_dir("staging-leave");

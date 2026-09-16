@@ -1,6 +1,17 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
-import { Check, Crown, Download, Eye, EyeOff, Snowflake, Ticket, TriangleAlert } from "lucide-react";
+import {
+  Ban,
+  Check,
+  Crown,
+  Download,
+  Eye,
+  EyeOff,
+  Snowflake,
+  Ticket,
+  TriangleAlert,
+  UserX,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -12,6 +23,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { BanList } from "@/components/BanList";
 import { Hint, HintProvider } from "@/components/Hint";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { Rolling, TrackNumber } from "@/components/Rolling";
@@ -29,12 +41,18 @@ function PeerRow({
   peer,
   flash,
   port,
+  onKick,
+  onBan,
 }: {
   ref?: React.Ref<HTMLDivElement>;
   peer: Peer;
   flash?: boolean;
   port: number | null;
+  /** Host-only moderation; both absent on a guest's roster and on the self row. */
+  onKick?: () => void;
+  onBan?: () => void;
 }) {
+  const moderate = !peer.is_self && !!onKick && !!onBan;
   // Click-to-follow, same as the overlay HUD: only meaningful for someone
   // else who's actually on a track.
   const clickable = !peer.is_self && peer.track != null && peer.track > 0;
@@ -75,7 +93,7 @@ function PeerRow({
         role={clickable ? "button" : undefined}
         tabIndex={clickable ? 0 : undefined}
         className={cn(
-          "relative flex items-center gap-3 rounded-lg px-2 py-1.5",
+          "group relative flex items-center gap-3 rounded-lg px-2 py-1.5",
           clickable && "cursor-pointer transition-colors hover:bg-secondary/60",
         )}
       >
@@ -112,6 +130,38 @@ function PeerRow({
           </Badge>
         )}
         <TrackNumber track={peer.track} />
+        {moderate && (
+          // Host controls, revealed on hover / keyboard focus so the roster
+          // stays calm. A kick is harmless (they can rejoin at once) and fires
+          // directly; a block is confirmed by the parent first.
+          <span
+            className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 has-[:focus-visible]:opacity-100"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => e.stopPropagation()}
+          >
+            <Hint label={t("kickPeer", { name: displayName(peer) })}>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label={t("kickPeer", { name: displayName(peer) })}
+                onClick={onKick}
+              >
+                <UserX aria-hidden="true" />
+              </Button>
+            </Hint>
+            <Hint label={t("banPeer", { name: displayName(peer) })}>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="hover:text-red-400"
+                aria-label={t("banPeer", { name: displayName(peer) })}
+                onClick={onBan}
+              >
+                <Ban aria-hidden="true" />
+              </Button>
+            </Hint>
+          </span>
+        )}
       </motion.div>
     </Hint>
   );
@@ -299,6 +349,17 @@ export function Session({
 }) {
   const hosting = state.mode === "hosting";
   const [confirmStop, setConfirmStop] = useState(false);
+  // Guest the host is about to block (the confirm dialog's subject).
+  const [banTarget, setBanTarget] = useState<Peer | null>(null);
+  const kick = (p: Peer) => send({ cmd: "kick", peer_id: p.id }, port ?? undefined);
+  const ban = () => {
+    if (banTarget) send({ cmd: "ban", peer_id: banTarget.id }, port ?? undefined);
+    setBanTarget(null);
+  };
+  // Drop the confirm if its subject leaves on their own meanwhile.
+  useEffect(() => {
+    if (banTarget && !state.peers.some((p) => p.id === banTarget.id)) setBanTarget(null);
+  }, [banTarget, state.peers]);
   const others = state.peers.length - 1;
   const hostPass = hosting ? getHostPass(port) : "";
   const leave = () => {
@@ -376,6 +437,8 @@ export function Session({
                 peer={p}
                 flash={flashPeers.includes(p.id)}
                 port={port}
+                onKick={hosting ? () => kick(p) : undefined}
+                onBan={hosting ? () => setBanTarget(p) : undefined}
               />
             ))}
           </AnimatePresence>
@@ -386,18 +449,41 @@ export function Session({
           button stays pinned to the bottom. */}
       <div className="min-h-0 flex-1" />
 
-      {/* Invite link + password reminder: two quiet host-only lines, kept
-          tight together (and away from the Leave button) as one group. */}
-      {(hostPass || (hosting && !!state.ticket)) && (
+      {(hostPass || (hosting && (!!state.ticket || !!state.bans?.length))) && (
         <div className="flex flex-col gap-1">
           {hosting && !!state.ticket && <InviteTicket ticket={state.ticket} />}
           {hostPass && <HostPassword pass={hostPass} />}
+          {hosting && <BanList bans={state.bans ?? []} port={port} />}
         </div>
       )}
 
       <Button variant="secondary" className="shrink-0" onClick={requestLeave}>
         {hosting ? t("stopHosting") : t("leaveSession")}
       </Button>
+
+      <Dialog open={banTarget !== null} onOpenChange={(o) => !o && setBanTarget(null)}>
+        <DialogContent className="max-w-[340px] gap-4 rounded-2xl">
+          <DialogHeader>
+            <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-red-500/15 sm:mx-0">
+              <Ban className="size-5 text-red-400" aria-hidden="true" />
+            </div>
+            <DialogTitle className="text-[15px]">
+              {t("banTitle", { name: banTarget ? displayName(banTarget) : "" })}
+            </DialogTitle>
+            <DialogDescription className="text-[13px] leading-relaxed">
+              {t("banBody")}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button variant="outline" className="flex-1" onClick={() => setBanTarget(null)}>
+              {t("cancel")}
+            </Button>
+            <Button variant="destructive" className="flex-1" onClick={ban}>
+              {t("banConfirm")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={confirmStop} onOpenChange={setConfirmStop}>
         <DialogContent className="max-w-[340px] gap-4 rounded-2xl">

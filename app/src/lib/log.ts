@@ -52,6 +52,8 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   media_ready: "logMediaReady",
   placeholders_unresolved: "logPlaceholdersUnresolved",
   placeholder_blocked: "logPlaceholderBlocked",
+  kicked: "kickedByHost",
+  banned: "bannedByHost",
 };
 
 export function localizeLogEntry(entry: LogEntry | string): string {
@@ -95,6 +97,19 @@ export function localizeLogEntry(entry: LogEntry | string): string {
       const count = entry.params?.count ?? 0;
       const track = entry.params?.track;
       return track ? t("pluginsAddedTrack", { count, track }) : t("pluginsAdded", { count });
+    }
+    // Host-side moderation: the guest may never have sent a display name.
+    case "peer_kicked": {
+      const name = entry.params?.name;
+      return name ? t("peerKicked", { name }) : t("peerKickedUnnamed");
+    }
+    case "peer_banned": {
+      const name = entry.params?.name;
+      return name ? t("peerBanned", { name }) : t("peerBannedUnnamed");
+    }
+    case "peer_unbanned": {
+      const name = entry.params?.name;
+      return name ? t("peerUnbanned", { name }) : t("peerUnbannedUnnamed");
     }
   }
   const key = entry.code ? CODE_KEYS[entry.code] : undefined;

@@ -13,6 +13,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { PasswordInput } from "@/components/PasswordInput";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { BanList } from "@/components/BanList";
 import { FirewallBlocked } from "@/components/FirewallNotice";
 import { TrustDialog } from "@/components/TrustDialog";
 import { FOUND_COLOR, inkFor } from "@/lib/colors";
@@ -40,7 +41,15 @@ const CHECK_TIMEOUT_MS = 12_000;
 /// may be across a VPN, and only fast-fails after its own connect timeout.
 const TICKET_CHECK_TIMEOUT_MS = 35_000;
 
-type CheckOutcome = "ok" | "bad" | "unknown";
+type CheckOutcome = "ok" | "bad" | "banned" | "unknown";
+type CheckError = "" | Exclude<CheckOutcome, "ok">;
+
+/** Inline text under the passphrase field for a failed check. */
+function checkErrorText(error: CheckError): string {
+  if (error === "bad") return t("wrongPassword");
+  if (error === "banned") return t("bannedFromSession");
+  return t("checkNoAnswer");
+}
 
 /** Run a passphrase pre-check until it answers, is replaced, or times out. */
 function usePassphraseCheck(
@@ -74,8 +83,17 @@ function usePassphraseCheck(
     }
     if (!sawPending.current) return; // ignore a stale prior result
     // Only a refused token is a wrong passphrase; a host that never answered
-    // (timeout, unreachable, gone) must not be reported as one.
-    finish(probe.ok ? "ok" : probe.reason === "rejected" ? "bad" : "unknown");
+    // (timeout, unreachable, gone) must not be reported as one. A blocked
+    // device gets its own answer, whatever it typed.
+    finish(
+      probe.ok
+        ? "ok"
+        : probe.reason === "rejected"
+          ? "bad"
+          : probe.reason === "banned"
+            ? "banned"
+            : "unknown",
+    );
   }, [probe, checking, sid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -286,7 +304,7 @@ function SessionCard({
 }) {
   const [pass, setPass] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const [error, setError] = useState<"" | "bad" | "unknown">("");
+  const [error, setError] = useState<CheckError>("");
   // Prevent a second join command while the first one starts downloading.
   const [joining, setJoining] = useJoinPending();
   const { scope: shakeScope, shake } = useShake();
@@ -318,8 +336,9 @@ function SessionCard({
     CHECK_TIMEOUT_MS,
     (outcome) => {
       if (outcome === "ok") return setConfirmOpen(true);
-      // A refused probe for an open session means the host did not answer.
-      setError(session.auth ? outcome : "unknown");
+      // A refused probe for an open session means the host did not answer,
+      // unless the host said outright that this device is blocked.
+      setError(session.auth || outcome === "banned" ? outcome : "unknown");
       shake();
     },
   );
@@ -406,11 +425,7 @@ function SessionCard({
             onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
           />
         )}
-        {error && (
-          <ErrorLine>
-            {error === "bad" ? t("wrongPassword") : t("checkNoAnswer")}
-          </ErrorLine>
-        )}
+        {error && <ErrorLine>{checkErrorText(error)}</ErrorLine>}
       </div>
 
       {/* Confirm the files, plugins, and claimed host before joining. */}
@@ -439,7 +454,7 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
   const [raw, setRaw] = useState("");
   const [pass, setPass] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const [error, setError] = useState<"" | "bad" | "unknown">("");
+  const [error, setError] = useState<CheckError>("");
   const [joining, setJoining] = useJoinPending();
   const { scope: shakeScope, shake } = useShake();
   const ticket = decodeTicket(raw);
@@ -465,7 +480,7 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
     TICKET_CHECK_TIMEOUT_MS,
     (outcome) => {
       if (outcome === "ok") return setConfirmOpen(true);
-      setError(ticket?.auth ? outcome : "unknown");
+      setError(ticket?.auth || outcome === "banned" ? outcome : "unknown");
       shake();
     },
   );
@@ -640,11 +655,7 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
                     onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
                   />
                 )}
-                {error && (
-                  <ErrorLine>
-                    {error === "bad" ? t("wrongPassword") : t("checkNoAnswer")}
-                  </ErrorLine>
-                )}
+                {error && <ErrorLine>{checkErrorText(error)}</ErrorLine>}
               </div>
             </div>
           </motion.div>
@@ -855,6 +866,9 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
       </div>
 
       <TicketJoin probe={state.probe} port={port} />
+
+      {/* Blocks outlive the session they were made in: keep them revocable. */}
+      <BanList bans={state.bans ?? []} port={port} />
 
       <HostCard
         project={state.project}
