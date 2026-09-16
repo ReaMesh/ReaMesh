@@ -325,6 +325,15 @@ static std::string g_followPeer;
 static std::string g_followLastFocus;   // last focus GUID acted on
 static double g_followLastPlay = -1.0;  // last beacon position acted on
 static double g_followV0 = 0.0, g_followV1 = 0.0;  // last adopted view span
+// Last re-seek of a rolling transport (steady_clock), so drift correction
+// can never turn into a stutter: re-seeks are audible, one per second at most.
+static std::chrono::steady_clock::time_point g_followLastSeek{};
+// Follow-mode drift tolerance (seconds) between our play position and the
+// followed peer's estimated one before we re-seek. Beacons arrive every ~100ms
+// while we follow and their age + half the RTT is compensated, so the estimate
+// is good to well under 100ms; the tolerance stays generous because a re-seek
+// is an audible glitch and the two REAPERs free-run at the same rate anyway.
+static constexpr double kFollowDriftSec = 0.5;
 // Hosting: mtime of the served .rpp when the session meta (track count +
 // plugin list) was last computed; a mid-session save changes the served file,
 // so the meta follows it.
@@ -2599,11 +2608,18 @@ static void drainSharedMarkers() {
   UpdateArrange();
 }
 
-// Follow mode: mirror the followed peer's transport and view. Runs every tick
-// while a target is set. Beacons arrive ~1s apart, so this is a gentle
-// shepherd, not a sample-accurate link: play starts/stops mirror within a
-// beacon, a local pause is overridden (it starts again: following means
-// following), and only real drift (> 2.5s) re-seeks a rolling transport.
+// Follow mode: mirror the followed peer's transport and view. Runs every
+// timer tick (~30Hz) while a target is set, so the receiving end reacts to a
+// beacon within one tick of it landing. The followed peer sees our beacon's
+// `follow` field and switches to the fast beacon cadence (~100ms, see
+// PRESENCE_FAST_INTERVAL in lib.rs), so play starts/stops and cursor moves
+// mirror within ~150ms end to end. The beacon's play position is dated: the
+// roster reports how long ago it landed (`age`) and the smoothed ping RTT, and
+// while the target rolls both are added back so we seek to where their
+// transport is *now*, not where it was when the beacon left. A local pause is
+// overridden (it starts again: following means following), and only real
+// drift (> kFollowDriftSec, at most once a second) re-seeks a rolling
+// transport, since a re-seek is audible.
 static void followTick() {
   if (g_followPeer.empty()) return;
   json peers = handleJson(reamesh_peers, json::array());
@@ -2626,17 +2642,29 @@ static void followTick() {
   const std::string tFocus = jsonStr(*target, "focus");
   const double tv0 = target->value("v0", 0.0), tv1 = target->value("v1", 0.0);
   const bool playing = (GetPlayState() & 1) != 0;
+  // Where their transport should be by now: the beacon position plus the time
+  // it has spent in flight (half the round trip) and sitting here (`age`).
+  // Only meaningful while they roll; a stopped cursor doesn't age.
+  const double ageSec = target->value("age", 0.0) / 1000.0;
+  const double rttSec = target->value("rtt", 0.0) / 1000.0;
+  const double tNow = tPlaying ? tPlay + ageSec + rttSec * 0.5 : tPlay;
+  const auto now = std::chrono::steady_clock::now();
 
   if (tPlaying && !playing) {
     // They are rolling and we are not (they just hit play, or the local user
-    // tried to pause): jump to where they are and roll.
-    SetEditCurPos(tPlay, true, true);
+    // tried to pause): jump to where they are now and roll.
+    SetEditCurPos(tNow, true, true);
     Main_OnCommand(1007, 0);  // Transport: Play
+    g_followLastSeek = now;
   } else if (!tPlaying && playing) {
     Main_OnCommand(1016, 0);  // Transport: Stop
     SetEditCurPos(tPlay, true, false);
   } else if (tPlaying && playing) {
-    if (std::abs(GetPlayPosition() - tPlay) > 2.5) SetEditCurPos(tPlay, false, true);
+    if (std::abs(GetPlayPosition() - tNow) > kFollowDriftSec &&
+        now - g_followLastSeek > std::chrono::seconds(1)) {
+      SetEditCurPos(tNow, false, true);
+      g_followLastSeek = now;
+    }
   } else if (g_followLastPlay < 0 || std::abs(tPlay - g_followLastPlay) > 1e-9) {
     // Both stopped: mirror their edit cursor as it moves.
     SetEditCurPos(tPlay, true, false);
@@ -2664,6 +2692,7 @@ static void stopFollowing() {
   g_followLastFocus.clear();
   g_followLastPlay = -1.0;
   g_followV0 = g_followV1 = 0.0;
+  g_followLastSeek = {};
 }
 
 // Read a whole file as UTF-8 text ("" on failure).
@@ -3186,15 +3215,17 @@ static void ctlPublishState() {
       if (!p.is_object()) continue;
       std::string guid = jsonStr(p, "focus");
       p.erase("focus");
-      // The app never shows timeline positions or view spans; keeping them
-      // would republish the whole state on every presence beacon while someone
-      // scrolls (click-to-follow asks the extension directly via `reveal_peer`).
+      // The app never shows timeline positions, view spans or beacon ages;
+      // keeping them would republish the whole state on every presence beacon
+      // (ten a second for a followed peer) while someone scrolls or plays
+      // (click-to-follow asks the extension directly via `reveal_peer`).
       // `follow` and `frozen` stay: the roster paints the "following you" and
       // "REAPER isn't responding" indicators from them.
       p.erase("play");
       p.erase("v0");
       p.erase("v1");
       p.erase("playing");
+      p.erase("age");
       if (guid.empty()) continue;
       if (MediaTrack* tr = findTrackByGuid(guid)) {
         int n = static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"));

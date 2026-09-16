@@ -120,10 +120,22 @@ const TAG_PROPOSAL: u8 = b'P';
 /// rejected edit back at once, name the holder, and (later) show it).
 const TAG_LOCKS: u8 = b'L';
 /// Presence beacon: `'N'` + JSON `{"name","color"}`, published by every
-/// session participant every ~1s so peers can show who is in the session.
+/// session participant every `PRESENCE_INTERVAL` so peers can show who is in
+/// the session (every `PRESENCE_FAST_INTERVAL` while someone follows us).
 const TAG_PRESENCE: u8 = b'N';
 /// Presence entries not refreshed within this window are dropped.
 const PRESENCE_STALE: Duration = Duration::from_secs(8);
+/// Beacon cadence when nobody is following this peer: rosters and
+/// click-to-follow only need a coarse "where are they".
+const PRESENCE_INTERVAL: Duration = Duration::from_secs(1);
+/// Beacon cadence while at least one peer's beacon says it *follows us*
+/// (`LivePresence::follow` == our peer id). Follow mode mirrors our transport
+/// from these beacons, so a play start/stop or a cursor move reaches the
+/// follower within ~100ms instead of up to a second. Only the followed peer
+/// speeds up: the follower's own beacon is nobody's transport source, and the
+/// rest of the session keeps the 1s cadence. Ten ~300-byte messages a second
+/// on a mesh of a few peers is negligible even over a VPN.
+const PRESENCE_FAST_INTERVAL: Duration = Duration::from_millis(100);
 /// Shared (non-synced) marker: `'M'` + JSON `{"name","pos","by","color","mac"}`,
 /// published once when a user shares a flag marker from the roster bar. Every
 /// receiver drops a *local* marker into its project: deliberately outside the
@@ -529,6 +541,9 @@ struct PeerPresence {
     /// network thread still beacons: i.e. their REAPER isn't responding.
     frozen: bool,
     last_seen: Instant,
+    /// Verified beacons received from this peer so far (tests read the rate
+    /// through `Reamesh::beacon_count`; nothing on the wire depends on it).
+    beacons: u64,
 }
 
 /// Process-wide display profile (name, color hex), set by the companion app
@@ -1893,10 +1908,13 @@ impl Reamesh {
 
     /// Everyone visibly in the session: self first, then the session-topic
     /// peers with an *authenticated* presence beacon, as a JSON array of
-    /// `{"id","name","color","is_self","is_owner"}`. A topic subscriber that
-    /// never produced a verifying beacon (no session token) is not listed:
+    /// `{"id","name","color",…,"age","is_self","is_owner"}`. A topic subscriber
+    /// that never produced a verifying beacon (no session token) is not listed:
     /// topic membership is public knowledge, roster membership is not. A
-    /// legitimate joiner appears within one beacon interval (~1s).
+    /// legitimate joiner appears within one beacon interval (~1s). `age` is
+    /// the milliseconds since that peer's latest beacon landed here (0 for
+    /// self): follow mode adds it (plus half the RTT) to the beaconed play
+    /// position to estimate where the followed transport is *now*.
     pub fn peers_json(&self) -> String {
         let owner = self.shared.owner_peer.lock().unwrap().clone();
         let (my_name, my_color) = PROFILE.lock().unwrap().clone();
@@ -1911,6 +1929,7 @@ impl Reamesh {
                      follow: &str,
                      frozen: bool,
                      rtt: u64,
+                     age: u64,
                      is_self: bool| {
             json!({
                 "id": id,
@@ -1926,6 +1945,7 @@ impl Reamesh {
                 // Smoothed round trip to this peer in whole ms (rounded up so a
                 // real sub-ms LAN sample is 1, never the "unknown" 0).
                 "rtt": rtt,
+                "age": age,
                 "is_self": is_self,
                 "is_owner": id == owner,
             })
@@ -1941,6 +1961,7 @@ impl Reamesh {
             &me.follow,
             false, // if our own main thread were frozen, nobody would be asking
             0,     // no round trip to ourselves
+            0,     // our own presence is never stale
             true,
         )];
         let mut rtts = self.shared.peer_rtt.lock().unwrap();
@@ -1975,11 +1996,26 @@ impl Reamesh {
                     &info.follow,
                     info.frozen,
                     rtts.get(&id).map(|(ms, _)| ms.ceil() as u64).unwrap_or(0),
+                    now.duration_since(info.last_seen).as_millis() as u64,
                     false,
                 ));
             }
         }
         json!(arr).to_string()
+    }
+
+    /// Number of verified presence beacons received from `peer_id` so far
+    /// (0 for an unknown peer). A test hook for the beacon cadence: the
+    /// roster JSON deliberately carries no counter, since a value that moves
+    /// on every beacon would churn the composed app state.
+    pub fn beacon_count(&self, peer_id: &str) -> u64 {
+        self.shared
+            .peers_info
+            .lock()
+            .unwrap()
+            .get(peer_id)
+            .map(|p| p.beacons)
+            .unwrap_or(0)
     }
 
     /// The live editing locks currently held by a peer *other than us*, as a
@@ -2770,6 +2806,42 @@ fn handle_fetch_response(
     }
 }
 
+/// Publish our presence beacon on the session topic: name, color, focused
+/// track, timeline position, view span, transport state and who we follow.
+/// Called from the network thread's beacon timer (see `PRESENCE_INTERVAL` /
+/// `PRESENCE_FAST_INTERVAL` for the cadence).
+fn publish_presence(swarm: &mut Swarm<Behaviour>, shared: &Shared, topic: &gossipsub::IdentTopic) {
+    let (name, color) = PROFILE.lock().unwrap().clone();
+    let live = LIVE.lock().unwrap().clone();
+    // The MAC proves token possession; peers only roster beacons that verify
+    // (see presence_mac).
+    let mac = presence_mac(
+        &shared.auth_token.lock().unwrap().clone(),
+        &swarm.local_peer_id().to_string(),
+    );
+    let mut data = vec![TAG_PRESENCE];
+    data.extend_from_slice(
+        json!({
+            "name": name,
+            "color": color,
+            "focus": live.focus,
+            "play": live.play,
+            "v0": live.v0,
+            "v1": live.v1,
+            "playing": live.playing,
+            "follow": live.follow,
+            // This beacon is sent by the *network* thread; the main-thread
+            // presence feed going quiet while it still runs is exactly
+            // "REAPER isn't responding".
+            "frozen": main_thread_stale(),
+            "mac": mac,
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let _ = publish_session(swarm, shared, topic, &data);
+}
+
 fn set_status(shared: &Shared, f: impl FnOnce(&mut StatusState)) {
     f(&mut shared.status.lock().unwrap());
 }
@@ -3172,6 +3244,13 @@ async fn run_network(
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tick_count: u64 = 0;
+    // Presence beacon timer. Runs at the *fast* cadence and decides per tick
+    // whether a beacon is due: always while a peer follows us (their beacon
+    // says `follow` == our id), else once per PRESENCE_INTERVAL. A single
+    // publish path keeps both cadences on the same message.
+    let mut beacon_tick = tokio::time::interval(PRESENCE_FAST_INTERVAL);
+    beacon_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_beacon: Option<Instant> = None;
     // Client: last time the session owner was seen on the session topic (for
     // the owner-vanished fallback below).
     let mut last_owner_seen = Instant::now();
@@ -3330,6 +3409,23 @@ async fn run_network(
                     break;
                 }
             },
+            _ = beacon_tick.tick() => {
+                if let Some(t) = sess_topic.clone() {
+                    let me = swarm.local_peer_id().to_string();
+                    let followed = shared
+                        .peers_info
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .any(|p| p.follow == me && p.last_seen.elapsed() < PRESENCE_STALE);
+                    let due = followed
+                        || last_beacon.is_none_or(|at| at.elapsed() >= PRESENCE_INTERVAL);
+                    if due {
+                        last_beacon = Some(Instant::now());
+                        publish_presence(&mut swarm, &shared, &t);
+                    }
+                }
+            }
             _ = tick.tick() => {
                 tick_count += 1;
                 // End an unanswered passphrase check with a timeout result.
@@ -3466,40 +3562,8 @@ async fn run_network(
                         .gossipsub
                         .publish(lobby.clone(), v.to_string().into_bytes());
                 }
-                // Everyone: presence beacon on the session topic every ~1s so
-                // peers can show who is here: name, color, focused track,
-                // playhead and selection.
-                if tick_count % 2 == 0 && let Some(t) = sess_topic.clone() {
-                    let (name, color) = PROFILE.lock().unwrap().clone();
-                    let live = LIVE.lock().unwrap().clone();
-                    // The MAC proves token possession; peers only roster
-                    // beacons that verify (see presence_mac).
-                    let mac = presence_mac(
-                        &shared.auth_token.lock().unwrap().clone(),
-                        &swarm.local_peer_id().to_string(),
-                    );
-                    let mut data = vec![TAG_PRESENCE];
-                    data.extend_from_slice(
-                        json!({
-                            "name": name,
-                            "color": color,
-                            "focus": live.focus,
-                            "play": live.play,
-                            "v0": live.v0,
-                            "v1": live.v1,
-                            "playing": live.playing,
-                            "follow": live.follow,
-                            // This beacon is sent by the *network* thread; the
-                            // main-thread presence feed going quiet while it
-                            // still runs is exactly "REAPER isn't responding".
-                            "frozen": main_thread_stale(),
-                            "mac": mac,
-                        })
-                        .to_string()
-                        .as_bytes(),
-                    );
-                    let _ = publish_session(&mut swarm, &shared, &t, &data);
-                }
+                // (The presence beacon has its own timer below: it needs a
+                // finer cadence than this tick while someone follows us.)
                 // Owner: republish the editing-lock table whenever the live set
                 // changes (an acquisition or a lapse), so peers can snap a
                 // rejected edit back at once and name who holds each field.
@@ -3823,7 +3887,10 @@ async fn run_network(
                                         );
                                         continue;
                                     }
-                                    shared.peers_info.lock().unwrap().insert(
+                                    let mut infos = shared.peers_info.lock().unwrap();
+                                    let beacons =
+                                        infos.get(&src.to_string()).map(|p| p.beacons).unwrap_or(0) + 1;
+                                    infos.insert(
                                         src.to_string(),
                                         PeerPresence {
                                             name: get("name"),
@@ -3836,6 +3903,7 @@ async fn run_network(
                                             follow: get("follow"),
                                             frozen: v.get("frozen").and_then(|x| x.as_bool()).unwrap_or(false),
                                             last_seen: Instant::now(),
+                                            beacons,
                                         },
                                     );
                                 }

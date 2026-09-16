@@ -1101,3 +1101,59 @@ fn presence_names_propagate() {
     let _ = fs::remove_dir_all(project);
     let _ = fs::remove_dir_all(staging);
 }
+
+#[test]
+fn followed_peer_beacons_fast() {
+    let project = temp_dir("proj-followfast");
+    let staging = temp_dir("staging-followfast");
+    make_project(&project);
+    let (owner, client) = establish("followfast-test", &project, &staging);
+
+    let self_id = |peer: &Reamesh| -> String {
+        let v: Value = serde_json::from_str(&peer.peers_json()).unwrap();
+        v[0]["id"].as_str().unwrap().to_string()
+    };
+    let owner_id = self_id(&owner);
+    let client_id = self_id(&client);
+    assert!(wait_until(Duration::from_secs(10), || {
+        owner.beacon_count(&client_id) > 0 && client.beacon_count(&owner_id) > 0
+    }));
+
+    // Nobody follows anybody: ~1 beacon per second each way.
+    let count_in = |window: Duration, from: &Reamesh, of: &str| -> u64 {
+        let before = from.beacon_count(of);
+        std::thread::sleep(window);
+        from.beacon_count(of) - before
+    };
+    let idle = count_in(Duration::from_secs(2), &client, &owner_id);
+    assert!((1..=4).contains(&idle), "idle beacon rate off: {idle} in 2s");
+
+    // The client follows the owner. Live presence is process-global, so the
+    // owner's own beacon *also* says "follow <owner>", which nobody acts on:
+    // following yourself isn't being followed. Only the owner, whose id the
+    // client's beacon names, must switch to the fast cadence.
+    reamesh::set_presence(&serde_json::json!({ "follow": owner_id }).to_string());
+    assert!(wait_until(Duration::from_secs(5), || {
+        let o: Value = serde_json::from_str(&owner.peers_json()).unwrap();
+        o.as_array().unwrap().iter().any(|p| p["id"] == client_id && p["follow"] == owner_id)
+    }));
+    let fast = count_in(Duration::from_secs(2), &client, &owner_id);
+    let other = count_in(Duration::from_secs(2), &owner, &client_id);
+    assert!(fast >= 10, "followed owner did not beacon fast: {fast} in 2s");
+    assert!(other <= 4, "the follower sped up too: {other} in 2s");
+
+    // Stop following: once the client's beacon no longer names the owner, the
+    // owner drops back to the idle cadence.
+    reamesh::set_presence("{}");
+    assert!(wait_until(Duration::from_secs(5), || {
+        let o: Value = serde_json::from_str(&owner.peers_json()).unwrap();
+        o.as_array().unwrap().iter().any(|p| p["id"] == client_id && p["follow"] == "")
+    }));
+    let slow = count_in(Duration::from_secs(2), &client, &owner_id);
+    assert!(slow <= 4, "owner kept the fast cadence after unfollow: {slow} in 2s");
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
