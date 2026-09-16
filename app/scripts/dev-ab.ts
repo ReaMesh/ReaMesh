@@ -43,13 +43,13 @@ for (const [tag, port] of Object.entries(PORTS)) {
   }
 }
 
-function launch(tag: string, args: string[]) {
+function launch(tag: string, args: string[], env: Record<string, string | undefined> = process.env) {
   const proc = Bun.spawn([bun, "run", ...args], {
     cwd: app,
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
-    env: process.env,
+    env,
   });
   const forward = async (stream: ReadableStream<Uint8Array>, out: NodeJS.WriteStream) => {
     let carry = "";
@@ -66,7 +66,15 @@ function launch(tag: string, args: string[]) {
   return proc;
 }
 
-const procs = [launch("A", ["tauri", "dev"]), launch("B", ["dev:b"])];
+// Both instances normally share target/debug/app. Windows cannot replace
+// a running executable, so B needs a separate target directory there.
+// Keeping it under target/ excludes it from Git and Tauri's file watcher.
+const envB: Record<string, string | undefined> =
+  process.platform === "win32"
+    ? { ...process.env, CARGO_TARGET_DIR: resolve(app, "src-tauri", "target", "dev-b") }
+    : process.env;
+
+const procs = [launch("A", ["tauri", "dev"]), launch("B", ["dev:b"], envB)];
 
 const stop = () => {
   for (const p of procs) p.kill("SIGINT");
@@ -77,6 +85,14 @@ const stop = () => {
   if (process.platform !== "win32") {
     // cargo runs it as the relative `target/debug/app`, hence the loose match.
     Bun.spawnSync(["pkill", "-f", "(^|/)target/debug/app$"], { stdout: "ignore", stderr: "ignore" });
+  } else {
+    // Match the executable path; other projects may also use the name app.exe.
+    const root = resolve(app, "src-tauri", "target").replaceAll("'", "''");
+    Bun.spawnSync(
+      ["powershell", "-NoProfile", "-Command",
+       `Get-Process app -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '${root}\\*' } | Stop-Process -Force`],
+      { stdout: "ignore", stderr: "ignore" },
+    );
   }
 };
 process.on("SIGINT", stop);
