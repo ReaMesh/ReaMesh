@@ -551,19 +551,30 @@ fn clap_cache_names(path: &Path, out: &mut Vec<String>) {
     }
 }
 
-/// Names from REAPER's AU cache (`reaper-auplugins*.ini`, macOS): the key side
-/// carries the display name.
+/// Names from REAPER's AU cache (`reaper-auplugins*.ini`, macOS). The key
+/// side is `Vendor: Name` (REAPER's AU naming), while an .rpp refers to the
+/// same plugin as `AU: Name (Vendor)`. Emit the .rpp spelling so the
+/// frontend's name+vendor matcher hits without an AU special case.
 fn au_cache_names(path: &Path, out: &mut Vec<String>) {
     let Ok(text) = fs::read_to_string(path) else { return };
+    au_cache_names_from(&text, out);
+}
+
+fn au_cache_names_from(text: &str, out: &mut Vec<String>) {
     for line in text.lines() {
         if line.starts_with('[') {
             continue;
         }
-        if let Some((key, _)) = line.split_once('=') {
-            let key = key.trim();
-            if !key.is_empty() {
-                out.push(key.to_string());
+        let Some((key, _)) = line.split_once('=') else { continue };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        match key.split_once(": ") {
+            Some((vendor, name)) if !vendor.trim().is_empty() && !name.trim().is_empty() => {
+                out.push(format!("AU: {} ({})", name.trim(), vendor.trim()));
             }
+            _ => out.push(format!("AU: {key}")),
         }
     }
 }
@@ -615,7 +626,10 @@ fn installed_plugins(app: AppHandle) -> Vec<String> {
     ] {
         clap_cache_names(&dir.join(name), &mut out);
     }
-    for name in ["reaper-auplugins64.ini", "reaper-auplugins-arm64.ini"] {
+    // Intel REAPER writes `reaper-auplugins64.ini`, Apple Silicon
+    // `reaper-auplugins_arm64.ini` (underscore, like the VST cache). The
+    // `-bc.ini` sibling is a different, space-separated format and is skipped.
+    for name in ["reaper-auplugins64.ini", "reaper-auplugins_arm64.ini"] {
         au_cache_names(&dir.join(name), &mut out);
     }
     js_effect_names(&dir.join("Effects"), &mut out);
@@ -1465,5 +1479,25 @@ mod native_overlay {
 
     pub fn set_interactive(on: bool) {
         unsafe { reamesh_overlay_set_interactive(on as i32) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn au_cache_keys_become_rpp_display_names() {
+        let text = "[auplugins]\nApple: AUDelay=<!inst>\nMeldaProduction: MAGC=<!inst>\nOddOne=1\n";
+        let mut out = Vec::new();
+        au_cache_names_from(text, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                "AU: AUDelay (Apple)".to_string(),
+                "AU: MAGC (MeldaProduction)".to_string(),
+                "AU: OddOne".to_string(),
+            ]
+        );
     }
 }
