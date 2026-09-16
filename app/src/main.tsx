@@ -63,7 +63,16 @@ if (import.meta.env.DEV && params.get("mock") === "tauri") {
   let cbId = 0;
   const plugins = (params.get("plugins") ?? "").split(",").filter(Boolean);
   // deno-lint-ignore no-explicit-any
+  // Window metadata lets @tauri-apps/api/window resolve getCurrentWindow(), so
+  // the overlay HUD (?overlay=1) previews too; its size/move calls are no-ops.
+  const label = params.get("overlay") === "1" ? "overlay" : "main";
   (window as unknown as { __TAURI_INTERNALS__: any }).__TAURI_INTERNALS__ = {
+    metadata: {
+      currentWindow: { label },
+      currentWebview: { label, windowLabel: label },
+      windows: [{ label }],
+      webviews: [{ label, windowLabel: label }],
+    },
     transformCallback: () => ++cbId,
     unregisterCallback: () => {},
     convertFileSrc: (p: string) => p,
@@ -84,6 +93,8 @@ if (import.meta.env.DEV && params.get("mock") === "tauri") {
           return null;
         case "get_language":
           return params.get("lang") ?? "system";
+        case "get_overlay_settings":
+          return 3; // roster + tint on, like a fresh install
         default:
           return undefined;
       }
