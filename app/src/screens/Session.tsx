@@ -129,13 +129,11 @@ function PeerRow({
             {t("youBadge")}
           </Badge>
         )}
-        <TrackNumber track={peer.track} />
         {moderate && (
-          // Host controls, revealed on hover / keyboard focus so the roster
-          // stays calm. A kick is harmless (they can rejoin at once) and fires
-          // directly; a block is confirmed by the parent first.
+          // Show moderation controls on hover or keyboard focus. Kicks take effect
+          // immediately; the parent confirms blocks before sending them.
           <span
-            className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 has-[:focus-visible]:opacity-100"
+            className="mr-1 flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 has-[:focus-visible]:opacity-100"
             onClick={(e) => e.stopPropagation()}
             onKeyDown={(e) => e.stopPropagation()}
           >
@@ -143,6 +141,7 @@ function PeerRow({
               <Button
                 variant="ghost"
                 size="icon-xs"
+                className="text-muted-foreground hover:text-foreground"
                 aria-label={t("kickPeer", { name: displayName(peer) })}
                 onClick={onKick}
               >
@@ -153,7 +152,7 @@ function PeerRow({
               <Button
                 variant="ghost"
                 size="icon-xs"
-                className="hover:text-red-400"
+                className="text-muted-foreground hover:text-red-400"
                 aria-label={t("banPeer", { name: displayName(peer) })}
                 onClick={onBan}
               >
@@ -162,6 +161,7 @@ function PeerRow({
             </Hint>
           </span>
         )}
+        <TrackNumber track={peer.track} />
       </motion.div>
     </Hint>
   );
@@ -450,10 +450,12 @@ export function Session({
       <div className="min-h-0 flex-1" />
 
       {(hostPass || (hosting && (!!state.ticket || !!state.bans?.length))) && (
-        <div className="flex flex-col gap-1">
-          {hosting && !!state.ticket && <InviteTicket ticket={state.ticket} />}
-          {hostPass && <HostPassword pass={hostPass} />}
-          {hosting && <BanList bans={state.bans ?? []} port={port} />}
+        <div className="flex items-end gap-2">
+          <div className="flex min-w-0 flex-1 flex-col gap-1">
+            {hosting && !!state.ticket && <InviteTicket ticket={state.ticket} />}
+            {hostPass && <HostPassword pass={hostPass} />}
+          </div>
+          {hosting && <BanList bans={state.bans ?? []} port={port} variant="icon" />}
         </div>
       )}
 
