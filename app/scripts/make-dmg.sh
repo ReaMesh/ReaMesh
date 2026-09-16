@@ -11,6 +11,28 @@ cd "$(dirname "$0")/.."
 APP_BUNDLE="src-tauri/target/release/bundle/macos/ReaMesh.app"
 [ -d "$APP_BUNDLE" ] || { echo "error: $APP_BUNDLE not found; run 'bun run tauri build' first" >&2; exit 1; }
 
+# Refuse to package an app whose binary does not embed the frontend. Tauri
+# embeds dist/ at compile time as a table keyed "/index.html", "/assets/…";
+# a compile that saw an empty dist/ (overlapping builds) yields a binary
+# without them that only shows "asset not found: index.html" when launched.
+BIN="$APP_BUNDLE/Contents/MacOS/app"
+if [ -d dist/assets ]; then
+  MISSING=""
+  grep -q -a -F "/index.html" "$BIN" || MISSING="/index.html"
+  for f in dist/assets/*; do
+    case "$f" in *.map) continue ;; esac
+    grep -q -a -F "/assets/$(basename "$f")" "$BIN" || MISSING="$MISSING /assets/$(basename "$f")"
+  done
+  if [ -n "$MISSING" ]; then
+    echo "error: $BIN does not embed the frontend (missing:$MISSING)." >&2
+    echo "       The app crate was compiled against an empty dist/. Rebuild with 'bun run dmg:full'" >&2
+    echo "       (it forces the embed). Never run two tauri builds at the same time." >&2
+    exit 1
+  fi
+else
+  echo "warning: dist/assets not found; cannot verify the app embeds its frontend" >&2
+fi
+
 # Codesigning identity for the DMG container: APPLE_SIGNING_IDENTITY, i.e. a
 # "Developer ID Application" cert. Without one the image stays unsigned on
 # purpose: Gatekeeper assesses a signed disk image when it is opened and

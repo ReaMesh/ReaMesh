@@ -33,6 +33,11 @@ if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
   BUILD_ARGS+=(--config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$APPLE_SIGNING_IDENTITY\"}}}")
 fi
 
+# Rebuild tauri::generate_context!() so it embeds the current frontend.
+# An overlapping build can leave dist/ empty during code generation; Cargo
+# then has no embedded files to watch and may reuse the incomplete binary.
+touch src-tauri/src/lib.rs
+
 echo "==> Building ReaMesh.app (bun run tauri build)…"
 bun run tauri build "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"
 
