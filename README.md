@@ -1,5 +1,9 @@
 # ReaMesh
 
+<a href="LICENSE"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/License-GPL--3.0--only-3f3f46.svg?variant=outline&amp;logo=ri%3AGoLaw&amp;mode=dark&amp;valueColor=f0f6fc&amp;labelTextColor=f0f6fc&amp;logoColor=f0f6fc&amp;labelOpacity=1"><img alt="License: GPL-3.0-only" src="https://shieldcn.dev/badge/License-GPL--3.0--only-d4d4d8.svg?variant=outline&amp;logo=ri%3AGoLaw&amp;mode=light&amp;valueColor=1f2328&amp;labelTextColor=1f2328&amp;logoColor=1f2328&amp;labelOpacity=1"></picture></a>
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/badges/platforms-dark.svg"><img alt="Platforms: Windows and macOS" src="docs/badges/platforms-light.svg"></picture>
+<a href="app/"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/Tauri-v2-3f3f46.svg?variant=outline&amp;logo=tauri&amp;mode=dark&amp;valueColor=f0f6fc&amp;labelTextColor=f0f6fc&amp;logoColor=f0f6fc&amp;labelOpacity=1"><img alt="Tauri v2" src="https://shieldcn.dev/badge/Tauri-v2-d4d4d8.svg?variant=outline&amp;logo=tauri&amp;mode=light&amp;valueColor=1f2328&amp;labelTextColor=1f2328&amp;logoColor=1f2328&amp;labelOpacity=1"></picture></a>
+
 Work on a REAPER project together. ReaMesh shares project files and keeps edits
 in sync between computers on a local network or VPN. No account or server needed.
 
