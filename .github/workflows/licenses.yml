@@ -18,12 +18,14 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses
-          arguments: --manifest-path rust/Cargo.toml --config deny.toml
+          manifest-path: rust/Cargo.toml
+          arguments: --config deny.toml
       - name: Rust crates (companion app backend)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses
-          arguments: --manifest-path app/src-tauri/Cargo.toml --config deny.toml
+          manifest-path: app/src-tauri/Cargo.toml
+          arguments: --config deny.toml
       - name: npm packages (companion app)
         run: bun install --frozen-lockfile && bun ../tools/check-npm-licenses.ts .
         working-directory: app
