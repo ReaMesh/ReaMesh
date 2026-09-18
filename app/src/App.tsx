@@ -11,6 +11,7 @@ import { Disconnected } from "@/screens/Disconnected";
 import { Lobby } from "@/screens/Lobby";
 import { Downloading } from "@/screens/Downloading";
 import { Onboarding } from "@/screens/Onboarding";
+import { Outdated } from "@/screens/Outdated";
 import { Session } from "@/screens/Session";
 import { Settings } from "@/screens/Settings";
 import { startScanning, send, useActiveInstance } from "@/lib/connection";
@@ -376,9 +377,11 @@ export default function App() {
   // `activePort` happens to be when the effect runs.
   const mode = state?.mode;
   const port = activePort;
+  // An extension on a too-old REAPER runs as a stub that drops every command.
+  const unsupported = state?.unsupported ?? null;
   useEffect(() => {
-    if (mode === "idle" && port != null) send({ cmd: "browse" }, port);
-  }, [mode, port]);
+    if (mode === "idle" && port != null && !unsupported) send({ cmd: "browse" }, port);
+  }, [mode, port, unsupported]);
 
   // Give the overlay the active instance's port and process. A port change must
   // rebuild the HUD even when both instances are already in sessions.
@@ -437,6 +440,8 @@ export default function App() {
       key: "disconnected",
       node: <Disconnected closed={reaperClosed} closedWasSession={closedWasSession} />,
     };
+  } else if (unsupported) {
+    screen = { key: "outdated", node: <Outdated info={unsupported} /> };
   } else if (mode === "downloading") {
     screen = { key: "downloading", node: <Downloading state={state} port={port} /> };
   } else if (beatActive && mode === "client") {

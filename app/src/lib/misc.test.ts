@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { inkFor } from "./colors";
-import { formatBytes } from "./format";
+import { formatBytes, reaperVersionKey } from "./format";
 import { hostSeenCount, recordHostJoin } from "./knownHosts";
 import { localizeLogEntry } from "./log";
 import { initials, normalizeState } from "./types";
@@ -28,6 +28,19 @@ describe("formatBytes", () => {
   });
   it("localizes the decimal separator", () => {
     expect(formatBytes(1_300_000_000, "de")).toBe("1,30 GB");
+  });
+});
+
+describe("reaperVersionKey", () => {
+  it("orders releases as decimals", () => {
+    expect(reaperVersionKey("7.0")).toBeLessThan(reaperVersionKey("7.07"));
+    expect(reaperVersionKey("7.07")).toBeLessThan(reaperVersionKey("7.12"));
+    expect(reaperVersionKey("5.11")).toBeLessThan(reaperVersionKey("5.111"));
+    expect(reaperVersionKey("5.111")).toBeLessThan(reaperVersionKey("5.12"));
+  });
+  it("ignores build suffixes and rejects non-versions", () => {
+    expect(reaperVersionKey("7.43+dev0601")).toBe(reaperVersionKey("7.43"));
+    expect(reaperVersionKey("")).toBe(-1);
   });
 });
 

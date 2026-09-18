@@ -14,10 +14,18 @@ export function formatBytes(n: number, lang = resolveLang()): string {
   return fmt(n, "B", 0);
 }
 
-/** No bytes for this long and the transfer is treated as stalled: the rate
- *  decays and the UI stops promising a time. The Rust side gives a stall a full
- *  60s before failing the join, which is a long time to sit under a confident
- *  "About 7s to go". */
+/** Sortable key for a REAPER version label. REAPER numbers releases as a
+ *  decimal (7.0 < 7.07 < 7.12, 5.11 < 5.111 < 5.12), so the fraction digits are
+ *  right-padded to three. Mirrors `reaperVersionKey` in the extension; -1 when
+ *  the string doesn't start with a version. */
+export function reaperVersionKey(v: string): number {
+  const m = /^(\d+)(?:\.(\d{1,3}))?/.exec(v);
+  if (!m) return -1;
+  return Number(m[1]) * 1000 + Number((m[2] ?? "").padEnd(3, "0"));
+}
+
+/** After this much silence, report a stall and hide the ETA.
+ *  The network timeout is longer than the UI's stall threshold. */
 export const STALL_AFTER_MS = 6000;
 
 export interface Transfer {

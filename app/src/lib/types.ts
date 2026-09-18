@@ -35,7 +35,9 @@ export interface SessionPreview {
   files?: number;
   bytes?: number;
   project_file?: string;
-  meta?: { v?: number; tracks?: number; plugins?: string[] } | null;
+  /** `reaper` is the host's REAPER version ("7.42"; absent from an older
+   *  host): the trust dialog warns when it differs from the local one. */
+  meta?: { v?: number; tracks?: number; plugins?: string[]; reaper?: string } | null;
 }
 
 export interface SessionAd {
@@ -152,6 +154,13 @@ export interface ExtState {
    *  list outlives a stop-hosting / re-host cycle). Absent from an older
    *  extension. */
   bans?: BanEntry[];
+  /** Version of the REAPER this extension runs in ("7.42"). Absent from an
+   *  older extension. */
+  reaper?: string;
+  /** This REAPER is older than the extension supports (`min`). The extension
+   *  runs as a stub that publishes only this frame; the app shows an "update
+   *  REAPER" screen and sends it nothing. */
+  unsupported?: { version: string; min: string } | null;
 }
 
 /** One running REAPER instance (= one control server port). */

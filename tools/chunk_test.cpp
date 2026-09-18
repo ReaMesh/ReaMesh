@@ -454,6 +454,26 @@ int main() {
     assert(!chunkHasEmptySource("<ITEM\n  <SOURCE MIDI\n  >\n>\n"));
   }
 
+  // REAPER version gate: releases order as decimals, not as integer pairs.
+  {
+    assert(reaperVersionLabel("7.42/win64") == "7.42");
+    assert(reaperVersionLabel("7.43+dev0601/macOS-arm64") == "7.43+dev0601");
+    assert(reaperVersionKey("7.0") < reaperVersionKey("7.07"));
+    assert(reaperVersionKey("7.07") < reaperVersionKey("7.12"));
+    assert(reaperVersionKey("5.11") < reaperVersionKey("5.111"));
+    assert(reaperVersionKey("5.111") < reaperVersionKey("5.12"));
+    assert(reaperVersionKey("7.12rc3/win64") == reaperVersionKey("7.12"));
+    assert(reaperVersionKey("") == -1);
+    assert(reaperVersionSupported("7.12/win64"));
+    assert(reaperVersionSupported("7.42/macOS-arm64"));
+    assert(reaperVersionSupported("8.0/win64"));
+    assert(!reaperVersionSupported("7.11/win64"));
+    assert(!reaperVersionSupported("7.0/win64"));
+    assert(!reaperVersionSupported("6.83/linux-x86_64"));
+    // Unparseable: never lock anyone out over a format we didn't foresee.
+    assert(reaperVersionSupported("garbage"));
+  }
+
   printf("chunk_test: all assertions passed\n");
   return 0;
 }

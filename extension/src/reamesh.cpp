@@ -109,6 +109,8 @@
 #define REAPERAPI_WANT_GetCursorPosition
 #define REAPERAPI_WANT_GetSet_ArrangeView2
 #define REAPERAPI_WANT_SetEditCurPos
+// The minimum-version gate at plugin load, and the host-version mismatch hint.
+#define REAPERAPI_WANT_GetAppVersion
 
 #include "reaper_plugin.h"
 #include "reaper_plugin_functions.h"
@@ -165,6 +167,59 @@ static std::string fsUtf8(const fs::path& p) {
   return p.string();
 #endif
 }
+
+// ---------- REAPER version ----------
+//
+// The oldest REAPER every synced field round-trips on. Every imported function
+// exists long before this; what sets the floor is the track attributes read by
+// name: fixed lanes (I_NUMFIXEDLANES / C_LANEPLAYS, 7.0), P_LANENAME:n (7.07)
+// and C_LANESETTINGS (7.12). An older REAPER answers 0 for an attribute it
+// doesn't know and ignores the write, so those fields would silently fail to
+// sync (and below 7.0 a v7 .rpp with fixed lanes or FX containers doesn't even
+// load faithfully). Rather than degrade quietly, an older REAPER gets the
+// extension in a stub mode that only tells the app "update REAPER".
+static constexpr const char* kMinReaperVersion = "7.12";
+
+// GetAppVersion() reads "7.42/win64", "7.43+dev0601/macOS-arm64", "7.12rc3/…".
+// The part the user knows is everything before the slash.
+static std::string reaperVersionLabel(const std::string& appVersion) {
+  return appVersion.substr(0, appVersion.find('/'));
+}
+
+// REAPER numbers releases as a decimal: 7.0 < 7.07 < 7.12, and 5.11 < 5.111 <
+// 5.12. So compare major, then the fraction digits right-padded to three
+// ("12" → 120, "07" → 70, "111" → 111). Parsed by hand: strtod would read the
+// fraction by the process locale, and a German REAPER has a decimal comma.
+// Returns -1 when the string doesn't start with a version.
+static long reaperVersionKey(const std::string& v) {
+  size_t i = 0;
+  long major = 0;
+  if (i >= v.size() || v[i] < '0' || v[i] > '9') return -1;
+  for (; i < v.size() && v[i] >= '0' && v[i] <= '9'; ++i) major = major * 10 + (v[i] - '0');
+  long frac = 0;
+  int digits = 0;
+  if (i < v.size() && v[i] == '.')
+    for (++i; i < v.size() && v[i] >= '0' && v[i] <= '9' && digits < 3; ++i, ++digits)
+      frac = frac * 10 + (v[i] - '0');
+  for (; digits < 3; ++digits) frac *= 10;
+  return major * 1000 + frac;
+}
+
+// An unparseable version counts as supported: never lock a user out over a
+// version string format we didn't foresee.
+static bool reaperVersionSupported(const std::string& appVersion) {
+  const long have = reaperVersionKey(appVersion);
+  return have < 0 || have >= reaperVersionKey(kMinReaperVersion);
+}
+
+// This REAPER's version label ("7.42"), read once at plugin load. Published to
+// the app and, while hosting, put into the session meta so a joiner can be
+// warned about a mismatch before opening the host's project.
+static std::string g_reaperVersion;
+// Set at load when this REAPER is older than kMinReaperVersion (or lacks an
+// imported function): nothing but the control server runs, and its one state
+// frame carries `unsupported` so the app can ask for a REAPER update.
+static bool g_unsupported = false;
 
 // ---------- state ----------
 
@@ -3156,7 +3211,12 @@ static void refreshSessionMeta(bool force) {
   if (text.empty()) return;
   json plugins = json::array();
   for (const std::string& p : collectPlugins(text)) plugins.push_back(p);
-  const json meta = {{"v", 1}, {"tracks", CountTracks(nullptr)}, {"plugins", plugins}};
+  // `reaper` is this host's REAPER version: a joiner on a different one is
+  // warned in the trust dialog (a newer host's project may not load faithfully).
+  const json meta = {{"v", 1},
+                     {"tracks", CountTracks(nullptr)},
+                     {"plugins", plugins},
+                     {"reaper", g_reaperVersion}};
   reamesh_set_session_meta(g_handle, meta.dump().c_str());
 }
 
@@ -3188,6 +3248,23 @@ static json verifyDownloadedPlugins(const std::string& path) {
     if (!claimed.count(f)) extras.push_back(f);
   if (extras.empty()) return json();
   return json{{"extras", extras}, {"listed", listed}};
+}
+
+// The host's manifest meta names its REAPER version. A different one here is
+// worth a line in the Activity feed (the trust dialog already warned before the
+// join): state chunks are REAPER's own serialization, so a field written by a
+// newer REAPER can come back changed from an older one. An old host that sends
+// no version says nothing.
+static void noteHostReaperMismatch() {
+  if (!g_handle || g_reaperVersion.empty()) return;
+  char* raw = reamesh_session_meta(g_handle);
+  const json meta = json::parse(raw ? raw : "", nullptr, false);
+  reamesh_free_string(raw);
+  const std::string host = meta.is_object() ? jsonStr(meta, "reaper") : "";
+  if (host.empty() || reaperVersionKey(host) == reaperVersionKey(g_reaperVersion)) return;
+  logEvent("reaper_mismatch", {{"host", host}, {"local", g_reaperVersion}},
+           "the host runs REAPER " + host + ", you run " + g_reaperVersion +
+               ". Some edits may not sync cleanly");
 }
 
 // Tear the session down. `code`/`params`/`text` describe why as a structured
@@ -3785,6 +3862,8 @@ static void ctlPublishState() {
   state["type"] = "state";
   state["mode"] = modeName();
   state["project"] = fileStem(currentProjectPath());
+  // This REAPER's version, for the app's host-version mismatch warning.
+  state["reaper"] = g_reaperVersion;
   state["error"] = g_lastError;
   state["log"] = g_log;
   state["overridden"] = reverts;
@@ -4073,6 +4152,7 @@ static void openDownloadedProject(std::string path) {
   logEvent("connected", json::object(),
            g_noFx ? "connected without effects in view-only mode"
                   : "connected. You can edit live, but the session owner wins conflicts");
+  noteHostReaperMismatch();
 }
 
 static void pollDownload() {
@@ -4167,7 +4247,38 @@ static void updateLoadingState(const json& st) {
   g_mediaLoading = loading;
 }
 
+// The whole extension on a REAPER older than kMinReaperVersion: keep the control
+// server answering so the app can say "update REAPER" instead of mistaking the
+// extension for missing, and do nothing else. Commands are drained and dropped,
+// and no REAPER function is called: on a REAPER old enough to lack an import,
+// those pointers are null.
+static void unsupportedTick() {
+  reamesh_ctl_heartbeat();
+  while (char* raw = reamesh_ctl_poll()) reamesh_free_string(raw);
+  static bool published = false;
+  if (published) return;
+  published = true;
+  const json state = {{"type", "state"},
+                      {"mode", "idle"},
+                      {"state", ""},
+                      {"progress", 0.0},
+                      {"session", ""},
+                      {"project", ""},
+                      {"error", nullptr},
+                      {"log", json::array()},
+                      {"sessions", json::array()},
+                      {"peers", json::array()},
+                      {"bans", json::array()},
+                      {"reaper", g_reaperVersion},
+                      {"unsupported", {{"version", g_reaperVersion}, {"min", kMinReaperVersion}}}};
+  reamesh_ctl_publish(state.dump().c_str());
+}
+
 static void timerTick() {
+  if (g_unsupported) {
+    unsupportedTick();
+    return;
+  }
   if (g_applyingRemote) return;
   // Companion-app commands and state mirroring run in every mode, including
   // Idle (the app may connect before any session exists).
@@ -4270,6 +4381,13 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
   (void)hInstance;
   if (!rec) {
     // Plugin unloading.
+    if (g_rec && g_unsupported) {
+      // Stub mode registered the timer and nothing else, and there is no
+      // session to leave (leaveSession would call into REAPER).
+      g_rec->Register("-timer", (void*)timerTick);
+      g_rec = nullptr;
+      return 0;
+    }
     if (g_rec) {
       g_rec->Register("-timer", (void*)timerTick);
       g_rec->Register("-hookcommand", (void*)hookCommand);
@@ -4283,7 +4401,20 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
     return 0;
   }
   if (rec->caller_version != REAPER_PLUGIN_VERSION || !rec->GetFunc) return 0;
-  if (REAPERAPI_LoadAPI(rec->GetFunc) != 0) return 0;
+  // A missing import used to abort the load, which left the user with an app
+  // that calls the extension "not running" and no hint why. Load anyway and
+  // let the app explain: too old a REAPER (by version, or by a missing
+  // function) runs the stub mode, which touches no REAPER API past this point.
+  const int missingApis = REAPERAPI_LoadAPI(rec->GetFunc);
+  const std::string appVersion = GetAppVersion ? GetAppVersion() : "";
+  g_reaperVersion = reaperVersionLabel(appVersion);
+  if (missingApis != 0 || !reaperVersionSupported(appVersion)) {
+    g_unsupported = true;
+    g_rec = rec;
+    rec->Register("timer", (void*)timerTick);
+    reamesh_ctl_start();
+    return 1;
+  }
 
   g_rec = rec;
   // Lasting per-install network identity: persisted under REAPER's resource

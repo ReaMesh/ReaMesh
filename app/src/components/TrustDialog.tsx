@@ -2,7 +2,7 @@
 // The extension verifies the manifest's plugin list against the downloaded project.
 
 import { useMemo, useState } from "react";
-import { ShieldAlert } from "lucide-react";
+import { ShieldAlert, TriangleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -12,7 +12,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { formatBytes } from "@/lib/format";
+import { useActiveInstance } from "@/lib/connection";
+import { formatBytes, reaperVersionKey } from "@/lib/format";
 import { t } from "@/lib/i18n";
 import { parseFxName, pluginStatus, useInstalledPlugins, type PluginStatus } from "@/lib/plugins";
 import type { SessionPreview } from "@/lib/types";
@@ -137,6 +138,20 @@ export function TrustDialog({
   const totalFiles = preview?.files ?? files ?? 0;
   const tracks = preview?.meta?.tracks;
   const plugins = preview?.meta?.plugins;
+  // A host on another REAPER version: state chunks are REAPER's own format, so
+  // a newer host's project may not load faithfully here (and the other way
+  // round for edits). Silent when either side doesn't report a version.
+  const hostReaper = preview?.meta?.reaper;
+  const localReaper = useActiveInstance()?.state?.reaper;
+  const mismatch =
+    hostReaper && localReaper && hostReaper !== localReaper
+      ? t(
+          reaperVersionKey(hostReaper) > reaperVersionKey(localReaper)
+            ? "reaperMismatchHostNewer"
+            : "reaperMismatchHostOlder",
+          { host: hostReaper, local: localReaper },
+        )
+      : null;
 
   // Two lines of facts: "Host: Anna", then "12 tracks · 34 files · 1.2 GB".
   // Missing pieces drop out.
@@ -166,6 +181,16 @@ export function TrustDialog({
             {hostLine.length > 0 && <p>{hostLine.join(" · ")}</p>}
             {stats.length > 0 && <p>{stats.join(" · ")}</p>}
           </div>
+        )}
+
+        {mismatch && (
+          <p
+            role="status"
+            className="flex items-start gap-2 rounded-lg bg-amber-500/10 p-2.5 text-[12px] leading-relaxed text-amber-500"
+          >
+            <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+            {mismatch}
+          </p>
         )}
 
         {plugins && plugins.length > 0 && <PluginList plugins={plugins} />}

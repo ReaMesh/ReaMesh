@@ -297,6 +297,18 @@ const en = {
   nofxOpen: "Opening a view-only copy without effects.",
   verifyHold: "The downloaded project loads plugins the host didn't list.",
 
+  // REAPER version: minimum gate + host mismatch
+  reaperOutdatedTitle: "REAPER needs an update",
+  reaperOutdatedBody:
+    "ReaMesh needs REAPER {min} or newer. This is REAPER {version}. Update REAPER, then start it again.",
+  reaperOutdatedBodyUnknown: "ReaMesh needs REAPER {min} or newer. Update REAPER, then start it again.",
+  getReaperUpdate: "Get the REAPER update",
+  reaperMismatchHostNewer:
+    "The host runs REAPER {host}, you run {local}. Parts of the project may not load correctly here. Updating REAPER is recommended.",
+  reaperMismatchHostOlder:
+    "The host runs REAPER {host}, you run {local}. Some of your edits may not arrive cleanly on their side.",
+  logReaperMismatch: "The host runs REAPER {host}, you run {local}. Some edits may not sync cleanly.",
+
   // Progressive join: the project opens while media is still downloading.
   logProgressiveOpen: "Project opened. Items waiting for their media: {count}",
   logLoadingReadonly: "The project is still loading. Editing unlocks once everything is here.",
@@ -622,6 +634,20 @@ const de: Record<MsgKey, string> = {
   followEnded: "Du folgst der Person nicht mehr, weil sie die Session verlassen hat.",
   nofxOpen: "Schreibgeschützte Kopie wird ohne Effekte geöffnet.",
   verifyHold: "Das heruntergeladene Projekt enthält Plugins, die der Host nicht angegeben hat.",
+
+  // REAPER version: minimum gate + host mismatch
+  reaperOutdatedTitle: "REAPER braucht ein Update",
+  reaperOutdatedBody:
+    "ReaMesh braucht REAPER {min} oder neuer. Das hier ist REAPER {version}. Aktualisiere REAPER und starte es danach neu.",
+  reaperOutdatedBodyUnknown:
+    "ReaMesh braucht REAPER {min} oder neuer. Aktualisiere REAPER und starte es danach neu.",
+  getReaperUpdate: "REAPER-Update holen",
+  reaperMismatchHostNewer:
+    "Der Host nutzt REAPER {host}, du nutzt {local}. Teile des Projekts werden hier eventuell nicht korrekt geladen. Ein REAPER-Update wird empfohlen.",
+  reaperMismatchHostOlder:
+    "Der Host nutzt REAPER {host}, du nutzt {local}. Manche deiner Änderungen kommen dort eventuell nicht sauber an.",
+  logReaperMismatch:
+    "Der Host nutzt REAPER {host}, du nutzt {local}. Manche Änderungen werden eventuell nicht sauber synchronisiert.",
 
   logProgressiveOpen: "Projekt geöffnet. Items, die noch auf ihre Medien warten: {count}",
   logLoadingReadonly: "Das Projekt lädt noch. Bearbeiten geht, sobald alles da ist.",

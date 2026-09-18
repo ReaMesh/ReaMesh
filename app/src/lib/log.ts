@@ -46,6 +46,7 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   follow_ended: "followEnded",
   nofx_open: "nofxOpen",
   verify_hold: "verifyHold",
+  reaper_mismatch: "logReaperMismatch",
   progressive_open: "logProgressiveOpen",
   loading_readonly: "logLoadingReadonly",
   media_downloaded: "logMediaDownloaded",
