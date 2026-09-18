@@ -1,16 +1,16 @@
 import { useEffect, useState } from "react";
-import { motion } from "motion/react";
 import { CircleSlash } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { ArcRing } from "@/components/ArcRing";
 import { FirewallNotice } from "@/components/FirewallNotice";
 import { isWindows } from "@/lib/platform";
 // Concrete color values (mirrors of index.css variables) because Motion can
 // only interpolate between real colors: a CSS variable would snap instead of
 // easing grey→blue.
-import { FOUND_COLOR, SCAN_COLOR } from "@/lib/colors";
+import { FG_COLOR, FOUND_COLOR } from "@/lib/colors";
 import { t } from "@/lib/i18n";
 
 async function launchReaper() {
@@ -68,7 +68,7 @@ export function Disconnected({
       : t("startReaperToConnect");
   return (
     <div className="flex flex-1 flex-col items-center [justify-content:safe_center] overflow-y-auto gap-6 px-10 text-center">
-      <BreathingBeacon found={found} />
+      <ScanSpinner found={found} />
 
       <div className="space-y-1.5">
         <h2 className="text-[15px] font-semibold">{title}</h2>
@@ -96,50 +96,20 @@ export function Disconnected({
   );
 }
 
-// Two staggered rings pulse around the center dot. When REAPER answers, the
-// existing animation changes color instead of restarting.
-function BreathingBeacon({ found }: { found: boolean }) {
-  const color = found ? FOUND_COLOR : SCAN_COLOR;
+// Spin while searching for REAPER. On connection, finish the turn,
+// close the ring, and transition to the success color.
+function ScanSpinner({ found }: { found: boolean }) {
   return (
-    <div className="flex h-11 w-11 items-center justify-center">
-      <div className="relative flex items-center justify-center">
-        {[0, 1].map((i) => (
-          <motion.span
-            key={i}
-            className="absolute size-[9px] rounded-full border-[1.5px]"
-            initial={{ scale: 1, opacity: 0, borderColor: SCAN_COLOR }}
-            animate={{ scale: 4.2, opacity: [0, 0.5, 0], borderColor: color }}
-            transition={{
-              scale: {
-                duration: 2,
-                repeat: Infinity,
-                ease: [0, 0.2, 0.8, 1],
-                delay: i,
-              },
-              // Start and end at zero opacity to hide the loop boundary. Fade
-              // out before maximum scale so the outer edge does not linger.
-              opacity: {
-                duration: 2,
-                repeat: Infinity,
-                ease: "easeOut",
-                times: [0, 0.2, 0.8],
-                delay: i,
-              },
-              // Color changes independently so the pulse does not restart.
-              borderColor: { duration: 0.45, ease: "easeOut" },
-            }}
-          />
-        ))}
-        <motion.span
-          className="size-[9px] rounded-full"
-          initial={{ backgroundColor: SCAN_COLOR }}
-          animate={{ scale: found ? [1, 1.35, 1] : 1, backgroundColor: color }}
-          transition={{
-            scale: { duration: 0.5, ease: "easeOut" },
-            backgroundColor: { duration: 0.45, ease: "easeOut" },
-          }}
-        />
-      </div>
+    <div className="relative size-11">
+      <ArcRing
+        size={44}
+        radius={11}
+        strokeWidth={2.5}
+        spinning={!found}
+        progress={1}
+        color={found ? FOUND_COLOR : FG_COLOR}
+        track={false}
+      />
     </div>
   );
 }

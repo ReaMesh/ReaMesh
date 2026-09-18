@@ -16,7 +16,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { FG_COLOR, FOUND_COLOR, SCAN_COLOR } from "@/lib/colors";
+import { ArcRing } from "@/components/ArcRing";
+import { FG_COLOR, FOUND_COLOR } from "@/lib/colors";
 import { send } from "@/lib/connection";
 import { formatBytes, useTransfer } from "@/lib/format";
 import { resolveLang, t } from "@/lib/i18n";
@@ -35,11 +36,7 @@ function phaseIndex(state: ExtState): number {
   return 0; // connecting: join sent, waiting for the host's manifest
 }
 
-const R = 30; // ring radius inside the 76px beacon box
-const CIRC = 2 * Math.PI * R;
-
-/** Keep the percentage and ring on the same spring. Rolling digits are too
- *  distracting at the transfer update rate. */
+/** Use the same spring for the percentage and ring to keep them in sync. */
 function GlidingPercent({ progress }: { progress: number }) {
   const reduce = useReducedMotion();
   const spring = useSpring(0, { stiffness: 80, damping: 20 });
@@ -54,119 +51,26 @@ function GlidingPercent({ progress }: { progress: number }) {
   return <motion.span>{text}</motion.span>;
 }
 
-/** Expanding pulse shared with the disconnected screen. The ring is transparent
- *  at both ends of the loop to avoid a visible restart. */
-function Breath({
-  className,
-  toScale,
-  delay = 0,
-}: {
-  className: string;
-  toScale: number;
-  delay?: number;
-}) {
-  return (
-    <motion.span
-      className={className}
-      style={{ borderColor: SCAN_COLOR }}
-      initial={{ scale: 1, opacity: 0 }}
-      animate={{ scale: toScale, opacity: [0, 0.5, 0] }}
-      exit={{ opacity: 0, transition: { duration: 0.2 } }}
-      transition={{
-        scale: { duration: 2, repeat: Infinity, ease: [0, 0.2, 0.8, 1], delay },
-        opacity: { duration: 2, repeat: Infinity, ease: "easeOut", times: [0, 0.2, 0.8], delay },
-      }}
-    />
-  );
-}
-
-/** Join progress indicator: pulsing dot while connecting, progress ring during
- *  transfer, full ring while opening, and a checkmark when done. */
+/** Join progress indicator: one ring throughout. It spins as an open arc while
+ *  connecting, shows the transfer progress, spins again while REAPER opens the
+ *  project, and closes around a checkmark when done. */
 function ProgressBeacon({ phase, progress }: { phase: number; progress: number }) {
   const done = phase >= 3;
-  // The opening phase holds the ring visually full even if the last progress
-  // report landed a hair short of 1.
-  const p = phase >= 2 ? 1 : Math.min(1, Math.max(0, progress));
+  const spinning = phase === 0 || phase === 2;
 
   return (
     <div className="relative grid size-[76px] place-items-center">
-      <AnimatePresence>
-        {phase === 0 && (
-          <>
-            {/* Match the pulse used on the disconnected screen. */}
-            <Breath
-              key="b0"
-              className="absolute size-[9px] rounded-full border-[1.5px]"
-              toScale={4.2}
-            />
-            <Breath
-              key="b1"
-              className="absolute size-[9px] rounded-full border-[1.5px]"
-              toScale={4.2}
-              delay={1}
-            />
-          </>
-        )}
-        {/* Pulse the full ring while REAPER opens the project. */}
-        {phase === 2 && (
-          <Breath
-            key="ring-breath"
-            className="absolute inset-1 rounded-full border-[1.5px]"
-            toScale={1.3}
-          />
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence initial={false}>
-        {phase >= 1 && (
-          <motion.svg
-            key="ring"
-            viewBox="0 0 76 76"
-            className="absolute inset-0 -rotate-90"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            transition={{ duration: 0.35, ease: "easeOut" }}
-          >
-            <circle
-              cx="38"
-              cy="38"
-              r={R}
-              fill="none"
-              strokeWidth="3"
-              className="stroke-secondary"
-            />
-            <motion.circle
-              cx="38"
-              cy="38"
-              r={R}
-              fill="none"
-              strokeWidth="3"
-              strokeLinecap="round"
-              strokeDasharray={CIRC}
-              initial={{ strokeDashoffset: CIRC, stroke: FG_COLOR }}
-              animate={{
-                strokeDashoffset: CIRC * (1 - p),
-                stroke: done ? FOUND_COLOR : FG_COLOR,
-              }}
-              transition={{
-                strokeDashoffset: { type: "spring", stiffness: 80, damping: 20 },
-                stroke: { duration: 0.45, ease: "easeOut" },
-              }}
-            />
-          </motion.svg>
-        )}
-      </AnimatePresence>
+      <ArcRing
+        size={76}
+        radius={30}
+        strokeWidth={3}
+        spinning={spinning}
+        progress={done ? 1 : progress}
+        color={done ? FOUND_COLOR : FG_COLOR}
+      />
 
       <AnimatePresence mode="wait" initial={false}>
-        {phase === 0 ? (
-          <motion.span
-            key="dot"
-            className="size-[9px] rounded-full"
-            style={{ backgroundColor: SCAN_COLOR }}
-            exit={{ scale: 0.5, opacity: 0 }}
-            transition={{ duration: 0.15, ease: "easeOut" }}
-          />
-        ) : done ? (
+        {spinning ? null : done ? (
           <motion.span
             key="check"
             initial={{ scale: 0 }}
@@ -186,7 +90,7 @@ function ProgressBeacon({ phase, progress }: { phase: number; progress: number }
             transition={{ duration: 0.15, ease: "easeOut" }}
             className="text-[13px] font-semibold tabular-nums"
           >
-            <GlidingPercent progress={p} />
+            <GlidingPercent progress={progress} />
           </motion.span>
         )}
       </AnimatePresence>
