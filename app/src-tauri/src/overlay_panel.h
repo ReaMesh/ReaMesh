@@ -24,4 +24,8 @@ void reamesh_overlay_detach(void);
 // it only makes the panel key, which is what a text field needs.
 void reamesh_overlay_set_interactive(int on);
 
+// Keep the dragged offset across relaunches (1) or start from the default
+// anchor every session and forget any stored offset (0). Call before attach.
+void reamesh_overlay_set_remember(int on);
+
 #endif

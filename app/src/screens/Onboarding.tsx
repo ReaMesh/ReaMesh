@@ -1,11 +1,13 @@
 import { useState } from "react";
-import { AnimatePresence, motion } from "motion/react";
-import { CheckCircle2, ExternalLink, TriangleAlert } from "lucide-react";
+import { Check, ExternalLink, TriangleAlert } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { BarMark } from "@/components/BarMark";
 import { FirewallNotice } from "@/components/FirewallNotice";
+import { Group } from "@/components/Group";
+import { PathField } from "@/components/PathField";
 import { t } from "@/lib/i18n";
 import {
   installExtension,
@@ -13,19 +15,64 @@ import {
   setReaperPath,
   type ReaperStatus,
 } from "@/lib/install";
+import { cn } from "@/lib/utils";
 
-// First-run setup for locating REAPER, installing the extension, and handing
-// control back to the main app.
+// First-run setup as one checklist: find REAPER, install the extension,
+// restart REAPER. All three steps stay visible; only the current one opens.
 
-const BAR_COLORS = ["#f0846b", "#e8d35c", "#7bd88f", "#5b8def"];
-const BAR_HEIGHTS = [22, 34, 28, 38];
+function Step({
+  n,
+  state,
+  title,
+  children,
+}: {
+  n: number;
+  state: "done" | "current" | "todo";
+  title: string;
+  children?: React.ReactNode;
+}) {
+  return (
+    <li className="flex gap-3 px-3 py-3">
+      <span
+        aria-hidden="true"
+        className={cn(
+          "mt-px grid size-[22px] shrink-0 place-items-center rounded-full text-[11px] font-semibold tabular-nums",
+          state === "done" && "bg-emerald-500/15 text-emerald-400",
+          state === "current" && "bg-foreground text-background",
+          state === "todo" && "bg-white/[0.07] text-muted-foreground",
+        )}
+      >
+        {state === "done" ? <Check className="size-3" strokeWidth={3} /> : n}
+      </span>
+      <div className="min-w-0 flex-1 space-y-2.5">
+        <h2
+          className={cn(
+            "text-[13px] leading-[22px] font-semibold",
+            state === "todo" && "text-muted-foreground",
+          )}
+        >
+          {title}
+        </h2>
+        {state !== "todo" && children}
+      </div>
+    </li>
+  );
+}
 
-function LocateStep({ status }: { status: ReaperStatus }) {
+export function Onboarding({ status }: { status: ReaperStatus }) {
+  // Local "installed just now" flag so the last step stays visible until
+  // Finish refreshes the status and the App-level gate moves on. Dev-only:
+  // ?step=done jumps straight to it for preview (see the ?mock=onboarding
+  // harness in main.tsx).
+  const [done, setDone] = useState(
+    import.meta.env.DEV &&
+      new URLSearchParams(window.location.search).get("step") === "done",
+  );
+  const [busy, setBusy] = useState(false);
+  const found = status.reaperFound;
+
   const pick = async () => {
-    const dir = await open({
-      directory: true,
-      title: t("locateReaperFolder"),
-    });
+    const dir = await open({ directory: true, title: t("locateReaperFolder") });
     if (typeof dir === "string") {
       try {
         await setReaperPath(dir);
@@ -36,63 +83,11 @@ function LocateStep({ status }: { status: ReaperStatus }) {
       await refreshStatus();
     }
   };
-
-  return (
-    <div className="space-y-3 rounded-xl bg-card p-3.5">
-      <div className="space-y-1">
-        <h2 className="text-[13px] font-semibold">{t("reaperNotFound")}</h2>
-        <p className="text-[12px] leading-relaxed text-muted-foreground">
-          {t("reaperNotFoundBody")}
-        </p>
-      </div>
-      <div className="flex items-center gap-2">
-        <p className="min-w-0 flex-1 break-all rounded-md bg-secondary/60 px-2.5 py-1.5 text-[12px] leading-relaxed text-foreground/80">
-          {status.resourcePath}
-        </p>
-        <Button
-          variant="outline"
-          size="sm"
-          className="h-7 shrink-0 text-[12px]"
-          onClick={pick}
-        >
-          {t("change")}
-        </Button>
-      </div>
-      <div className="flex gap-2">
-        <Button
-          size="sm"
-          className="h-7 flex-1 gap-1.5 text-[12px]"
-          onClick={() => openUrl("https://www.reaper.fm/download.php")}
-        >
-          {t("downloadReaper")}
-          <ExternalLink className="size-3" />
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          className="h-7 flex-1 text-[12px]"
-          onClick={() => refreshStatus()}
-        >
-          {t("checkAgain")}
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-function InstallStep({
-  status,
-  onInstalled,
-}: {
-  status: ReaperStatus;
-  onInstalled: () => void;
-}) {
-  const [busy, setBusy] = useState(false);
   const install = async () => {
     setBusy(true);
     try {
       await installExtension();
-      onInstalled();
+      setDone(true);
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -101,104 +96,78 @@ function InstallStep({
   };
 
   return (
-    <div className="space-y-3 rounded-xl bg-card p-3.5">
-      <div className="space-y-1">
-        <h2 className="text-[13px] font-semibold">{t("installExtTitle")}</h2>
-        <p className="text-[12px] leading-relaxed text-muted-foreground">
-          {t("installExtBody")}{" "}
-          <span className="break-all text-foreground/80">
-            {status.userPlugins}
-          </span>
-          .
-        </p>
-      </div>
-      {!status.isReaperDir && (
-        <p className="flex items-start gap-2 rounded-lg bg-amber-500/10 p-2.5 text-[12px] leading-relaxed text-amber-500">
-          <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
-          {t("notReaperDirWarning")}
-        </p>
-      )}
-      <Button
-        size="sm"
-        className="h-7 w-full text-[12px]"
-        disabled={busy}
-        onClick={install}
-      >
-        {busy ? t("installing") : t("installExtension")}
-      </Button>
-    </div>
-  );
-}
-
-function DoneStep() {
-  return (
-    <div className="space-y-3 rounded-xl bg-card p-3.5">
-      <div className="space-y-1">
-        <h2 className="flex items-center gap-1.5 text-[13px] font-semibold">
-          <CheckCircle2 className="size-4 shrink-0 text-emerald-500" />
-          {t("allSet")}
-        </h2>
-        <p className="text-[12px] leading-relaxed text-muted-foreground">
-          {t("allSetBody")}
-        </p>
-      </div>
-      <FirewallNotice />
-      <Button
-        size="sm"
-        className="h-7 w-full text-[12px]"
-        onClick={() => refreshStatus()}
-      >
-        {t("finish")}
-      </Button>
-    </div>
-  );
-}
-
-export function Onboarding({ status }: { status: ReaperStatus }) {
-  // Local "installed just now" flag so the success step stays visible until
-  // Finish refreshes the status and the App-level gate moves on. Dev-only:
-  // ?step=done jumps straight to the "All set" step for preview (see the
-  // ?mock=onboarding harness in main.tsx).
-  const [done, setDone] = useState(
-    import.meta.env.DEV &&
-      new URLSearchParams(window.location.search).get("step") === "done",
-  );
-  const step = done ? "done" : status.reaperFound ? "install" : "locate";
-
-  return (
-    <div className="flex flex-1 flex-col [justify-content:safe_center] overflow-y-auto gap-5 px-6 pb-8">
-      <div className="space-y-3 px-0.5">
-        <div className="flex h-10 items-end gap-1.5">
-          {BAR_COLORS.map((c, i) => (
-            <div
-              key={c}
-              className="w-2.5 rounded-full"
-              style={{ backgroundColor: c, height: BAR_HEIGHTS[i] }}
-            />
-          ))}
-        </div>
+    <div className="flex flex-1 flex-col [justify-content:safe_center] gap-5 overflow-y-auto px-4 pb-6">
+      <div className="space-y-3 px-1">
+        <BarMark height={38} />
         <div className="space-y-1">
-          <h1 className="text-[15px] font-semibold">{t("welcome")}</h1>
+          <h1 className="text-[21px] leading-tight font-semibold tracking-[-0.015em]">{t("welcome")}</h1>
           <p className="text-[13px] text-muted-foreground">{t("tagline")}</p>
         </div>
       </div>
-      <AnimatePresence mode="wait">
-        <motion.div
-          key={step}
-          initial={{ opacity: 0, y: 8 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: -8 }}
-          transition={{ duration: 0.18, ease: "easeOut" }}
-        >
-          {step === "done" ? (
-            <DoneStep />
-          ) : step === "install" ? (
-            <InstallStep status={status} onInstalled={() => setDone(true)} />
-          ) : (
-            <LocateStep status={status} />
-          )}
-        </motion.div>
-      </AnimatePresence>
+
+      <Group>
+        <ol className="divide-y divide-white/[0.07]">
+          <Step
+            n={1}
+            state={found ? "done" : "current"}
+            title={found ? t("reaperFound") : t("reaperNotFound")}
+          >
+            <PathField
+              path={status.resourcePath}
+              action={
+                <Button variant="ghost" size="sm" className="h-7 shrink-0 px-2.5 text-[12px]" onClick={pick}>
+                  {t("change")}
+                </Button>
+              }
+            />
+            {!found && (
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  className="h-8 flex-1 gap-1.5 text-[12px]"
+                  onClick={() => openUrl("https://www.reaper.fm/download.php")}
+                >
+                  {t("downloadReaper")}
+                  <ExternalLink className="size-3" aria-hidden="true" />
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="h-8 flex-1 text-[12px]"
+                  onClick={() => refreshStatus()}
+                >
+                  {t("checkAgain")}
+                </Button>
+              </div>
+            )}
+          </Step>
+          <Step
+            n={2}
+            state={done ? "done" : found ? "current" : "todo"}
+            title={done ? t("allSet") : t("installExtTitle")}
+          >
+            {!done && (
+              <>
+                {!status.isReaperDir && (
+                  <p className="flex items-start gap-2 rounded-[10px] bg-amber-500/10 px-2.5 py-2 text-[12px] leading-snug text-amber-500">
+                    <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+                    {t("notReaperDirWarning")}
+                  </p>
+                )}
+                <Button size="sm" className="h-8 w-full text-[13px]" disabled={busy} onClick={install}>
+                  {busy ? t("installing") : t("installExtension")}
+                </Button>
+              </>
+            )}
+          </Step>
+          <Step n={3} state={done ? "current" : "todo"} title={t("restartReaperStep")}>
+            <FirewallNotice />
+            <Button size="sm" className="h-8 w-full text-[13px]" onClick={() => refreshStatus()}>
+              {t("finish")}
+            </Button>
+          </Step>
+        </ol>
+      </Group>
     </div>
   );
 }

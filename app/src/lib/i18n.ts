@@ -413,6 +413,20 @@ const en = {
   editingTempo: "the tempo map",
   editingMarkers: "markers",
   editingProject: "project settings",
+  olRememberPos: "Remember HUD position",
+  privacy: "Privacy",
+  help: "Help",
+  documentation: "Documentation",
+  copyDiagnostics: "Copy diagnostics",
+  diagnosticsCopied: "Copied",
+  installShort: "Install",
+  reinstallShort: "Reinstall",
+  updateShort: "Update",
+  removeShort: "Remove",
+  resetShort: "Reset",
+  restartReaperStep: "Restart REAPER",
+  endFollow: "End",
+  markerTool: "Marker",
 } as const;
 
 export type MsgKey = keyof typeof en;
@@ -795,6 +809,20 @@ const de: Record<MsgKey, string> = {
   editingTempo: "die Tempo-Map",
   editingMarkers: "Marker",
   editingProject: "Projekteinstellungen",
+  olRememberPos: "HUD-Position merken",
+  privacy: "Datenschutz",
+  help: "Hilfe",
+  documentation: "Dokumentation",
+  copyDiagnostics: "Diagnose kopieren",
+  diagnosticsCopied: "Kopiert",
+  installShort: "Installieren",
+  reinstallShort: "Neu installieren",
+  updateShort: "Aktualisieren",
+  removeShort: "Entfernen",
+  resetShort: "Zurücksetzen",
+  restartReaperStep: "REAPER neu starten",
+  endFollow: "Beenden",
+  markerTool: "Marker",
 };
 
 function readStoredPref(): LangPref {

@@ -23,6 +23,11 @@ static NSString *const kReaperBundleId = @"com.cockos.reaper";
 // toolbar).
 static const CGFloat kDefaultOffsetX = -16.0;
 static const CGFloat kDefaultOffsetY = 48.0;
+
+// "Remember HUD position": the dragged offset survives relaunches while on.
+static BOOL gRememberOffset = YES;
+static NSString *const kOffsetXKey = @"ReaMeshHudOffsetX";
+static NSString *const kOffsetYKey = @"ReaMeshHudOffsetY";
 static const NSTimeInterval kDragPause = 0.25; // suspend follow during a drag
 
 // NSPanel subclass with ZERO added ivars, so object_setClass over tao's
@@ -310,8 +315,13 @@ static ReaMeshOverlayController *gOverlay = nil;
     CGFloat overlayTopY_cg = H - NSMaxY(f);
     CGFloat reaperRightX = r.origin.x + r.size.width;
     CGFloat reaperTopY = r.origin.y;
-    // Session-only: the drag holds until the overlay detaches; it is never saved.
     self.userOffset = NSMakePoint(overlayRightX_cg - reaperRightX, overlayTopY_cg - reaperTopY);
+    // Kept across relaunches only while "remember HUD position" is on.
+    if (gRememberOffset) {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        [d setDouble:self.userOffset.x forKey:kOffsetXKey];
+        [d setDouble:self.userOffset.y forKey:kOffsetYKey];
+    }
     self.followPausedUntil = [NSDate timeIntervalSinceReferenceDate] + kDragPause;
 }
 
@@ -361,9 +371,13 @@ static ReaMeshOverlayController *gOverlay = nil;
     self.cachedReaperPID = 0;
     self.cachedWindowID = kCGNullWindowID;
     self.nextWindowScan = 0;
-    // Always start from the default anchor: the dragged offset lives only for
-    // the life of this attach (one session), never across relaunches.
+    // Start from the default anchor, or from where the user last dragged it
+    // when "remember HUD position" is on.
     self.userOffset = NSMakePoint(kDefaultOffsetX, kDefaultOffsetY);
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if (gRememberOffset && [d objectForKey:kOffsetXKey] && [d objectForKey:kOffsetYKey]) {
+        self.userOffset = NSMakePoint([d doubleForKey:kOffsetXKey], [d doubleForKey:kOffsetYKey]);
+    }
 
     [[[NSWorkspace sharedWorkspace] notificationCenter]
         addObserver:self
@@ -459,6 +473,17 @@ void reamesh_overlay_detach(void) {
     if (gOverlay) {
         gOverlay.pinnedReaperPID = 0;
         [gOverlay detach];
+    }
+}
+
+// Turning the setting off also forgets the stored offset, so the next session
+// starts from the default anchor again.
+void reamesh_overlay_set_remember(int on) {
+    gRememberOffset = on ? YES : NO;
+    if (!on) {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        [d removeObjectForKey:kOffsetXKey];
+        [d removeObjectForKey:kOffsetYKey];
     }
 }
 

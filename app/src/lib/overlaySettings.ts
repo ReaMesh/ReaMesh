@@ -18,6 +18,9 @@ export interface OverlaySettings {
    * activity bit was on by default) keep the tint on without a migration.
    */
   tint: boolean;
+  /** Keep the HUD where the user dragged it across relaunches. Bit 4: the
+   *  retired peer-playheads toggle (on by default), so it starts out on. */
+  rememberPos: boolean;
 }
 
 const KEY = "reamesh.overlay";
@@ -25,19 +28,22 @@ const EVENT = "reamesh:overlay-settings";
 const DEFAULTS: OverlaySettings = {
   roster: true,
   tint: true,
+  rememberPos: true,
 };
 
-// Bit layout: must match settings_window.h (kReaMeshOverlay*) and the Rust
-// `OVERLAY_ALL` mask. Bits 4/8 (peer playheads / time-selection) are retired.
+// Bit layout: must match the Rust `OVERLAY_ALL` mask. Bit 8 (time-selection)
+// is retired.
 const BITS: Record<keyof OverlaySettings, number> = {
   roster: 1,
   tint: 2,
+  rememberPos: 4,
 };
 
 function maskToSettings(mask: number): OverlaySettings {
   return {
     roster: !!(mask & BITS.roster),
     tint: !!(mask & BITS.tint),
+    rememberPos: !!(mask & BITS.rememberPos),
   };
 }
 

@@ -8,7 +8,7 @@
 
 import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
-import { ChevronUp, Crown, Eye, Flag, Pin, PinOff, Snowflake } from "lucide-react";
+import { ChevronUp, Crown, Eye, Flag, Snowflake, Users } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { currentMonitor, getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { Hint, HintProvider } from "@/components/Hint";
@@ -16,6 +16,7 @@ import { PeerAvatar } from "@/components/PeerAvatar";
 import { TrackNumber } from "@/components/TrackNumber";
 import { formatBytes, useTransfer } from "@/lib/format";
 import { resolveLang, t, useLang } from "@/lib/i18n";
+import { localizeLogEntry } from "@/lib/log";
 import { displayName, type ExtState, type Peer } from "@/lib/types";
 import { useOverlaySettings } from "@/lib/overlaySettings";
 import { noContextMenu } from "@/lib/utils";
@@ -127,7 +128,7 @@ function PeerRow({
           <Hint label={followingYou}>
             <span className="flex shrink-0 items-center gap-0.5 text-found">
               <Eye className="size-3" aria-hidden="true" />
-              {followerCount > 1 && <span className="text-[9px]">{followerCount}</span>}
+              {followerCount > 1 && <span className="text-[11px]">{followerCount}</span>}
               <span className="sr-only">{followingYou}</span>
             </span>
           </Hint>
@@ -141,11 +142,9 @@ function PeerRow({
           </Hint>
         )}
         {peer.is_self && (
-          <span className="shrink-0 text-[9px] text-muted-foreground">
-            {t("youBadge")}
-          </span>
+          <span className="shrink-0 text-[11px] text-muted-foreground">{t("youBadge")}</span>
         )}
-        <TrackNumber track={peer.track} />
+        <TrackNumber track={peer.track} small />
       </motion.div>
     </Hint>
   );
@@ -173,7 +172,7 @@ function LoadingStrip({ state }: { state: ExtState }) {
     <div className="border-t border-white/10 px-2.5 pt-1.5 pb-2" role="status" aria-live="polite">
       <div className="flex items-baseline justify-between gap-2">
         <span className="text-[11px] font-medium">{t("loadingMedia")}</span>
-        <span className="text-[10px] tabular-nums text-muted-foreground">{pct}%</span>
+        <span className="text-[11px] tabular-nums text-muted-foreground">{pct} %</span>
       </div>
       <div
         className="mt-1 h-1 overflow-hidden rounded-full bg-white/10"
@@ -190,7 +189,7 @@ function LoadingStrip({ state }: { state: ExtState }) {
           transition={{ type: "spring", stiffness: 120, damping: 26 }}
         />
       </div>
-      <p className="mt-1 truncate text-[10px] text-muted-foreground">
+      <p className="mt-1 truncate text-[11px] text-muted-foreground">
         {pct < 100 && detail ? detail : t("loadingEditsLocked")}
       </p>
     </div>
@@ -213,7 +212,7 @@ function AvatarStack({ peers }: { peers: Peer[] }) {
       ))}
       {/* Otherwise the collapsed HUD silently under-reports who is present. */}
       {extra > 0 && (
-        <span className="ml-1 shrink-0 text-[10px] font-medium text-muted-foreground">
+        <span className="ml-1 shrink-0 text-[11px] font-medium text-muted-foreground">
           +{extra}
         </span>
       )}
@@ -296,6 +295,30 @@ export function Overlay({ port }: { port: number | null }) {
       // Plain-browser development has no Tauri window API.
     }
   };
+
+  // An edit of yours just snapped back because someone else holds the field.
+  // Say so here, where the eyes are while working in REAPER; the main window
+  // toasts it too, but that window is usually behind REAPER.
+  const overridden = state?.overridden ?? 0;
+  const lastOverridden = useRef<number | null>(null);
+  const [lockNotice, setLockNotice] = useState<{ text: string; by?: Peer } | null>(null);
+  useEffect(() => {
+    if (!state) return;
+    const before = lastOverridden.current;
+    lastOverridden.current = overridden;
+    if (before == null || overridden <= before) return;
+    const last = [...state.log].reverse().find((e) => e.code === "edit_locked");
+    const by = last?.params?.by;
+    setLockNotice({
+      text: last ? localizeLogEntry(last) : t("editLocked"),
+      by: by ? state.peers.find((p) => !p.is_self && displayName(p) === by) : undefined,
+    });
+  }, [overridden, state]);
+  useEffect(() => {
+    if (!lockNotice) return;
+    const id = setTimeout(() => setLockNotice(null), 4500);
+    return () => clearTimeout(id);
+  }, [lockNotice]);
 
   // ---- roster bar: shared markers + follow mode ----
   const self = peers.find((p) => p.is_self);
@@ -406,20 +429,41 @@ export function Overlay({ port }: { port: number | null }) {
             </motion.div>
           )}
         </AnimatePresence>
-        <div
-          onMouseDown={dragWindow}
-          className="flex min-w-0 flex-1 items-center"
-        >
-          <AnimatePresence initial={false}>
-            {collapsed && settings.roster && peers.length > 0 && (
+        <div onMouseDown={dragWindow} className="flex min-w-0 flex-1 items-center">
+          <AnimatePresence initial={false} mode="popLayout">
+            {collapsed && settings.roster && peers.length > 0 ? (
               <motion.div
                 key="stack"
                 initial={{ opacity: 0, scale: 0.85, x: -4 }}
                 animate={{ opacity: 1, scale: 1, x: 0 }}
                 exit={{ opacity: 0, scale: 0.85, x: -4 }}
                 transition={{ type: "spring", stiffness: 420, damping: 30 }}
+                className="pointer-events-none"
               >
                 <AvatarStack peers={peers} />
+              </motion.div>
+            ) : (
+              // Which session this is and how many are in it, at a glance.
+              <motion.div
+                key="title"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="pointer-events-none flex min-w-0 flex-1 items-center gap-2"
+              >
+                <span
+                  aria-hidden="true"
+                  className="size-1.5 shrink-0 rounded-full bg-found shadow-[0_0_0_3px_color-mix(in_srgb,var(--found)_18%,transparent)]"
+                />
+                <span className="min-w-0 truncate text-[12px] font-semibold">
+                  {state?.session || t("sessionFallback")}
+                </span>
+                {peers.length > 0 && (
+                  <span className="flex shrink-0 items-center gap-1 text-[11px] tabular-nums text-muted-foreground">
+                    <Users className="size-3" aria-hidden="true" />
+                    {peers.length}
+                  </span>
+                )}
               </motion.div>
             )}
           </AnimatePresence>
@@ -450,6 +494,24 @@ export function Overlay({ port }: { port: number | null }) {
             transition={{ type: "spring", stiffness: 400, damping: 38 }}
             style={{ overflow: "hidden" }}
           >
+            <AnimatePresence initial={false}>
+              {lockNotice && (
+                <motion.div
+                  key="lock"
+                  role="status"
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: "auto", opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  transition={{ type: "spring", stiffness: 400, damping: 38 }}
+                  className="overflow-hidden"
+                >
+                  <div className="flex items-start gap-2 border-t border-white/10 bg-white/[0.04] px-2.5 py-2">
+                    {lockNotice.by && <PeerAvatar peer={lockNotice.by} size="sm" className="size-5 text-[9px]" />}
+                    <p className="min-w-0 flex-1 text-[11.5px] leading-snug">{lockNotice.text}</p>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
             <AnimatePresence initial={false}>
               {loading && state && (
                 <motion.div
@@ -492,51 +554,45 @@ export function Overlay({ port }: { port: number | null }) {
 
             {/* Markers and follow mode share this expandable area. */}
             <div className="border-t border-white/10 px-1.5 py-1">
-              <div className="flex h-6 items-center gap-1">
-                <Hint label={t("shareMarkerTitle")}>
+              {followTarget ? (
+                // Following someone: say whom, and end it with one click.
+                <div className="flex h-7 items-center gap-1.5 rounded-md bg-found/15 pl-2 pr-1 text-found">
+                  <Eye className="size-3.5 shrink-0" aria-hidden="true" />
+                  <span className="min-w-0 flex-1 truncate text-[11.5px] font-medium">
+                    {t("followingName", { name: displayName(followTarget) })}
+                  </span>
                   <button
                     type="button"
-                    onClick={openMarker}
-                    aria-expanded={markerOpen}
-                    aria-label={t("shareMarkerTitle")}
-                    className={`grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
-                      markerOpen ? "bg-white/10 text-foreground" : "text-muted-foreground"
-                    }`}
+                    onClick={stopFollowing}
+                    className="h-5 shrink-0 rounded px-1.5 text-[11px] font-medium transition-colors outline-none hover:bg-found/20 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                   >
-                    <Flag className="size-3.5" aria-hidden="true" />
+                    {t("endFollow")}
                   </button>
-                </Hint>
-                {followTarget ? (
-                  // Pinned to someone: the whole label is the unpin button.
-                  <Hint label={t("stopFollowing")}>
-                    <button
-                      type="button"
-                      onClick={stopFollowing}
-                      aria-label={t("stopFollowing")}
-                      className="flex h-6 min-w-0 items-center gap-1 rounded-md px-1.5 text-found transition-colors outline-none hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                    >
-                      <PinOff className="size-3.5 shrink-0" aria-hidden="true" />
-                      <span className="min-w-0 truncate text-[11px] font-medium">
-                        {t("followingName", { name: displayName(followTarget) })}
-                      </span>
-                    </button>
-                  </Hint>
-                ) : (
-                  <Hint label={t("followMode")}>
-                    <button
-                      type="button"
-                      onClick={openPick}
-                      aria-expanded={pickMode}
-                      aria-label={t("followMode")}
-                      className={`grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
-                        pickMode ? "bg-white/10 text-foreground" : "text-muted-foreground"
-                      }`}
-                    >
-                      <Pin className="size-3.5" aria-hidden="true" />
-                    </button>
-                  </Hint>
-                )}
-              </div>
+                </div>
+              ) : (
+                <div className="flex h-7 items-center gap-1">
+                  {(
+                    [
+                      { key: "marker", label: t("markerTool"), hint: t("shareMarkerTitle"), icon: Flag, on: markerOpen, click: openMarker },
+                      { key: "follow", label: t("followAction"), hint: t("followMode"), icon: Eye, on: pickMode, click: openPick },
+                    ] as const
+                  ).map((tool) => (
+                    <Hint key={tool.key} label={tool.hint}>
+                      <button
+                        type="button"
+                        onClick={tool.click}
+                        aria-expanded={tool.on}
+                        className={`flex h-7 flex-1 items-center justify-center gap-1.5 rounded-md text-[11.5px] font-medium transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
+                          tool.on ? "bg-white/10 text-foreground" : "text-foreground/65"
+                        }`}
+                      >
+                        <tool.icon className="size-3.5 shrink-0" aria-hidden="true" />
+                        {tool.label}
+                      </button>
+                    </Hint>
+                  ))}
+                </div>
+              )}
               <AnimatePresence initial={false} mode="wait">
                 {markerOpen ? (
                   <motion.div
@@ -583,7 +639,7 @@ export function Overlay({ port }: { port: number | null }) {
                     transition={{ type: "spring", stiffness: 400, damping: 38 }}
                     className="overflow-hidden"
                   >
-                    <p className="px-1.5 pt-1 pb-0.5 text-[10px] leading-relaxed text-muted-foreground">
+                    <p className="px-1.5 pt-1 pb-0.5 text-[11px] leading-snug text-muted-foreground">
                       {t("pickPersonToFollow")}
                     </p>
                   </motion.div>

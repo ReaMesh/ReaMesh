@@ -3807,6 +3807,44 @@ static void ctlPublishState() {
         if (n > 0) p["track"] = n;
       }
     }
+    // "Alex is editing Bass DI": name what each other person holds an editing
+    // lock on, so the roster says it in words. One entry per holder (their
+    // first lock is enough for a roster line), resolved locally like the track
+    // number above: the wire carries GUIDs, names are per-project.
+    if (g_mode == Mode::ClientActive || g_mode == Mode::Hosting) {
+      json locks = handleJson(reamesh_locked_entities, json::array());
+      if (locks.is_array() && !locks.empty()) {
+        std::map<std::string, json> editing;
+        for (const auto& e : locks) {
+          if (!e.is_object()) continue;
+          const std::string holder = jsonStr(e, "holder");
+          if (holder.empty() || editing.count(holder)) continue;
+          const std::string section = jsonStr(e, "section");
+          const std::string id = jsonStr(e, "id");
+          MediaTrack* tr = nullptr;
+          if (section == "tracks") {
+            tr = findTrackByGuid(id);
+          } else if (section == "items") {
+            if (MediaItem* it = findItemByGuid(id)) tr = GetMediaItem_Track(it);
+          } else if (section == "project") {
+            editing[holder] = {{"kind", "project"}, {"field", jsonStr(e, "field")}};
+            continue;
+          }
+          if (!tr) continue;
+          char buf[512] = "";
+          GetSetMediaTrackInfo_String(tr, "P_NAME", buf, false);
+          editing[holder] = {
+              {"kind", "track"},
+              {"name", std::string(buf)},
+              {"n", static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"))}};
+        }
+        for (auto& p : peers) {
+          if (!p.is_object()) continue;
+          auto it = editing.find(jsonStr(p, "id"));
+          if (it != editing.end()) p["editing"] = it->second;
+        }
+      }
+    }
   }
   json st = handleJson(reamesh_status, json::object());
   // An edit of this user's just snapped back because someone else holds the

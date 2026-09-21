@@ -68,7 +68,7 @@ fn bundled_plugin(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 /// The custom REAPER folder override is persisted backend-side (not in the
-/// webview's localStorage) so the native macOS settings window and the webview
+/// webview's localStorage) so every window and the backend
 /// share one source of truth. Absent file = use the default location.
 fn custom_path_file(app: &AppHandle) -> Option<PathBuf> {
     app.path()
@@ -115,7 +115,7 @@ fn files_equal(a: &Path, b: &Path) -> bool {
 //
 // The app speaks English and German. The preference ("system" | "en" | "de")
 // is persisted backend-side (like the REAPER folder) so the webview and the
-// native macOS settings window share one source of truth; "system" resolves
+// backend share one source of truth; "system" resolves
 // through the device locale, anything that isn't German falls back to English.
 
 #[derive(Clone, Copy, PartialEq)]
@@ -149,12 +149,33 @@ fn store_lang_pref(app: &AppHandle, pref: &str) {
 }
 
 // Overlay visibility toggles, persisted backend-side as a small bitmask so the
-// native settings window AND the overlay webview share one source of truth.
-// Bits: roster=1, tint=2 (must match settings_window.h's kReaMeshOverlay* and
-// overlaySettings.ts). Bit 2 was the retired "activity feed" toggle, reused for
+// main window and the overlay webview share one source of truth.
+// Bits: roster=1, tint=2 (must match overlaySettings.ts). Bit 2 was the retired "activity feed" toggle, reused for
 // the locked-item tint so existing installs keep it on without a migration.
-// Bits 4/8 (peer playheads / time-selection) are retired and masked off.
-const OVERLAY_ALL: u8 = 0b11;
+// Bit 4 is "remember HUD position" (it was the retired peer-playheads toggle,
+// on by default, so existing installs start with it on as well). Bit 8
+// (time-selection) is retired and masked off.
+const OVERLAY_ALL: u8 = 0b111;
+const OVERLAY_REMEMBER_POS: u8 = 0b100;
+
+/// Hand the "remember HUD position" toggle to the native panel layer.
+fn sync_overlay_remember(app: &AppHandle, mask: u8) {
+    let on = mask & OVERLAY_REMEMBER_POS != 0;
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        native_overlay::set_remember(on);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let path = app.path().app_config_dir().ok().map(|d| d.join("overlay-pos"));
+        overlay_panel_win::set_remember(path, on);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (app, on);
+    }
+}
 
 fn overlay_file(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_config_dir().ok().map(|d| d.join("overlay"))
@@ -182,6 +203,7 @@ fn store_overlay(app: &AppHandle, mask: u8) {
 fn apply_overlay(app: &AppHandle, mask: u8) {
     let mask = mask & OVERLAY_ALL;
     store_overlay(app, mask);
+    sync_overlay_remember(app, mask);
     use tauri::Emitter;
     let _ = app.emit("overlay-settings-changed", mask);
 }
@@ -468,7 +490,12 @@ fn reaper_status(app: AppHandle) -> Result<ReaperStatus, String> {
 
 #[tauri::command]
 fn install_extension(app: AppHandle) -> Result<ReaperStatus, String> {
-    do_install(&app, &load_custom_path(&app))
+    let st = do_install(&app, &load_custom_path(&app))?;
+    // A running REAPER keeps the copy it loaded at startup: the webview shows
+    // its "restart REAPER" banner for a manual install too.
+    use tauri::Emitter;
+    let _ = app.emit("extension-installed", ());
+    Ok(st)
 }
 
 /// Locate reaper.exe on Windows. Check portable installs first, then the known
@@ -809,6 +836,7 @@ fn ensure_hud_overlay(app: &AppHandle, port: u16, pid: u32) -> Result<(), String
         // passes through a state where the frontend closes it for us.
         close_hud_overlay(app);
     }
+    sync_overlay_remember(app, load_overlay(app));
     let url = format!("index.html?overlay=1&port={port}");
     let win = tauri::WebviewWindowBuilder::new(app, "overlay", tauri::WebviewUrl::App(url.into()))
         .title("ReaMesh overlay")
@@ -1463,6 +1491,7 @@ mod native_overlay {
         fn reamesh_overlay_attach(ns_window: *mut c_void, width: f64, reaper_pid: i32);
         fn reamesh_overlay_detach();
         fn reamesh_overlay_set_interactive(on: i32);
+        fn reamesh_overlay_set_remember(on: i32);
     }
 
     /// `reaper_pid` pins the HUD to one REAPER instance (0 = follow whichever
@@ -1475,6 +1504,10 @@ mod native_overlay {
 
     pub fn detach() {
         unsafe { reamesh_overlay_detach() };
+    }
+
+    pub fn set_remember(on: bool) {
+        unsafe { reamesh_overlay_set_remember(on as i32) };
     }
 
     pub fn set_interactive(on: bool) {

@@ -58,6 +58,37 @@ fn offset() -> &'static Mutex<(i32, i32)> {
     OFFSET.get_or_init(|| Mutex::new((0, 0)))
 }
 
+/// Where the dragged offset is persisted while "remember HUD position" is on
+/// (`None` = off: every session starts from the default anchor).
+fn offset_store() -> &'static Mutex<Option<std::path::PathBuf>> {
+    static STORE: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(None))
+}
+
+/// Turn position memory on (with the file to keep it in) or off. Off also
+/// deletes the stored offset. Call before `attach`.
+pub fn set_remember(path: Option<std::path::PathBuf>, on: bool) {
+    if !on {
+        if let Some(p) = &path {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+    *offset_store().lock().unwrap() = if on { path } else { None };
+}
+
+fn load_offset() -> Option<(i32, i32)> {
+    let path = offset_store().lock().unwrap().clone()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let (x, y) = text.trim().split_once(',')?;
+    Some((x.parse().ok()?, y.parse().ok()?))
+}
+
+fn save_offset(off: (i32, i32)) {
+    if let Some(path) = offset_store().lock().unwrap().clone() {
+        let _ = std::fs::write(path, format!("{},{}", off.0, off.1));
+    }
+}
+
 /// The last position we placed the overlay at, so the loop can tell its own
 /// move from one the user made by dragging the HUD.
 fn last_placed() -> &'static Mutex<Option<(i32, i32)>> {
@@ -201,10 +232,10 @@ pub fn attach(hwnd: isize, scale: f64, reaper_pid: u32) {
         let _ = ShowWindow(overlay, SW_HIDE);
     }
 
-    *offset().lock().unwrap() = (
+    *offset().lock().unwrap() = load_offset().unwrap_or((
         (DEFAULT_OFFSET_X * scale).round() as i32,
         (DEFAULT_OFFSET_Y * scale).round() as i32,
-    );
+    ));
     *last_placed().lock().unwrap() = None;
     OVERLAY.store(hwnd, Ordering::SeqCst);
 
@@ -282,7 +313,9 @@ fn follow_loop() {
         // they put it by re-deriving the offset from REAPER's current frame.
         let placed = *last_placed().lock().unwrap();
         if placed.is_some_and(|(x, y)| (x, y) != (orr.left, orr.top)) {
-            *offset().lock().unwrap() = (orr.right - rr.right, orr.top - rr.top);
+            let dragged = (orr.right - rr.right, orr.top - rr.top);
+            *offset().lock().unwrap() = dragged;
+            save_offset(dragged);
         }
 
         let (off_x, off_y) = *offset().lock().unwrap();

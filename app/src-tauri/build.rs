@@ -1,6 +1,7 @@
 fn main() {
-    // Compile the native macOS Settings window. Rust calls it through
-    // the C interface in src/settings_window.h.
+    // On macOS the Settings window and the presence HUD (a non-activating
+    // panel) are native AppKit code, compiled here; Rust talks to them over
+    // tiny C ABIs (settings_window.h, overlay_panel.h).
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         cc::Build::new()
             .file("src/settings_window.m")

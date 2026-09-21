@@ -46,6 +46,7 @@ import { cn, focusRing, noContextMenu } from "@/lib/utils";
 
 function editingLabel(e: NonNullable<Peer["editing"]>): string {
   if (e.kind === "track") return e.name ? t("quoted", { text: e.name }) : t("trackN", { n: e.n ?? 0 });
+  if (e.kind !== "project") return ""; // unknown shape from a newer extension
   if (e.field === "tempo") return t("editingTempo");
   if (e.field === "markers") return t("editingMarkers");
   return t("editingProject");
@@ -65,7 +66,7 @@ function PeerMeta({ peer, peers }: { peer: Peer; peers: Peer[] }) {
       t("reaperNotRespondingPeer"),
       "text-sky-300",
     );
-  if (peer.editing)
+  if (peer.editing && editingLabel(peer.editing))
     return line(
       <Pencil className="size-[11px] shrink-0" aria-hidden="true" />,
       t("peerEditing", { what: editingLabel(peer.editing) }),
