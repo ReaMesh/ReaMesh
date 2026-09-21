@@ -14,7 +14,9 @@ export function inkFor(bg: string | undefined): string {
     return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
   };
   const l = 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2]);
-  return l > 0.4 ? "rgba(0,0,0,0.82)" : "#ffffff";
+  // Dark ink wins on every palette colour: white on the coral or the blue
+  // sits near 2.6:1 and 3.2:1. Only genuinely dark backgrounds get white.
+  return l > 0.18 ? "rgba(0,0,0,0.82)" : "#ffffff";
 }
 
 function parseHex(v: string | undefined): [number, number, number] | null {

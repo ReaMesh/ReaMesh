@@ -3,6 +3,8 @@
 // whenever it changes; the extension gossips it to session peers as a
 // presence beacon.
 
+import { useSyncExternalStore } from "react";
+
 export interface Profile {
   name: string;
   color: string;
@@ -23,6 +25,22 @@ export const PALETTE = [
 const KEY = "reamesh.profile";
 
 export function getProfile(): Profile {
+  if (current) return current;
+  return (current = readProfile());
+}
+
+/** Subscribe a component to profile edits made anywhere in the window. */
+export function useProfile(): Profile {
+  return useSyncExternalStore(
+    (cb) => {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    getProfile,
+  );
+}
+
+function readProfile(): Profile {
   try {
     const raw = localStorage.getItem(KEY);
     if (raw) {
@@ -46,7 +64,13 @@ export function getProfile(): Profile {
   return p;
 }
 
+// One in-memory copy so the title-bar chip and the first-run card stay in step.
+let current: Profile | null = null;
+const listeners = new Set<() => void>();
+
 export function saveProfile(p: Profile) {
+  current = p;
+  listeners.forEach((l) => l());
   try {
     localStorage.setItem(KEY, JSON.stringify(p));
   } catch {

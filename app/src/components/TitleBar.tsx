@@ -1,14 +1,26 @@
 import { useEffect, useState } from "react";
 import { Copy, Minus, Settings, Square, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { BarMark } from "@/components/BarMark";
+import { ProfileChip } from "@/components/ProfileChip";
 import { useConnections, setActivePort } from "@/lib/connection";
 import { t } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
 import { cn, focusRing } from "@/lib/utils";
 
-// Draggable title bar with REAPER instance tabs. macOS supplies native window
-// controls and a Settings menu. Windows uses the caption buttons below;
-// Tauri's drag-region handler toggles maximize on double-click.
+// Title bar: a 44px draggable strip at the top of the window on both
+// platforms.
+//
+// On macOS the native traffic lights sit over its left end (titleBarStyle
+// Overlay), the mark + wordmark sit centred, and the right end carries the
+// REAPER instance tabs (when several run) and the identity chip. Settings lives
+// in the application menu.
+//
+// On Windows the window is undecorated (tauri.windows.conf.json), so this strip
+// IS the title bar: app name at the left, instance tabs, the Settings gear,
+// and our own minimize / maximize / close buttons at the right, the layout
+// Windows Terminal, Spotify and the Windows Settings app use. Double-click on
+// the strip toggles maximize (Tauri's drag-region script handles that).
 export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
   const { instances, activePort } = useConnections();
 
@@ -48,11 +60,10 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
         data-tauri-drag-region
         className="relative flex h-11 shrink-0 select-none items-center bg-background/80 pl-3"
       >
-        <span data-tauri-drag-region className="text-[11px] font-medium text-muted-foreground">
-          ReaMesh
-        </span>
+        <Wordmark />
         <div className="ml-auto flex h-full items-center gap-1">
           {tabs}
+          <ProfileChip />
           <button
             type="button"
             onClick={onOpenSettings}
@@ -74,14 +85,35 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
   return (
     <header
       data-tauri-drag-region
-      className="relative flex h-11 shrink-0 items-center bg-background/80 pl-[76px] pr-3"
+      className="relative flex h-11 shrink-0 items-center bg-background/80 pl-[76px] pr-2.5"
     >
-      {tabs && <div className="ml-auto">{tabs}</div>}
+      {/* Centred in the window, not in the space left of the chip. Several
+          REAPER instances need the room, so their tabs take its place. */}
+      {!tabs && (
+        <div className="pointer-events-none absolute inset-0 grid place-items-center">
+          <Wordmark />
+        </div>
+      )}
+      <div className="ml-auto flex items-center gap-2">
+        {tabs}
+        <ProfileChip />
+      </div>
     </header>
   );
 }
 
-// Windows caption buttons. Guard window calls for browser previews without Tauri.
+function Wordmark() {
+  return (
+    <span className="pointer-events-none flex select-none items-center gap-[7px] text-[12px] font-semibold tracking-[0.01em] text-muted-foreground">
+      <BarMark height={11} />
+      ReaMesh
+    </span>
+  );
+}
+
+// Windows caption buttons. Full-height, 46px wide, square (no rounding) like
+// the native ones; close turns Windows' signature red on hover. Every window
+// call is wrapped so the plain-browser dev harness (no Tauri) stays usable.
 function WindowControls() {
   const [maximized, setMaximized] = useState(false);
 

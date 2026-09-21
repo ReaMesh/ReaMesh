@@ -20,7 +20,7 @@ export function PasswordInput({
   }, [hasText, visible]);
 
   return (
-    <div className="relative">
+    <div className="relative min-w-0 flex-1">
       <Input
         {...props}
         type={visible ? "text" : "password"}

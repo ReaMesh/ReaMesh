@@ -61,7 +61,7 @@ export function BanList({
             onClick={() => setOpen(true)}
             aria-label={label}
             className={cn(
-              "relative flex size-8 shrink-0 items-center justify-center rounded-lg bg-secondary text-muted-foreground transition-colors hover:text-foreground",
+              "relative flex size-9 shrink-0 items-center justify-center rounded-lg bg-secondary text-muted-foreground transition-colors hover:text-foreground",
               focusRing,
             )}
           >
@@ -78,7 +78,7 @@ export function BanList({
         <button
           onClick={() => setOpen(true)}
           className={cn(
-            "flex shrink-0 items-center gap-1.5 self-start rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground",
+            "flex shrink-0 items-center gap-1.5 self-start rounded px-1 text-[12px] text-muted-foreground transition-colors hover:text-foreground",
             focusRing,
           )}
         >
@@ -88,10 +88,10 @@ export function BanList({
       )}
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-w-[360px] gap-4 rounded-2xl">
+        <DialogContent>
           <DialogHeader>
-            <DialogTitle className="text-[15px]">{t("blockedTitle")}</DialogTitle>
-            <DialogDescription className="text-[13px] leading-relaxed">
+            <DialogTitle>{t("blockedTitle")}</DialogTitle>
+            <DialogDescription>
               {t("blockedBody")}
             </DialogDescription>
           </DialogHeader>
@@ -111,7 +111,7 @@ export function BanList({
                     </span>
                   </span>
                   <Button
-                    variant="outline"
+                    variant="secondary"
                     size="xs"
                     onClick={() => send({ cmd: "unban", peer_id: b.id }, port ?? undefined)}
                   >
@@ -121,8 +121,8 @@ export function BanList({
               );
             })}
           </ul>
-          <DialogFooter className="gap-2 sm:gap-2">
-            <Button variant="outline" className="flex-1" onClick={() => setOpen(false)}>
+          <DialogFooter>
+            <Button variant="secondary" onClick={() => setOpen(false)}>
               {t("close")}
             </Button>
           </DialogFooter>

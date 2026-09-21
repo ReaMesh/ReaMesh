@@ -2,12 +2,14 @@
 // The extension verifies the manifest's plugin list against the downloaded project.
 
 import { useMemo, useState } from "react";
-import { ShieldAlert, TriangleAlert } from "lucide-react";
+import { TriangleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFact,
+  DialogFacts,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -15,6 +17,7 @@ import {
 import { useActiveInstance } from "@/lib/connection";
 import { formatBytes, reaperVersionKey } from "@/lib/format";
 import { t } from "@/lib/i18n";
+import { hostSeenCount } from "@/lib/knownHosts";
 import { parseFxName, pluginStatus, useInstalledPlugins, type PluginStatus } from "@/lib/plugins";
 import type { SessionPreview } from "@/lib/types";
 import { cn, focusRing } from "@/lib/utils";
@@ -85,7 +88,7 @@ function PluginList({ plugins }: { plugins: string[] }) {
           </button>
         )}
       </div>
-      <div className="scroll-slim max-h-36 space-y-0.5 overflow-y-auto rounded-lg bg-secondary/50 p-1.5">
+      <div className="scroll-slim max-h-36 space-y-0.5 overflow-y-auto rounded-xl bg-white/[0.04] p-1.5">
         {rows.map((r) => (
           <div key={r.raw} className="flex items-center gap-2 px-1 py-0.5" title={r.raw}>
             <span
@@ -99,7 +102,7 @@ function PluginList({ plugins }: { plugins: string[] }) {
               )}
             </span>
             {r.parsed.fmt && (
-              <span className="shrink-0 text-[10px] uppercase text-muted-foreground">
+              <span className="shrink-0 text-[11px] text-muted-foreground">
                 {r.parsed.fmt}
               </span>
             )}
@@ -115,7 +118,9 @@ export function TrustDialog({
   open,
   onOpenChange,
   name,
+  hostId,
   hostName,
+  hostColor,
   bytes,
   files,
   preview,
@@ -125,8 +130,11 @@ export function TrustDialog({
   onOpenChange: (open: boolean) => void;
   /** Session display name. */
   name: string;
+  /** The host's lasting peer id: keys the "joined N times" memory. */
+  hostId?: string;
   /** The host's self-reported display name ("" / undefined = none claimed). */
   hostName?: string;
+  hostColor?: string;
   /** Announce-level size info (fallback when the preview lacks it). */
   bytes?: number;
   files?: number;
@@ -134,10 +142,14 @@ export function TrustDialog({
   preview?: SessionPreview | null;
   onJoin: (nofx: boolean) => void;
 }) {
+  const [nofx, setNofx] = useState(false);
   const totalBytes = preview?.bytes ?? bytes ?? 0;
   const totalFiles = preview?.files ?? files ?? 0;
   const tracks = preview?.meta?.tracks;
   const plugins = preview?.meta?.plugins;
+  // Read when the dialog opens: the count is a memory of trusting this identity.
+  const seen = useMemo(() => (open && hostId ? hostSeenCount(hostId) : 0), [open, hostId]);
+
   // A host on another REAPER version: state chunks are REAPER's own format, so
   // a newer host's project may not load faithfully here (and the other way
   // round for edits). Silent when either side doesn't report a version.
@@ -153,9 +165,6 @@ export function TrustDialog({
         )
       : null;
 
-  // Two lines of facts: "Host: Anna", then "12 tracks · 34 files · 1.2 GB".
-  // Missing pieces drop out.
-  const hostLine = [hostName ? t("trustHost", { host: hostName }) : null].filter(Boolean);
   const stats = [
     typeof tracks === "number" && tracks > 0 ? t("previewTracks", { count: tracks }) : null,
     totalBytes > 0
@@ -165,28 +174,44 @@ export function TrustDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[360px] gap-4 rounded-2xl">
+      <DialogContent>
         <DialogHeader>
-          <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-amber-500/15 sm:mx-0">
-            <ShieldAlert className="size-5 text-amber-500" />
-          </div>
-          <DialogTitle className="text-[15px]">{t("trustTitle", { name })}</DialogTitle>
-          <DialogDescription className="text-[13px] leading-relaxed">
-            {t("trustBody")}
-          </DialogDescription>
+          <DialogTitle>{t("trustTitle", { name })}</DialogTitle>
+          <DialogDescription>{t("trustBody")}</DialogDescription>
         </DialogHeader>
 
-        {(hostLine.length > 0 || stats.length > 0) && (
-          <div className="space-y-0.5 text-[12px] text-muted-foreground">
-            {hostLine.length > 0 && <p>{hostLine.join(" · ")}</p>}
-            {stats.length > 0 && <p>{stats.join(" · ")}</p>}
-          </div>
-        )}
+        <DialogFacts>
+          {(hostName || hostId) && (
+            <DialogFact label={t("trustHostLabel")}>
+              {hostName && (
+                <>
+                  <span
+                    aria-hidden="true"
+                    className="size-2 shrink-0 rounded-full"
+                    style={{ backgroundColor: hostColor || undefined }}
+                  />
+                  <span className="truncate">{hostName}</span>
+                </>
+              )}
+              {hostId && (
+                <span className="shrink-0 font-normal text-muted-foreground">
+                  {hostName && "· "}
+                  {seen > 0 ? t("hostSeenTimes", { count: seen }) : t("hostSeenNever")}
+                </span>
+              )}
+            </DialogFact>
+          )}
+          {stats.length > 0 && (
+            <DialogFact label={t("trustProjectLabel")}>
+              <span className="truncate tabular-nums">{stats.join(" · ")}</span>
+            </DialogFact>
+          )}
+        </DialogFacts>
 
         {mismatch && (
           <p
             role="status"
-            className="flex items-start gap-2 rounded-lg bg-amber-500/10 p-2.5 text-[12px] leading-relaxed text-amber-500"
+            className="flex items-start gap-2 rounded-[10px] bg-amber-500/10 px-2.5 py-2 text-[12px] leading-snug text-amber-500"
           >
             <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
             {mismatch}
@@ -195,24 +220,39 @@ export function TrustDialog({
 
         {plugins && plugins.length > 0 && <PluginList plugins={plugins} />}
 
-        <DialogFooter className="flex-col gap-2 sm:flex-col sm:gap-2">
-          <div className="flex w-full gap-2">
-            <Button variant="outline" className="flex-1" onClick={() => onOpenChange(false)}>
-              {t("cancel")}
-            </Button>
-            <Button className="flex-1" onClick={() => onJoin(false)}>
-              {t("joinAnyway")}
-            </Button>
-          </div>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="w-full text-[12px] text-muted-foreground"
-            title={t("joinNoFxHint")}
-            onClick={() => onJoin(true)}
-          >
-            {t("joinNoFx")}
+        {/* An equal choice, not a fine-print link: without effects no plugin
+            code runs and the project opens view-only. */}
+        <div
+          role="radiogroup"
+          aria-label={t("joinModeLabel")}
+          className="flex gap-1 rounded-[10px] bg-white/[0.04] p-1"
+        >
+          {[false, true].map((v) => (
+            <button
+              key={String(v)}
+              type="button"
+              role="radio"
+              aria-checked={nofx === v}
+              title={v ? t("joinNoFxHint") : undefined}
+              onClick={() => setNofx(v)}
+              className={cn(
+                "h-7 flex-1 rounded-md text-[12px] font-medium transition-colors",
+                nofx === v
+                  ? "bg-secondary text-foreground"
+                  : "text-muted-foreground hover:text-foreground",
+                focusRing,
+              )}
+            >
+              {v ? t("joinWithoutFx") : t("joinWithFx")}
+            </button>
+          ))}
+        </div>
+
+        <DialogFooter>
+          <Button variant="secondary" onClick={() => onOpenChange(false)}>
+            {t("cancel")}
           </Button>
+          <Button onClick={() => onJoin(nofx)}>{t("joinAnyway")}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

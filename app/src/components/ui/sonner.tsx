@@ -5,7 +5,11 @@ const Toaster = ({ ...props }: ToasterProps) => {
   return (
     <Sonner
       theme="dark"
-      position="bottom-center"
+      // Under the title bar, never over the bottom action button.
+      position="top-center"
+      offset={{ top: 50 }}
+      mobileOffset={{ top: 50 }}
+      visibleToasts={2}
       toastOptions={{
         style: {
           background: "var(--popover)",

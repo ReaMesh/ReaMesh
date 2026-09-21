@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Check, ShieldAlert } from "lucide-react";
+import { Check, Crown, Download, Wifi } from "lucide-react";
 import {
   AnimatePresence,
   motion,
@@ -17,13 +17,15 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ArcRing } from "@/components/ArcRing";
-import { FG_COLOR, FOUND_COLOR } from "@/lib/colors";
+import { FOUND_COLOR } from "@/lib/colors";
 import { send } from "@/lib/connection";
 import { formatBytes, useTransfer } from "@/lib/format";
 import { resolveLang, t } from "@/lib/i18n";
 import { parseFxName } from "@/lib/plugins";
-import type { ExtState } from "@/lib/types";
+import { displayName, type ExtState } from "@/lib/types";
+import { cn } from "@/lib/utils";
 import { LinkNotice } from "@/components/LinkNotice";
+import { PeerAvatar } from "@/components/PeerAvatar";
 
 // The beacon covers three stages: connecting, downloading, and opening the
 // project in REAPER. Phase 3 is the brief completion state owned by App.
@@ -59,14 +61,14 @@ function ProgressBeacon({ phase, progress }: { phase: number; progress: number }
   const spinning = phase === 0 || phase === 2;
 
   return (
-    <div className="relative grid size-[76px] place-items-center">
+    <div className="relative grid size-[132px] place-items-center">
       <ArcRing
-        size={76}
-        radius={30}
-        strokeWidth={3}
+        size={132}
+        radius={54}
+        strokeWidth={5}
         spinning={spinning}
         progress={done ? 1 : progress}
-        color={done ? FOUND_COLOR : FG_COLOR}
+        color={FOUND_COLOR}
       />
 
       <AnimatePresence mode="wait" initial={false}>
@@ -79,7 +81,7 @@ function ProgressBeacon({ phase, progress }: { phase: number; progress: number }
             className="grid place-items-center"
             style={{ color: FOUND_COLOR }}
           >
-            <Check className="size-5" strokeWidth={2.5} />
+            <Check className="size-9" strokeWidth={2.25} />
           </motion.span>
         ) : (
           <motion.span
@@ -88,7 +90,7 @@ function ProgressBeacon({ phase, progress }: { phase: number; progress: number }
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.15, ease: "easeOut" }}
-            className="text-[13px] font-semibold tabular-nums"
+            className="text-[26px] font-semibold tracking-[-0.01em] tabular-nums"
           >
             <GlidingPercent progress={progress} />
           </motion.span>
@@ -98,25 +100,64 @@ function ProgressBeacon({ phase, progress }: { phase: number; progress: number }
   );
 }
 
-/** Show the active filename without moving the rows above it. */
+/** The active filename as a quiet pill; the slot keeps its height when empty. */
 function CurrentFile({ path }: { path?: string }) {
   const name = path ? (path.split(/[/\\]/).pop() ?? path) : "";
   return (
-    <div className="relative h-4 overflow-hidden">
+    <div className="flex h-[22px] justify-center">
       <AnimatePresence initial={false}>
         {name && (
-          <motion.p
-            key={name}
-            initial={{ y: 10, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            exit={{ y: -10, opacity: 0 }}
-            transition={{ duration: 0.2, ease: "easeOut" }}
-            className="absolute inset-0 truncate text-center text-[11px] text-muted-foreground"
+          <motion.span
+            key="file"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="flex max-w-full items-center gap-[5px] rounded-full bg-muted px-2 font-mono text-[11px] text-foreground/65"
           >
-            {name}
-          </motion.p>
+            <Download className="size-[11px] shrink-0" aria-hidden="true" />
+            <span className="truncate">{name}</span>
+          </motion.span>
         )}
       </AnimatePresence>
+    </div>
+  );
+}
+
+/** Who is already there: the host and anyone else in the session. */
+function WhoIsThere({ state }: { state: ExtState }) {
+  const others = state.peers.filter((p) => !p.is_self);
+  const host = others.find((p) => p.is_owner);
+  if (!host) return null;
+  const guests = others.filter((p) => !p.is_owner);
+  const rtt = Math.round(host.rtt ?? 0);
+  return (
+    <div className="flex w-full items-center gap-3 rounded-xl bg-card p-3 text-left">
+      <div className="flex shrink-0 items-center">
+        {[host, ...guests].slice(0, 3).map((p, i) => (
+          <div key={p.id} className={cn("relative", i > 0 && "-ml-2")} style={{ zIndex: 3 - i }}>
+            <PeerAvatar peer={p} size="sm" className="size-7 ring-2 ring-card" />
+          </div>
+        ))}
+      </div>
+      <div className="min-w-0 flex-1">
+        <p className="flex items-center gap-1.5 text-[13px] font-semibold">
+          <span className="truncate">{t("nameIsHosting", { name: displayName(host) })}</span>
+          <Crown className="size-3 shrink-0 text-amber-400" aria-hidden="true" />
+        </p>
+        {guests.length > 0 && (
+          <p className="truncate text-[12px] text-muted-foreground">
+            {guests.length === 1
+              ? t("alreadyHereOne", { name: displayName(guests[0]) })
+              : t("alreadyHereMany", { count: guests.length })}
+          </p>
+        )}
+      </div>
+      {rtt > 0 && (
+        <span className="flex shrink-0 items-center gap-[5px] text-[11px] tabular-nums text-muted-foreground">
+          <Wifi className="size-3" aria-hidden="true" />
+          {rtt} ms
+        </span>
+      )}
     </div>
   );
 }
@@ -174,7 +215,7 @@ export function Downloading({
     phase === 1 ? (stalled ? "stall" : remainingTime ? "eta" : "dl") : String(phase);
 
   return (
-    <div className="flex flex-1 flex-col items-center [justify-content:safe_center] overflow-y-auto gap-6 px-10 text-center">
+    <div className="flex flex-1 flex-col items-center overflow-y-auto px-6 pt-7 text-center">
       <div
         role="progressbar"
         aria-label={t("downloadProgress")}
@@ -185,15 +226,16 @@ export function Downloading({
         <ProgressBeacon phase={phase} progress={state.progress || 0} />
       </div>
 
-      <div className="w-full space-y-1.5">
+      <div className="mt-5 w-full space-y-1">
         <h2
-          className="truncate text-[15px] font-semibold tracking-tight"
+          className="truncate text-[18px] font-semibold tracking-[-0.01em]"
           title={state.session || undefined}
         >
           {state.session || t("sessionFallback")}
         </h2>
-        {/* Crossfade on phase changes; update stats in place. Reserve the line
-            height so status changes do not move the progress ring. */}
+        {/* One narration line per wait, crossfading on phase changes; the
+            stats update in place without re-animating. Fixed-height so the
+            swap never shifts the beacon above. */}
         <div className="relative h-[18px]" role="status" aria-live="polite">
           <AnimatePresence initial={false}>
             <motion.p
@@ -202,14 +244,15 @@ export function Downloading({
               animate={{ y: 0, opacity: 1 }}
               exit={{ y: -6, opacity: 0 }}
               transition={{ duration: 0.2, ease: "easeOut" }}
-              className="absolute inset-0 truncate text-[13px] tabular-nums text-muted-foreground"
+              className="absolute inset-0 truncate text-[13px] tabular-nums text-foreground/65"
               style={phase >= 3 ? { color: FOUND_COLOR } : undefined}
             >
               {line}
             </motion.p>
           </AnimatePresence>
         </div>
-        {/* Reserve the stats row's height even in phases with no transfer data. */}
+        {/* Bytes and rate, dimmed under the narration; fixed-height so the
+            other phases hold the same layout with the slot empty. */}
         <div className="h-4">
           <AnimatePresence initial={false}>
             {phase === 1 && detail && (
@@ -219,7 +262,7 @@ export function Downloading({
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
                 transition={{ duration: 0.2, ease: "easeOut" }}
-                className="truncate text-[11px] tabular-nums text-muted-foreground"
+                className="truncate text-[12px] tabular-nums text-muted-foreground"
               >
                 {detail}
               </motion.p>
@@ -231,12 +274,15 @@ export function Downloading({
 
       {/* The host answers pings from the manifest on, so a slow VPN hop shows
           here before the first minute of "why is this taking so long". */}
-      {phase === 1 && <LinkNotice peers={state.peers} hosting={false} downloading />}
+      <div className="mt-6 flex w-full flex-col gap-2.5">
+        <WhoIsThere state={state} />
+        {phase === 1 && <LinkNotice peers={state.peers} hosting={false} downloading />}
+      </div>
 
       <Button
         variant="ghost"
         size="sm"
-        className="text-muted-foreground"
+        className="mt-auto mb-4 text-foreground/65"
         onClick={() => send({ cmd: "leave" }, port ?? undefined)}
         // Allow cancellation during stalls and plugin verification. Disable it
         // only while REAPER is actively opening the project.
@@ -249,23 +295,19 @@ export function Downloading({
       {/* The dialog closes only through its explicit actions. */}
       <Dialog open={!!state.verify}>
         <DialogContent
-          className="max-w-[360px] gap-4 rounded-2xl"
           showCloseButton={false}
           onEscapeKeyDown={(e) => e.preventDefault()}
           onInteractOutside={(e) => e.preventDefault()}
         >
           <DialogHeader>
-            <div className="mx-auto flex size-11 items-center justify-center rounded-full bg-amber-500/15 sm:mx-0">
-              <ShieldAlert className="size-5 text-amber-500" aria-hidden="true" />
-            </div>
-            <DialogTitle className="text-[15px]">{t("verifyTitle")}</DialogTitle>
-            <DialogDescription className="text-left text-[13px] leading-relaxed">
+            <DialogTitle>{t("verifyTitle")}</DialogTitle>
+            <DialogDescription>
               {state.verify?.listed
                 ? t("verifyBodyListed", { count: state.verify.extras.length })
                 : t("verifyBodyNoList")}
             </DialogDescription>
           </DialogHeader>
-          <div className="scroll-slim max-h-36 space-y-0.5 overflow-y-auto rounded-lg bg-secondary/50 p-1.5">
+          <div className="scroll-slim max-h-36 space-y-0.5 overflow-y-auto rounded-xl bg-white/[0.04] p-1.5">
             {(state.verify?.extras ?? []).map((raw) => {
               const p = parseFxName(raw);
               return (
@@ -279,7 +321,7 @@ export function Downloading({
                     {p.vendor && <span className="text-muted-foreground"> · {p.vendor}</span>}
                   </span>
                   {p.fmt && (
-                    <span className="shrink-0 text-[10px] uppercase text-muted-foreground">
+                    <span className="shrink-0 text-[11px] text-muted-foreground">
                       {p.fmt}
                     </span>
                   )}
@@ -287,16 +329,14 @@ export function Downloading({
               );
             })}
           </div>
-          <DialogFooter className="gap-2 sm:gap-2">
+          <DialogFooter>
             <Button
-              variant="outline"
-              className="flex-1"
+              variant="secondary"
               onClick={() => send({ cmd: "leave" }, port ?? undefined)}
             >
               {t("cancel")}
             </Button>
             <Button
-              className="flex-1"
               onClick={() => send({ cmd: "open_confirm" }, port ?? undefined)}
             >
               {t("verifyContinue")}
