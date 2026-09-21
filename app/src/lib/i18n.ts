@@ -26,10 +26,6 @@ const en = {
   yourName: "Your name",
   sessionsOnNetwork: "Sessions on this network",
   noSessionsYet: "No sessions yet",
-  noSessionsHint: "Sessions hosted by others on your network appear here automatically.",
-  setPassword: "Set a password…",
-  passwordSetLabel: "Password set",
-  filesAndSize: "Files: {count} · {size}",
   join: "Join",
   password: "Password",
   passwordOptional: "Password (optional)",
@@ -42,10 +38,8 @@ const en = {
   checkNoAnswer: "No answer from the host. Try again.",
   logBadChangeset: "Ignored an invalid incoming edit.",
   sessionContested: "Two devices claim to host this session. Only join if you know the real host.",
-  trustHost: "Host: {host}",
   hostAction: "Host",
   untitledProject: "Untitled project",
-  shareProject: "Share this project on your network",
   trustTitle: "Join {name}?",
   trustBody:
     "Plugins in the project can run code. Only join people you trust.",
@@ -62,7 +56,6 @@ const en = {
   // Join preview / trust dialog
   previewTracks: "{count} tracks",
   previewFiles: "{count} files · {size}",
-  joinNoFx: "Join without effects",
   joinNoFxHint: "View-only copy, all effect chains removed. No third-party code runs.",
   pluginsAllInstalled: "All {total} plugins installed",
   pluginsMissingSummary: "{missing} of {total} plugins missing",
@@ -75,10 +68,6 @@ const en = {
 
   // Pre-host warning
   hostCopyTitle: "Before you host",
-  hostCopyBody:
-    "Files outside the project: {count} ({size}). ReaMesh will copy them into the project folder so guests can download them.",
-  hostFreeOk: "{free} free on that drive.",
-  hostFreeNotEnough: "That drive only has {free} free, which isn't enough.",
   hostCloudWarning:
     "This project is in a cloud-synced folder such as Dropbox, OneDrive, or iCloud. To avoid file conflicts, pause cloud syncing while you host.",
   hostAnyway: "Host anyway",
@@ -103,10 +92,7 @@ const en = {
 
   // Session
   sessionFallback: "Session",
-  hostingBadge: "Hosting",
   connectedBadge: "Connected",
-  justYou: "Just you so far",
-  peopleInSession: "People in this session: {count}",
   stopHosting: "Stop hosting",
   leaveSession: "Leave session",
   youBadge: "you",
@@ -115,15 +101,12 @@ const en = {
   stopHostingBodyOne: "One other person is connected. They'll be disconnected if you stop hosting.",
   stopHostingBodyMany:
     "{count} other people are connected. They'll all be disconnected if you stop hosting.",
-  copyInvite: "Copy invite code",
   inviteCopied: "Invite code copied",
   inviteTicketHint:
     "Send this code to anyone you want to invite. They can paste it in their lobby to join, even over a VPN such as Tailscale. The code works while you host this session.",
 
   // Moderation (host only): kick = they may rejoin at once; block = their
   // device is kept out for 30 minutes, revocable from the blocked list.
-  kickPeer: "Remove {name}",
-  banPeer: "Block {name}",
   banTitle: "Block {name}?",
   banBody:
     "They'll be removed from the session, and this device can't rejoin for 30 minutes. You can unblock them earlier from the blocked list.",
@@ -159,21 +142,15 @@ const en = {
   welcome: "Set up ReaMesh",
   tagline: "Real-time collaboration for REAPER",
   reaperNotFound: "REAPER not found",
-  reaperNotFoundBody:
-    "REAPER may not be installed, or you may be using a portable install with its data stored elsewhere.",
   change: "Change…",
   downloadReaper: "Download REAPER",
   checkAgain: "Check again",
   installExtTitle: "Install the REAPER extension",
-  installExtBody:
-    "ReaMesh adds a small extension that lets the app connect to REAPER. It will be installed here:",
   notReaperDirWarning:
     "This folder doesn't appear to be a REAPER data folder yet because it has no reaper.ini file. You can still install here, but check the location in Settings if REAPER doesn't find the extension.",
   installing: "Installing…",
   installExtension: "Install extension",
   allSet: "Extension installed",
-  allSetBody:
-    "Start REAPER, or restart it if it's already open. ReaMesh will connect automatically.",
   finish: "Finish",
   locateReaperFolder: "Locate your REAPER folder",
 
@@ -196,7 +173,6 @@ const en = {
   maximizeWindow: "Maximize",
   restoreWindow: "Restore",
   closeWindow: "Close",
-  reaperFolder: "REAPER folder",
   notFoundBadge: "Not found",
   useDefault: "Use default",
   dontHaveReaper: "Don't have REAPER? Download it",
@@ -204,13 +180,9 @@ const en = {
   notInstalled: "Not installed",
   installed: "Installed",
   updateAvailable: "Update available",
-  reinstallExtension: "Reinstall extension",
-  updateExtension: "Update extension",
   autoInstallExt: "Install and update automatically",
-  restartNote: "REAPER only loads the extension when it starts. Restart REAPER after installing or updating it.",
   extInstalledToast: "Extension installed. Restart REAPER to load it.",
   extUpdatedRestart: "The REAPER extension was updated. Restart REAPER to load the new version.",
-  removeExtension: "Remove extension",
   extRemovedToast: "Extension removed. Restart REAPER to unload it.",
   language: "Language",
   languageSystem: "System",
@@ -319,7 +291,6 @@ const en = {
   loadingMedia: "Loading media",
   loadingMediaShort: "Loading",
   loadingEditsLocked: "You can listen already. Editing unlocks once everything is here.",
-  loadingBadgeHint: "The project is still being received. Listening works; editing unlocks once every file is here.",
   loadingFilesOf: "{done} of {total} files",
 
   // Download
@@ -345,7 +316,6 @@ const en = {
 
   // Settings: network identity
   networkIdentity: "Network identity",
-  resetIdentity: "Reset network identity",
   resetIdentityHint:
     "This installation has a stable, anonymous peer ID so others can recognize you across sessions. If you reset it, ReaMesh creates a new ID the next time you join or host.",
   identityWasReset: "Identity reset. ReaMesh will create a new one for your next session.",
@@ -354,7 +324,6 @@ const en = {
   // A11y labels
   peopleList: "People in this session",
   reaperInstances: "REAPER instances",
-  copyInviteFailed: "Couldn't copy the code. Select and copy it manually:",
   inviteWaitsInLobby: "Invite code received. It will be waiting in the lobby once you leave this session.",
 
   // Crash fallback
@@ -441,10 +410,6 @@ const de: Record<MsgKey, string> = {
   yourName: "Dein Name",
   sessionsOnNetwork: "Sessions in diesem Netzwerk",
   noSessionsYet: "Noch keine Sessions",
-  noSessionsHint: "Sessions, die andere in deinem Netzwerk hosten, erscheinen hier automatisch.",
-  setPassword: "Passwort festlegen…",
-  passwordSetLabel: "Passwort festgelegt",
-  filesAndSize: "Dateien: {count} · {size}",
   join: "Beitreten",
   password: "Passwort",
   passwordOptional: "Passwort (optional)",
@@ -457,10 +422,8 @@ const de: Record<MsgKey, string> = {
   checkNoAnswer: "Keine Antwort vom Host. Versuch es noch einmal.",
   logBadChangeset: "Ungültige Änderung empfangen und ignoriert.",
   sessionContested: "Zwei Geräte geben sich als Host aus. Tritt nur bei, wenn du den echten Host kennst.",
-  trustHost: "Host: {host}",
   hostAction: "Hosten",
   untitledProject: "Unbenanntes Projekt",
-  shareProject: "Projekt im Netzwerk freigeben",
   trustTitle: "{name} beitreten?",
   trustBody:
     "Plugins im Projekt können Code ausführen. Tritt nur Leuten bei, denen du vertraust.",
@@ -476,7 +439,6 @@ const de: Record<MsgKey, string> = {
 
   previewTracks: "{count} Tracks",
   previewFiles: "{count} Dateien · {size}",
-  joinNoFx: "Ohne Effekte beitreten",
   joinNoFxHint: "Schreibgeschützte Kopie ohne Effektketten. Es läuft kein Code von Drittanbietern.",
   pluginsAllInstalled: "Alle {total} Plugins installiert",
   pluginsMissingSummary: "{missing} von {total} Plugins fehlen",
@@ -488,10 +450,6 @@ const de: Record<MsgKey, string> = {
   pluginUnknown: "Nicht feststellbar",
 
   hostCopyTitle: "Bevor du hostest",
-  hostCopyBody:
-    "Dateien außerhalb des Projekts: {count} ({size}). ReaMesh kopiert sie in den Projektordner, damit Gäste sie herunterladen können.",
-  hostFreeOk: "{free} frei auf dem Laufwerk.",
-  hostFreeNotEnough: "Auf dem Laufwerk sind nur {free} frei. Das reicht nicht aus.",
   hostCloudWarning:
     "Dieses Projekt liegt in einem synchronisierten Cloud-Ordner, etwa bei Dropbox, OneDrive oder iCloud. Pausiere den Cloud-Sync während des Hostings, um Dateikonflikte zu vermeiden.",
   hostAnyway: "Trotzdem hosten",
@@ -512,10 +470,7 @@ const de: Record<MsgKey, string> = {
   slowLinkRtt: "Antwortzeit: {ms} ms",
 
   sessionFallback: "Session",
-  hostingBadge: "Hosting",
   connectedBadge: "Verbunden",
-  justYou: "Bisher nur du",
-  peopleInSession: "Personen in dieser Session: {count}",
   stopHosting: "Hosting beenden",
   leaveSession: "Session verlassen",
   youBadge: "du",
@@ -525,13 +480,10 @@ const de: Record<MsgKey, string> = {
     "Eine weitere Person nimmt teil. Wenn du das Hosting beendest, wird ihre Verbindung getrennt.",
   stopHostingBodyMany:
     "{count} weitere Personen nehmen teil. Wenn du das Hosting beendest, werden ihre Verbindungen getrennt.",
-  copyInvite: "Einladungscode kopieren",
   inviteCopied: "Einladungscode kopiert",
   inviteTicketHint:
     "Schick diesen Code an alle, die du einladen möchtest. Sie können ihn in ihrer Lobby einfügen und auch über ein VPN wie Tailscale beitreten. Der Code gilt, solange du diese Session hostest.",
 
-  kickPeer: "{name} entfernen",
-  banPeer: "{name} blockieren",
   banTitle: "{name} blockieren?",
   banBody:
     "Die Person wird aus der Session entfernt und kann mit diesem Gerät 30 Minuten lang nicht wieder beitreten. Du kannst die Blockierung in der Liste vorher aufheben.",
@@ -565,21 +517,15 @@ const de: Record<MsgKey, string> = {
   welcome: "ReaMesh einrichten",
   tagline: "Gemeinsam in Echtzeit an REAPER-Projekten arbeiten",
   reaperNotFound: "REAPER nicht gefunden",
-  reaperNotFoundBody:
-    "REAPER ist möglicherweise nicht installiert. Bei einer portablen Installation können die Daten auch an einem anderen Ort liegen.",
   change: "Ändern…",
   downloadReaper: "REAPER herunterladen",
   checkAgain: "Erneut prüfen",
   installExtTitle: "REAPER-Erweiterung installieren",
-  installExtBody:
-    "ReaMesh installiert eine kleine Erweiterung, über die sich die App mit REAPER verbindet. Sie kommt in diesen Ordner:",
   notReaperDirWarning:
     "Dieser Ordner scheint noch kein REAPER-Datenordner zu sein, da die Datei reaper.ini fehlt. Du kannst die Erweiterung trotzdem hier installieren. Falls REAPER sie nicht findet, prüfe den Ordner in den Einstellungen.",
   installing: "Wird installiert…",
   installExtension: "Erweiterung installieren",
   allSet: "Erweiterung installiert",
-  allSetBody:
-    "Starte REAPER oder öffne es neu, falls es bereits läuft. ReaMesh verbindet sich dann automatisch.",
   finish: "Fertig",
   locateReaperFolder: "Wähle deinen REAPER-Ordner",
 
@@ -599,7 +545,6 @@ const de: Record<MsgKey, string> = {
   maximizeWindow: "Maximieren",
   restoreWindow: "Wiederherstellen",
   closeWindow: "Schließen",
-  reaperFolder: "REAPER-Ordner",
   notFoundBadge: "Nicht gefunden",
   useDefault: "Standard verwenden",
   dontHaveReaper: "REAPER noch nicht installiert? Jetzt herunterladen",
@@ -607,14 +552,9 @@ const de: Record<MsgKey, string> = {
   notInstalled: "Nicht installiert",
   installed: "Installiert",
   updateAvailable: "Update verfügbar",
-  reinstallExtension: "Erweiterung neu installieren",
-  updateExtension: "Erweiterung aktualisieren",
   autoInstallExt: "Automatisch installieren und aktualisieren",
-  restartNote:
-    "REAPER lädt die Erweiterung nur beim Start. Öffne REAPER nach einer Installation oder einem Update neu.",
   extInstalledToast: "Erweiterung installiert. Starte REAPER neu, um sie zu laden.",
   extUpdatedRestart: "Die REAPER-Erweiterung wurde aktualisiert. Starte REAPER neu, um die neue Version zu laden.",
-  removeExtension: "Erweiterung entfernen",
   extRemovedToast: "Erweiterung entfernt. Starte REAPER neu, damit die Änderung wirksam wird.",
   language: "Sprache",
   languageSystem: "System",
@@ -721,7 +661,6 @@ const de: Record<MsgKey, string> = {
   loadingMedia: "Medien werden geladen",
   loadingMediaShort: "Lädt",
   loadingEditsLocked: "Anhören geht schon. Bearbeiten, sobald alles da ist.",
-  loadingBadgeHint: "Das Projekt wird noch empfangen. Anhören geht schon, bearbeiten sobald alle Dateien da sind.",
   loadingFilesOf: "{done} von {total} Dateien",
 
   downloadStalled: "Der Download kommt nicht voran. Der Host ist möglicherweise offline.",
@@ -743,7 +682,6 @@ const de: Record<MsgKey, string> = {
   fwFixCopied: "Kopiert. Öffne PowerShell als Administrator und füge den Befehl ein.",
 
   networkIdentity: "Netzwerkidentität",
-  resetIdentity: "Netzwerkidentität zurücksetzen",
   resetIdentityHint:
     "Diese Installation hat eine feste, anonyme Peer-ID, an der dich andere über mehrere Sessions hinweg erkennen. Nach dem Zurücksetzen erstellt ReaMesh beim nächsten Beitritt oder Hosting eine neue ID.",
   identityWasReset: "Identität zurückgesetzt. Für die nächste Session erstellt ReaMesh eine neue.",
@@ -751,7 +689,6 @@ const de: Record<MsgKey, string> = {
 
   peopleList: "Personen in dieser Session",
   reaperInstances: "REAPER-Instanzen",
-  copyInviteFailed: "Der Code konnte nicht kopiert werden. Markiere und kopiere ihn manuell:",
   inviteWaitsInLobby: "Einladungscode erhalten. Er wartet in der Lobby, sobald du diese Session verlässt.",
 
   crashTitle: "Bei ReaMesh ist ein Fehler aufgetreten",

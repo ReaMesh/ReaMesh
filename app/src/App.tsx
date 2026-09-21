@@ -6,6 +6,7 @@ import { listen } from "@tauri-apps/api/event";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
+import { PeerAvatar } from "@/components/PeerAvatar";
 import { TitleBar } from "@/components/TitleBar";
 import { Disconnected } from "@/screens/Disconnected";
 import { Lobby } from "@/screens/Lobby";
@@ -174,7 +175,17 @@ function useOverrideToasts(state: ExtState | undefined, port: number | undefined
       // The most recent lock event carries the track and who's editing it; fall
       // back to the generic notice when the extension couldn't resolve them.
       const last = [...(state?.log ?? [])].reverse().find((e) => e.code === "edit_locked");
-      toast(last ? localizeLogEntry(last) : t("editLocked"));
+      // Put the holder's face on it: "who" reads faster than the sentence.
+      const by = last?.params?.by;
+      const holder = by
+        ? state?.peers.find((p) => !p.is_self && displayName(p) === by)
+        : undefined;
+      toast(
+        <span className="flex items-center gap-2.5">
+          {holder && <PeerAvatar peer={holder} size="sm" />}
+          <span>{last ? localizeLogEntry(last) : t("editLocked")}</span>
+        </span>,
+      );
       prev.current.lastAt = now;
     }
     prev.current.mode = state?.mode;
