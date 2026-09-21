@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useAnimate, useReducedMotion } from "motion/react";
 import {
   AudioLines,
+  ChevronDown,
   ClipboardPaste,
   LoaderCircle,
   LockKeyhole,
@@ -24,6 +25,7 @@ import {
 import { PasswordInput } from "@/components/PasswordInput";
 import { BanList } from "@/components/BanList";
 import { Divider, Group, IconTile, SectionLabel } from "@/components/Group";
+import { SURFACE_EASE } from "@/components/ProfileChip";
 import { ProfileEditor } from "@/components/ProfileEditor";
 import { FirewallBlocked } from "@/components/FirewallNotice";
 import { TrustDialog } from "@/components/TrustDialog";
@@ -34,10 +36,15 @@ import { takeInvite, useInviteSeq } from "@/lib/invite";
 import { recordHostJoin } from "@/lib/knownHosts";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
-import { getProfile, useProfile } from "@/lib/profile";
+import {
+  getProfile,
+  setProfileEditorOpen,
+  setProfileInlineHost,
+  useProfileEditor,
+} from "@/lib/profile";
 import { decodeTicket, normalizeTicket } from "@/lib/ticket";
 import { initials, type ExtState, type SessionAd } from "@/lib/types";
-import { cn } from "@/lib/utils";
+import { cn, focusRing } from "@/lib/utils";
 
 /// Shortest passphrase accepted by the host form. This is only a minimum for
 /// avoiding misleadingly weak protected sessions, not a security guarantee.
@@ -217,25 +224,49 @@ function PendingButton({
   );
 }
 
-/** First run: ask once who this is instead of silently joining as "Guest".
- *  Later edits happen in the title-bar chip. */
-function FirstRunCard({ onDone }: { onDone: () => void }) {
-  const profile = useProfile();
+/** The identity editor as a card at the top of the Lobby, unfolding out of the
+ *  title-bar chip. On a first run it opens by itself and asks once who this
+ *  is, instead of silently joining as "Guest". */
+function ProfileCard({ firstRun }: { firstRun: boolean }) {
   return (
-    <div className="flex shrink-0 flex-col gap-3 rounded-xl bg-card p-3.5">
-      <div className="flex items-center justify-between gap-2">
-        <h2 className="text-[13px] font-semibold">{t("firstRunTitle")}</h2>
-        <Button
-          size="xs"
-          variant="secondary"
-          disabled={!profile.name.trim()}
-          onClick={onDone}
-        >
-          {t("done")}
-        </Button>
+    // Height, not a transform: the list below is pushed down frame by frame
+    // and nothing inside is ever scaled. The negative margin eats the parent's
+    // flex gap while the card is folded away.
+    <motion.div
+      initial={{ height: 0, opacity: 0, marginBottom: -18 }}
+      animate={{ height: "auto", opacity: 1, marginBottom: 0 }}
+      exit={{ height: 0, opacity: 0, marginBottom: -18 }}
+      transition={SURFACE_EASE}
+      className="shrink-0 overflow-hidden rounded-xl"
+    >
+      <div className="flex flex-col gap-3 bg-card p-3.5">
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="text-[13px] font-semibold">
+            {firstRun ? t("firstRunTitle") : t("editProfile")}
+          </h2>
+          <button
+            type="button"
+            aria-label={t("collapse")}
+            onClick={() => setProfileEditorOpen(false)}
+            className={cn(
+              "flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-white/10 hover:text-foreground",
+              focusRing,
+            )}
+          >
+            <motion.span
+              className="flex"
+              initial={{ rotate: 0 }}
+              animate={{ rotate: 180 }}
+              exit={{ rotate: 0 }}
+              transition={SURFACE_EASE}
+            >
+              <ChevronDown className="size-4" aria-hidden="true" />
+            </motion.span>
+          </button>
+        </div>
+        <ProfileEditor autoFocus ringOffset="ring-offset-card" />
       </div>
-      <ProfileEditor ringOffset="ring-offset-card" layoutId="profile-color-ring-lobby" />
-    </div>
+    </motion.div>
   );
 }
 
@@ -744,8 +775,21 @@ function HostCard({
 export function Lobby({ state, port }: { state: ExtState; port: number | null }) {
   // Sessions discovered after this timestamp get a one-time highlight.
   const mountedAt = useRef(Date.now()).current;
-  // Decided once per visit: typing the first letter must not fold the card away.
-  const [firstRun, setFirstRun] = useState(() => !getProfile().name.trim());
+  // Decided once per visit, so typing the first letter does not retitle the card.
+  const firstRun = useRef(!getProfile().name.trim()).current;
+  // While the Lobby is up the identity editor unfolds here, as part of the
+  // page; a nameless first run opens it unasked.
+  const editor = useProfileEditor();
+  useEffect(() => {
+    setProfileInlineHost(true);
+    if (firstRun) setProfileEditorOpen(true);
+    // Leaving the Lobby (a join, hosting) folds the card back into the chip
+    // rather than letting it reappear as a panel over the next screen.
+    return () => {
+      setProfileEditorOpen(false);
+      setProfileInlineHost(false);
+    };
+  }, [firstRun]);
   const count = state.sessions.length;
 
   return (
@@ -765,10 +809,12 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
       {/* Show a repair path for an active Windows Firewall block rule. */}
       <FirewallBlocked />
 
-      {firstRun && <FirstRunCard onDone={() => setFirstRun(false)} />}
+      <AnimatePresence initial={false}>
+        {editor.open && editor.inline && <ProfileCard key="profile" firstRun={firstRun} />}
+      </AnimatePresence>
 
       <section className="flex min-h-0 flex-1 flex-col gap-2">
-        <SectionLabel aside={count > 0 ? t("sessionsFound", { count }) : t("searching")}>
+        <SectionLabel aside={count > 0 ? t("sessionsFound", { count }) : undefined}>
           {t("sessionsOnNetwork")}
         </SectionLabel>
         <Group className="min-h-0 shrink">

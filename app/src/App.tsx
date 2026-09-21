@@ -529,7 +529,10 @@ export default function App() {
       </AnimatePresence>
       <AnimatePresence mode="wait">
         <motion.main
-          key={screen.key + (port ?? "")}
+          // The waiting screen keeps one key while REAPER answers (the port
+          // appears at that moment): the same spinner closes into a blue ring
+          // instead of the screen remounting and fading a new one in.
+          key={screen.key === "disconnected" ? screen.key : screen.key + (port ?? "")}
           className="flex min-h-0 flex-1 flex-col"
           initial={{ opacity: 0, y: 6 }}
           animate={{ opacity: 1, y: 0 }}

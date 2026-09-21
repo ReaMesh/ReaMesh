@@ -77,3 +77,36 @@ export function saveProfile(p: Profile) {
     // storage unavailable/full: the in-memory profile still reaches the extension
   }
 }
+
+// ---- the editor's open state ----
+//
+// One editor, two homes: on the Lobby it unfolds as a card at the top of the
+// page, everywhere else as a panel under the title-bar chip. The chip toggles
+// it; whichever screen is up decides where it unfolds.
+
+let editor = { open: false, inline: false };
+const editorListeners = new Set<() => void>();
+
+function setEditor(next: Partial<typeof editor>) {
+  editor = { ...editor, ...next };
+  editorListeners.forEach((l) => l());
+}
+
+export function setProfileEditorOpen(open: boolean) {
+  if (open !== editor.open) setEditor({ open });
+}
+
+/** The Lobby claims the editor while it is on screen. */
+export function setProfileInlineHost(inline: boolean) {
+  if (inline !== editor.inline) setEditor({ inline });
+}
+
+export function useProfileEditor(): { open: boolean; inline: boolean } {
+  return useSyncExternalStore(
+    (cb) => {
+      editorListeners.add(cb);
+      return () => editorListeners.delete(cb);
+    },
+    () => editor,
+  );
+}

@@ -1,9 +1,8 @@
-import { motion } from "motion/react";
 import { Input } from "@/components/ui/input";
 import { inkFor } from "@/lib/colors";
 import { sendProfile } from "@/lib/connection";
 import { t } from "@/lib/i18n";
-import { PALETTE, saveProfile, useProfile, type Profile } from "@/lib/profile";
+import { PALETTE, saveProfile, setProfileEditorOpen, useProfile, type Profile } from "@/lib/profile";
 import { initials } from "@/lib/types";
 import { cn, focusRing } from "@/lib/utils";
 
@@ -13,17 +12,15 @@ export function updateProfile(p: Profile) {
   sendProfile();
 }
 
-// Name field + colour swatches. Lives in the title-bar chip's popover and, on a
-// first run, as a card at the top of the Lobby.
+// Name field + colour swatches. Lives in the panel under the title-bar chip
+// and, on the Lobby, in the card the chip morphs into.
 export function ProfileEditor({
   autoFocus,
   ringOffset = "ring-offset-popover",
-  layoutId = "profile-color-ring",
 }: {
   autoFocus?: boolean;
   /** Surface the swatches sit on, so the selection ring's gap matches it. */
   ringOffset?: string;
-  layoutId?: string;
 }) {
   const profile = useProfile();
   return (
@@ -38,6 +35,7 @@ export function ProfileEditor({
       <div className="min-w-0 flex-1 space-y-2.5">
         <Input
           value={profile.name}
+          onKeyDown={(e) => e.key === "Enter" && setProfileEditorOpen(false)}
           autoFocus={autoFocus}
           aria-label={t("yourName")}
           placeholder={t("yourName")}
@@ -64,15 +62,15 @@ export function ProfileEditor({
               )}
               style={{ backgroundColor: c }}
             >
-              {profile.color === c && (
-                // One ring shared across all swatches: picking a new colour
-                // slides it over instead of blinking it in place.
-                <motion.span
-                  layoutId={layoutId}
-                  className="absolute -inset-1 rounded-full border-2 border-foreground/70"
-                  transition={{ type: "spring", stiffness: 500, damping: 35 }}
-                />
-              )}
+              {/* Plain CSS, no layout animation: the ring has to stay glued to
+                  its swatch while the editor around it unfolds. */}
+              <span
+                aria-hidden="true"
+                className={cn(
+                  "absolute -inset-1 rounded-full border-2 border-foreground/70 transition-[opacity,scale] duration-200 ease-out",
+                  profile.color === c ? "scale-100 opacity-100" : "scale-75 opacity-0",
+                )}
+              />
             </button>
           ))}
         </div>
