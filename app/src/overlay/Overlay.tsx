@@ -74,7 +74,7 @@ function PeerRow({
     <Hint
       label={
         pickable
-          ? t("followingName", { name: displayName(peer) })
+          ? t("followPerson", { name: displayName(peer) })
           : clickable
             ? t("revealPeerTrack", { name: displayName(peer) })
             : undefined

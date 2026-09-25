@@ -238,8 +238,8 @@ export function TrustDialog({
               className={cn(
                 "h-7 flex-1 rounded-md text-[12px] font-medium transition-colors",
                 nofx === v
-                  ? "bg-secondary text-foreground"
-                  : "text-muted-foreground hover:text-foreground",
+                  ? "bg-white/[0.14] text-foreground shadow-sm ring-1 ring-inset ring-white/10"
+                  : "text-muted-foreground hover:text-foreground/80",
                 focusRing,
               )}
             >
