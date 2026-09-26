@@ -41,7 +41,7 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
             className={cn(
               "max-w-28 truncate rounded-md px-2 py-1 text-[11px] transition-colors",
               active
-                ? "bg-secondary text-foreground"
+                ? "bg-foreground/[0.14] text-foreground"
                 : "text-muted-foreground hover:text-foreground",
               focusRing,
             )}

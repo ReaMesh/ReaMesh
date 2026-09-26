@@ -242,7 +242,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
                 className={cn(
                   "h-7 flex-1 rounded-lg text-[12px] font-medium transition-colors",
                   getLangPref() === o.value
-                    ? "bg-secondary text-foreground"
+                    ? "bg-foreground/[0.14] text-foreground"
                     : "text-muted-foreground hover:text-foreground",
                   focusRing,
                 )}

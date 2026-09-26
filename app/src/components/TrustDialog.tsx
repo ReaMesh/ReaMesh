@@ -1,6 +1,7 @@
 // Show the host, project size, and local plugin availability before joining.
 // The extension verifies the manifest's plugin list against the downloaded project.
 
+import { motion } from "motion/react";
 import { useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -220,14 +221,21 @@ export function TrustDialog({
               title={v ? t("joinNoFxHint") : undefined}
               onClick={() => setNofx(v)}
               className={cn(
-                "h-7 flex-1 rounded-md text-[12px] font-medium transition-colors",
-                nofx === v
-                  ? "bg-white/[0.14] text-foreground shadow-sm ring-1 ring-inset ring-white/10"
-                  : "text-muted-foreground hover:text-foreground/80",
+                "relative h-7 flex-1 rounded-md text-[12px] font-medium transition-colors duration-200",
+                nofx === v ? "text-foreground" : "text-muted-foreground hover:text-foreground",
                 focusRing,
               )}
             >
-              {v ? t("joinWithoutFx") : t("joinWithFx")}
+              {/* The chosen side gets a clearly lighter surface that slides
+                  across; bg-secondary sat almost on the dialog's own colour. */}
+              {nofx === v && (
+                <motion.span
+                  layoutId="join-mode-pill"
+                  className="absolute inset-0 rounded-md bg-foreground/[0.14]"
+                  transition={{ type: "spring", stiffness: 400, damping: 38 }}
+                />
+              )}
+              <span className="relative">{v ? t("joinWithoutFx") : t("joinWithFx")}</span>
             </button>
           ))}
         </div>
