@@ -673,16 +673,47 @@ fn installed_plugins(app: AppHandle) -> Vec<String> {
 // registry mirror of the rule set is world-readable, so the app can at least
 // say "Windows is blocking REAPER" and hand the user the exact fix.
 
-/// Active inbound Block rules for a reaper.exe, read via `reg.exe query` (no
-/// registry crate needed; the value format is locale-independent). Returns the
-/// blocked exe path, or None when no block exists / not on Windows.
-#[tauri::command]
-fn firewall_block() -> Option<String> {
+/// What the firewall rules say about REAPER: the exe path of an active inbound
+/// Block rule (`""` when the rule has no App segment), and whether an active
+/// inbound Allow rule exists, which is what the prompt leaves behind once the
+/// user clicks "Allow access".
+#[derive(Debug, Default, PartialEq)]
+struct ReaperFirewall {
+    block: Option<String>,
+    allowed: bool,
+}
+
+/// Parse `reg query … /f reaper.exe /d` output. Value lines look like
+/// `  <name>  REG_SZ  v2.33|Action=Block|Active=TRUE|Dir=In|…|App=C:\…\reaper.exe|…`
+/// and the format is locale-independent.
+fn parse_reaper_firewall(text: &str) -> ReaperFirewall {
+    let mut out = ReaperFirewall::default();
+    for line in text.lines() {
+        let Some(idx) = line.find("REG_SZ") else { continue };
+        let value = line[idx + "REG_SZ".len()..].trim();
+        let lower = value.to_ascii_lowercase();
+        if !(lower.contains("|active=true|") && lower.contains("|dir=in|") && lower.contains("reaper.exe")) {
+            continue;
+        }
+        if lower.contains("|action=allow|") {
+            out.allowed = true;
+        } else if lower.contains("|action=block|") && out.block.is_none() {
+            // The App= segment carries the exact exe path the rule binds.
+            let app = value.split('|').find_map(|seg| seg.strip_prefix("App="));
+            out.block = Some(app.unwrap_or("").to_string());
+        }
+    }
+    out
+}
+
+/// Read REAPER's firewall rules via `reg.exe query` (no registry crate needed).
+/// Default (nothing blocked, nothing allowed) off Windows or when reg fails.
+fn reaper_firewall() -> ReaperFirewall {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let out = std::process::Command::new("reg")
+        let Ok(out) = std::process::Command::new("reg")
             .args([
                 "query",
                 r"HKLM\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules",
@@ -692,33 +723,30 @@ fn firewall_block() -> Option<String> {
             ])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            // Value lines: `  <name>  REG_SZ  v2.33|Action=Block|Active=TRUE|...`
-            let Some(idx) = line.find("REG_SZ") else { continue };
-            let value = line[idx + "REG_SZ".len()..].trim();
-            let lower = value.to_ascii_lowercase();
-            if lower.contains("|action=block|")
-                && lower.contains("|active=true|")
-                && lower.contains("|dir=in|")
-                && lower.contains("reaper.exe")
-            {
-                // The App= segment carries the exact exe path the rule binds.
-                for seg in value.split('|') {
-                    if let Some(app) = seg.strip_prefix("App=") {
-                        return Some(app.to_string());
-                    }
-                }
-                return Some(String::new());
-            }
-        }
-        None
+        else {
+            return ReaperFirewall::default();
+        };
+        parse_reaper_firewall(&String::from_utf8_lossy(&out.stdout))
     }
     #[cfg(not(target_os = "windows"))]
     {
-        None
+        ReaperFirewall::default()
     }
+}
+
+/// The blocked exe path, or None when no active inbound Block rule exists.
+#[tauri::command]
+fn firewall_block() -> Option<String> {
+    reaper_firewall().block
+}
+
+/// True once REAPER may accept inbound connections: an active Allow rule and
+/// no Block rule (a Block outranks any Allow). The app drops its "Windows will
+/// ask for network access" notice then, since the prompt was already answered.
+#[tauri::command]
+fn firewall_allowed() -> bool {
+    let fw = reaper_firewall();
+    fw.allowed && fw.block.is_none()
 }
 
 /// Open the Windows Firewall control panel (the allowed-apps surface) so the
@@ -1244,6 +1272,7 @@ pub fn run() {
             clear_join_badge,
             installed_plugins,
             firewall_block,
+            firewall_allowed,
             open_firewall_settings,
             port_trouble,
             reset_network_identity
@@ -1532,5 +1561,19 @@ mod tests {
                 "AU: OddOne".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn firewall_rules_split_into_block_and_allow() {
+        let exe = r"C:\Program Files\REAPER (x64)\reaper.exe";
+        let allow = format!("    {{A}}    REG_SZ    v2.33|Action=Allow|Active=TRUE|Dir=In|Protocol=6|Profile=Private|App={exe}|Name=reaper.exe|\n");
+        let block = format!("    {{B}}    REG_SZ    v2.33|Action=Block|Active=TRUE|Dir=In|Protocol=17|Profile=Public|App={exe}|Name=reaper.exe|\n");
+        let off = "    {C}    REG_SZ    v2.33|Action=Allow|Active=FALSE|Dir=In|App=C:/REAPER/reaper.exe|\n";
+        assert_eq!(parse_reaper_firewall(""), ReaperFirewall::default());
+        assert_eq!(parse_reaper_firewall(off), ReaperFirewall::default());
+        assert_eq!(parse_reaper_firewall(&allow), ReaperFirewall { block: None, allowed: true });
+        let both = parse_reaper_firewall(&format!("{allow}{block}"));
+        assert!(both.allowed);
+        assert_eq!(both.block.as_deref(), Some(exe));
     }
 }

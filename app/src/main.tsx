@@ -49,6 +49,8 @@ if (import.meta.env.DEV && params.get("mock") === "onboarding") {
           return null;
         case "get_language":
           return "system";
+        case "firewall_allowed":
+          return params.get("fw") === "allowed";
         default:
           return undefined; // Event listeners and setters are no-ops in the mock.
       }
@@ -94,6 +96,8 @@ if (import.meta.env.DEV && params.get("mock") === "tauri") {
           return params.get("lang") ?? "system";
         case "get_overlay_settings":
           return 3; // roster + tint on, like a fresh install
+        case "firewall_allowed":
+          return params.get("fw") === "allowed"; // ?fw=allowed hides the firewall notice
         default:
           return undefined;
       }
