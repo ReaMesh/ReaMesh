@@ -198,16 +198,12 @@ export function normalizeState(msg: Record<string, unknown>): ExtState {
   };
 }
 
-/** First character of a word, as a whole code point: indexing with [0] would
- *  split an astral character (an emoji name) into a lone surrogate, which
- *  renders as a replacement glyph in every peer's roster. */
-function firstChar(word: string): string {
-  return Array.from(word)[0] ?? "";
-}
-
+/** The letter on someone's avatar: the first character of their name. One
+ *  letter, because two taken from one name ("DA", "AN") read like an
+ *  abbreviation. Taken as a whole code point: indexing with [0] would split an
+ *  astral character (an emoji name) into a lone surrogate, which renders as a
+ *  replacement glyph in every peer's roster. */
 export function initials(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return "?";
-  if (parts.length === 1) return Array.from(parts[0]).slice(0, 2).join("").toUpperCase();
-  return (firstChar(parts[0]) + firstChar(parts[parts.length - 1])).toUpperCase();
+  const first = Array.from(name.trim())[0];
+  return first ? first.toUpperCase() : "?";
 }

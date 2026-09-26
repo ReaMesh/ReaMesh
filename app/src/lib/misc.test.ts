@@ -6,15 +6,15 @@ import { localizeLogEntry } from "./log";
 import { initials, normalizeState } from "./types";
 
 describe("initials", () => {
-  it("takes first+last word initials, whole code points", () => {
-    expect(initials("Daniel Weiss")).toBe("DW");
-    expect(initials("daniel")).toBe("DA");
+  it("is the name's first letter, uppercased", () => {
+    expect(initials("Daniel Weiss")).toBe("D");
+    expect(initials("daniel")).toBe("D");
+    expect(initials("  ana")).toBe("A");
     expect(initials("  ")).toBe("?");
-    expect(initials("Ana Maria Silva")).toBe("AS");
   });
   it("never splits an astral character into surrogates", () => {
-    expect(initials("🎸 Player")).toBe("🎸P");
-    expect(initials("🎸🎤")).toBe("🎸🎤");
+    expect(initials("🎸 Player")).toBe("🎸");
+    expect(initials("🎸🎤")).toBe("🎸");
   });
 });
 

@@ -56,7 +56,8 @@ the wire has to round-trip identically on both platforms.
 ## Reporting bugs
 
 Use GitHub issues. Include your REAPER version, OS, whether you were host or
-guest, and the Activity feed from the companion app. Network-level logs go to
-stderr; launching REAPER from a terminal shows them.
+guest, and what **Settings → Copy diagnostics** in the companion app puts on
+your clipboard. Network-level logs go to stderr; launching REAPER from a
+terminal shows them.
 
 Security issues go through [SECURITY.md](SECURITY.md), not public issues.

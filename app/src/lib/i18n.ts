@@ -17,7 +17,6 @@ const KEY = "reamesh.lang";
 const en = {
   // Disconnected
   waitingForReaper: "Waiting for REAPER",
-  startReaperToConnect: "Start REAPER to connect.",
   openReaper: "Open REAPER",
   couldntOpenReaper: "Couldn't open REAPER. Launch it manually.",
   reaperFound: "REAPER found",
@@ -37,12 +36,11 @@ const en = {
   identityColorN: "Color {n}",
   checkNoAnswer: "No answer from the host. Try again.",
   logBadChangeset: "Ignored an invalid incoming edit.",
-  sessionContested: "Two devices claim to host this session. Only join if you know the real host.",
+  sessionContested: "Two devices claim to be the host",
   hostAction: "Host",
   untitledProject: "Untitled project",
   trustTitle: "Join {name}?",
-  trustBody:
-    "Plugins in the project can run code. Only join people you trust.",
+  trustBody: "Plugins in the project can run code.",
   cancel: "Cancel",
   close: "Close",
   joinAnyway: "Join",
@@ -54,68 +52,52 @@ const en = {
     "Invite codes also work outside this network, for example over a VPN such as Tailscale.",
 
   // Join preview / trust dialog
-  previewTracks: "{count} tracks",
-  previewFiles: "{count} files · {size}",
   joinNoFxHint: "View-only copy, all effect chains removed. No third-party code runs.",
   pluginsAllInstalled: "All {total} plugins installed",
   pluginsMissingSummary: "{missing} of {total} plugins missing",
-  pluginsUnknown: "{total} plugins · not checked",
+  pluginsUnknown: "{total} plugins, not checked",
   copyMissing: "Copy missing",
   missingCopied: "Copied",
   pluginInstalled: "Installed",
-  pluginMissing: "Not installed",
+  pluginMissingShort: "missing",
   pluginUnknown: "Can't tell",
 
   // Pre-host warning
   hostCopyTitle: "Before you host",
-  hostCloudWarning:
-    "This project is in a cloud-synced folder such as Dropbox, OneDrive, or iCloud. To avoid file conflicts, pause cloud syncing while you host.",
+  hostCloudWarning: "The project is in a cloud folder. Pause syncing while you host.",
   hostAnyway: "Host anyway",
 
   // Post-download plugin verification
   verifyTitle: "The plugin list was incomplete",
-  verifyBodyListed:
-    "The downloaded project uses plugins missing from the host's list ({count} total):",
-  verifyBodyNoList: "The host didn't provide a plugin list. The downloaded project uses these plugins:",
+  verifyBodyListed: "These plugins weren't on the host's list:",
+  verifyBodyNoList: "The host sent no plugin list. The project loads these plugins:",
   verifyContinue: "Open anyway",
 
-  // Join-without-effects session badge
-  nofxBadge: "Effects off",
-  nofxBadgeHint: "You joined without effects. The project is view-only, and your edits aren't shared.",
-  // Slow-link notice (ping round trip to the host / slowest guest is high).
-  slowLinkTitle: "Slow connection to {who}",
-  slowLinkHost: "the host",
-  slowLinkBody:
-    "Edits take a moment longer to arrive on both sides. Nothing gets lost; live editing just feels less immediate.",
-  slowLinkBodyDownload: "The download will take longer than usual. It continues in the background.",
+  // Joined without effects: the line under the session name.
+  nofxSub: "Without effects (view only)",
+  // Ping round trip to a peer is high.
+  slowLink: "Slow connection",
+  slowLinkToHost: "Slow connection to the host",
   slowLinkRtt: "Round trip: {ms} ms",
 
   // Session
   sessionFallback: "Session",
-  connectedBadge: "Connected",
   stopHosting: "Stop hosting",
   leaveSession: "Leave session",
   youBadge: "you",
   sessionHost: "Session host",
   stopHostingTitle: "Stop hosting?",
-  stopHostingBodyOne: "One other person is connected. They'll be disconnected if you stop hosting.",
-  stopHostingBodyMany:
-    "{count} other people are connected. They'll all be disconnected if you stop hosting.",
-  inviteCopied: "Invite code copied",
+  stopHostingBodyOne: "One person will be disconnected.",
+  stopHostingBodyMany: "{count} people will be disconnected.",
   inviteTicketHint:
     "Send this code to anyone you want to invite. They can paste it in their lobby to join, even over a VPN such as Tailscale. The code works while you host this session.",
 
   // Moderation (host only): kick = they may rejoin at once; block = their
   // device is kept out for 30 minutes, revocable from the blocked list.
   banTitle: "Block {name}?",
-  banBody:
-    "They'll be removed from the session, and this device can't rejoin for 30 minutes. You can unblock them earlier from the blocked list.",
-  banConfirm: "Block for 30 minutes",
-  blockedOne: "1 blocked device",
-  blockedMany: "{count} blocked devices",
-  blockedTitle: "Blocked devices",
-  blockedBody:
-    "Blocked devices can't join your sessions until the block expires. Unblocking lets them join again right away.",
+  banBody: "{name} will be removed and can't rejoin for 30 minutes.",
+  banConfirm: "Block",
+  blockedSection: "Blocked",
   blockExpiresIn: "{minutes} min left",
   blockExpiresSoon: "less than a minute left",
   unblock: "Unblock",
@@ -136,7 +118,7 @@ const en = {
   downloadReady: "Ready",
   etaAboutSeconds: "About {s}s to go",
   etaAboutMinutes: "About {m} min to go",
-  reaperBusyBanner: "REAPER isn't responding. Check whether it has a dialog waiting for you.",
+  reaperBusyBanner: "REAPER isn't responding. A dialog may be waiting there.",
 
   // Onboarding
   welcome: "Set up ReaMesh",
@@ -146,8 +128,7 @@ const en = {
   downloadReaper: "Download REAPER",
   checkAgain: "Check again",
   installExtTitle: "Install the REAPER extension",
-  notReaperDirWarning:
-    "This folder doesn't appear to be a REAPER data folder yet because it has no reaper.ini file. You can still install here, but check the location in Settings if REAPER doesn't find the extension.",
+  notReaperDirWarning: "This folder has no reaper.ini. Is it REAPER's data folder?",
   installing: "Installing…",
   installExtension: "Install extension",
   allSet: "Extension installed",
@@ -156,9 +137,8 @@ const en = {
 
   // Windows Firewall (Windows only). Shown *before* the prompt appears.
   // ReaMesh is silently unusable if it gets dismissed.
-  firewallTitle: "Windows will ask for network access",
   firewallBody:
-    "The first time REAPER runs with ReaMesh, Windows Defender Firewall asks for permission. Select “Private networks,” then choose “Allow access.” Without it, ReaMesh can't connect to anyone on your network.",
+    "On first start, Windows asks for network access. Choose “Private networks” and “Allow access.”",
   firewallNamesReaper:
     "The prompt says REAPER because ReaMesh runs inside it.",
   firewallAlreadyDismissed: "Closed the prompt already?",
@@ -182,15 +162,15 @@ const en = {
   updateAvailable: "Update available",
   autoInstallExt: "Install and update automatically",
   extInstalledToast: "Extension installed. Restart REAPER to load it.",
-  extUpdatedRestart: "The REAPER extension was updated. Restart REAPER to load the new version.",
+  extUpdatedRestart: "Extension updated. Restart REAPER to load it.",
   extRemovedToast: "Extension removed. Restart REAPER to unload it.",
   language: "Language",
   languageSystem: "System",
 
   // Presence / shared
   guest: "Guest",
-  joinedSessionSuffix: "joined the session",
-  leftSessionSuffix: "left the session",
+  joinedSessionSuffix: "joined",
+  leftSessionSuffix: "left",
 
   // Overlay
   connecting: "Connecting…",
@@ -208,9 +188,8 @@ const en = {
   stopFollowing: "Stop following",
   followingName: "Following {name}",
   followPerson: "Follow {name}",
-  followingYouOne: "Following you",
-  followingYouMany: "{count} following you",
   reaperNotRespondingPeer: "Their REAPER isn't responding",
+  reaperNotResponding: "REAPER not responding",
 
   // Activity-log / error events from the extension, rendered by code (see
   // lib/log.ts). `text` on the wire is the English fallback for unknown codes.
@@ -255,7 +234,8 @@ const en = {
   peerMarkersChanged: "Markers and regions changed",
   peerTitleChanged: "Project info changed",
   peerNotesChanged: "Project notes changed",
-  reconnectingBanner: "Connection to the host lost. Reconnecting…",
+  reconnectingBanner: "Reconnecting…",
+  reconnectingTo: "Reconnecting to “{name}”…",
   logMarkerShared: "Shared marker “{name}”",
   logMarkerReceived: "{by} shared marker “{name}”",
   logMarkerReceivedUnnamed: "Marker “{name}” was shared",
@@ -265,17 +245,17 @@ const en = {
   pluginAdded: "{plugin} was added",
   pluginsAddedTrack: "Plugins added to “{track}”: {count}",
   pluginsAdded: "Plugins added: {count}",
-  pluginNotInstalledHere: "It isn't installed here, so it'll appear offline.",
+  pluginNotInstalledHere: "Not installed here, so it shows offline.",
   followEnded: "You stopped following because they left the session.",
   nofxOpen: "Opening a view-only copy without effects.",
   verifyHold: "The downloaded project loads plugins the host didn't list.",
 
   // REAPER version: minimum gate + host mismatch
   reaperOutdatedTitle: "REAPER needs an update",
-  reaperOutdatedBody:
-    "ReaMesh needs REAPER {min} or newer. This is REAPER {version}. Update REAPER, then start it again.",
-  reaperOutdatedBodyUnknown: "ReaMesh needs REAPER {min} or newer. Update REAPER, then start it again.",
+  reaperOutdatedBody: "ReaMesh needs REAPER {min} or newer. You have {version}.",
+  reaperOutdatedBodyUnknown: "ReaMesh needs REAPER {min} or newer.",
   getReaperUpdate: "Get the REAPER update",
+  reaperYou: "{host} (you: {local})",
   reaperMismatchHostNewer:
     "The host runs REAPER {host}, you run {local}. Parts of the project may not load correctly here. Updating REAPER is recommended.",
   reaperMismatchHostOlder:
@@ -290,27 +270,19 @@ const en = {
   logPlaceholdersUnresolved: "Items that never received their media and stay empty here: {count}",
   logPlaceholderBlocked: "Kept an item that is still waiting for its media out of the sync.",
   loadingMedia: "Loading media",
-  loadingMediaShort: "Loading",
-  loadingEditsLocked: "You can listen already. Editing unlocks once everything is here.",
-  loadingFilesOf: "{done} of {total} files",
 
   // Download
   downloadStalled: "The download isn't moving. The host may be offline.",
   downloadProgress: "Download progress",
-  fileOfTotal: "File {done} of {total}",
+  bytesOf: "{done} of {total}",
 
   // Disconnected variants
   reaperClosed: "REAPER was closed",
-  reaperClosedBody: "Start it again to reconnect.",
   reaperClosedSession: "The session ended when REAPER closed.",
-  portTroubleTitle: "ReaMesh is running, but every port is taken",
-  portTroubleBody:
-    "The extension is loaded, but all four ReaMesh ports are already in use by other REAPER instances or programs. Close one of them and ReaMesh will connect automatically. You don't need to reinstall anything.",
+  portTrouble: "Every ReaMesh port is taken. Close another REAPER instance and ReaMesh connects on its own.",
 
   // Windows Firewall: an existing block detected
-  fwBlockedTitle: "Windows is blocking REAPER",
-  fwBlockedBody:
-    "A firewall rule is blocking incoming connections to REAPER. This often happens after the permission prompt is dismissed. Remove the rule so others on your network can reach you.",
+  fwBlocked: "A firewall rule blocks REAPER. Others on your network can't reach you.",
   fwOpenSettings: "Open firewall settings",
   fwCopyFix: "Copy fix",
   fwFixCopied: "Copied. Paste it into PowerShell running as administrator.",
@@ -336,25 +308,20 @@ const en = {
   crashCopied: "Copied",
   trackN: "Track {n}",
   editProfile: "Edit profile",
+  profile: "Profile",
   trustHostLabel: "Host",
-  trustProjectLabel: "Project",
+  trustSizeLabel: "Size",
   hostSeenTimes: "joined {count}×",
   hostSeenNever: "first time",
   joinModeLabel: "Effects",
   joinWithFx: "With effects",
   joinWithoutFx: "Without effects",
   passwordFor: "Password for {name}",
-  firstRunTitle: "What should others call you?",
-  yourOpenProject: "Your open REAPER project",
-  hostCopyWhy: "Guests download your project folder. Files stored elsewhere are copied into it first.",
-  hostCopyLabel: "Copy",
+  hostCopyLabel: "Copy into the project folder",
   hostFreeLabel: "Free",
-  hostFreeEnough: "enough",
   hostFreeShort: "not enough",
-  sessionsFound: "{count} found",
   hostSection: "Host",
   peerEditing: "editing {what}",
-  nameFollowsYou: "{name} follows you",
   followsYou: "follows you",
   followsName: "follows {name}",
   followingShort: "Following",
@@ -364,19 +331,16 @@ const en = {
   kickAction: "Remove",
   banAction: "Block…",
   copy: "Copy",
+  copied: "Copied",
   inviteLink: "Invite link",
+  inviteCode: "Invite code",
   hide: "Hide",
   show: "Show",
-  history: "Activity",
-  live: "Live",
-  youAreHosting: "You're hosting",
-  connectedTo: "Connected to {name}",
-  sinceMinutes: "for {m} min",
   people: "People",
   invite: "Invite",
-  nameIsHosting: "{name} is hosting",
   alreadyHereOne: "{name} is already here",
-  alreadyHereMany: "{count} people are already here",
+  alreadyHereTwo: "{a} and {b} are already here",
+  alreadyHereMany: "{a} and {count} others are already here",
   quoted: "“{text}”",
   editingTempo: "the tempo map",
   editingMarkers: "markers",
@@ -401,7 +365,6 @@ export type MsgKey = keyof typeof en;
 
 const de: Record<MsgKey, string> = {
   waitingForReaper: "Warte auf REAPER",
-  startReaperToConnect: "Starte REAPER. ReaMesh verbindet sich dann automatisch.",
   openReaper: "REAPER öffnen",
   couldntOpenReaper: "REAPER konnte nicht geöffnet werden. Starte es manuell.",
   reaperFound: "REAPER gefunden",
@@ -420,12 +383,11 @@ const de: Record<MsgKey, string> = {
   identityColorN: "Farbe {n}",
   checkNoAnswer: "Keine Antwort vom Host. Versuch es noch einmal.",
   logBadChangeset: "Ungültige Änderung empfangen und ignoriert.",
-  sessionContested: "Zwei Geräte geben sich als Host aus. Tritt nur bei, wenn du den echten Host kennst.",
+  sessionContested: "Zwei Geräte geben sich als Host aus",
   hostAction: "Hosten",
   untitledProject: "Unbenanntes Projekt",
   trustTitle: "{name} beitreten?",
-  trustBody:
-    "Plugins im Projekt können Code ausführen. Tritt nur Leuten bei, denen du vertraust.",
+  trustBody: "Plugins im Projekt können Code ausführen.",
   cancel: "Abbrechen",
   close: "Schließen",
   joinAnyway: "Beitreten",
@@ -436,62 +398,45 @@ const de: Record<MsgKey, string> = {
   ticketJoinHint:
     "Einladungscodes funktionieren auch außerhalb dieses Netzwerks, zum Beispiel über ein VPN wie Tailscale.",
 
-  previewTracks: "{count} Tracks",
-  previewFiles: "{count} Dateien · {size}",
   joinNoFxHint: "Schreibgeschützte Kopie ohne Effektketten. Es läuft kein Code von Drittanbietern.",
   pluginsAllInstalled: "Alle {total} Plugins installiert",
   pluginsMissingSummary: "{missing} von {total} Plugins fehlen",
-  pluginsUnknown: "{total} Plugins · nicht geprüft",
+  pluginsUnknown: "{total} Plugins, nicht geprüft",
   copyMissing: "Fehlende kopieren",
   missingCopied: "Kopiert",
   pluginInstalled: "Installiert",
-  pluginMissing: "Nicht installiert",
+  pluginMissingShort: "fehlt",
   pluginUnknown: "Nicht feststellbar",
 
   hostCopyTitle: "Bevor du hostest",
-  hostCloudWarning:
-    "Dieses Projekt liegt in einem synchronisierten Cloud-Ordner, etwa bei Dropbox, OneDrive oder iCloud. Pausiere den Cloud-Sync während des Hostings, um Dateikonflikte zu vermeiden.",
+  hostCloudWarning: "Das Projekt liegt in einem Cloud-Ordner. Pausiere den Sync, solange du hostest.",
   hostAnyway: "Trotzdem hosten",
 
   verifyTitle: "Plugin-Liste unvollständig",
-  verifyBodyListed:
-    "Das heruntergeladene Projekt verwendet Plugins, die nicht in der Liste des Hosts standen (insgesamt {count}):",
-  verifyBodyNoList: "Der Host hat keine Plugin-Liste angegeben. Das heruntergeladene Projekt verwendet diese Plugins:",
+  verifyBodyListed: "Diese Plugins standen nicht in der Liste des Hosts:",
+  verifyBodyNoList: "Der Host hat keine Plugin-Liste geschickt. Das Projekt lädt diese Plugins:",
   verifyContinue: "Trotzdem öffnen",
 
-  nofxBadge: "Effekte aus",
-  nofxBadgeHint: "Du bist ohne Effekte beigetreten. Das Projekt ist schreibgeschützt und deine Änderungen werden nicht geteilt.",
-  slowLinkTitle: "Langsame Verbindung zu {who}",
-  slowLinkHost: "dem Host",
-  slowLinkBody:
-    "Änderungen brauchen in beide Richtungen etwas länger. Es geht nichts verloren, die Live-Bearbeitung fühlt sich nur weniger direkt an.",
-  slowLinkBodyDownload: "Der Download dauert länger als üblich. Er läuft im Hintergrund weiter.",
+  nofxSub: "Ohne Effekte (nur ansehen)",
+  slowLink: "Langsame Verbindung",
+  slowLinkToHost: "Langsame Verbindung zum Host",
   slowLinkRtt: "Antwortzeit: {ms} ms",
 
   sessionFallback: "Session",
-  connectedBadge: "Verbunden",
   stopHosting: "Hosting beenden",
   leaveSession: "Session verlassen",
   youBadge: "du",
   sessionHost: "Session-Host",
   stopHostingTitle: "Hosting beenden?",
-  stopHostingBodyOne:
-    "Eine weitere Person nimmt teil. Wenn du das Hosting beendest, wird ihre Verbindung getrennt.",
-  stopHostingBodyMany:
-    "{count} weitere Personen nehmen teil. Wenn du das Hosting beendest, werden ihre Verbindungen getrennt.",
-  inviteCopied: "Einladungscode kopiert",
+  stopHostingBodyOne: "Eine Person wird getrennt.",
+  stopHostingBodyMany: "{count} Personen werden getrennt.",
   inviteTicketHint:
     "Schick diesen Code an alle, die du einladen möchtest. Sie können ihn in ihrer Lobby einfügen und auch über ein VPN wie Tailscale beitreten. Der Code gilt, solange du diese Session hostest.",
 
   banTitle: "{name} blockieren?",
-  banBody:
-    "Die Person wird aus der Session entfernt und kann mit diesem Gerät 30 Minuten lang nicht wieder beitreten. Du kannst die Blockierung in der Liste vorher aufheben.",
-  banConfirm: "30 Minuten blockieren",
-  blockedOne: "1 blockiertes Gerät",
-  blockedMany: "{count} blockierte Geräte",
-  blockedTitle: "Blockierte Geräte",
-  blockedBody:
-    "Blockierte Geräte können deinen Sessions nicht beitreten, bis die Blockierung abläuft. Nach dem Aufheben können sie sofort wieder beitreten.",
+  banBody: "{name} wird entfernt und kann 30 Minuten nicht beitreten.",
+  banConfirm: "Blockieren",
+  blockedSection: "Blockiert",
   blockExpiresIn: "noch {minutes} Min.",
   blockExpiresSoon: "weniger als eine Minute",
   unblock: "Freigeben",
@@ -511,7 +456,7 @@ const de: Record<MsgKey, string> = {
   downloadReady: "Bereit",
   etaAboutSeconds: "Noch etwa {s} s",
   etaAboutMinutes: "Noch etwa {m} Min.",
-  reaperBusyBanner: "REAPER reagiert nicht. Prüfe, ob dort ein Dialog auf deine Eingabe wartet.",
+  reaperBusyBanner: "REAPER reagiert nicht. Vielleicht wartet dort ein Dialog.",
 
   welcome: "ReaMesh einrichten",
   tagline: "Gemeinsam in Echtzeit an REAPER-Projekten arbeiten",
@@ -520,20 +465,18 @@ const de: Record<MsgKey, string> = {
   downloadReaper: "REAPER herunterladen",
   checkAgain: "Erneut prüfen",
   installExtTitle: "REAPER-Erweiterung installieren",
-  notReaperDirWarning:
-    "Dieser Ordner scheint noch kein REAPER-Datenordner zu sein, da die Datei reaper.ini fehlt. Du kannst die Erweiterung trotzdem hier installieren. Falls REAPER sie nicht findet, prüfe den Ordner in den Einstellungen.",
+  notReaperDirWarning: "Dieser Ordner hat keine reaper.ini. Ist es der REAPER-Datenordner?",
   installing: "Wird installiert…",
   installExtension: "Erweiterung installieren",
   allSet: "Erweiterung installiert",
   finish: "Fertig",
   locateReaperFolder: "Wähle deinen REAPER-Ordner",
 
-  firewallTitle: "Windows fragt nach Netzwerkzugriff",
   firewallBody:
-    "Wenn REAPER zum ersten Mal mit ReaMesh läuft, fragt die Windows-Defender-Firewall nach einer Berechtigung. Aktiviere „Private Netzwerke“ und wähle dann „Zugriff zulassen“. Sonst kann sich ReaMesh mit niemandem in deinem Netzwerk verbinden.",
+    "Beim ersten Start fragt Windows nach Netzwerkzugriff. Wähle „Private Netzwerke“ und „Zugriff zulassen“.",
   firewallNamesReaper:
     "Im Dialog steht REAPER, weil ReaMesh darin ausgeführt wird.",
-  firewallAlreadyDismissed: "Berechtigungsdialog schon geschlossen?",
+  firewallAlreadyDismissed: "Dialog schon geschlossen?",
   firewallRecover:
     "Öffne Windows-Sicherheit und gehe zu Firewall- & Netzwerkschutz → Zulassen einer App durch die Firewall. Aktiviere dort „Privat“ für REAPER.",
   firewallGotIt: "Verstanden",
@@ -553,14 +496,14 @@ const de: Record<MsgKey, string> = {
   updateAvailable: "Update verfügbar",
   autoInstallExt: "Automatisch installieren und aktualisieren",
   extInstalledToast: "Erweiterung installiert. Starte REAPER neu, um sie zu laden.",
-  extUpdatedRestart: "Die REAPER-Erweiterung wurde aktualisiert. Starte REAPER neu, um die neue Version zu laden.",
+  extUpdatedRestart: "Erweiterung aktualisiert. Starte REAPER neu, um sie zu laden.",
   extRemovedToast: "Erweiterung entfernt. Starte REAPER neu, damit die Änderung wirksam wird.",
   language: "Sprache",
   languageSystem: "System",
 
   guest: "Gast",
-  joinedSessionSuffix: "ist der Session beigetreten",
-  leftSessionSuffix: "hat die Session verlassen",
+  joinedSessionSuffix: "ist beigetreten",
+  leftSessionSuffix: "ist gegangen",
 
   connecting: "Verbindung wird hergestellt…",
   expand: "Ausklappen",
@@ -577,9 +520,8 @@ const de: Record<MsgKey, string> = {
   stopFollowing: "Nicht mehr folgen",
   followingName: "Du folgst {name}",
   followPerson: "{name} folgen",
-  followingYouOne: "Folgt dir",
-  followingYouMany: "{count} folgen dir",
   reaperNotRespondingPeer: "REAPER reagiert bei dieser Person nicht",
+  reaperNotResponding: "REAPER reagiert nicht",
 
   hostEndedSession: "Der Host hat die Session beendet.",
   hostLost: "Verbindung zum Host verloren.",
@@ -623,7 +565,8 @@ const de: Record<MsgKey, string> = {
   peerMarkersChanged: "Marker und Regionen geändert",
   peerTitleChanged: "Projektinfo geändert",
   peerNotesChanged: "Projektnotizen geändert",
-  reconnectingBanner: "Verbindung zum Host verloren. Sie wird wiederhergestellt…",
+  reconnectingBanner: "Verbinde erneut…",
+  reconnectingTo: "Verbinde erneut mit „{name}“…",
   logMarkerShared: "Marker „{name}“ geteilt",
   logMarkerReceived: "{by} hat den Marker „{name}“ geteilt",
   logMarkerReceivedUnnamed: "Marker „{name}“ wurde geteilt",
@@ -633,18 +576,17 @@ const de: Record<MsgKey, string> = {
   pluginAdded: "{plugin} wurde hinzugefügt",
   pluginsAddedTrack: "Zur Spur „{track}“ hinzugefügte Plugins: {count}",
   pluginsAdded: "Hinzugefügte Plugins: {count}",
-  pluginNotInstalledHere: "Dieses Plugin ist hier nicht installiert und erscheint deshalb offline.",
+  pluginNotInstalledHere: "Hier nicht installiert, erscheint deshalb offline.",
   followEnded: "Du folgst der Person nicht mehr, weil sie die Session verlassen hat.",
   nofxOpen: "Schreibgeschützte Kopie wird ohne Effekte geöffnet.",
   verifyHold: "Das heruntergeladene Projekt enthält Plugins, die der Host nicht angegeben hat.",
 
   // REAPER version: minimum gate + host mismatch
   reaperOutdatedTitle: "REAPER braucht ein Update",
-  reaperOutdatedBody:
-    "ReaMesh braucht REAPER {min} oder neuer. Das hier ist REAPER {version}. Aktualisiere REAPER und starte es danach neu.",
-  reaperOutdatedBodyUnknown:
-    "ReaMesh braucht REAPER {min} oder neuer. Aktualisiere REAPER und starte es danach neu.",
+  reaperOutdatedBody: "ReaMesh braucht REAPER {min} oder neuer. Installiert ist {version}.",
+  reaperOutdatedBodyUnknown: "ReaMesh braucht REAPER {min} oder neuer.",
   getReaperUpdate: "REAPER-Update holen",
+  reaperYou: "{host} (du: {local})",
   reaperMismatchHostNewer:
     "Der Host nutzt REAPER {host}, du nutzt {local}. Teile des Projekts werden hier eventuell nicht korrekt geladen. Ein REAPER-Update wird empfohlen.",
   reaperMismatchHostOlder:
@@ -659,24 +601,17 @@ const de: Record<MsgKey, string> = {
   logPlaceholdersUnresolved: "Items, deren Medien nie angekommen sind und hier leer bleiben: {count}",
   logPlaceholderBlocked: "Ein Item, das noch auf seine Medien wartet, wurde nicht synchronisiert.",
   loadingMedia: "Medien werden geladen",
-  loadingMediaShort: "Lädt",
-  loadingEditsLocked: "Anhören geht schon. Bearbeiten, sobald alles da ist.",
-  loadingFilesOf: "{done} von {total} Dateien",
 
   downloadStalled: "Der Download kommt nicht voran. Der Host ist möglicherweise offline.",
   downloadProgress: "Download-Fortschritt",
-  fileOfTotal: "Datei {done} von {total}",
+  bytesOf: "{done} von {total}",
 
   reaperClosed: "REAPER wurde beendet",
-  reaperClosedBody: "Starte es erneut, um dich wieder zu verbinden.",
   reaperClosedSession: "Die Session endete, als REAPER beendet wurde.",
-  portTroubleTitle: "ReaMesh läuft, aber kein Port ist frei",
-  portTroubleBody:
-    "Die Erweiterung ist geladen, aber alle vier ReaMesh-Ports werden bereits von anderen REAPER-Instanzen oder Programmen verwendet. Schließe eines davon. ReaMesh verbindet sich danach automatisch, ohne dass du etwas neu installieren musst.",
+  portTrouble:
+    "Alle ReaMesh-Ports sind belegt. Schließe eine andere REAPER-Instanz, dann verbindet sich ReaMesh von selbst.",
 
-  fwBlockedTitle: "Windows blockiert REAPER",
-  fwBlockedBody:
-    "Eine Firewall-Regel blockiert eingehende Verbindungen zu REAPER. Das passiert oft, wenn der Berechtigungsdialog geschlossen wurde. Entferne die Regel, damit dich andere im Netzwerk erreichen können.",
+  fwBlocked: "Eine Firewall-Regel blockiert REAPER. Andere im Netzwerk erreichen dich nicht.",
   fwOpenSettings: "Firewall-Einstellungen öffnen",
   fwCopyFix: "Lösung kopieren",
   fwFixCopied: "Kopiert. Öffne PowerShell als Administrator und füge den Befehl ein.",
@@ -699,25 +634,20 @@ const de: Record<MsgKey, string> = {
   crashCopied: "Kopiert",
   trackN: "Spur {n}",
   editProfile: "Profil bearbeiten",
+  profile: "Profil",
   trustHostLabel: "Host",
-  trustProjectLabel: "Projekt",
+  trustSizeLabel: "Größe",
   hostSeenTimes: "{count}× beigetreten",
   hostSeenNever: "erstes Mal",
   joinModeLabel: "Effekte",
   joinWithFx: "Mit Effekten",
   joinWithoutFx: "Ohne Effekte",
   passwordFor: "Passwort für {name}",
-  firstRunTitle: "Wie sollen dich die anderen sehen?",
-  yourOpenProject: "Dein offenes REAPER-Projekt",
-  hostCopyWhy: "Gäste laden deinen Projektordner. Dateien von woanders werden vorher hineinkopiert.",
-  hostCopyLabel: "Kopieren",
+  hostCopyLabel: "In den Projektordner kopieren",
   hostFreeLabel: "Frei",
-  hostFreeEnough: "reicht",
   hostFreeShort: "reicht nicht",
-  sessionsFound: "{count} gefunden",
   hostSection: "Hosten",
   peerEditing: "bearbeitet {what}",
-  nameFollowsYou: "{name} folgt dir",
   followsYou: "folgt dir",
   followsName: "folgt {name}",
   followingShort: "Folgst du",
@@ -727,19 +657,16 @@ const de: Record<MsgKey, string> = {
   kickAction: "Entfernen",
   banAction: "Blockieren…",
   copy: "Kopieren",
+  copied: "Kopiert",
   inviteLink: "Einladungslink",
+  inviteCode: "Einladungscode",
   hide: "Verbergen",
   show: "Anzeigen",
-  history: "Verlauf",
-  live: "Live",
-  youAreHosting: "Du hostest",
-  connectedTo: "Verbunden mit {name}",
-  sinceMinutes: "seit {m} Min.",
   people: "Personen",
   invite: "Einladen",
-  nameIsHosting: "{name} hostet",
   alreadyHereOne: "{name} ist schon da",
-  alreadyHereMany: "{count} Personen sind schon da",
+  alreadyHereTwo: "{a} und {b} sind schon da",
+  alreadyHereMany: "{a} und {count} weitere sind schon da",
   quoted: "„{text}“",
   editingTempo: "die Tempo-Map",
   editingMarkers: "Marker",

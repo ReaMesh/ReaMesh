@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { Copy, Minus, Settings, Square, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { BarMark } from "@/components/BarMark";
-import { ProfileChip } from "@/components/ProfileChip";
 import { useConnections, setActivePort } from "@/lib/connection";
 import { t } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
@@ -13,8 +12,8 @@ import { cn, focusRing } from "@/lib/utils";
 //
 // On macOS the native traffic lights sit over its left end (titleBarStyle
 // Overlay), the mark + wordmark sit centred, and the right end carries the
-// REAPER instance tabs (when several run) and the identity chip. Settings lives
-// in the application menu.
+// REAPER instance tabs (when several run). Settings lives in the application
+// menu. Name and colour are edited in the Lobby and in Settings.
 //
 // On Windows the window is undecorated (tauri.windows.conf.json), so this strip
 // IS the title bar: app name at the left, instance tabs, the Settings gear,
@@ -37,7 +36,7 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
             type="button"
             role="radio"
             aria-checked={active}
-            title={`${label} · :${inst.port}`}
+            title={`${label} (:${inst.port})`}
             onClick={() => setActivePort(inst.port)}
             className={cn(
               "max-w-28 truncate rounded-md px-2 py-1 text-[11px] transition-colors",
@@ -63,7 +62,6 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
         <Wordmark />
         <div className="ml-auto flex h-full items-center gap-1">
           {tabs}
-          <ProfileChip />
           <button
             type="button"
             onClick={onOpenSettings}
@@ -87,17 +85,14 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
       data-tauri-drag-region
       className="relative flex h-11 shrink-0 items-center bg-background/80 pl-[76px] pr-2.5"
     >
-      {/* Centred in the window, not in the space left of the chip. Several
-          REAPER instances need the room, so their tabs take its place. */}
+      {/* Centred in the window. Several REAPER instances need the room, so
+          their tabs take its place. */}
       {!tabs && (
         <div className="pointer-events-none absolute inset-0 grid place-items-center">
           <Wordmark />
         </div>
       )}
-      <div className="ml-auto flex items-center gap-2">
-        {tabs}
-        <ProfileChip />
-      </div>
+      {tabs && <div className="ml-auto flex items-center gap-2">{tabs}</div>}
     </header>
   );
 }

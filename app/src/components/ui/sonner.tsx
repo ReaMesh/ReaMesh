@@ -10,11 +10,20 @@ const Toaster = ({ ...props }: ToasterProps) => {
       offset={{ top: 50 }}
       mobileOffset={{ top: 50 }}
       visibleToasts={2}
+      // Two at once sit one under the other, both readable, instead of
+      // stacking into each other.
+      expand
       toastOptions={{
+        // Regular text; only the names inside are bold.
+        classNames: { title: "font-normal!" },
         style: {
           background: "var(--popover)",
           color: "var(--popover-foreground)",
           border: "1px solid var(--border)",
+          borderRadius: "10px",
+          padding: "12px 14px",
+          // Flat like the rest of the app: the border sets it apart.
+          boxShadow: "none",
         },
       }}
       {...props}

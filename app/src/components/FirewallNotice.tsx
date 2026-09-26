@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ChevronRight, ShieldAlert, ShieldX } from "lucide-react";
+import { AnimatePresence, motion } from "motion/react";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
 import { t } from "@/lib/i18n";
@@ -56,28 +56,19 @@ export function FirewallBlocked() {
   };
 
   return (
-    <div role="alert" className="space-y-2 rounded-xl bg-red-500/10 p-3 text-left">
-      <p className="flex items-start gap-2 text-[12px] font-semibold leading-relaxed text-red-400">
-        <ShieldX className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-        {t("fwBlockedTitle")}
-      </p>
-      <p className="text-[12px] leading-relaxed text-red-400/90">{t("fwBlockedBody")}</p>
+    <div role="alert" className="flex shrink-0 flex-col gap-2 rounded-xl bg-card p-3">
+      <p className="text-[12px] leading-normal text-red-400">{t("fwBlocked")}</p>
       <div className="flex flex-wrap gap-2">
         <Button
-          variant="ghost"
+          variant="secondary"
           size="sm"
-          className="h-6 px-2 text-[11px] text-red-400 hover:bg-red-500/15 hover:text-red-300"
+          className="h-7 px-2.5 text-[12px]"
           onClick={() => invoke("open_firewall_settings").catch(() => {})}
         >
           {t("fwOpenSettings")}
         </Button>
         {exe && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-6 px-2 text-[11px] text-red-400 hover:bg-red-500/15 hover:text-red-300"
-            onClick={copyFix}
-          >
+          <Button variant="ghost" size="sm" className="h-7 px-2.5 text-[12px]" onClick={copyFix}>
             {copied ? t("fwFixCopied") : t("fwCopyFix")}
           </Button>
         )}
@@ -86,10 +77,14 @@ export function FirewallBlocked() {
   );
 }
 
+/** Two sentences about the prompt. Why it names REAPER, and how to undo a
+ *  dismissed one, wait behind the "Closed the prompt already?" link. */
 export function FirewallNotice({
   dismissible = false,
+  className,
 }: {
   dismissible?: boolean;
+  className?: string;
 }) {
   const [acked, setAcked] = useState(
     () => dismissible && localStorage.getItem(ACK_KEY) === "1",
@@ -101,49 +96,44 @@ export function FirewallNotice({
     localStorage.setItem(ACK_KEY, "1");
     setAcked(true);
   };
+  const link = "rounded text-[11px] transition-colors hover:text-foreground";
 
   return (
-    <div className="space-y-2 rounded-lg bg-amber-500/10 p-2.5 text-left">
-      <p className="flex items-start gap-2 text-[12px] font-semibold leading-relaxed text-amber-500">
-        <ShieldAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-        {t("firewallTitle")}
-      </p>
-      {/* Keep body text above the 4.5:1 contrast target. */}
-      <p className="text-[12px] leading-relaxed text-amber-500">{t("firewallBody")}</p>
-      <p className="text-[11px] leading-relaxed text-amber-500">
-        {t("firewallNamesReaper")}
-      </p>
-      {/* Keep the recovery steps collapsed until they are needed. */}
-      <button
-        type="button"
-        aria-expanded={showRecover}
-        onClick={() => setShowRecover((v) => !v)}
-        className={cn(
-          "flex w-full items-center gap-1 rounded text-left text-[11px] font-medium text-amber-500/90 underline-offset-2 hover:underline",
-          focusRing,
+    // Margins instead of a flex gap: the recovery text must bring its own
+    // spacing with it as it unfolds, not before.
+    <div className={cn("flex flex-col text-left", className)}>
+      <p className="text-[12px] leading-normal text-foreground/65">{t("firewallBody")}</p>
+      <div className="mt-2.5 flex gap-4">
+        {dismissible && (
+          <button type="button" onClick={ack} className={cn(link, "font-semibold text-foreground", focusRing)}>
+            {t("firewallGotIt")}
+          </button>
         )}
-      >
-        <ChevronRight
-          className={cn("size-3 shrink-0 transition-transform", showRecover && "rotate-90")}
-          aria-hidden="true"
-        />
-        {t("firewallAlreadyDismissed")}
-      </button>
-      {showRecover && (
-        <p className="pl-4 text-[11px] leading-relaxed text-amber-500">
-          {t("firewallRecover")}
-        </p>
-      )}
-      {dismissible && (
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-6 w-full text-[11px] text-amber-500 hover:bg-amber-500/15 hover:text-amber-500"
-          onClick={ack}
+        <button
+          type="button"
+          aria-expanded={showRecover}
+          onClick={() => setShowRecover((v) => !v)}
+          className={cn(link, "text-muted-foreground", focusRing)}
         >
-          {t("firewallGotIt")}
-        </Button>
-      )}
+          {t("firewallAlreadyDismissed")}
+        </button>
+      </div>
+      <AnimatePresence initial={false}>
+        {showRecover && (
+          <motion.div
+            key="recover"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ type: "spring", stiffness: 400, damping: 38 }}
+            className="overflow-hidden"
+          >
+            <p className="pt-2.5 text-[11px] leading-normal text-muted-foreground">
+              {t("firewallNamesReaper")} {t("firewallRecover")}
+            </p>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

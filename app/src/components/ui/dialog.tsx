@@ -50,6 +50,7 @@ function DialogContent({
   className,
   children,
   showCloseButton = true,
+  onOpenAutoFocus,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean
@@ -61,10 +62,20 @@ function DialogContent({
         data-slot="dialog-content"
         className={cn(
           // Sized for the 420px companion window: the stock `sm:` breakpoints
-          // never fire here, so the layout is stated outright instead.
-          "fixed top-[50%] left-[50%] z-50 grid w-[calc(100%-2rem)] max-w-[372px] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-2xl border bg-popover p-5 shadow-2xl duration-200 outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",
+          // never fire here, so the layout is stated outright instead. No
+          // shadow: the dimmed backdrop already sets the dialog apart.
+          "fixed top-[50%] left-[50%] z-50 grid w-[calc(100%-2rem)] max-w-[372px] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-2xl border bg-popover p-5 duration-200 outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",
           className
         )}
+        // Open with focus on the dialog itself, not on its first button: a
+        // ring around "Cancel" the moment a dialog appears reads as a choice
+        // already made. Tab still walks the controls from the top.
+        onOpenAutoFocus={(e) => {
+          onOpenAutoFocus?.(e)
+          if (e.defaultPrevented) return
+          e.preventDefault()
+          ;(e.currentTarget as HTMLElement | null)?.focus()
+        }}
         {...props}
       >
         {children}
@@ -169,7 +180,7 @@ function DialogFact({
   return (
     <div className="flex min-h-9 items-center justify-between gap-3 py-2 text-[12.5px]">
       <dt className="shrink-0 text-muted-foreground">{label}</dt>
-      <dd className="flex min-w-0 items-center gap-1.5 text-right font-medium">{children}</dd>
+      <dd className="flex min-w-0 items-center gap-2 text-right font-medium">{children}</dd>
     </div>
   )
 }

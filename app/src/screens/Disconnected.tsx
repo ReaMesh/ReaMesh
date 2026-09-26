@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { CircleSlash } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -59,38 +58,30 @@ export function Disconnected({
 }) {
   const portless = usePortTrouble();
   const title = found ? t("reaperFound") : closed ? t("reaperClosed") : t("waitingForReaper");
-  const body = found
-    ? t("connecting")
-    : closed
-      ? closedWasSession
-        ? `${t("reaperClosedSession")} ${t("reaperClosedBody")}`
-        : t("reaperClosedBody")
-      : t("startReaperToConnect");
+  // The title and the button say what to do; a line below only when there is
+  // something they can't say.
+  const body = !found && closed && closedWasSession ? t("reaperClosedSession") : "";
   return (
     <div className="flex flex-1 flex-col items-center [justify-content:safe_center] overflow-y-auto gap-6 px-10 text-center">
       <ScanSpinner found={found} />
 
       <div className="space-y-1.5">
         <h2 className="text-[15px] font-semibold">{title}</h2>
-        <p className="text-[13px] leading-relaxed text-muted-foreground">{body}</p>
+        {body && <p className="text-[13px] leading-relaxed text-muted-foreground">{body}</p>}
       </div>
 
-      <div className="flex w-full max-w-[240px] flex-col items-center gap-3">
+      <div className="flex w-full max-w-[240px] flex-col gap-3">
         <Button className="w-full" onClick={launchReaper} disabled={found}>
           {t("openReaper")}
         </Button>
         {/* Explain why a loaded extension may still be unreachable. */}
         {portless && !found && (
-          <div role="status" className="space-y-1 rounded-lg bg-amber-500/10 p-2.5 text-left">
-            <p className="flex items-start gap-2 text-[12px] font-semibold leading-relaxed text-amber-500">
-              <CircleSlash className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-              {t("portTroubleTitle")}
-            </p>
-            <p className="text-[11px] leading-relaxed text-amber-500">{t("portTroubleBody")}</p>
-          </div>
+          <p role="status" className="text-left text-[12px] leading-normal text-amber-500">
+            {t("portTrouble")}
+          </p>
         )}
         {/* Show firewall advice before Windows opens its permission dialog. */}
-        {!found && <FirewallNotice dismissible />}
+        {!found && <FirewallNotice dismissible className="mt-5" />}
       </div>
     </div>
   );

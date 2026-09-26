@@ -35,18 +35,3 @@ export function Group({ className, ...props }: React.ComponentProps<"div">) {
 export function Divider({ inset = true }: { inset?: boolean }) {
   return <div aria-hidden="true" className={cn("h-px shrink-0 bg-white/[0.07]", inset && "ml-14")} />;
 }
-
-/** Square icon tile that stands where an avatar would in a non-person row. */
-export function IconTile({ children, className }: { children: React.ReactNode; className?: string }) {
-  return (
-    <div
-      aria-hidden="true"
-      className={cn(
-        "flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground [&_svg]:size-[15px]",
-        className,
-      )}
-    >
-      {children}
-    </div>
-  );
-}

@@ -1,25 +1,6 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
-import {
-  Ban,
-  Check,
-  ChevronDown,
-  Copy,
-  Crown,
-  Download,
-  Ellipsis,
-  Eye,
-  EyeOff,
-  History,
-  KeyRound,
-  Link2,
-  LocateFixed,
-  LogOut,
-  Pencil,
-  Snowflake,
-  UserX,
-  Wifi,
-} from "lucide-react";
+import { Ban, Check, Copy, Ellipsis, Eye, EyeOff, LocateFixed, UserX } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -31,17 +12,16 @@ import {
 } from "@/components/ui/dialog";
 import { Menu, MenuContent, MenuItem, MenuSeparator, MenuTrigger } from "@/components/ui/menu";
 import { BanList } from "@/components/BanList";
-import { Divider, Group, IconTile, SectionLabel } from "@/components/Group";
-import { Hint, HintProvider } from "@/components/Hint";
+import { Divider, Group, SectionLabel } from "@/components/Group";
+import { HintProvider } from "@/components/Hint";
+import { HostCrown } from "@/components/HostCrown";
+import { useSlowLink } from "@/components/LinkNotice";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { TrackNumber } from "@/components/TrackNumber";
 import { send } from "@/lib/connection";
-import { formatBytes, useTransfer } from "@/lib/format";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
-import { resolveLang, t } from "@/lib/i18n";
-import { localizeLogEntry } from "@/lib/log";
+import { t } from "@/lib/i18n";
 import { displayName, type ExtState, type Peer } from "@/lib/types";
-import { LinkNotice } from "@/components/LinkNotice";
 import { cn, focusRing, noContextMenu } from "@/lib/utils";
 
 function editingLabel(e: NonNullable<Peer["editing"]>): string {
@@ -52,51 +32,53 @@ function editingLabel(e: NonNullable<Peer["editing"]>): string {
   return t("editingProject");
 }
 
-/** What a person is doing right now, in words. One line, most urgent first. */
-function PeerMeta({ peer, peers }: { peer: Peer; peers: Peer[] }) {
-  const line = (icon: React.ReactNode, text: string, tone?: string) => (
-    <p className={cn("flex min-w-0 items-center gap-[5px] text-[12px] text-muted-foreground", tone)}>
-      {icon}
-      <span className="truncate">{text}</span>
+/** What someone else is doing right now, as one line of text, most urgent
+ *  first. Your own row has none: who follows you is said at their row. */
+function PeerMeta({
+  peer,
+  peers,
+  hosting,
+  following,
+}: {
+  peer: Peer;
+  peers: Peer[];
+  hosting: boolean;
+  following: boolean;
+}) {
+  // The link that matters: a guest's to the host, the host's to each guest.
+  const rtt = !peer.is_self && (hosting || peer.is_owner) ? (peer.rtt ?? 0) : 0;
+  const slow = useSlowLink(rtt);
+  if (peer.is_self) return null;
+
+  let text = "";
+  let tone = "text-muted-foreground";
+  let title: string | undefined;
+  if (peer.frozen) {
+    text = t("reaperNotResponding");
+    tone = "text-amber-500";
+    title = t("reaperNotRespondingPeer");
+  } else if (slow) {
+    text = t("slowLink");
+    tone = "text-amber-500";
+    title = t("slowLinkRtt", { ms: Math.round(rtt) });
+  } else if (following) {
+    text = t("followingShort");
+    tone = "text-found";
+  } else if (peer.editing && editingLabel(peer.editing)) {
+    text = t("peerEditing", { what: editingLabel(peer.editing) });
+  } else if (peer.follow) {
+    const target = peers.find((p) => p.id === peer.follow);
+    if (target) {
+      text = target.is_self ? t("followsYou") : t("followsName", { name: displayName(target) });
+      if (target.is_self) tone = "text-found";
+    }
+  }
+  if (!text) return null;
+  return (
+    <p className={cn("truncate text-[12px]", tone)} title={title}>
+      {text}
     </p>
   );
-  if (peer.frozen && !peer.is_self)
-    return line(
-      <Snowflake className="size-3 shrink-0" aria-hidden="true" />,
-      t("reaperNotRespondingPeer"),
-      "text-sky-300",
-    );
-  if (peer.editing && editingLabel(peer.editing))
-    return line(
-      <Pencil className="size-[11px] shrink-0" aria-hidden="true" />,
-      t("peerEditing", { what: editingLabel(peer.editing) }),
-    );
-  if (peer.is_self) {
-    const followers = peers.filter((p) => !p.is_self && p.follow === peer.id);
-    if (followers.length === 0) return null;
-    return line(
-      <Eye className="size-3 shrink-0" aria-hidden="true" />,
-      followers.length === 1
-        ? t("nameFollowsYou", { name: displayName(followers[0]) })
-        : t("followingYouMany", { count: followers.length }),
-      "text-found",
-    );
-  }
-  if (peer.follow) {
-    const target = peers.find((p) => p.id === peer.follow);
-    if (target)
-      return line(
-        <Eye className="size-3 shrink-0" aria-hidden="true" />,
-        target.is_self ? t("followsYou") : t("followsName", { name: displayName(target) }),
-        target.is_self ? "text-found" : undefined,
-      );
-  }
-  if ((peer.rtt ?? 0) > 0)
-    return line(
-      <Wifi className="size-3 shrink-0" aria-hidden="true" />,
-      `${Math.round(peer.rtt ?? 0)} ms`,
-    );
-  return null;
 }
 
 // Forward the ref so popLayout can measure and remove an exiting row from flow.
@@ -104,6 +86,7 @@ function PeerRow({
   ref,
   peer,
   peers,
+  hosting,
   flash,
   port,
   following,
@@ -113,6 +96,7 @@ function PeerRow({
   ref?: React.Ref<HTMLDivElement>;
   peer: Peer;
   peers: Peer[];
+  hosting: boolean;
   flash?: boolean;
   port: number | null;
   /** This user currently follows this peer. */
@@ -155,45 +139,27 @@ function PeerRow({
     >
       <span ref={flashScope} aria-hidden className="pointer-events-none absolute inset-0" />
       <PeerAvatar peer={peer} />
-      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <div className="flex min-w-0 items-center gap-1.5">
+      <div className="flex min-w-0 flex-1 flex-col gap-px">
+        <div className="flex min-w-0 items-baseline gap-1.5">
           <span className="truncate text-[13px] font-semibold">{name}</span>
           {peer.is_self && (
             <span className="shrink-0 text-[12px] text-muted-foreground">{t("youBadge")}</span>
           )}
-          {peer.is_owner && (
-            // The crown needs real text for the host to be identifiable non-visually.
-            <Hint label={t("sessionHost")}>
-              <span className="flex shrink-0 items-center">
-                <Crown className="size-3 text-amber-400" aria-hidden="true" />
-                <span className="sr-only">{t("sessionHost")}</span>
-              </span>
-            </Hint>
-          )}
+          {peer.is_owner && <HostCrown />}
         </div>
-        <PeerMeta peer={peer} peers={peers} />
+        <PeerMeta peer={peer} peers={peers} hosting={hosting} following={following} />
       </div>
+      {/* The track as plain text, right-aligned in one column; your own row
+          keeps the menu's width empty so it lines up too. */}
       <div
-        className="flex shrink-0 items-center gap-1"
+        className="flex shrink-0 items-center gap-3"
         onClick={(e) => e.stopPropagation()}
         onKeyDown={(e) => e.stopPropagation()}
       >
-        {following && (
-          <button
-            type="button"
-            onClick={() => follow(false)}
-            title={t("stopFollowing")}
-            className={cn(
-              "flex h-6 items-center gap-1 rounded-md bg-found/15 px-2 text-[11.5px] font-medium text-found transition-colors hover:bg-found/25",
-              focusRing,
-            )}
-          >
-            <Eye className="size-3" aria-hidden="true" />
-            {t("followingShort")}
-          </button>
-        )}
         <TrackNumber track={peer.track} />
-        {!peer.is_self && (
+        {peer.is_self ? (
+          <span aria-hidden="true" className="w-7 shrink-0" />
+        ) : (
           <Menu>
             <MenuTrigger asChild>
               <button
@@ -260,32 +226,22 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
-
-/** A row of the "Invite" group: icon tile, content, one action on the right. */
-function InviteRowShell({
-  icon,
-  children,
-  action,
-}: {
-  icon: React.ReactNode;
-  children: React.ReactNode;
-  action: React.ReactNode;
-}) {
+/** A row of the "Invite" group: content on the left, one action on the right. */
+function InviteRow({ children, action }: { children: React.ReactNode; action: React.ReactNode }) {
   return (
-    <div className="flex min-h-[52px] items-center gap-3 py-2 pl-3 pr-2">
-      <IconTile>{icon}</IconTile>
+    <div className="flex min-h-[52px] items-center gap-3 py-2 pr-2 pl-3">
       <div className="min-w-0 flex-1">{children}</div>
       {action}
     </div>
   );
 }
 
-// The session's invite link. It lets someone outside mDNS reach (VPN, strict
+// The session's invite code. It lets someone outside mDNS reach (VPN, strict
 // LAN) join: opening it takes them straight into their app's join flow,
-// pasting it in their Lobby works too.
-function InviteLink({ ticket }: { ticket: string }) {
+// pasting it in their Lobby works too. The row names it; the link itself only
+// shows when the clipboard refuses it, so it can be copied by hand.
+function InviteCode({ ticket }: { ticket: string }) {
   const [copied, setCopied] = useState(false);
-  // Make the link selectable by hand if clipboard access fails.
   const [reveal, setReveal] = useState(false);
   useEffect(() => {
     if (!copied) return;
@@ -293,8 +249,7 @@ function InviteLink({ ticket }: { ticket: string }) {
     return () => clearTimeout(id);
   }, [copied]);
   return (
-    <InviteRowShell
-      icon={<Link2 />}
+    <InviteRow
       action={
         <Button
           variant="ghost"
@@ -306,7 +261,7 @@ function InviteLink({ ticket }: { ticket: string }) {
           }}
         >
           {copied ? <Check className="size-3.5" aria-hidden="true" /> : <Copy className="size-3.5" aria-hidden="true" />}
-          {copied ? t("inviteCopied") : t("copy")}
+          {copied ? t("copied") : t("copy")}
         </Button>
       }
     >
@@ -317,14 +272,14 @@ function InviteLink({ ticket }: { ticket: string }) {
           aria-label={t("inviteLink")}
           value={ticket}
           onFocus={(e) => e.currentTarget.select()}
-          className="w-full bg-transparent font-mono text-[11.5px] outline-none"
+          className="w-full bg-transparent text-[12px] text-foreground/80 outline-none"
         />
       ) : (
-        <p className="truncate font-mono text-[11.5px] text-foreground/80" title={t("inviteTicketHint")}>
-          {ticket}
+        <p className="truncate text-[13px]" title={t("inviteTicketHint")}>
+          {t("inviteCode")}
         </p>
       )}
-    </InviteRowShell>
+    </InviteRow>
   );
 }
 
@@ -338,8 +293,7 @@ function HostPassword({ pass }: { pass: string }) {
     return () => clearTimeout(id);
   }, [shown]);
   return (
-    <InviteRowShell
-      icon={<KeyRound />}
+    <InviteRow
       action={
         <Button
           variant="ghost"
@@ -353,127 +307,52 @@ function HostPassword({ pass }: { pass: string }) {
         </Button>
       }
     >
-      <p className="truncate text-[13px] font-semibold">{t("password")}</p>
+      <p className="truncate text-[13px]">{t("password")}</p>
       <p className={cn("truncate text-[12px] text-muted-foreground", shown && "font-mono text-foreground/80")}>
         {shown ? pass : "••••••••"}
       </p>
-    </InviteRowShell>
+    </InviteRow>
   );
 }
 
 // Progressive join: the project is open, media still streaming in behind it.
-function LoadingNotice({ state }: { state: ExtState }) {
-  const lang = resolveLang();
+// One line and a thin bar under the session name; the edits that snap back
+// meanwhile explain themselves in a toast.
+function LoadingStrip({ state }: { state: ExtState }) {
   const done = state.done_bytes || 0;
   const total = state.total_bytes || 0;
   const pct = total > 0 ? Math.min(100, Math.floor((done / total) * 100)) : 0;
-  const { rate } = useTransfer(done, total);
-  const filesTotal = state.files_total || 0;
-  const detail = [
-    filesTotal > 0 ? t("loadingFilesOf", { done: state.files_done || 0, total: filesTotal }) : null,
-    total > 0 ? `${formatBytes(done, lang)} / ${formatBytes(total, lang)}` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
   return (
     <motion.div
-      layout
-      initial={{ opacity: 0, y: -4 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -4 }}
-      className="flex shrink-0 flex-col gap-2 rounded-xl bg-card p-3"
-      role="status"
-      aria-live="polite"
+      initial={{ height: 0, opacity: 0 }}
+      animate={{ height: "auto", opacity: 1 }}
+      exit={{ height: 0, opacity: 0 }}
+      transition={{ type: "spring", stiffness: 400, damping: 38 }}
+      className="shrink-0 overflow-hidden"
     >
-      <div className="flex items-center gap-2">
-        <Download className="size-[15px] shrink-0 text-found" aria-hidden="true" />
-        <span className="min-w-0 flex-1 truncate text-[13px] font-semibold">{t("loadingMedia")}</span>
-        <span className="shrink-0 text-[12px] tabular-nums text-foreground/65">{pct} %</span>
-      </div>
-      <div
-        className="h-1 overflow-hidden rounded-full bg-white/[0.07]"
-        role="progressbar"
-        aria-label={t("loadingMedia")}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={pct}
-      >
-        <motion.div
-          className="h-full rounded-full bg-found"
-          initial={false}
-          animate={{ width: `${pct}%` }}
-          transition={{ type: "spring", stiffness: 120, damping: 26 }}
-        />
-      </div>
-      {detail && (
-        <div className="flex justify-between gap-2 text-[11.5px] tabular-nums text-muted-foreground">
-          <span className="truncate">{detail}</span>
-          {rate > 0 && <span className="shrink-0">{formatBytes(rate, lang)}/s</span>}
+      <div className="flex flex-col gap-1.5 px-5 pt-3">
+        <div className="flex justify-between gap-2 text-[12px]">
+          <span className="truncate text-foreground/65">{t("loadingMedia")}</span>
+          <span className="shrink-0 tabular-nums text-muted-foreground">{pct} %</span>
         </div>
-      )}
-      {/* The one sentence that matters here; it wraps instead of truncating. */}
-      <p className="text-[12px] leading-snug text-foreground/65">{t("loadingEditsLocked")}</p>
+        <div
+          className="h-[3px] overflow-hidden rounded-full bg-secondary"
+          role="progressbar"
+          aria-label={t("loadingMedia")}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={pct}
+        >
+          <motion.div
+            className="h-full rounded-full bg-found"
+            initial={false}
+            animate={{ width: `${pct}%` }}
+            transition={{ type: "spring", stiffness: 120, damping: 26 }}
+          />
+        </div>
+      </div>
     </motion.div>
   );
-}
-
-/** Activity as one quiet row: the latest event, expandable to the recent few. */
-function HistoryRow({ log }: { log: ExtState["log"] }) {
-  const [open, setOpen] = useState(false);
-  if (log.length === 0) return null;
-  const recent = log.slice(-8).reverse();
-  return (
-    <Group>
-      <button
-        type="button"
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-        className={cn("flex h-10 items-center gap-2 px-3 text-left transition-colors hover:bg-white/[0.03]", focusRing)}
-      >
-        <History className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-        <span className="shrink-0 text-[13px] font-semibold">{t("history")}</span>
-        {!open && (
-          <span className="min-w-0 flex-1 truncate text-[12px] text-muted-foreground">
-            {localizeLogEntry(recent[0])}
-          </span>
-        )}
-        <ChevronDown
-          className={cn("ml-auto size-3.5 shrink-0 text-muted-foreground transition-transform", open && "rotate-180")}
-          aria-hidden="true"
-        />
-      </button>
-      <AnimatePresence initial={false}>
-        {open && (
-          <motion.ul
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ type: "spring", stiffness: 400, damping: 38 }}
-            className="overflow-hidden"
-          >
-            {recent.map((e, i) => (
-              <li key={i} className="px-3 py-1.5 text-[12px] leading-snug text-foreground/65 last:pb-2.5">
-                {localizeLogEntry(e)}
-              </li>
-            ))}
-          </motion.ul>
-        )}
-      </AnimatePresence>
-    </Group>
-  );
-}
-
-// When each session was first seen, so "for 38 min" survives a trip to Settings.
-const startedAt = new Map<string, number>();
-
-function useMinutesSince(key: string): number {
-  if (!startedAt.has(key)) startedAt.set(key, Date.now());
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 30_000);
-    return () => clearInterval(id);
-  }, []);
-  return Math.floor((now - (startedAt.get(key) ?? now)) / 60_000);
 }
 
 export function Session({
@@ -516,54 +395,29 @@ export function Session({
     if (confirmStop && others <= 0) setConfirmStop(false);
   }, [confirmStop, others]);
 
-  const minutes = useMinutesSince(`${port}:${state.mode}:${state.session}`);
   const self = state.peers.find((p) => p.is_self);
-  const owner = state.peers.find((p) => p.is_owner);
   const loading = !hosting && !!state.loading;
-  // The status line says the state in words instead of stacking badges.
-  const status = [
-    loading ? t("loadingMediaShort") : t("live"),
-    hosting
-      ? t("youAreHosting")
-      : owner
-        ? t("connectedTo", { name: displayName(owner) })
-        : t("connectedBadge"),
-    !hosting && (owner?.rtt ?? 0) > 0 ? `${Math.round(owner?.rtt ?? 0)} ms` : null,
-    hosting && minutes >= 1 ? t("sinceMinutes", { m: minutes }) : null,
-  ].filter(Boolean);
+  const banName = banTarget ? displayName(banTarget) : "";
 
   return (
     <HintProvider>
       <div className="flex min-h-0 flex-1 flex-col">
-        <header className="flex shrink-0 flex-col gap-1.5 px-5 pt-1">
+        {/* The name, and nothing that the list or the button below already
+            say: the role is in the button, the host is in the list. */}
+        <header className="flex shrink-0 flex-col gap-1 px-5 pt-1">
           <h2 className="truncate text-[21px] leading-tight font-semibold tracking-[-0.015em]">
             {state.session || t("sessionFallback")}
           </h2>
-          <p className="flex items-center gap-2 text-[12px] text-foreground/65">
-            <span
-              aria-hidden="true"
-              className="size-2 shrink-0 rounded-full bg-found shadow-[0_0_0_3px_color-mix(in_srgb,var(--found)_15%,transparent)]"
-            />
-            <span className="truncate">{status.join(" · ")}</span>
-            {/* Explain why edits are not sent in view-only mode. */}
-            {state.nofx && (
-              <Hint label={t("nofxBadgeHint")}>
-                <span className="shrink-0 text-amber-500">· {t("nofxBadge")}</span>
-              </Hint>
-            )}
-          </p>
+          {state.nofx && <p className="text-[12px] text-muted-foreground">{t("nofxSub")}</p>}
         </header>
 
+        <AnimatePresence initial={false}>
+          {loading && <LoadingStrip key="loading" state={state} />}
+        </AnimatePresence>
+
         <div className="scroll-slim flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-4 pt-3.5 pb-1">
-          <AnimatePresence initial={false}>
-            {loading && <LoadingNotice key="loading" state={state} />}
-          </AnimatePresence>
-
-          {/* Explain lag before someone blames the app for it. */}
-          <LinkNotice peers={state.peers} hosting={hosting} />
-
           <section className="flex shrink-0 flex-col gap-2">
-            <SectionLabel aside={state.peers.length}>{t("people")}</SectionLabel>
+            <SectionLabel>{t("people")}</SectionLabel>
             <Group aria-label={t("peopleList")} onContextMenu={noContextMenu}>
               {/* Animate later roster changes, but not the initial peer list. */}
               <AnimatePresence mode="popLayout" initial={false}>
@@ -573,6 +427,7 @@ export function Session({
                     <PeerRow
                       peer={p}
                       peers={state.peers}
+                      hosting={hosting}
                       flash={flashPeers.includes(p.id)}
                       port={port}
                       following={!!self?.follow && self.follow === p.id}
@@ -589,21 +444,19 @@ export function Session({
             <section className="flex shrink-0 flex-col gap-2">
               <SectionLabel>{t("invite")}</SectionLabel>
               <Group>
-                {!!state.ticket && <InviteLink ticket={state.ticket} />}
-                {!!state.ticket && !!hostPass && <Divider />}
+                {!!state.ticket && <InviteCode ticket={state.ticket} />}
+                {!!state.ticket && !!hostPass && <Divider inset={false} />}
                 {!!hostPass && <HostPassword pass={hostPass} />}
               </Group>
             </section>
           )}
 
-          <HistoryRow log={state.log} />
+          {hosting && <BanList bans={state.bans ?? []} port={port} />}
         </div>
 
         {/* One anchored action; toasts appear at the top and never cover it. */}
-        <footer className="flex shrink-0 items-center gap-2 px-4 pt-3 pb-4">
-          {hosting && <BanList bans={state.bans ?? []} port={port} variant="icon" />}
-          <Button variant="secondary" className="h-9 flex-1 gap-1.5" onClick={requestLeave}>
-            <LogOut className="size-[15px]" aria-hidden="true" />
+        <footer className="flex shrink-0 px-4 pt-3 pb-4">
+          <Button variant="secondary" className="h-9 flex-1" onClick={requestLeave}>
             {hosting ? t("stopHosting") : t("leaveSession")}
           </Button>
         </footer>
@@ -611,10 +464,8 @@ export function Session({
         <Dialog open={banTarget !== null} onOpenChange={(o) => !o && setBanTarget(null)}>
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>
-                {t("banTitle", { name: banTarget ? displayName(banTarget) : "" })}
-              </DialogTitle>
-              <DialogDescription>{t("banBody")}</DialogDescription>
+              <DialogTitle>{t("banTitle", { name: banName })}</DialogTitle>
+              <DialogDescription>{t("banBody", { name: banName })}</DialogDescription>
             </DialogHeader>
             <DialogFooter>
               <Button variant="secondary" onClick={() => setBanTarget(null)}>

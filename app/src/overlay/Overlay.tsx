@@ -8,18 +8,18 @@
 
 import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
-import { ChevronUp, Crown, Eye, Flag, Snowflake, Users } from "lucide-react";
+import { ChevronUp, Eye, Flag } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { currentMonitor, getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { Hint, HintProvider } from "@/components/Hint";
+import { HostCrown } from "@/components/HostCrown";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { TrackNumber } from "@/components/TrackNumber";
-import { formatBytes, useTransfer } from "@/lib/format";
-import { resolveLang, t, useLang } from "@/lib/i18n";
+import { t, useLang } from "@/lib/i18n";
 import { localizeLogEntry } from "@/lib/log";
 import { displayName, type ExtState, type Peer } from "@/lib/types";
 import { useOverlaySettings } from "@/lib/overlaySettings";
-import { noContextMenu } from "@/lib/utils";
+import { cn, noContextMenu } from "@/lib/utils";
 import { useOverlayState } from "./useOverlayState";
 
 const WIDTH = 232;
@@ -29,20 +29,23 @@ const MAX_HEIGHT_FRACTION = 0.5;
 /// Floor for the clamp, so a tiny/odd monitor report can't collapse the HUD.
 const MIN_MAX_HEIGHT = 160;
 
+// One person per row: face, name (plus "you" and the host's crown), and at
+// most one thing on the right: that they follow you, or else their track. A
+// peer whose REAPER stopped responding is dimmed; the tooltip says why.
 function PeerRow({
   peer,
   onReveal,
   pickMode = false,
   onPick,
-  followerCount = 0,
+  followsYou = false,
 }: {
   peer: Peer;
   onReveal?: (peer: Peer) => void;
   /** Follow-mode picking: clicking any other person starts following them. */
   pickMode?: boolean;
   onPick?: (peer: Peer) => void;
-  /** On the self row: how many peers are following this user. */
-  followerCount?: number;
+  /** This peer's transport mirrors yours. */
+  followsYou?: boolean;
 }) {
   // Other peers can be followed in pick mode or revealed when they are on a track.
   const pickable = pickMode && !peer.is_self && !!onPick;
@@ -66,24 +69,25 @@ function PeerRow({
       { duration: 0.5, ease: "easeOut" },
     );
   };
-  const followingYou =
-    followerCount === 1
-      ? t("followingYouOne")
-      : t("followingYouMany", { count: followerCount });
+  const frozen = !!peer.frozen && !peer.is_self;
   return (
     <Hint
       label={
         pickable
           ? t("followPerson", { name: displayName(peer) })
-          : clickable
-            ? t("revealPeerTrack", { name: displayName(peer) })
-            : undefined
+          : frozen
+            ? t("reaperNotRespondingPeer")
+            : clickable
+              ? t("revealPeerTrack", { name: displayName(peer) })
+              : undefined
       }
     >
       <motion.div
         layout
         initial={{ opacity: 0, x: -8 }}
-        animate={{ opacity: 1, x: 0 }}
+        // Online, but their REAPER has stopped responding: the row dims. Set
+        // here rather than as a class, which Motion's inline opacity would beat.
+        animate={{ opacity: frozen ? 0.45 : 1, x: 0 }}
         exit={{ opacity: 0, x: 8 }}
         transition={{ type: "spring", stiffness: 350, damping: 28 }}
         onClick={clickable ? activate : undefined}
@@ -99,9 +103,11 @@ function PeerRow({
         }
         role={clickable ? "button" : undefined}
         tabIndex={clickable ? 0 : undefined}
-        className={`relative flex items-center gap-2 rounded-md px-1.5 py-1 ${
-          clickable ? "cursor-pointer transition-colors hover:bg-white/5" : ""
-        } ${pickable ? "ring-1 ring-inset ring-white/15" : ""}`}
+        className={cn(
+          "relative flex items-center gap-2 rounded-md px-1.5 py-1",
+          clickable && "cursor-pointer transition-colors hover:bg-white/5",
+          pickable && "ring-1 ring-inset ring-white/15",
+        )}
       >
         {clickable && (
           <span
@@ -110,41 +116,20 @@ function PeerRow({
             className="pointer-events-none absolute inset-0 rounded-md"
           />
         )}
-        <PeerAvatar peer={peer} size="sm" />
-        <span className="min-w-0 flex-1 truncate text-[12px] font-medium">
-          {displayName(peer)}
+        <PeerAvatar peer={peer} size="xs" />
+        <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
+          <span className="truncate text-[12px] font-medium">{displayName(peer)}</span>
+          {peer.is_self && (
+            <span className="shrink-0 text-[11px] text-muted-foreground">{t("youBadge")}</span>
+          )}
+          {peer.is_owner && <HostCrown />}
+          {frozen && <span className="sr-only">{t("reaperNotRespondingPeer")}</span>}
         </span>
-        {peer.frozen && !peer.is_self && (
-          // The peer is online, but their REAPER has stopped responding.
-          <Hint label={t("reaperNotRespondingPeer")}>
-            <span className="flex shrink-0 items-center">
-              <Snowflake className="size-3 text-sky-300" aria-hidden="true" />
-              <span className="sr-only">{t("reaperNotRespondingPeer")}</span>
-            </span>
-          </Hint>
+        {followsYou ? (
+          <span className="shrink-0 text-[11px] text-found">{t("followsYou")}</span>
+        ) : (
+          <TrackNumber track={peer.track} small />
         )}
-        {peer.is_self && followerCount > 0 && (
-          // The being-followed indicator: someone's transport now mirrors yours.
-          <Hint label={followingYou}>
-            <span className="flex shrink-0 items-center gap-0.5 text-found">
-              <Eye className="size-3" aria-hidden="true" />
-              {followerCount > 1 && <span className="text-[11px]">{followerCount}</span>}
-              <span className="sr-only">{followingYou}</span>
-            </span>
-          </Hint>
-        )}
-        {peer.is_owner && (
-          <Hint label={t("sessionHost")}>
-            <span className="flex shrink-0 items-center">
-              <Crown className="size-3 text-amber-400" aria-hidden="true" />
-              <span className="sr-only">{t("sessionHost")}</span>
-            </span>
-          </Hint>
-        )}
-        {peer.is_self && (
-          <span className="shrink-0 text-[11px] text-muted-foreground">{t("youBadge")}</span>
-        )}
-        <TrackNumber track={peer.track} small />
       </motion.div>
     </Hint>
   );
@@ -152,30 +137,21 @@ function PeerRow({
 
 const STACK_MAX = 4;
 
-/** Show background media-transfer progress while the project is open.
- *  Hide the row once all files arrive and editing unlocks. */
+/** Background media-transfer progress while the project is open: a word, the
+ *  percentage, and a bar. The row goes once all files are here and editing
+ *  unlocks. */
 function LoadingStrip({ state }: { state: ExtState }) {
-  const lang = resolveLang();
   const done = state.done_bytes || 0;
   const total = state.total_bytes || 0;
   const pct = total > 0 ? Math.min(100, Math.floor((done / total) * 100)) : 0;
-  const { rate } = useTransfer(done, total);
-  const filesTotal = state.files_total || 0;
-  const detail = [
-    filesTotal > 0 ? t("loadingFilesOf", { done: state.files_done || 0, total: filesTotal }) : null,
-    total > 0 ? `${formatBytes(done, lang)} / ${formatBytes(total, lang)}` : null,
-    rate > 0 ? `${formatBytes(rate, lang)}/s` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
   return (
-    <div className="border-t border-white/10 px-2.5 pt-1.5 pb-2" role="status" aria-live="polite">
+    <div className="flex flex-col gap-1.5 border-t border-white/10 px-2.5 pt-[7px] pb-[9px]">
       <div className="flex items-baseline justify-between gap-2">
         <span className="text-[11px] font-medium">{t("loadingMedia")}</span>
         <span className="text-[11px] tabular-nums text-muted-foreground">{pct} %</span>
       </div>
       <div
-        className="mt-1 h-1 overflow-hidden rounded-full bg-white/10"
+        className="h-[3px] overflow-hidden rounded-full bg-secondary"
         role="progressbar"
         aria-label={t("loadingMedia")}
         aria-valuemin={0}
@@ -189,14 +165,12 @@ function LoadingStrip({ state }: { state: ExtState }) {
           transition={{ type: "spring", stiffness: 120, damping: 26 }}
         />
       </div>
-      <p className="mt-1 truncate text-[11px] text-muted-foreground">
-        {pct < 100 && detail ? detail : t("loadingEditsLocked")}
-      </p>
     </div>
   );
 }
 
-/** Overlapping identity avatars, shown only when collapsed. */
+/** Overlapping identity avatars, shown only when collapsed. One letter each,
+ *  ringed in the card's colour, so no letter is ever cut by the next face. */
 function AvatarStack({ peers }: { peers: Peer[] }) {
   const extra = peers.length - STACK_MAX;
   return (
@@ -205,9 +179,9 @@ function AvatarStack({ peers }: { peers: Peer[] }) {
         <motion.div
           key={p.id}
           layout
-          style={{ marginLeft: i === 0 ? 0 : -8, zIndex: peers.length - i }}
+          style={{ marginLeft: i === 0 ? 0 : -5, zIndex: peers.length - i }}
         >
-          <PeerAvatar peer={p} size="sm" className="ring-2 ring-background" />
+          <PeerAvatar peer={p} size="xs" className="ring-2 ring-background" />
         </motion.div>
       ))}
       {/* Otherwise the collapsed HUD silently under-reports who is present. */}
@@ -324,9 +298,6 @@ export function Overlay({ port }: { port: number | null }) {
   const self = peers.find((p) => p.is_self);
   const followingId = self?.follow || "";
   const followTarget = followingId ? peers.find((p) => p.id === followingId) : undefined;
-  const followerCount = self
-    ? peers.filter((p) => !p.is_self && p.follow && p.follow === self.id).length
-    : 0;
   const [markerOpen, setMarkerOpen] = useState(false);
   const [markerName, setMarkerName] = useState("");
   const [pickMode, setPickMode] = useState(false);
@@ -401,7 +372,9 @@ export function Overlay({ port }: { port: number | null }) {
     <div
       ref={cardRef}
       style={{ width: WIDTH }}
-      className="overflow-hidden rounded-xl border border-white/10 bg-background/80 text-foreground opacity-90 backdrop-blur-xl transition-opacity duration-200 hover:opacity-100"
+      // A plain card: a backdrop blur has nothing to soften behind a
+      // transparent window.
+      className="overflow-hidden rounded-xl border border-white/10 bg-background text-foreground opacity-90 transition-opacity duration-200 hover:opacity-100"
       onContextMenu={noContextMenu}
     >
       <div
@@ -443,27 +416,17 @@ export function Overlay({ port }: { port: number | null }) {
                 <AvatarStack peers={peers} />
               </motion.div>
             ) : (
-              // Which session this is and how many are in it, at a glance.
+              // Which session this is; who is in it is the list below.
               <motion.div
                 key="title"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
-                className="pointer-events-none flex min-w-0 flex-1 items-center gap-2"
+                className="pointer-events-none flex min-w-0 flex-1 items-center"
               >
-                <span
-                  aria-hidden="true"
-                  className="size-1.5 shrink-0 rounded-full bg-found shadow-[0_0_0_3px_color-mix(in_srgb,var(--found)_18%,transparent)]"
-                />
                 <span className="min-w-0 truncate text-[12px] font-semibold">
                   {state?.session || t("sessionFallback")}
                 </span>
-                {peers.length > 0 && (
-                  <span className="flex shrink-0 items-center gap-1 text-[11px] tabular-nums text-muted-foreground">
-                    <Users className="size-3" aria-hidden="true" />
-                    {peers.length}
-                  </span>
-                )}
               </motion.div>
             )}
           </AnimatePresence>
@@ -505,8 +468,8 @@ export function Overlay({ port }: { port: number | null }) {
                   transition={{ type: "spring", stiffness: 400, damping: 38 }}
                   className="overflow-hidden"
                 >
-                  <div className="flex items-start gap-2 border-t border-white/10 bg-white/[0.04] px-2.5 py-2">
-                    {lockNotice.by && <PeerAvatar peer={lockNotice.by} size="sm" className="size-5 text-[9px]" />}
+                  <div className="flex items-start gap-2 border-t border-white/10 px-2.5 py-2">
+                    {lockNotice.by && <PeerAvatar peer={lockNotice.by} size="xs" />}
                     <p className="min-w-0 flex-1 text-[11.5px] leading-snug">{lockNotice.text}</p>
                   </div>
                 </motion.div>
@@ -544,7 +507,7 @@ export function Overlay({ port }: { port: number | null }) {
                         onReveal={reveal}
                         pickMode={pickMode}
                         onPick={pickFollow}
-                        followerCount={followerCount}
+                        followsYou={!p.is_self && !!self && p.follow === self.id}
                       />
                     ))}
                   </AnimatePresence>
@@ -556,15 +519,14 @@ export function Overlay({ port }: { port: number | null }) {
             <div className="border-t border-white/10 px-1.5 py-1">
               {followTarget ? (
                 // Following someone: say whom, and end it with one click.
-                <div className="flex h-7 items-center gap-1.5 rounded-md bg-found/15 pl-2 pr-1 text-found">
-                  <Eye className="size-3.5 shrink-0" aria-hidden="true" />
+                <div className="flex h-7 items-center gap-2 pl-1 text-found">
                   <span className="min-w-0 flex-1 truncate text-[11.5px] font-medium">
                     {t("followingName", { name: displayName(followTarget) })}
                   </span>
                   <button
                     type="button"
                     onClick={stopFollowing}
-                    className="h-5 shrink-0 rounded px-1.5 text-[11px] font-medium transition-colors outline-none hover:bg-found/20 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                    className="h-6 shrink-0 rounded px-1.5 text-[11.5px] font-semibold transition-colors outline-none hover:bg-found/15 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                   >
                     {t("endFollow")}
                   </button>
@@ -618,7 +580,7 @@ export function Overlay({ port }: { port: number | null }) {
                         maxLength={80}
                         aria-label={t("markerNamePlaceholder")}
                         placeholder={t("markerNamePlaceholder")}
-                        className="h-6 min-w-0 flex-1 rounded-md bg-white/5 px-1.5 text-[11px] outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                        className="h-6 min-w-0 flex-1 rounded-md bg-white/5 px-1.5 text-[11px] outline-none placeholder:text-muted-foreground focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-foreground/40"
                       />
                       <button
                         type="button"

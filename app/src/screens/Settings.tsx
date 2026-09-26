@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Divider, Group, SectionLabel } from "@/components/Group";
 import { PathField } from "@/components/PathField";
+import { ProfileEditor } from "@/components/ProfileEditor";
 import { useConnections } from "@/lib/connection";
 import { localizeLogEntry } from "@/lib/log";
 import { getLangPref, setLangPref, t, useLang, type LangPref } from "@/lib/i18n";
@@ -79,7 +80,7 @@ function Switch({
     >
       <span
         className={cn(
-          "absolute top-0.5 left-0.5 size-[18px] rounded-full bg-white shadow transition-transform",
+          "absolute top-0.5 left-0.5 size-[18px] rounded-full bg-white transition-transform",
           checked && "translate-x-4",
         )}
       />
@@ -222,6 +223,13 @@ export function Settings({ onBack }: { onBack: () => void }) {
         </div>
 
         <section className="space-y-2">
+          <SectionLabel>{t("profile")}</SectionLabel>
+          <Group className="p-3">
+            <ProfileEditor />
+          </Group>
+        </section>
+
+        <section className="space-y-2">
           <SectionLabel>{t("language")}</SectionLabel>
           <div role="radiogroup" aria-label={t("language")} className="flex gap-1 rounded-xl bg-card p-1">
             {langOptions.map((o) => (
@@ -269,7 +277,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
               )}
               {/* Explain when the selected folder does not look like REAPER. */}
               {status && status.reaperFound && !status.isReaperDir && (
-                <p role="status" className="rounded-[10px] bg-amber-500/10 px-2.5 py-2 text-[12px] leading-snug text-amber-500">
+                <p role="status" className="px-0.5 text-[12px] leading-normal text-amber-500">
                   {t("notReaperDirWarning")}
                 </p>
               )}
@@ -289,12 +297,8 @@ export function Settings({ onBack }: { onBack: () => void }) {
             <Row
               label={t("reaperExtension")}
               sub={
-                <span
-                  className={cn(
-                    status?.installed && status.upToDate && "text-emerald-400",
-                    status?.installed && !status.upToDate && "text-amber-500",
-                  )}
-                >
+                // Neutral when all is well; only an available update is worth a colour.
+                <span className={cn(status?.installed && !status.upToDate && "text-amber-500")}>
                   {extStatus}
                 </span>
               }
@@ -397,7 +401,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
             >
               <Row label={copied ? t("diagnosticsCopied") : t("copyDiagnostics")}>
                 {copied ? (
-                  <Check className="size-3.5 text-emerald-400" aria-hidden="true" />
+                  <Check className="size-3.5 text-foreground" aria-hidden="true" />
                 ) : (
                   <ChevronRight className="size-3.5 text-muted-foreground" aria-hidden="true" />
                 )}

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, ExternalLink, TriangleAlert } from "lucide-react";
+import { Check, ExternalLink } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -37,7 +37,7 @@ function Step({
         aria-hidden="true"
         className={cn(
           "mt-px grid size-[22px] shrink-0 place-items-center rounded-full text-[11px] font-semibold tabular-nums",
-          state === "done" && "bg-emerald-500/15 text-emerald-400",
+          state === "done" && "bg-foreground/10 text-foreground",
           state === "current" && "bg-foreground text-background",
           state === "todo" && "bg-white/[0.07] text-muted-foreground",
         )}
@@ -149,10 +149,7 @@ export function Onboarding({ status }: { status: ReaperStatus }) {
             {!done && (
               <>
                 {!status.isReaperDir && (
-                  <p className="flex items-start gap-2 rounded-[10px] bg-amber-500/10 px-2.5 py-2 text-[12px] leading-snug text-amber-500">
-                    <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-                    {t("notReaperDirWarning")}
-                  </p>
+                  <p className="text-[12px] leading-normal text-amber-500">{t("notReaperDirWarning")}</p>
                 )}
                 <Button size="sm" className="h-8 w-full text-[13px]" disabled={busy} onClick={install}>
                   {busy ? t("installing") : t("installExtension")}

@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { RefreshCw, TriangleAlert } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
@@ -64,17 +63,18 @@ function usePresenceToasts(state: ExtState | undefined, port: number | undefined
     // and new lists would report every peer as joining or leaving.
     if (!before || before.port !== port || before.mode !== state.mode || !inSession) return;
 
-    const dot = (color: string) => (
-      <span
-        className="inline-block size-2 shrink-0 rounded-full"
-        style={{ backgroundColor: color }}
+    // Their face, as in the roster and the lock notice.
+    const face = (id: string, info: { name: string; color: string }) => (
+      <PeerAvatar
+        peer={{ id, name: info.name, color: info.color, is_self: false, is_owner: false }}
+        size="xs"
       />
     );
     for (const [id, info] of ids) {
       if (!before.ids.has(id)) {
         toast(
-          <span className="flex items-center gap-2">
-            {dot(info.color)}
+          <span className="flex items-center gap-2.5">
+            {face(id, info)}
             <span>
               <b>{info.name}</b> {t("joinedSessionSuffix")}
             </span>
@@ -93,8 +93,8 @@ function usePresenceToasts(state: ExtState | undefined, port: number | undefined
     for (const [id, info] of before.ids) {
       if (!ids.has(id)) {
         toast(
-          <span className="flex items-center gap-2">
-            {dot(info.color)}
+          <span className="flex items-center gap-2.5">
+            {face(id, info)}
             <span>
               <b>{info.name}</b> {t("leftSessionSuffix")}
             </span>
@@ -182,7 +182,7 @@ function useOverrideToasts(state: ExtState | undefined, port: number | undefined
         : undefined;
       toast(
         <span className="flex items-center gap-2.5">
-          {holder && <PeerAvatar peer={holder} size="sm" />}
+          {holder && <PeerAvatar peer={holder} size="xs" />}
           <span>{last ? localizeLogEntry(last) : t("editLocked")}</span>
         </span>,
       );
@@ -490,10 +490,9 @@ export default function App() {
           >
             <div
               role="status"
-              className="mx-4 mt-2 flex items-center gap-2.5 rounded-xl bg-secondary px-3 py-2.5"
+              className="mx-4 mt-2 flex items-center gap-2.5 rounded-xl bg-card px-3 py-2.5"
             >
-              <RefreshCw className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-              <span className="flex-1 text-[12px] font-medium">{t("extUpdatedRestart")}</span>
+              <span className="flex-1 text-[12px] text-foreground/80">{t("extUpdatedRestart")}</span>
               <button
                 type="button"
                 onClick={() => setRestartDismissed(true)}
@@ -517,12 +516,8 @@ export default function App() {
             exit={{ height: 0, opacity: 0 }}
             className="overflow-hidden"
           >
-            <div
-              role="status"
-              className="mx-4 mt-2 flex items-center gap-2.5 rounded-xl bg-amber-500/10 px-3 py-2.5 text-amber-500"
-            >
-              <TriangleAlert className="size-4 shrink-0" aria-hidden="true" />
-              <span className="text-[12px] font-medium">{t("reaperBusyBanner")}</span>
+            <div role="status" className="mx-4 mt-2 rounded-xl bg-card px-3 py-2.5">
+              <span className="text-[12px] text-amber-500">{t("reaperBusyBanner")}</span>
             </div>
           </motion.div>
         )}

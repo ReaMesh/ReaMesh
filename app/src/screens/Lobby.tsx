@@ -1,32 +1,21 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useAnimate, useReducedMotion } from "motion/react";
-import {
-  AudioLines,
-  ChevronDown,
-  ClipboardPaste,
-  LoaderCircle,
-  LockKeyhole,
-  Radio,
-  ShieldAlert,
-  Ticket,
-  Users,
-} from "lucide-react";
+import { ChevronDown, ClipboardPaste, LoaderCircle, LockKeyhole, Ticket, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogFact,
   DialogFacts,
   DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { PasswordInput } from "@/components/PasswordInput";
 import { BanList } from "@/components/BanList";
-import { Divider, Group, IconTile, SectionLabel } from "@/components/Group";
-import { SURFACE_EASE } from "@/components/ProfileChip";
-import { ProfileEditor } from "@/components/ProfileEditor";
+import { Divider, Group, SectionLabel } from "@/components/Group";
+import { ProfileFields } from "@/components/ProfileEditor";
 import { FirewallBlocked } from "@/components/FirewallNotice";
 import { TrustDialog } from "@/components/TrustDialog";
 import { FOUND_COLOR, inkFor } from "@/lib/colors";
@@ -36,12 +25,7 @@ import { takeInvite, useInviteSeq } from "@/lib/invite";
 import { recordHostJoin } from "@/lib/knownHosts";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
-import {
-  getProfile,
-  setProfileEditorOpen,
-  setProfileInlineHost,
-  useProfileEditor,
-} from "@/lib/profile";
+import { useProfile } from "@/lib/profile";
 import { decodeTicket, normalizeTicket } from "@/lib/ticket";
 import { initials, type ExtState, type SessionAd } from "@/lib/types";
 import { cn, focusRing } from "@/lib/utils";
@@ -58,6 +42,10 @@ const CHECK_TIMEOUT_MS = 12_000;
 /// Ticket checks legitimately take longer: the extension is dialing a host that
 /// may be across a VPN, and only fast-fails after its own connect timeout.
 const TICKET_CHECK_TIMEOUT_MS = 35_000;
+
+/** The spring the Lobby's cards unfold on, the one the invite card always had:
+ *  no hard start, no overshoot, settled after about 0.3 s. */
+const FOLD = { type: "spring", stiffness: 400, damping: 38 } as const;
 
 type CheckOutcome = "ok" | "bad" | "banned" | "unknown";
 type CheckError = "" | Exclude<CheckOutcome, "ok">;
@@ -190,19 +178,6 @@ function LockIcon() {
   );
 }
 
-/** Warn when different peers claim the same session id. */
-function ContestedWarning() {
-  return (
-    <div
-      role="status"
-      className="mt-2 flex items-start gap-2 rounded-[10px] bg-amber-500/10 px-2.5 py-2 text-amber-500"
-    >
-      <ShieldAlert className="mt-px size-3.5 shrink-0" aria-hidden="true" />
-      <span className="text-[11.5px] leading-snug">{t("sessionContested")}</span>
-    </div>
-  );
-}
-
 /** Keep the button's accessible name while its visible label becomes a spinner. */
 function PendingButton({
   busy,
@@ -224,72 +199,112 @@ function PendingButton({
   );
 }
 
-/** The identity editor as a card at the top of the Lobby, unfolding out of the
- *  title-bar chip. On a first run it opens by itself and asks once who this
- *  is, instead of silently joining as "Guest". */
-function ProfileCard({ firstRun }: { firstRun: boolean }) {
+/** Animates its own height when what is inside changes size (a pasted code
+ *  turning into its session, an error line), on the same spring. */
+function AutoHeight({ children }: { children: React.ReactNode }) {
+  const inner = useRef<HTMLDivElement>(null);
+  const [height, setHeight] = useState<number | "auto">("auto");
+  useLayoutEffect(() => {
+    const el = inner.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setHeight(el.offsetHeight));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   return (
-    // Height, not a transform: the list below is pushed down frame by frame
-    // and nothing inside is ever scaled. The negative margin eats the parent's
-    // flex gap while the card is folded away.
-    <motion.div
-      initial={{ height: 0, opacity: 0, marginBottom: -18 }}
-      animate={{ height: "auto", opacity: 1, marginBottom: 0 }}
-      exit={{ height: 0, opacity: 0, marginBottom: -18 }}
-      transition={SURFACE_EASE}
-      className="shrink-0 overflow-hidden rounded-xl"
-    >
-      <div className="flex flex-col gap-3 bg-card p-3.5">
-        <div className="flex items-center justify-between gap-2">
-          <h2 className="text-[13px] font-semibold">
-            {firstRun ? t("firstRunTitle") : t("editProfile")}
-          </h2>
-          <button
-            type="button"
-            aria-label={t("collapse")}
-            onClick={() => setProfileEditorOpen(false)}
-            className={cn(
-              "flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-white/10 hover:text-foreground",
-              focusRing,
-            )}
-          >
-            <motion.span
-              className="flex"
-              initial={{ rotate: 0 }}
-              animate={{ rotate: 180 }}
-              exit={{ rotate: 0 }}
-              transition={SURFACE_EASE}
-            >
-              <ChevronDown className="size-4" aria-hidden="true" />
-            </motion.span>
-          </button>
-        </div>
-        <ProfileEditor autoFocus ringOffset="ring-offset-card" />
-      </div>
+    <motion.div initial={false} animate={{ height }} transition={FOLD} className="overflow-hidden">
+      <div ref={inner}>{children}</div>
     </motion.div>
   );
 }
 
-/** The host's self-reported face. A contested session gets a neutral one: two
- *  devices claim it, so neither name deserves the trust a face implies. */
-function HostAvatar({ session }: { session: SessionAd }) {
-  if (session.contested || !session.owner_name) {
-    return (
-      <div
-        aria-hidden="true"
-        className="flex size-8 shrink-0 items-center justify-center rounded-full bg-[#2a2a31] text-muted-foreground"
+/** Who you are, as the Lobby's first row. The row itself becomes the head of
+ *  the name + colour card: the card's background fades in around it, the head
+ *  eases into its padding, and the fields grow in below on the spring. A
+ *  nameless first run opens it unasked, instead of silently joining as
+ *  "Guest". */
+function NameCard() {
+  const profile = useProfile();
+  const named = profile.name.trim().length > 0;
+  // Decided once per visit, so typing the first letter doesn't fold it away.
+  const [open, setOpen] = useState(() => !named);
+  return (
+    <div className={cn("shrink-0 rounded-xl transition-colors duration-300", open && "bg-card")}>
+      <button
+        type="button"
+        aria-expanded={open}
+        title={open ? undefined : t("editProfile")}
+        onClick={() => setOpen((v) => !v)}
+        className={cn(
+          "flex w-full items-center gap-2.5 rounded-xl px-1 py-1.5 text-left transition-[padding] duration-300",
+          open && "px-3 pt-2.5",
+          focusRing,
+        )}
       >
-        <Users className="size-[15px]" />
-      </div>
-    );
-  }
+        <span
+          aria-hidden="true"
+          className="flex size-6 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold transition-colors duration-300"
+          style={{ backgroundColor: profile.color, color: inkFor(profile.color) }}
+        >
+          {initials(profile.name)}
+        </span>
+        <span
+          className={cn(
+            "min-w-0 truncate text-[13px]",
+            named ? "font-semibold" : "text-muted-foreground",
+          )}
+        >
+          {named ? profile.name : t("yourName")}
+        </span>
+        <motion.span
+          className="ml-auto flex shrink-0 text-muted-foreground"
+          initial={false}
+          animate={{ rotate: open ? 180 : 0 }}
+          transition={FOLD}
+        >
+          <ChevronDown className="size-4" aria-hidden="true" />
+        </motion.span>
+      </button>
+      <AnimatePresence initial={false}>
+        {open && (
+          <motion.div
+            key="fields"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={FOLD}
+            className="overflow-hidden"
+          >
+            {/* Indented to the name above, past the avatar. */}
+            <div className="pt-1 pr-3 pb-3 pl-[46px]">
+              <ProfileFields autoFocus onDone={() => setOpen(false)} />
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+/** The host's self-reported face. A contested session gets a neutral one: two
+ *  devices claim it, so neither name deserves the trust a face implies. So
+ *  does a host that never said its name. */
+function HostAvatar({ session }: { session: SessionAd }) {
+  const known = !session.contested && !!session.owner_name;
   return (
     <div
       aria-hidden="true"
-      className="flex size-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold"
-      style={{ backgroundColor: session.owner_color, color: inkFor(session.owner_color) }}
+      className={cn(
+        "flex size-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold",
+        !known && "bg-[#2a2a31] text-muted-foreground",
+      )}
+      style={
+        known
+          ? { backgroundColor: session.owner_color, color: inkFor(session.owner_color) }
+          : undefined
+      }
     >
-      {initials(session.owner_name)}
+      {known ? initials(session.owner_name ?? "") : "?"}
     </div>
   );
 }
@@ -360,19 +375,16 @@ function SessionCard({
   };
   const busy = checking || joining;
 
-  const meta = [
-    !session.contested && session.owner_name ? session.owner_name : session.project_file,
-    (session.bytes ?? 0) > 0
-      ? t("previewFiles", { count: session.files ?? 0, size: formatBytes(session.bytes ?? 0) })
-      : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
-  const joinButton = (primary: boolean) => (
+  // Both join buttons look the same; the one beside a password field is as
+  // tall as the field.
+  const joinButton = (besideField: boolean) => (
     <PendingButton
       size="sm"
-      variant={primary ? "default" : "secondary"}
-      className={cn("shrink-0 px-3", primary ? "h-8 min-w-[84px] text-[13px]" : "h-7 min-w-[76px] text-[12px]")}
+      variant="secondary"
+      className={cn(
+        "shrink-0 px-3",
+        besideField ? "h-8 min-w-[84px] text-[13px]" : "h-7 min-w-[76px] text-[12px]",
+      )}
       disabled={(session.auth && !pass) || busy}
       busy={busy}
       label={t("join")}
@@ -412,13 +424,20 @@ function SessionCard({
               </span>
               {session.auth && <LockIcon />}
             </div>
-            <p className="truncate text-[12px] text-muted-foreground" title={session.project_file}>
-              {meta}
-            </p>
+            {/* One line: who hosts it. A second device claiming the same
+                session takes that line over. */}
+            {session.contested ? (
+              <p role="status" className="truncate text-[12px] text-amber-500">
+                {t("sessionContested")}
+              </p>
+            ) : (
+              <p className="truncate text-[12px] text-muted-foreground" title={session.project_file}>
+                {session.owner_name || session.project_file}
+              </p>
+            )}
           </div>
           {!session.auth && joinButton(false)}
         </div>
-        {session.contested && <ContestedWarning />}
         {/* Always mounted (empty:hidden when idle) so a failed probe on an open
             session still gets its "no answer" line and the shake. */}
         <div ref={shakeScope} className="mt-2 space-y-1.5 empty:hidden">
@@ -445,16 +464,14 @@ function SessionCard({
         </div>
       </div>
 
-      {/* Confirm the files, plugins, and claimed host before joining. */}
+      {/* Confirm the size, plugins, and claimed host before joining. */}
       <TrustDialog
         open={confirmOpen}
         onOpenChange={setConfirmOpen}
         name={session.session_name}
         hostId={session.owner}
         hostName={session.contested ? undefined : session.owner_name}
-        hostColor={session.owner_color}
         bytes={session.bytes}
-        files={session.files}
         preview={probe?.session_id === session.session_id ? probe?.preview : undefined}
         onJoin={join}
       />
@@ -465,10 +482,12 @@ function SessionCard({
 // Ticket parsing lives in lib/ticket.ts (unit-tested; mirrors the extension's
 // parse_ticket so the app never accepts a link the extension would refuse).
 
-// Join hosts that are not discoverable through mDNS through an invite link:
+// Join hosts that are not discoverable through mDNS through an invite code:
 // pasted here, or opened from a chat/browser (the OS hands it to the app, see
-// lib/invite).
-function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number | null }) {
+// lib/invite). A quiet link under the list that opens into a card in place:
+// the link stays put and becomes the card's head.
+function InviteCard({ probe, port }: { probe?: ExtState["probe"]; port: number | null }) {
+  const [open, setOpen] = useState(false);
   const [raw, setRaw] = useState("");
   const [pass, setPass] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -525,111 +544,174 @@ function TicketJoin({ probe, port }: { probe?: ExtState["probe"]; port: number |
     const link = takeInvite();
     if (!link) return;
     const info = decodeTicket(link);
+    setOpen(true);
     setRaw(link);
     setPass("");
     setError("");
     if (info && !info.auth && !joining) startCheck(normalizeTicket(link), "");
   }, [inviteSeq]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Emptying the field drops whatever check was running for the old link.
-  useEffect(() => {
-    if (code) return;
+  // The X in the head: fold back to the one-line link and forget the code, so
+  // it reopens fresh.
+  const close = () => {
+    setOpen(false);
+    setRaw("");
     setPass("");
     setError("");
     setJoining(false);
     reset();
-  }, [code]); // eslint-disable-line react-hooks/exhaustive-deps
+  };
 
   return (
-    // The list's last row: a session you can't see here is still a session.
-    <div className="flex shrink-0 items-start gap-3 py-2 pl-3 pr-2">
-      <IconTile>
-        <Ticket />
-      </IconTile>
-      <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex h-8 items-center gap-1">
-          <input
-            value={raw}
-            aria-label={t("haveInviteCode")}
-            placeholder={t("ticketPlaceholder")}
-            title={t("ticketJoinHint")}
-            spellCheck={false}
-            className="h-8 min-w-0 flex-1 bg-transparent text-[13px] outline-none placeholder:text-muted-foreground/80"
-            onChange={(e) => {
-              setRaw(e.target.value);
-              setError("");
-            }}
-            onKeyDown={(e) => e.key === "Enter" && ticket && (!ticket.auth || pass) && beginJoin()}
-          />
-          {ticket && !ticket.auth ? (
-            <PendingButton
-              size="sm"
-              variant="secondary"
-              className="h-7 min-w-[76px] shrink-0 px-3 text-[12px]"
-              disabled={busy}
-              busy={busy}
-              label={t("join")}
-              onClick={beginJoin}
-            />
-          ) : (
-            !ticket && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 shrink-0 gap-1.5 px-2.5 text-[12px] text-foreground/65"
-                onClick={async () => {
-                  const text = await readClipboard();
-                  if (text) {
-                    setRaw(text);
-                    setError("");
-                  }
-                }}
-              >
-                <ClipboardPaste className="size-3.5" aria-hidden="true" />
-                {t("pasteInvite")}
-              </Button>
-            )
-          )}
-        </div>
-        {invalid && <ErrorLine>{t("invalidTicket")}</ErrorLine>}
-        {ticket && (
-          <div className="flex items-center gap-1.5 pb-1 pr-1">
-            <span className="truncate text-[12px] text-muted-foreground" title={name}>
-              {name}
-            </span>
-            {ticket.auth && <LockIcon />}
-          </div>
+    // Keep the head mounted while the card's body unfolds below it.
+    <div className={cn("shrink-0 rounded-xl transition-colors duration-300", open && "bg-card")}>
+      <div
+        className={cn(
+          "flex items-center justify-between transition-[padding] duration-300",
+          open && "p-2 pb-1",
         )}
-        <div ref={shakeScope} className="space-y-1.5 pr-1 empty:hidden">
-          {ticket?.auth && (
-            <div className="flex gap-2 pt-1 pb-1">
-              <PasswordInput
-                value={pass}
-                aria-label={t("passwordFor", { name })}
-                placeholder={t("password")}
-                className={cn(
-                  "h-8 border-0 bg-muted text-[13px]",
-                  error && "ring-1 ring-red-500/70",
-                )}
-                onChange={(e) => {
-                  setPass(e.target.value);
-                  setError("");
-                }}
-                onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
-              />
-              <PendingButton
-                size="sm"
-                className="h-8 min-w-[84px] shrink-0 px-3 text-[13px]"
-                disabled={!pass || busy}
-                busy={busy}
-                label={t("join")}
-                onClick={beginJoin}
-              />
-            </div>
+      >
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => (open ? close() : setOpen(true))}
+          title={open ? undefined : t("ticketJoinHint")}
+          className={cn(
+            "flex min-w-0 items-center gap-1.5 rounded px-1 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground",
+            focusRing,
           )}
-          {error && <ErrorLine>{checkErrorText(error)}</ErrorLine>}
-        </div>
+        >
+          <Ticket className="size-3 shrink-0" aria-hidden="true" />
+          <span className="truncate">{t("haveInviteCode")}</span>
+        </button>
+        <AnimatePresence initial={false}>
+          {open && (
+            <motion.button
+              key="close"
+              type="button"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              onClick={close}
+              aria-label={t("close")}
+              className={cn(
+                "grid size-5 shrink-0 place-items-center rounded text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground",
+                focusRing,
+              )}
+            >
+              <X className="size-3.5" aria-hidden="true" />
+            </motion.button>
+          )}
+        </AnimatePresence>
       </div>
+
+      <AnimatePresence initial={false}>
+        {open && (
+          <motion.div
+            key="body"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={FOLD}
+            className="overflow-hidden"
+          >
+            <AutoHeight>
+              <div className="space-y-2 px-3 pt-1 pb-3">
+                {ticket ? (
+                  // The code has done its job: what is left is the session,
+                  // as the list above would show it.
+                  <div className="flex min-h-7 items-center gap-3 px-0.5">
+                    <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                      <span className="truncate text-[13px] font-semibold" title={name}>
+                        {name}
+                      </span>
+                      {ticket.auth && <LockIcon />}
+                    </div>
+                    {!ticket.auth && (
+                      <PendingButton
+                        size="sm"
+                        variant="secondary"
+                        autoFocus
+                        className="h-7 min-w-[76px] shrink-0 px-3 text-[12px]"
+                        disabled={busy}
+                        busy={busy}
+                        label={t("join")}
+                        onClick={beginJoin}
+                      />
+                    )}
+                  </div>
+                ) : (
+                  <div className="relative">
+                    <Input
+                      value={raw}
+                      aria-label={t("haveInviteCode")}
+                      placeholder={t("ticketPlaceholder")}
+                      spellCheck={false}
+                      autoFocus
+                      className="h-8 border-0 bg-muted pr-8 text-[13px]"
+                      onChange={(e) => {
+                        setRaw(e.target.value);
+                        setError("");
+                      }}
+                    />
+                    <button
+                      type="button"
+                      title={t("pasteInvite")}
+                      aria-label={t("pasteInvite")}
+                      className={cn(
+                        "absolute top-1/2 right-1 grid size-6 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:bg-background/60 hover:text-foreground",
+                        focusRing,
+                      )}
+                      onClick={async () => {
+                        const text = await readClipboard();
+                        if (text) {
+                          setRaw(text);
+                          setError("");
+                        }
+                      }}
+                    >
+                      <ClipboardPaste className="size-3.5" aria-hidden="true" />
+                    </button>
+                  </div>
+                )}
+                {invalid && <ErrorLine>{t("invalidTicket")}</ErrorLine>}
+                <div ref={shakeScope} className="space-y-2 empty:hidden">
+                  {ticket?.auth && (
+                    <div className="flex gap-2">
+                      <PasswordInput
+                        value={pass}
+                        autoFocus
+                        aria-label={t("passwordFor", { name })}
+                        placeholder={t("password")}
+                        className={cn(
+                          "h-8 border-0 bg-muted text-[13px]",
+                          error && "ring-1 ring-red-500/70",
+                        )}
+                        onChange={(e) => {
+                          setPass(e.target.value);
+                          setError("");
+                        }}
+                        onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
+                      />
+                      <PendingButton
+                        size="sm"
+                        variant="secondary"
+                        className="h-8 min-w-[84px] shrink-0 px-3 text-[13px]"
+                        disabled={!pass || busy}
+                        busy={busy}
+                        label={t("join")}
+                        onClick={beginJoin}
+                      />
+                    </div>
+                  )}
+                  {error && <ErrorLine>{checkErrorText(error)}</ErrorLine>}
+                </div>
+              </div>
+            </AutoHeight>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Use the same confirmation for discovered and invite-link sessions. */}
       <TrustDialog
@@ -695,16 +777,13 @@ function HostCard({
   const w = warning ?? null;
   return (
     <div className="flex shrink-0 flex-col gap-2.5 rounded-xl bg-card p-3">
-      <div className="flex items-center gap-3">
-        <IconTile className="text-foreground/65 [&_svg]:size-4">
-          <AudioLines />
-        </IconTile>
-        <div className="min-w-0 flex-1">
-          <span className="block truncate text-[13px] font-semibold" title={project || undefined}>
-            {project || t("untitledProject")}
-          </span>
-          <p className="truncate text-[12px] text-muted-foreground">{t("yourOpenProject")}</p>
-        </div>
+      <div className="flex min-h-7 items-center gap-3">
+        <span
+          className="min-w-0 flex-1 truncate text-[13px] font-semibold"
+          title={project || undefined}
+        >
+          {project || t("untitledProject")}
+        </span>
         <PendingButton
           size="sm"
           className="h-7 min-w-[68px] px-3 text-[12px]"
@@ -724,34 +803,31 @@ function HostCard({
       />
       {tooShort && <ErrorLine>{t("passwordTooShort", { min: MIN_PASSPHRASE })}</ErrorLine>}
 
-      {/* Confirm media size, free space, and cloud-folder warnings. */}
+      {/* Confirm media size, free space, and cloud-folder warnings. The row
+          labels say what the numbers mean. */}
       <Dialog open={!!w} onOpenChange={(open) => !open && dismissWarning()}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{t("hostCopyTitle")}</DialogTitle>
-            {w && w.files > 0 && <DialogDescription>{t("hostCopyWhy")}</DialogDescription>}
           </DialogHeader>
           {w && w.files > 0 && (
             <DialogFacts>
               <DialogFact label={t("hostCopyLabel")}>
-                <span className="tabular-nums">
-                  {t("previewFiles", { count: w.files, size: formatBytes(w.bytes) })}
-                </span>
+                <span className="tabular-nums">{formatBytes(w.bytes)}</span>
               </DialogFact>
               {w.free_known && (
                 <DialogFact label={t("hostFreeLabel")}>
                   <span className="tabular-nums">{formatBytes(w.free)}</span>
-                  <span className={cn("font-normal", w.enough ? "text-emerald-400" : "text-red-400")}>
-                    {w.enough ? t("hostFreeEnough") : t("hostFreeShort")}
-                  </span>
+                  {/* Worth a word only when it doesn't fit. */}
+                  {!w.enough && (
+                    <span className="font-normal text-red-400">{t("hostFreeShort")}</span>
+                  )}
                 </DialogFact>
               )}
             </DialogFacts>
           )}
           {w?.cloud && (
-            <p className="rounded-[10px] bg-amber-500/10 px-2.5 py-2 text-[12px] leading-snug text-amber-500">
-              {t("hostCloudWarning")}
-            </p>
+            <p className="text-[12px] leading-normal text-amber-500">{t("hostCloudWarning")}</p>
           )}
           <DialogFooter>
             <Button variant="secondary" onClick={dismissWarning}>
@@ -772,51 +848,39 @@ function HostCard({
   );
 }
 
+/** The extension lost the host without a farewell and is watching the lobby
+ *  to rejoin the same session on its own: one quiet row, nothing to do. */
+function ReconnectRow({ log }: { log: ExtState["log"] }) {
+  const name = [...log].reverse().find((e) => e.code === "reconnecting")?.params?.name;
+  return (
+    <div role="status" className="flex shrink-0 items-center gap-2.5 rounded-xl bg-card px-3 py-2.5">
+      <LoaderCircle
+        className="size-4 shrink-0 text-muted-foreground motion-safe:animate-spin"
+        aria-hidden="true"
+      />
+      <span className="min-w-0 truncate text-[12px] text-foreground/65">
+        {name ? t("reconnectingTo", { name: String(name) }) : t("reconnectingBanner")}
+      </span>
+    </div>
+  );
+}
+
 export function Lobby({ state, port }: { state: ExtState; port: number | null }) {
   // Sessions discovered after this timestamp get a one-time highlight.
   const mountedAt = useRef(Date.now()).current;
-  // Decided once per visit, so typing the first letter does not retitle the card.
-  const firstRun = useRef(!getProfile().name.trim()).current;
-  // While the Lobby is up the identity editor unfolds here, as part of the
-  // page; a nameless first run opens it unasked.
-  const editor = useProfileEditor();
-  useEffect(() => {
-    setProfileInlineHost(true);
-    if (firstRun) setProfileEditorOpen(true);
-    // Leaving the Lobby (a join, hosting) folds the card back into the chip
-    // rather than letting it reappear as a panel over the next screen.
-    return () => {
-      setProfileEditorOpen(false);
-      setProfileInlineHost(false);
-    };
-  }, [firstRun]);
   const count = state.sessions.length;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-[18px] px-4 pt-1.5 pb-4">
-      {/* The extension lost the host without a farewell and is watching the
-          lobby to rejoin the same session automatically. */}
-      {state.reconnecting && (
-        <div
-          role="status"
-          className="flex shrink-0 items-center gap-2.5 rounded-xl bg-amber-500/10 px-3 py-2.5 text-amber-500"
-        >
-          <LoaderCircle className="size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />
-          <span className="text-[12px] font-medium">{t("reconnectingBanner")}</span>
-        </div>
-      )}
+      {state.reconnecting && <ReconnectRow log={state.log} />}
 
       {/* Show a repair path for an active Windows Firewall block rule. */}
       <FirewallBlocked />
 
-      <AnimatePresence initial={false}>
-        {editor.open && editor.inline && <ProfileCard key="profile" firstRun={firstRun} />}
-      </AnimatePresence>
+      <NameCard />
 
       <section className="flex min-h-0 flex-1 flex-col gap-2">
-        <SectionLabel aside={count > 0 ? t("sessionsFound", { count }) : undefined}>
-          {t("sessionsOnNetwork")}
-        </SectionLabel>
+        <SectionLabel>{t("sessionsOnNetwork")}</SectionLabel>
         <Group className="min-h-0 shrink">
           {count > 0 ? (
             <div className="scroll-slim min-h-0 overflow-y-auto">
@@ -836,14 +900,13 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
             </div>
           ) : (
             /* Quiet on purpose: no permanent discovery spinner. */
-            <div className="flex flex-col items-center gap-2 px-6 py-6 text-center">
-              <Radio className="size-5 text-muted-foreground/70" aria-hidden="true" />
-              <p className="text-[13px] font-semibold">{t("noSessionsYet")}</p>
-            </div>
+            <p className="px-6 py-6 text-center text-[13px] text-muted-foreground">
+              {t("noSessionsYet")}
+            </p>
           )}
-          <Divider inset={false} />
-          <TicketJoin probe={state.probe} port={port} />
         </Group>
+        {/* A session you can't see here is still a session. */}
+        <InviteCard probe={state.probe} port={port} />
       </section>
 
       {/* Blocks outlive the session they were made in: keep them revocable. */}

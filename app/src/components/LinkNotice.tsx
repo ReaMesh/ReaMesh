@@ -1,15 +1,16 @@
 import { useEffect, useState } from "react";
-import { Wifi } from "lucide-react";
 import { t } from "@/lib/i18n";
-import { displayName, type Peer } from "@/lib/types";
+import type { Peer } from "@/lib/types";
 
-// Show a slow-connection notice from the extension's ping RTT samples.
-// Clients use the host's RTT; hosts use the slowest guest's. RTT measures
-// latency, while transfer rate is available only during downloads.
+// Slow connections, from the extension's ping RTT samples. RTT measures
+// latency; a transfer rate exists only during downloads. The Session roster
+// says "Slow connection" at the person it concerns (the host on a client, any
+// guest on the host); the download screen says it about the host.
 
-/** RTT threshold (ms) for showing the notice. */
+/** RTT threshold (ms) above which a link counts as slow. */
 const SLOW_ON = 400;
-/** Lower dismissal threshold to avoid flicker near the activation threshold. */
+/** Lower threshold for dropping it again, so a value hovering around the
+ *  threshold doesn't flicker. */
 const SLOW_OFF = 250;
 
 /** The peer whose link matters, or null when nothing is measured yet. */
@@ -25,39 +26,25 @@ export function slowestLink(peers: Peer[], hosting: boolean): { peer: Peer; rtt:
   return worst;
 }
 
-export function LinkNotice({
-  peers,
-  hosting,
-  /** Downloading: word the consequence as a slow transfer, not laggy edits. */
-  downloading = false,
-}: {
-  peers: Peer[];
-  hosting: boolean;
-  downloading?: boolean;
-}) {
-  const link = slowestLink(peers, hosting);
-  const rtt = link?.rtt ?? 0;
-  const [shown, setShown] = useState(false);
+/** Whether a round trip counts as slow, with hysteresis. 0 = not measured. */
+export function useSlowLink(rtt: number): boolean {
+  const [slow, setSlow] = useState(false);
   useEffect(() => {
-    if (rtt >= SLOW_ON) setShown(true);
-    else if (rtt < SLOW_OFF) setShown(false);
+    if (rtt >= SLOW_ON) setSlow(true);
+    else if (rtt < SLOW_OFF) setSlow(false);
   }, [rtt]);
-  if (!shown || !link) return null;
+  return slow;
+}
 
-  const who = link.peer.is_owner ? t("slowLinkHost") : displayName(link.peer);
+/** One amber line while the connection to the host is slow. */
+export function SlowHostLine({ peers }: { peers: Peer[] }) {
+  const link = slowestLink(peers, false);
+  const rtt = link?.rtt ?? 0;
+  const slow = useSlowLink(rtt);
+  if (!slow) return null;
   return (
-    <div
-      role="status"
-      className="space-y-1 rounded-lg bg-sky-500/10 p-2.5 text-left"
-      title={t("slowLinkRtt", { ms: Math.round(rtt) })}
-    >
-      <p className="flex items-start gap-2 text-[12px] font-semibold leading-relaxed text-sky-300">
-        <Wifi className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-        {t("slowLinkTitle", { who })}
-      </p>
-      <p className="text-[12px] leading-relaxed text-sky-300/90">
-        {downloading ? t("slowLinkBodyDownload") : t("slowLinkBody")}
-      </p>
-    </div>
+    <p role="status" className="text-[12px] text-amber-500" title={t("slowLinkRtt", { ms: Math.round(rtt) })}>
+      {t("slowLinkToHost")}
+    </p>
   );
 }
