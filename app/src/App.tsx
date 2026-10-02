@@ -26,6 +26,10 @@ import { isInviteLink } from "@/lib/ticket";
 import { displayName, type ExtState, type LogEntry, type Mode } from "@/lib/types";
 import { cn, focusRing } from "@/lib/utils";
 
+// How long a fresh launch waits for REAPER to answer before showing the
+// waiting screen (see `holdBlank`).
+const LAUNCH_GRACE_MS = 1200;
+
 startScanning();
 loadReaperPath().then(refreshStatus);
 
@@ -297,12 +301,27 @@ export default function App() {
     reaperClosed &&
     (lastLive.current?.mode === "hosting" || lastLive.current?.mode === "client");
 
+  // A running REAPER answers within a few hundred ms of launch. Until this
+  // grace passes, a missing state shows the blank checking screen instead of
+  // "Waiting for REAPER", so a normal start goes straight to the lobby without
+  // flashing the waiting screen and its "REAPER found" handoff.
+  const [launchGrace, setLaunchGrace] = useState(true);
+  useEffect(() => {
+    const id = setTimeout(() => setLaunchGrace(false), LAUNCH_GRACE_MS);
+    return () => clearTimeout(id);
+  }, []);
+  const holdBlank = launchGrace && !state && lastLive.current == null;
+
   // Hold the Disconnected screen briefly after REAPER answers so its
   // success animation finishes before the lobby appears. `waiting` matches
   // the render condition below.
   const hasState = !!state;
   const waiting =
-    !settingsOpen && reaper !== undefined && !state && !(reaper && !reaper.installed);
+    !settingsOpen &&
+    reaper !== undefined &&
+    !holdBlank &&
+    !state &&
+    !(reaper && !reaper.installed);
   const [foundBeat, setFoundBeat] = useState(false);
   // Detect the waiting-to-connected transition during render. This avoids a
   // one-frame trip through the lobby that would replay the entire entrance.
@@ -440,7 +459,7 @@ export default function App() {
       key: "settings",
       node: <Settings onBack={() => setSettingsOpen(false)} />,
     };
-  } else if (reaper === undefined) {
+  } else if (reaper === undefined || (holdBlank && !(reaper && !reaper.installed))) {
     screen = { key: "checking", node: null };
   } else if (foundBeat) {
     screen = { key: "disconnected", node: <Disconnected found /> };
