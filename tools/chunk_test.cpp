@@ -452,6 +452,11 @@ int main() {
     assert(!chunkHasFileSource("<ITEM\n  <SOURCE EMPTY\n  >\n>\n"));
     assert(chunkHasEmptySource("<ITEM\n  <SOURCE EMPTY\n  >\n>\n"));
     assert(!chunkHasEmptySource("<ITEM\n  <SOURCE MIDI\n  >\n>\n"));
+    // Only the item's own COLOR line counts: an item in the default colour has
+    // none, and that is what tells applyItem to clear a leftover lock tint.
+    assert(itemChunkHasColor("<ITEM\n  POSITION 1\n  COLOR 21036910 R\n  <SOURCE WAVE\n  >\n>\n"));
+    assert(!itemChunkHasColor("<ITEM\n  POSITION 1\n  TAKECOLOR 123 B\n  <SOURCE WAVE\n  >\n>\n"));
+    assert(!itemChunkHasColor("<ITEM\n  <TAKEFX\n    COLOR 5\n  >\n>\n"));
   }
 
   // REAPER version gate: releases order as decimals, not as integer pairs.

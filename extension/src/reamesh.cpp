@@ -111,6 +111,10 @@
 #define REAPERAPI_WANT_SetEditCurPos
 // The minimum-version gate at plugin load, and the host-version mismatch hint.
 #define REAPERAPI_WANT_GetAppVersion
+// Peak building for media that lands mid-session (processPeakJobs).
+#define REAPERAPI_WANT_CountTakes
+#define REAPERAPI_WANT_GetMediaSourceParent
+#define REAPERAPI_WANT_PCM_Source_BuildPeaks
 
 #include "reaper_plugin.h"
 #include "reaper_plugin_functions.h"
@@ -1115,6 +1119,29 @@ static bool chunkHasFileSource(const std::string& chunk) {
     size_t eol = chunk.find('\n', pos);
     if (eol == std::string::npos) eol = chunk.size();
     if (ltrim(std::string_view(chunk.data() + pos, eol - pos)).rfind("FILE ", 0) == 0) return true;
+    pos = eol + 1;
+  }
+  return false;
+}
+
+// Whether an item chunk sets the item's own colour: a `COLOR` line directly
+// inside `<ITEM` (nested blocks are skipped). REAPER writes none for an item in
+// the default colour, and applying such a chunk leaves whatever colour the item
+// had, so the caller has to reset it explicitly.
+static bool itemChunkHasColor(const std::string& chunk) {
+  int depth = 0;
+  size_t pos = 0;
+  while (pos < chunk.size()) {
+    size_t eol = chunk.find('\n', pos);
+    if (eol == std::string::npos) eol = chunk.size();
+    std::string_view t = ltrim(std::string_view(chunk.data() + pos, eol - pos));
+    if (!t.empty() && t.front() == '<') {
+      ++depth;
+    } else if (!t.empty() && t.front() == '>') {
+      --depth;
+    } else if (depth == 1 && t.rfind("COLOR ", 0) == 0) {
+      return true;
+    }
     pos = eol + 1;
   }
   return false;
@@ -2144,6 +2171,90 @@ static void applyReorder(const std::map<std::string, double>& desiredIndex) {
     if (MediaTrack* tr = findTrackByGuid(guid)) SetTrackSelected(tr, true);
 }
 
+// ---- peak building for media that arrived mid-session ----
+//
+// REAPER doesn't reliably redraw an item whose source file appeared after the
+// item was drawn: the background peak build ("build missing peaks") finished,
+// but the waveform only showed up once the item was clicked. So peaks for
+// freshly fetched media are built here through PCM_Source_BuildPeaks, in small
+// time slices on the main thread, and the arrange redraws when each finishes.
+// Jobs are keyed by item GUID and re-resolve their sources every tick (a track
+// chunk set rebuilds the items and their sources); a source is only ever
+// advanced right after being resolved from the live item.
+struct PeakJob {
+  std::set<PCM_source*> begun;  // sources whose build we started
+  std::set<PCM_source*> done;   // sources with finished (or already valid) peaks
+  std::chrono::steady_clock::time_point since;
+};
+static std::map<std::string, PeakJob> g_peakJobs;
+static constexpr std::chrono::seconds PEAK_JOB_MAX_AGE{180};
+static constexpr std::chrono::milliseconds PEAK_TICK_BUDGET{8};
+
+static void queuePeakBuild(const std::string& guid) {
+  // A new chunk may have brought new sources: (re)start the job.
+  g_peakJobs[guid] = PeakJob{{}, {}, std::chrono::steady_clock::now()};
+}
+
+static PCM_source* rootSource(PCM_source* src) {
+  // Section/reverse wrappers build through the file source they wrap.
+  for (int guard = 0; src && guard < 8; ++guard) {
+    PCM_source* parent = GetMediaSourceParent(src);
+    if (!parent) break;
+    src = parent;
+  }
+  return src;
+}
+
+static void processPeakJobs() {
+  if (g_peakJobs.empty()) return;
+  const auto now = std::chrono::steady_clock::now();
+  const auto deadline = now + PEAK_TICK_BUDGET;
+  bool redraw = false;
+  for (auto job = g_peakJobs.begin(); job != g_peakJobs.end();) {
+    MediaItem* item = findItemByGuid(job->first);
+    if (!item || now - job->second.since > PEAK_JOB_MAX_AGE) {
+      job = g_peakJobs.erase(job);
+      continue;
+    }
+    bool pending = false;
+    for (int t = 0, n = CountTakes(item); t < n; ++t) {
+      MediaItem_Take* take = GetMediaItemTake(item, t);
+      PCM_source* src = take ? rootSource(GetMediaItemTake_Source(take)) : nullptr;
+      if (!src || job->second.done.count(src)) continue;
+      if (!job->second.begun.count(src)) {
+        if (PCM_Source_BuildPeaks(src, 0) == 0) {  // peaks already valid
+          job->second.done.insert(src);
+          redraw = true;
+          continue;
+        }
+        job->second.begun.insert(src);
+      }
+      bool finished = false;
+      while (std::chrono::steady_clock::now() < deadline) {
+        if (PCM_Source_BuildPeaks(src, 1) == 0) {
+          PCM_Source_BuildPeaks(src, 2);
+          finished = true;
+          break;
+        }
+      }
+      if (finished) {
+        job->second.done.insert(src);
+        redraw = true;
+      } else {
+        pending = true;
+      }
+    }
+    if (!pending) {
+      UpdateItemInProject(item);
+      job = g_peakJobs.erase(job);
+    } else {
+      ++job;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) break;
+  }
+  if (redraw) UpdateArrange();
+}
+
 // Media files this item needs that are missing from the project folder.
 static std::vector<std::string> missingMediaIn(const json& fields) {
   std::vector<std::string> missing;
@@ -2160,39 +2271,59 @@ static std::vector<std::string> missingMediaIn(const json& fields) {
 
 // Apply one item's fields (creation, move across tracks, content update,
 // deletion). Caller has verified the referenced media exists.
-static void applyItem(const std::string& guid, const json& fields) {
+static void applyItem(const std::string& guid, const json& fields, bool freshMedia = false) {
   // Any remote change to this item restores its real (synced) color, so drop a
   // tint record we hold for it: reconcileItemTints will re-stash the FRESH real
   // color and re-tint if the item is still locked. This is what keeps a tinted
-  // item's restore color current when its real color changes mid-lock.
-  g_itemTints.erase(guid);
+  // item's restore color current when its real color changes mid-lock. The
+  // grey has to actually leave the item here, though: a change without a
+  // chunk (a move to another track) or a chunk without a COLOR line (an item in
+  // the default colour) would otherwise keep it, the next reconcile would stash
+  // that grey as the "real" colour, and the item would stay grey for good.
+  int tintedReal = -1;
+  if (auto rec = g_itemTints.find(guid); rec != g_itemTints.end()) {
+    if (!rec->second.expired) tintedReal = rec->second.real;
+    g_itemTints.erase(rec);
+  }
   MediaItem* item = findItemByGuid(guid);
   if (!jsonBool(fields, "present", true)) {
     if (item) DeleteTrackMediaItem(GetMediaItem_Track(item), item);
     g_placeholders.erase(guid);  // the owner removed it: nothing left to stand in for
+    g_peakJobs.erase(guid);
     return;
   }
   MediaTrack* tr = nullptr;
   if (fields.contains("track") && fields["track"].is_string())
     tr = findTrackByGuid(fields["track"].get<std::string>());
+  bool created = false;
   if (!item) {
     if (!tr) return;  // no destination track (yet); the full-sync will retry
     item = AddMediaItemToTrack(tr);
     if (!item) return;
+    created = true;
   } else if (tr && GetMediaItem_Track(item) != tr) {
     MoveMediaItemToTrack(item, tr);
   }
+  bool resolvedPlaceholder = false;
+  bool fileBacked = false;
   if (fields.contains("chunk") && fields["chunk"].is_string()) {
     // The chunk carries the originator's item GUID, so identity is stamped
     // onto newly created items as a side effect.
     const std::string& chunk = fields["chunk"].get_ref<const std::string&>();
     setObjectStateChunk(item, chunk);
+    if (!itemChunkHasColor(chunk)) SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", 0.0);
+    fileBacked = chunkHasFileSource(chunk);
     // A file-backed chunk landing on a progressive-join placeholder is its
     // media arriving: the stand-in is resolved. (A chunk without a FILE line
     // may be the placeholder itself being re-applied by a local snap-back.)
-    if (!g_placeholders.empty() && chunkHasFileSource(chunk)) g_placeholders.erase(guid);
+    if (fileBacked && g_placeholders.erase(guid)) resolvedPlaceholder = true;
+  } else if (tintedReal >= 0) {
+    SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", static_cast<double>(tintedReal));
   }
   UpdateItemInProject(item);
+  // Media that only just reached this machine has no peaks yet: build them
+  // and redraw once done, or the waveform only appears after a click.
+  if (fileBacked && (freshMedia || created || resolvedPlaceholder)) queuePeakBuild(guid);
 }
 
 // Names the peer currently holding the editing lock on `(section, id)`: the
@@ -2639,7 +2770,7 @@ static void processDeferredItems() {
   PreventUIRefresh(1);
   for (const DeferredItem& d : ready) {
     try {
-      applyItem(d.guid, d.fields);
+      applyItem(d.guid, d.fields, /*freshMedia=*/true);
     } catch (const std::exception& e) {
       logEvent("bad_changeset", {{"error", e.what()}},
                std::string("dropped a malformed incoming edit: ") + e.what());
@@ -2651,8 +2782,8 @@ static void processDeferredItems() {
   g_lastChangeCount = GetProjectStateChangeCount(nullptr);
   g_applyingRemote = false;
   // The media behind these items was just fetched, so it has no local peaks
-  // yet; queue a background build so the items don't render as flat blocks.
-  Main_OnCommand(40047, 0);  // Peaks: Build any missing peaks
+  // yet: applyItem queued them for processPeakJobs, which builds the peaks and
+  // redraws when they're done (so the items don't sit there as flat blocks).
   // While a progressive join is still loading, items land in a steady trickle
   // and the progress strip tells the story; a per-batch line would flood the feed.
   if (!g_mediaLoading)
@@ -3285,6 +3416,7 @@ static void leaveSession(const char* code, json params, const std::string& text)
   g_deferredItems.clear();
   g_deferredRecv.clear();
   g_placeholders.clear();
+  g_peakJobs.clear();  // REAPER builds whatever is left on demand
   g_mediaLoading = false;
   g_downloadBackground = false;
   g_placeholdersGivenUp = false;
@@ -4378,6 +4510,7 @@ static void timerTick() {
       applyRemoteChanges();
       processDeferredItems();
       processDeferredRecv();
+      processPeakJobs();
       // Last: re-paint the local lock tints. After capture (so the grey is
       // already invisible to it via the re-baseline) and after the applies (so a
       // remotely-recolored locked item re-tints with its fresh real color).
