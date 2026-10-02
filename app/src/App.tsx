@@ -17,6 +17,7 @@ import { Settings } from "@/screens/Settings";
 import { startScanning, send, useActiveInstance } from "@/lib/connection";
 import { offerInvite } from "@/lib/invite";
 import { openOverlay, closeOverlay, setSessionState } from "@/lib/overlay";
+import { buildDiagnostics } from "@/lib/diagnostics";
 import { loadReaperPath, refreshStatus, useReaperStatus } from "@/lib/install";
 import { t, useLang } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
@@ -372,6 +373,8 @@ export default function App() {
   // macOS the backend opens a native AppKit window instead and emits
   // `menu:settings-changed` after edits so we can re-read status; the
   // `menu:settings` event only fires on platforms using the in-webview screen.
+  // The native window's "Copy diagnostics" asks us for the text (we hold the
+  // connection state) and the backend puts it on the pasteboard.
   useEffect(() => {
     const subs = [
       listen("menu:settings", () => {
@@ -380,6 +383,10 @@ export default function App() {
       }),
       listen("menu:settings-changed", () => {
         loadReaperPath().then(refreshStatus);
+      }),
+      listen("settings:copy-diagnostics", async () => {
+        await refreshStatus();
+        invoke("copy_diagnostics_text", { text: await buildDiagnostics() }).catch(() => {});
       }),
     ];
     return () => {

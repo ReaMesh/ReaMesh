@@ -9,8 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Divider, Group, SectionLabel } from "@/components/Group";
 import { PathField } from "@/components/PathField";
 import { ProfileEditor } from "@/components/ProfileEditor";
-import { useConnections } from "@/lib/connection";
-import { localizeLogEntry } from "@/lib/log";
+import { buildDiagnostics } from "@/lib/diagnostics";
 import { getLangPref, setLangPref, t, useLang, type LangPref } from "@/lib/i18n";
 import {
   getReaperPath,
@@ -90,7 +89,7 @@ function Switch({
 
 // Full-screen app settings, reached from the Windows title-bar gear or Ctrl+,
 // (macOS has the native AppKit settings window instead, from Cmd+,). Grouped rows with one
-// control each.
+// control each; your name and colour on top (the Lobby edits them too).
 export function Settings({ onBack }: { onBack: () => void }) {
   const [busy, setBusy] = useState(false);
   const status = useReaperStatus();
@@ -171,30 +170,14 @@ export function Settings({ onBack }: { onBack: () => void }) {
     { value: "de", label: "Deutsch" },
   ];
 
-  const { instances } = useConnections();
   const [version, setVersion] = useState("");
   useEffect(() => {
     getVersion().then(setVersion).catch(() => {});
   }, []);
   const [copied, setCopied] = useState(false);
-  // Everything a bug report needs, as plain text: no project data, no names.
   const copyDiagnostics = async () => {
-    const lines = [
-      `ReaMesh ${version || "?"} · ${navigator.userAgent}`,
-      `Language: ${getLangPref()}`,
-      `REAPER folder found: ${status?.reaperFound ?? "?"} · looks like REAPER: ${status?.isReaperDir ?? "?"}`,
-      `Extension installed: ${status?.installed ?? "?"} · up to date: ${status?.upToDate ?? "?"}`,
-      `Auto-install: ${autoInstall} · overlay: ${JSON.stringify(overlay)}`,
-      `Instances: ${instances.length}`,
-      ...instances.map(
-        (i) =>
-          `  :${i.port} mode=${i.state?.mode ?? "?"} state=${i.state?.state ?? "?"} people=${i.state?.peers.length ?? 0} busy=${!!i.busy}`,
-      ),
-      "Recent events:",
-      ...(instances[0]?.state?.log ?? []).slice(-12).map((e) => `  ${e.code || "-"}: ${localizeLogEntry(e)}`),
-    ];
     try {
-      await navigator.clipboard.writeText(lines.join("\n"));
+      await navigator.clipboard.writeText(await buildDiagnostics());
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (e) {

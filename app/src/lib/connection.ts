@@ -176,6 +176,10 @@ export function setActivePort(port: number) {
   }
 }
 
+export function getConnections(): StoreState {
+  return snapshot;
+}
+
 export function useConnections(): StoreState {
   return useSyncExternalStore(
     (cb) => {

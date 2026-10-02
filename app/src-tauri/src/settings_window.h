@@ -25,11 +25,12 @@ enum {
 
 // Overlay toggle bits (a bitmask shared with Rust + overlaySettings.ts).
 // Bit 2 was the retired "activity feed" toggle; it now drives the locked-item
-// tint, so existing installs (activity default-on) keep the tint on. Bits 4/8
-// (peer playheads / time-selection) are retired.
+// tint. Bit 4 (once peer playheads) is "remember HUD position". Bit 8
+// (time-selection) is retired.
 enum {
     kReaMeshOverlayRoster = 1,
     kReaMeshOverlayTint = 2,
+    kReaMeshOverlayRememberPos = 4,
 };
 
 // Callbacks the native window uses to read state and act. `ctx` is an opaque
@@ -38,6 +39,7 @@ typedef struct {
     void *ctx;
     ReaperStatusC (*get_status)(void *ctx);
     int32_t (*install)(void *ctx);            // returns 1 on success, 0 on failure
+    int32_t (*remove)(void *ctx);             // returns 1 on success, 0 on failure
     void (*set_path)(void *ctx, const char *path); // path == NULL => use default
     int32_t (*get_language)(void *ctx);       // kReaMeshLang* preference
     void (*set_language)(void *ctx, int32_t pref);
@@ -45,10 +47,20 @@ typedef struct {
     void (*set_overlay)(void *ctx, int32_t mask);
     int32_t (*get_auto_install)(void *ctx);   // 1 = auto-install/update on
     void (*set_auto_install)(void *ctx, int32_t enabled);
+    int32_t (*reset_identity)(void *ctx);     // 1 = reset, 0 = none stored, -1 = failed
+    void (*copy_diagnostics)(void *ctx);      // the webview assembles + copies them
+    const char *(*get_version)(void *ctx);    // static, owned by Rust
 } SettingsCallbacks;
 
 // Opens (or re-focuses) the native settings window. Must be called on the
 // main thread.
 void reamesh_settings_open(SettingsCallbacks cb);
+
+// Rebuild the open window from current state (no-op when it was never
+// opened). Main thread only.
+void reamesh_settings_refresh(void);
+
+// Put plain text on the general pasteboard. Main thread only.
+void reamesh_pasteboard_set(const char *text);
 
 #endif

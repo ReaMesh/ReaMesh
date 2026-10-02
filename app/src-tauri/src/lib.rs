@@ -216,6 +216,7 @@ fn get_overlay_settings(app: AppHandle) -> u8 {
 #[tauri::command]
 fn set_overlay_settings(app: AppHandle, mask: u8) {
     apply_overlay(&app, mask);
+    refresh_native_settings(&app);
 }
 
 // ---------- auto-install ----------
@@ -299,6 +300,7 @@ fn get_auto_install(app: AppHandle) -> bool {
 #[tauri::command]
 fn set_auto_install(app: AppHandle, enabled: bool) {
     apply_auto_install(&app, enabled);
+    refresh_native_settings(&app);
 }
 
 fn device_lang() -> Lang {
@@ -332,6 +334,7 @@ fn get_language(app: AppHandle) -> String {
 #[tauri::command]
 fn set_language(app: AppHandle, pref: String) {
     apply_language(&app, &pref);
+    refresh_native_settings(&app);
 }
 
 /// Persist the preference, rebuild the (localized) native menu, and tell every
@@ -435,13 +438,20 @@ fn do_remove(app: &AppHandle, custom_path: &Option<String>) -> Result<ReaperStat
     compute_status(app, custom_path)
 }
 
-#[tauri::command]
-fn remove_extension(app: AppHandle) -> Result<ReaperStatus, String> {
-    // Disable auto-install so the extension stays removed on the next launch.
-    store_auto_install(&app, false);
+/// Remove the extension and disable auto-install so it stays removed on the
+/// next launch. Shared by the webview command and the native settings window.
+fn apply_remove(app: &AppHandle) -> Result<ReaperStatus, String> {
+    store_auto_install(app, false);
     use tauri::Emitter;
     let _ = app.emit("auto-install-changed", false);
-    do_remove(&app, &load_custom_path(&app))
+    do_remove(app, &load_custom_path(app))
+}
+
+#[tauri::command]
+fn remove_extension(app: AppHandle) -> Result<ReaperStatus, String> {
+    let st = apply_remove(&app);
+    refresh_native_settings(&app);
+    st
 }
 
 /// Delete parked copies REAPER has since let go of.
@@ -495,6 +505,7 @@ fn install_extension(app: AppHandle) -> Result<ReaperStatus, String> {
     // its "restart REAPER" banner for a manual install too.
     use tauri::Emitter;
     let _ = app.emit("extension-installed", ());
+    refresh_native_settings(&app);
     Ok(st)
 }
 
@@ -809,7 +820,11 @@ fn port_trouble() -> bool {
 /// stored identity existed.
 #[tauri::command]
 fn reset_network_identity(app: AppHandle) -> Result<bool, String> {
-    let dir = resource_dir(&load_custom_path(&app))?;
+    do_reset_identity(&app)
+}
+
+fn do_reset_identity(app: &AppHandle) -> Result<bool, String> {
+    let dir = resource_dir(&load_custom_path(app))?;
     let path = dir.join("reamesh-identity.key");
     if !path.is_file() {
         return Ok(false);
@@ -829,7 +844,36 @@ fn set_reaper_path(app: AppHandle, path: Option<String>) -> Result<(), String> {
     // A freshly located REAPER folder should pick up the extension on its own
     // when auto-install is on (no-op in manual mode).
     maybe_auto_install(&app);
+    refresh_native_settings(&app);
     Ok(())
+}
+
+/// The webview's half of the native window's "Copy diagnostics": it owns the
+/// connection state, assembles the text and hands it back here, because a
+/// clipboard write from an unfocused webview is refused.
+#[tauri::command]
+fn copy_diagnostics_text(app: AppHandle, text: String) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.run_on_main_thread(move || native_settings::set_pasteboard(&text));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, text);
+    }
+}
+
+/// Re-read state into the native macOS settings window if it is open, after a
+/// change made from the webview (or anywhere but the window itself).
+fn refresh_native_settings(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.run_on_main_thread(native_settings::refresh);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+    }
 }
 
 /// Width of the floating presence overlay, in logical pixels. The webview
@@ -1275,7 +1319,8 @@ pub fn run() {
             firewall_allowed,
             open_firewall_settings,
             port_trouble,
-            reset_network_identity
+            reset_network_identity,
+            copy_diagnostics_text
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -1298,8 +1343,8 @@ pub fn run() {
         })
         .on_menu_event(|app, event| {
             if event.id() == "settings" {
-                // macOS opens the real AppKit settings window; other platforms
-                // fall back to the in-webview Settings screen.
+                // macOS opens the native AppKit settings window; other
+                // platforms switch the main window to the in-webview screen.
                 #[cfg(target_os = "macos")]
                 {
                     let app = app.clone();
@@ -1310,6 +1355,11 @@ pub fn run() {
                 #[cfg(not(target_os = "macos"))]
                 {
                     use tauri::Emitter;
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.unminimize();
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                    }
                     let _ = app.emit("menu:settings", ());
                 }
             } else if event.id() == "quit" {
@@ -1349,16 +1399,21 @@ pub fn run() {
         });
 }
 
+
+/// Bridge to the native overlay panel (src/overlay_panel.m). It turns the Tauri
+/// overlay window into a non-activating panel that follows REAPER's window and
+/// shows only while REAPER is frontmost; all of that state lives on the ObjC
+/// side. Must be called on the main thread.
 /// Bridge to the native AppKit settings window (src/settings_window.m). The
 /// window calls back into these `extern "C"` functions to read status, run the
-/// install, and persist the REAPER-folder override. `ctx` is a leaked, stable
-/// `AppHandle` pointer.
+/// install, and persist preferences. `ctx` is a leaked, stable `AppHandle`
+/// pointer.
 #[cfg(target_os = "macos")]
 mod native_settings {
     use super::{
-        apply_auto_install, apply_language, apply_overlay, compute_status, do_install,
-        load_auto_install, load_custom_path, load_lang_pref, load_overlay, maybe_auto_install,
-        store_custom_path, ReaperStatus,
+        apply_auto_install, apply_language, apply_overlay, apply_remove, compute_status, do_install,
+        do_reset_identity, load_auto_install, load_custom_path, load_lang_pref, load_overlay,
+        maybe_auto_install, store_custom_path, ReaperStatus,
     };
     use std::cell::RefCell;
     use std::ffi::{c_char, c_void, CStr, CString};
@@ -1380,6 +1435,7 @@ mod native_settings {
         ctx: *mut c_void,
         get_status: extern "C" fn(*mut c_void) -> ReaperStatusC,
         install: extern "C" fn(*mut c_void) -> i32,
+        remove: extern "C" fn(*mut c_void) -> i32,
         set_path: extern "C" fn(*mut c_void, *const c_char),
         get_language: extern "C" fn(*mut c_void) -> i32,
         set_language: extern "C" fn(*mut c_void, i32),
@@ -1387,10 +1443,15 @@ mod native_settings {
         set_overlay: extern "C" fn(*mut c_void, i32),
         get_auto_install: extern "C" fn(*mut c_void) -> i32,
         set_auto_install: extern "C" fn(*mut c_void, i32),
+        reset_identity: extern "C" fn(*mut c_void) -> i32,
+        copy_diagnostics: extern "C" fn(*mut c_void),
+        get_version: extern "C" fn(*mut c_void) -> *const c_char,
     }
 
     extern "C" {
         fn reamesh_settings_open(cb: SettingsCallbacks);
+        fn reamesh_settings_refresh();
+        fn reamesh_pasteboard_set(text: *const c_char);
     }
 
     thread_local! {
@@ -1430,6 +1491,18 @@ mod native_settings {
     extern "C" fn install(ctx: *mut c_void) -> i32 {
         let app = handle(ctx);
         let ok = do_install(app, &load_custom_path(app)).is_ok();
+        if ok {
+            // A running REAPER keeps the copy it loaded: the webview shows its
+            // "restart REAPER" banner.
+            let _ = app.emit("extension-installed", ());
+        }
+        let _ = app.emit("menu:settings-changed", ());
+        ok as i32
+    }
+
+    extern "C" fn remove(ctx: *mut c_void) -> i32 {
+        let app = handle(ctx);
+        let ok = apply_remove(app).is_ok();
         let _ = app.emit("menu:settings-changed", ());
         ok as i32
     }
@@ -1457,17 +1530,15 @@ mod native_settings {
     }
 
     extern "C" fn set_language(ctx: *mut c_void, pref: i32) {
-        let app = handle(ctx);
         let pref = match pref {
             1 => "en",
             2 => "de",
             _ => "system",
         };
-        apply_language(app, pref);
+        apply_language(handle(ctx), pref);
     }
 
-    // Overlay toggles as a bitmask (roster=1, tint=2: kReaMeshOverlay* in
-    // settings_window.h).
+    // Overlay toggles as a bitmask (kReaMeshOverlay* in settings_window.h).
     extern "C" fn get_overlay(ctx: *mut c_void) -> i32 {
         load_overlay(handle(ctx)) as i32
     }
@@ -1485,6 +1556,30 @@ mod native_settings {
         apply_auto_install(handle(ctx), enabled != 0);
     }
 
+    extern "C" fn reset_identity(ctx: *mut c_void) -> i32 {
+        match do_reset_identity(handle(ctx)) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(_) => -1,
+        }
+    }
+
+    // The webview holds the connection state the diagnostics describe; it
+    // answers with `copy_diagnostics_text`, which lands in `set_pasteboard`.
+    extern "C" fn copy_diagnostics(ctx: *mut c_void) {
+        let _ = handle(ctx).emit("settings:copy-diagnostics", ());
+    }
+
+    static VERSION: OnceLock<CString> = OnceLock::new();
+
+    extern "C" fn get_version(ctx: *mut c_void) -> *const c_char {
+        VERSION
+            .get_or_init(|| {
+                CString::new(handle(ctx).package_info().version.to_string()).unwrap_or_default()
+            })
+            .as_ptr()
+    }
+
     // The AppHandle is leaked once so the pointer stays valid for the lifetime
     // of the (long-lived) native window.
     static APP_PTR: OnceLock<usize> = OnceLock::new();
@@ -1495,6 +1590,7 @@ mod native_settings {
             ctx: ptr as *mut c_void,
             get_status,
             install,
+            remove,
             set_path,
             get_language,
             set_language,
@@ -1502,15 +1598,25 @@ mod native_settings {
             set_overlay,
             get_auto_install,
             set_auto_install,
+            reset_identity,
+            copy_diagnostics,
+            get_version,
         };
         unsafe { reamesh_settings_open(cb) };
     }
+
+    /// Main thread only.
+    pub fn refresh() {
+        unsafe { reamesh_settings_refresh() };
+    }
+
+    /// Main thread only.
+    pub fn set_pasteboard(text: &str) {
+        let c = CString::new(text.replace('\0', "")).unwrap_or_default();
+        unsafe { reamesh_pasteboard_set(c.as_ptr()) };
+    }
 }
 
-/// Bridge to the native overlay panel (src/overlay_panel.m). It turns the Tauri
-/// overlay window into a non-activating panel that follows REAPER's window and
-/// shows only while REAPER is frontmost; all of that state lives on the ObjC
-/// side. Must be called on the main thread.
 #[cfg(target_os = "macos")]
 mod native_overlay {
     use std::ffi::c_void;

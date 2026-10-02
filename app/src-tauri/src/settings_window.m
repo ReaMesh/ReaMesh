@@ -1,12 +1,14 @@
 #import "settings_window.h"
 #import <Cocoa/Cocoa.h>
 
-// Native macOS Settings window with General and Overlay panes.
+// Native macOS Settings window with General, Overlay and Advanced panes.
 // REAPER access goes through the Rust SettingsCallbacks interface.
 
 static NSString *const kTabGeneral = @"general";
 static NSString *const kTabOverlay = @"overlay";
+static NSString *const kTabAdvanced = @"advanced";
 static NSString *const kReaperDownloadURL = @"https://www.reaper.fm/download.php";
+static NSString *const kDocsURL = @"https://reamesh.com/docs";
 
 static const CGFloat kWindowWidth = 480;
 static const CGFloat kWindowHeight = 416;
@@ -96,13 +98,13 @@ static ReaMeshSettingsController *gController = nil;
 #pragma mark - NSToolbarDelegate
 
 - (NSArray<NSToolbarItemIdentifier> *)toolbarDefaultItemIdentifiers:(NSToolbar *)t {
-    return @[ kTabGeneral, kTabOverlay ];
+    return @[ kTabGeneral, kTabOverlay, kTabAdvanced ];
 }
 - (NSArray<NSToolbarItemIdentifier> *)toolbarAllowedItemIdentifiers:(NSToolbar *)t {
-    return @[ kTabGeneral, kTabOverlay ];
+    return @[ kTabGeneral, kTabOverlay, kTabAdvanced ];
 }
 - (NSArray<NSToolbarItemIdentifier> *)toolbarSelectableItemIdentifiers:(NSToolbar *)t {
-    return @[ kTabGeneral, kTabOverlay ];
+    return @[ kTabGeneral, kTabOverlay, kTabAdvanced ];
 }
 
 - (NSToolbarItem *)toolbar:(NSToolbar *)toolbar
@@ -111,7 +113,13 @@ static ReaMeshSettingsController *gController = nil;
     NSToolbarItem *item = [[NSToolbarItem alloc] initWithItemIdentifier:identifier];
     item.target = self;
     item.action = @selector(tabSelected:);
-    if ([identifier isEqualToString:kTabOverlay]) {
+    if ([identifier isEqualToString:kTabAdvanced]) {
+        item.label = L(@"Advanced", @"Erweitert");
+        if (@available(macOS 11.0, *)) {
+            item.image = [NSImage imageWithSystemSymbolName:@"gearshape.2"
+                                   accessibilityDescription:item.label];
+        }
+    } else if ([identifier isEqualToString:kTabOverlay]) {
         item.label = L(@"Overlay", @"Overlay");
         if (@available(macOS 11.0, *)) {
             item.image = [NSImage imageWithSystemSymbolName:@"rectangle.on.rectangle"
@@ -158,7 +166,9 @@ static ReaMeshSettingsController *gController = nil;
     resolveUILanguage(self.cb.get_language(self.cb.ctx));
     self.window.title = L(@"ReaMesh Settings", @"ReaMesh-Einstellungen");
     ReaperStatusC st = self.cb.get_status(self.cb.ctx);
-    if ([identifier isEqualToString:kTabOverlay]) {
+    if ([identifier isEqualToString:kTabAdvanced]) {
+        [self buildAdvancedPane];
+    } else if ([identifier isEqualToString:kTabOverlay]) {
         [self buildOverlayPane];
     } else {
         [self buildGeneralPane:st];
@@ -192,6 +202,7 @@ static ReaMeshSettingsController *gController = nil;
     NSArray *rows = @[
         @[ @(kReaMeshOverlayRoster), L(@"Participants", @"Teilnehmer") ],
         @[ @(kReaMeshOverlayTint), L(@"Tint locked items", @"Gesperrte Items einfärben") ],
+        @[ @(kReaMeshOverlayRememberPos), L(@"Remember HUD position", @"HUD-Position merken") ],
     ];
     for (NSArray *row in rows) {
         int32_t bit = (int32_t)[row[0] integerValue];
@@ -326,7 +337,7 @@ static ReaMeshSettingsController *gController = nil;
         ? L(@"Install extension", @"Erweiterung installieren")
         : st.up_to_date ? L(@"Reinstall extension", @"Erweiterung neu installieren")
                         : L(@"Update extension", @"Erweiterung aktualisieren");
-    CGFloat btnW = 230;
+    CGFloat btnW = 200;
     NSButton *installBtn = [NSButton buttonWithTitle:btnTitle
                                               target:self
                                               action:@selector(install:)];
@@ -336,9 +347,23 @@ static ReaMeshSettingsController *gController = nil;
     installBtn.enabled = st.reaper_found ? YES : NO;
     [self.container addSubview:installBtn];
 
+    // Explicit removal: uninstalling the app leaves the extension in REAPER's
+    // UserPlugins folder.
+    CGFloat usedW = btnW;
+    if (st.installed) {
+        CGFloat rmW = 96;
+        NSButton *removeBtn = [NSButton buttonWithTitle:L(@"Remove", @"Entfernen")
+                                                 target:self
+                                                 action:@selector(removeExtension:)];
+        removeBtn.frame = NSMakeRect(kMargin + w - btnW - 4 - rmW, y, rmW, 28);
+        removeBtn.bezelStyle = NSBezelStyleRounded;
+        [self.container addSubview:removeBtn];
+        usedW += rmW + 4;
+    }
+
     NSTextField *statusLabel =
         [self labelWithString:statusText
-                        frame:NSMakeRect(kMargin, y + 4, w - btnW - 12, 18)];
+                        frame:NSMakeRect(kMargin, y + 4, w - usedW - 12, 18)];
     statusLabel.textColor = statusColor;
     statusLabel.font = [NSFont systemFontOfSize:13];
     statusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
@@ -372,20 +397,141 @@ static ReaMeshSettingsController *gController = nil;
     [self.container addSubview:help];
 }
 
+// Privacy (network identity) and help (docs, diagnostics, version): the
+// settings that came after the first native window.
+- (void)buildAdvancedPane {
+    CGFloat w = kWindowWidth - 2 * kMargin;
+    CGFloat y = kMargin;
+
+    [self.container addSubview:[self headerWithString:L(@"Privacy", @"Datenschutz") y:y]];
+    y += 26;
+
+    CGFloat resetW = 120;
+    NSTextField *idLabel = [self labelWithString:L(@"Network identity", @"Netzwerkidentität")
+                                           frame:NSMakeRect(kMargin, y + 4, w - resetW - 12, 18)];
+    idLabel.font = [NSFont systemFontOfSize:13];
+    [self.container addSubview:idLabel];
+    NSButton *reset = [NSButton buttonWithTitle:L(@"Reset…", @"Zurücksetzen…")
+                                         target:self
+                                         action:@selector(resetIdentity:)];
+    reset.frame = NSMakeRect(kMargin + w - resetW, y, resetW, 28);
+    reset.bezelStyle = NSBezelStyleRounded;
+    [self.container addSubview:reset];
+    y += 50;
+
+    [self.container addSubview:[self headerWithString:L(@"Help", @"Hilfe") y:y]];
+    y += 28;
+
+    NSButton *docs = [NSButton buttonWithTitle:L(@"Documentation", @"Dokumentation")
+                                        target:self
+                                        action:@selector(openDocs:)];
+    docs.frame = NSMakeRect(kMargin, y, 180, 28);
+    docs.bezelStyle = NSBezelStyleRounded;
+    [self.container addSubview:docs];
+
+    NSButton *diag = [NSButton buttonWithTitle:L(@"Copy diagnostics", @"Diagnose kopieren")
+                                        target:self
+                                        action:@selector(copyDiagnostics:)];
+    diag.frame = NSMakeRect(kMargin + 188, y, 180, 28);
+    diag.bezelStyle = NSBezelStyleRounded;
+    [self.container addSubview:diag];
+    y += 44;
+
+    const char *ver = self.cb.get_version(self.cb.ctx);
+    if (ver && *ver) {
+        NSTextField *v = [self labelWithString:[NSString stringWithFormat:@"ReaMesh %s", ver]
+                                         frame:NSMakeRect(kMargin, y, w, 16)];
+        v.textColor = [NSColor secondaryLabelColor];
+        v.font = [NSFont systemFontOfSize:11];
+        [self.container addSubview:v];
+    }
+}
+
 #pragma mark - Actions
+
+- (void)resetIdentity:(id)sender {
+    NSAlert *confirm = [[NSAlert alloc] init];
+    confirm.messageText = L(@"Reset network identity?", @"Netzwerkidentität zurücksetzen?");
+    confirm.informativeText =
+        L(@"This installation has a stable, anonymous peer ID so others can recognize you "
+          @"across sessions. If you reset it, ReaMesh creates a new ID the next time you "
+          @"join or host.",
+          @"Diese Installation hat eine feste, anonyme Peer-ID, an der dich andere über "
+          @"mehrere Sessions hinweg erkennen. Nach dem Zurücksetzen erstellt ReaMesh beim "
+          @"nächsten Beitritt oder Hosting eine neue ID.");
+    [confirm addButtonWithTitle:L(@"Reset", @"Zurücksetzen")];
+    [confirm addButtonWithTitle:L(@"Cancel", @"Abbrechen")];
+    [confirm beginSheetModalForWindow:self.window
+                    completionHandler:^(NSModalResponse response) {
+        if (response != NSAlertFirstButtonReturn) return;
+        int32_t r = self.cb.reset_identity(self.cb.ctx);
+        // Show the outcome once the confirm sheet is gone.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSAlert *done = [[NSAlert alloc] init];
+            if (r < 0) {
+                done.alertStyle = NSAlertStyleWarning;
+                done.messageText = L(@"Couldn't reset the identity",
+                                     @"Identität konnte nicht zurückgesetzt werden");
+            } else if (r > 0) {
+                done.messageText = L(@"Identity reset. ReaMesh will create a new one for your "
+                                     @"next session.",
+                                     @"Identität zurückgesetzt. Für die nächste Session "
+                                     @"erstellt ReaMesh eine neue.");
+            } else {
+                done.messageText = L(@"No stored identity yet.",
+                                     @"Noch keine gespeicherte Identität.");
+            }
+            [done beginSheetModalForWindow:self.window completionHandler:nil];
+        });
+    }];
+}
+
+- (void)openDocs:(id)sender {
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:kDocsURL]];
+}
+
+- (void)copyDiagnostics:(NSButton *)sender {
+    self.cb.copy_diagnostics(self.cb.ctx);
+    NSString *title = sender.title;
+    sender.title = L(@"Copied", @"Kopiert");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        sender.title = title;
+    });
+}
+
+- (void)removeExtension:(id)sender {
+    int32_t ok = self.cb.remove(self.cb.ctx);
+    [self showTab:self.selectedTab];
+    NSAlert *alert = [[NSAlert alloc] init];
+    if (ok) {
+        alert.messageText = L(@"Extension removed", @"Erweiterung entfernt");
+        alert.informativeText = L(@"Restart REAPER to unload it.",
+                                  @"Starte REAPER neu, damit die Änderung wirksam wird.");
+    } else {
+        alert.alertStyle = NSAlertStyleWarning;
+        alert.messageText = L(@"Couldn't remove the extension",
+                              @"Erweiterung konnte nicht entfernt werden");
+    }
+    [alert beginSheetModalForWindow:self.window completionHandler:nil];
+}
 
 - (void)languageChanged:(NSPopUpButton *)sender {
     // Item index == kReaMeshLang* value. Rust persists it, rebuilds the menu
     // bar, and notifies the webview; this window retitles itself via showTab.
     self.cb.set_language(self.cb.ctx, (int32_t)sender.indexOfSelectedItem);
-    // The toolbar caches its item labels: rebuild it so the tab names follow.
+    [self rebuildToolbar];
+    [self showTab:self.selectedTab];
+}
+
+// The toolbar caches its item labels: rebuild it so the tab names follow the
+// language.
+- (void)rebuildToolbar {
     resolveUILanguage(self.cb.get_language(self.cb.ctx));
     NSToolbar *toolbar = [[NSToolbar alloc] initWithIdentifier:@"ReaMeshSettingsToolbar"];
     toolbar.delegate = self;
     toolbar.allowsUserCustomization = NO;
     toolbar.selectedItemIdentifier = self.selectedTab;
     self.window.toolbar = toolbar;
-    [self showTab:self.selectedTab];
 }
 
 - (void)changeFolder:(id)sender {
@@ -442,9 +588,23 @@ static ReaMeshSettingsController *gController = nil;
 
 @end
 
+void reamesh_settings_refresh(void) {
+    if (gController && gController.window.isVisible) {
+        [gController rebuildToolbar];
+        [gController showTab:gController.selectedTab];
+    }
+}
+
+void reamesh_pasteboard_set(const char *text) {
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    [pb clearContents];
+    [pb setString:(text ? @(text) : @"") forType:NSPasteboardTypeString];
+}
+
 void reamesh_settings_open(SettingsCallbacks cb) {
     if (gController) {
         gController.cb = cb;
+        [gController rebuildToolbar];
         [gController showTab:gController.selectedTab];
         [gController.window makeKeyAndOrderFront:nil];
     } else {

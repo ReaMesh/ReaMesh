@@ -75,6 +75,10 @@ export async function removeExtension(): Promise<ReaperStatus> {
   return invoke<ReaperStatus>("remove_extension");
 }
 
+export function getReaperStatus(): ReaperStatus | null | undefined {
+  return status;
+}
+
 export function useReaperStatus(): ReaperStatus | null | undefined {
   return useSyncExternalStore(
     (cb) => {
