@@ -115,6 +115,9 @@
 #define REAPERAPI_WANT_CountTakes
 #define REAPERAPI_WANT_GetMediaSourceParent
 #define REAPERAPI_WANT_PCM_Source_BuildPeaks
+// The persisted-tint ledger (tintLedgerSave / tintLedgerLine).
+#define REAPERAPI_WANT_GetCurrentProjectInLoadSave
+#define REAPERAPI_WANT_MarkProjectDirty
 
 #include "reaper_plugin.h"
 #include "reaper_plugin_functions.h"
@@ -2861,30 +2864,49 @@ static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback);
 // are never tinted (reamesh_locked_entities filters our own holds out).
 //
 // The one place the tint could leak to disk is a project SAVE, which serializes
-// the live (grey) item color. It is guarded on every path we can hook:
-//   • Ctrl+S / menu Save / Save As: dispatchCommand intercepts the action and
-//     calls restoreAllItemTints() first, so REAPER writes the REAL colors; the
-//     next tick re-applies the tints.
-//   • Quit: the "atexit" hook restores the real colors (restoreAllItemTints)
-//     before REAPER tears down, so a quit-time "save changes?" serializes clean.
-//   • Session exit: leaveSession restores them too.
-//   • Crash: REAPER writes nothing, so the last on-disk file stays clean.
-// The one path REAPER exposes no pre-save hook for is the periodic AUTO-SAVE; it
-// is bounded two ways so the exposure is tiny and self-healing: a tint lives at
-// most TINT_MAX_AGE (the safety cap in reconcileItemTints), and any later
-// hooked save (Ctrl+S / quit) re-cleans the file. Auto-save also defaults to
-// timestamped backups, not the live .rpp. There is no per-item sentinel to
-// auto-undo a persisted tint on load: that would itself be project pollution.
+// the live (grey) item color. Two layers keep it out:
+//   • Before the save, where we can hook it: dispatchCommand intercepts the
+//     save actions (Ctrl+S, Save As, Save new version) and the actions that
+//     end in a "save changes?" prompt (Quit, Close project, Close all, New /
+//     Open project), and calls restoreAllItemTints() first, so REAPER writes
+//     the REAL colors. While the prompt is up the timer doesn't tick, so
+//     nothing re-greys underneath it; the next tick re-applies the tints (or
+//     a cancelled quit simply carries on). leaveSession restores them too, and
+//     a crash writes nothing.
+//   • Everywhere else: the AUTO-SAVE, the Windows close button and whatever
+//     else saves without an action we can see. There the save writes the grey,
+//     but never alone: tintLedgerSave adds one `REAMESH_TINT <guid> <real>
+//     <tint>` line per tinted item to every project save, so the file always
+//     carries the way back. On the next load (outside a session) the ledger is
+//     read back and every item still in exactly that grey gets its real colour
+//     again (healPersistedTints). The ledger only exists in a file that holds
+//     grey; a clean save writes none. The "atexit" hook stays registered, but
+//     REAPER most likely calls it only after the quit prompt was answered, so
+//     it is not what keeps a quit-time save clean.
 
 // The dark grey a locked item is tinted with. Computed LOCALLY: never
 // colorToWire, since this color never rides the wire; the high 0x1000000 bit is
 // REAPER's "custom color is set" flag.
 static int lockTintNative() { return 0x1000000 | ColorToNative(64, 64, 64); }
 
-// Which save action ids we intercept (in dispatchCommand) to drop the tints
-// before REAPER serializes the project, so grey never reaches the .rpp:
-// 40026 = File: Save project, 40022 = File: Save project as…
-static bool isSaveCommand(int command) { return command == 40026 || command == 40022; }
+// Which action ids we intercept (in dispatchCommand) to drop the tints before
+// REAPER serializes the project, so grey never reaches the .rpp: the saves
+// themselves and the actions that can end in a "save changes?" prompt.
+static bool isSaveCommand(int command) {
+  switch (command) {
+    case 40026:  // File: Save project
+    case 40022:  // File: Save project as…
+    case 41895:  // File: Save new version of project
+    case 40004:  // File: Quit REAPER
+    case 40860:  // Close current project tab
+    case 40886:  // File: Close all projects
+    case 40023:  // File: New project
+    case 40025:  // File: Open project
+      return true;
+    default:
+      return false;
+  }
+}
 
 // Item GUIDs whose editing lock is currently held by a peer OTHER than us, from
 // the live lock table Rust maintains. These are the items to show as grey.
@@ -2924,6 +2946,87 @@ static void restoreAllItemTints() {
     g_lastChangeCount = GetProjectStateChangeCount(nullptr);
   }
   g_applyingRemote = false;
+}
+
+// ---- persisted-tint ledger ----
+//
+// Every project save (any path, auto-save included) calls tintLedgerSave, which
+// records the tinted items' real colours next to the grey they were saved
+// with. Loading such a file collects the lines (tintLedgerLine) and the next
+// timer tick puts the real colours back (healPersistedTints). Undo states are
+// left alone: they never reach a file.
+struct TintLedgerEntry {
+  int real;
+  int tint;
+};
+static std::map<std::string, TintLedgerEntry> g_tintHeal;
+static ReaProject* g_tintHealProject = nullptr;
+
+static void tintLedgerSave(ProjectStateContext* ctx, bool isUndo, project_config_extension_t*) {
+  if (isUndo || !ctx || g_itemTints.empty()) return;
+  // The tints live in the active project; another tab saving is not ours.
+  if (GetCurrentProjectInLoadSave() != EnumProjects(-1, nullptr, 0)) return;
+  const int tint = lockTintNative();
+  for (const auto& [guid, rec] : g_itemTints)
+    if (!rec.expired)  // an expired tint already shows the real colour
+      ctx->AddLine("REAMESH_TINT %s %d %d", guid.c_str(), rec.real, tint);
+}
+
+static bool tintLedgerLine(const char* line, ProjectStateContext*, bool isUndo,
+                           project_config_extension_t*) {
+  std::string_view t = ltrim(line ? std::string_view(line) : std::string_view());
+  if (t.rfind("REAMESH_TINT ", 0) != 0) return false;
+  if (isUndo) return true;
+  char guid[96] = {};
+  int real = 0, tint = 0;
+  const std::string rest(t.substr(13));
+  if (std::sscanf(rest.c_str(), "%95s %d %d", guid, &real, &tint) == 3) {
+    g_tintHeal[guid] = {real, tint};
+    g_tintHealProject = GetCurrentProjectInLoadSave();
+  }
+  return true;
+}
+
+static void tintLedgerBeginLoad(bool isUndo, project_config_extension_t*) {
+  if (isUndo) return;
+  g_tintHeal.clear();
+  g_tintHealProject = nullptr;
+}
+
+static project_config_extension_t g_tintLedgerReg = {tintLedgerLine, tintLedgerSave,
+                                                     tintLedgerBeginLoad, nullptr};
+
+// Put back the real colours a loaded file's ledger names, on the tick after the
+// load (the items exist by then). Only outside a session: a joiner's copy gets
+// its colours from the owner's doc, and a session's own capture must never see
+// this as an edit. An item someone has recoloured since is left alone: only
+// exactly the recorded grey is replaced. No undo point; the project is marked
+// changed, so the next save writes the real colours (and no ledger).
+static void healPersistedTints() {
+  if (g_tintHeal.empty()) return;
+  std::map<std::string, TintLedgerEntry> heal;
+  heal.swap(g_tintHeal);
+  ReaProject* proj = std::exchange(g_tintHealProject, nullptr);
+  if (g_mode != Mode::Idle && g_mode != Mode::Browsing) return;
+  bool open = false;
+  for (int i = 0; ReaProject* p = EnumProjects(i, nullptr, 0); ++i)
+    if (p == proj) open = true;
+  if (!proj || !open) return;
+  int healed = 0;
+  for (int i = 0, n = CountMediaItems(proj); i < n; ++i) {
+    MediaItem* item = GetMediaItem(proj, i);
+    auto e = heal.find(itemGuid(item));
+    if (e == heal.end()) continue;
+    if (static_cast<int>(GetMediaItemInfo_Value(item, "I_CUSTOMCOLOR")) != e->second.tint) continue;
+    SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", static_cast<double>(e->second.real));
+    ++healed;
+  }
+  if (healed == 0) return;
+  MarkProjectDirty(proj);
+  UpdateArrange();
+  logEvent("tints_healed", {{"count", healed}},
+           "restored the colour of " + std::to_string(healed) +
+               " item(s) saved grey while another person was editing them");
 }
 
 // Reconcile the dark-grey tints against the live set of items another peer is
@@ -4453,6 +4556,7 @@ static void timerTick() {
   // Companion-app commands and state mirroring run in every mode, including
   // Idle (the app may connect before any session exists).
   ctlTick();
+  healPersistedTints();
   if (!g_handle) return;
 
   switch (g_mode) {
@@ -4528,8 +4632,8 @@ static bool dispatchCommand(int command) {
   // lock tints so the REAL item colors hit the .rpp, never our grey. We do NOT
   // consume the action (return false): REAPER still performs the save; the next
   // tick's reconcileItemTints re-applies whatever is still locked. Covers the
-  // deliberate-save actions (Ctrl+S / menu); auto-save and the quit "save?"
-  // prompt don't route through the command hooks (see the note in the header).
+  // saves and the actions that end in a "save changes?" prompt; auto-save and
+  // the like are covered by the tint ledger (see the note in the header).
   if (isSaveCommand(command)) restoreAllItemTints();
   if (command == g_cmdHost) { onHost(""); return true; }
   if (command == g_cmdLeave) { onLeave(); return true; }
@@ -4564,6 +4668,7 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
       g_rec->Register("-hookcommand", (void*)hookCommand);
       g_rec->Register("-hookcommand2", (void*)hookCommand2);
       g_rec->Register("-atexit", (void*)restoreAllItemTints);
+      g_rec->Register("-projectconfig", &g_tintLedgerReg);
       g_rec->Register("-custom_action", &g_caHost);
       g_rec->Register("-custom_action", &g_caLeave);
     }
@@ -4600,10 +4705,12 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
   rec->Register("hookcommand", (void*)hookCommand);
   rec->Register("hookcommand2", (void*)hookCommand2);
   rec->Register("timer", (void*)timerTick);
-  // Restore real item colours before REAPER quits, so a quit-time save prompt
-  // serializes the real colours, never our grey lock tint (the deliberate-save
-  // actions are covered separately in dispatchCommand).
+  // Restore real item colours when REAPER quits. Probably only after the quit
+  // prompt (dispatchCommand covers that); kept as a last tidy-up.
   rec->Register("atexit", (void*)restoreAllItemTints);
+  // Every project save carries the real colours of tinted items; every load
+  // puts them back (see the persisted-tint ledger).
+  rec->Register("projectconfig", &g_tintLedgerReg);
   reamesh_ctl_start();
   return 1;
 }

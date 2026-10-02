@@ -26,6 +26,7 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   browse_failed: "logBrowseFailed",
   waiting_media: "logWaitingMedia",
   media_applied: "logMediaApplied",
+  tints_healed: "logTintsHealed",
   media_copied: "logMediaCopied",
   media_copy_failed: "logMediaCopyFailed",
   media_timeout: "logMediaTimeout",
