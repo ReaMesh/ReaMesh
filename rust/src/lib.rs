@@ -1408,6 +1408,11 @@ struct Hosting {
     /// trust dialog can say what a join loads *before* any download. "" until
     /// the extension supplies it.
     meta: String,
+    /// Every path any manifest of this session has listed. Only these (and
+    /// media the live doc references) are served: a file in the project
+    /// folder the project never used stays private, and a joiner that planned
+    /// its download against an older manifest can still finish it.
+    ever_listed: HashSet<String>,
 }
 
 struct NetConfig {
@@ -1430,8 +1435,9 @@ pub struct Reamesh {
 
 impl Reamesh {
     /// Start hosting a session for the project at `project_dir/project_file`.
-    /// Everything under `project_dir` (except hidden files, backups and peak
-    /// caches) is offered to joining clients.
+    /// The project file and the files under `project_dir` the project uses
+    /// (see `referenced_files`) are offered to joining clients; anything else
+    /// in the folder stays private.
     pub fn host(
         session_name: &str,
         project_dir: &str,
@@ -1448,7 +1454,7 @@ impl Reamesh {
         // thread below; a client that requests the manifest before that
         // finishes simply downloads without resume-dedup/verify (empty hashes
         // are legal throughout the transfer path).
-        let files = build_manifest(&dir)?;
+        let files = referenced_files(build_manifest(&dir)?, &dir, project_file, "");
         let files_for_hash = files.clone();
         let session_id = new_session_id();
         let salt = random_hex(16); // fresh CSPRNG public salt, distinct from the id
@@ -1457,6 +1463,7 @@ impl Reamesh {
             session_id: session_id.clone(),
             session_name: session_name.to_string(),
             project_file: project_file.to_string(),
+            ever_listed: files.iter().map(|f| f.path.clone()).collect(),
             files,
             salt,
             auth: !passphrase.is_empty(),
@@ -1491,9 +1498,11 @@ impl Reamesh {
         {
             let files = files_for_hash;
             let cmd_tx = r.cmd_tx.clone();
+            let shared = Arc::downgrade(&r.shared);
+            let project_file = project_file.to_string();
             std::thread::Builder::new()
                 .name("reamesh-hash".into())
-                .spawn(move || manifest_worker(dir, files, cmd_tx))
+                .spawn(move || manifest_worker(dir, project_file, shared, files, cmd_tx))
                 .ok();
         }
         Ok(r)
@@ -2583,6 +2592,154 @@ fn build_manifest(dir: &Path) -> anyhow::Result<Vec<FileMeta>> {
     Ok(out)
 }
 
+/// Narrow a folder walk to the files the project actually uses: the project
+/// file itself plus every file whose name appears in the project text, the
+/// `.rpp` on disk and `live_text` (the live doc on a running session). The
+/// text is searched with plugin state decoded too, so a sampler or
+/// convolution plugin keeps the sample/impulse it loads from the project
+/// folder; a referenced sub-project (`.rpp`) brings in what it uses in turn.
+///
+/// A file whose name is unique in the folder matches on its name alone (the
+/// project may store it absolute, relative, or with Windows separators); two
+/// files sharing a name match on their project-relative path. Erring towards
+/// sharing a same-named file is harmless; missing one the project needs is
+/// not, which is why the match is a plain case-insensitive substring search.
+fn referenced_files(files: Vec<FileMeta>, dir: &Path, project_file: &str, live_text: &str) -> Vec<FileMeta> {
+    use aho_corasick::{AhoCorasick, MatchKind};
+
+    let lower = |p: &str| p.to_ascii_lowercase();
+    let base_of = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    let mut name_count: HashMap<String, usize> = HashMap::new();
+    for f in &files {
+        *name_count.entry(lower(&base_of(&f.path))).or_default() += 1;
+    }
+    let patterns: Vec<String> = files
+        .iter()
+        .map(|f| {
+            let base = base_of(&f.path);
+            if name_count.get(&lower(&base)).copied().unwrap_or(0) > 1 { f.path.clone() } else { base }
+        })
+        .collect();
+    let Ok(ac) = AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .match_kind(MatchKind::Standard)
+        .build(&patterns)
+    else {
+        return files; // can't search: share the walk as before rather than nothing
+    };
+
+    let mut keep: Vec<bool> = files.iter().map(|f| f.path == project_file).collect();
+    let mut read_texts: HashSet<String> = HashSet::new();
+    let mut texts: Vec<Vec<u8>> = vec![live_text.as_bytes().to_vec()];
+    let mut to_read: Vec<String> = vec![project_file.to_string()];
+    to_read.retain(|p| !p.is_empty());
+    // Sub-projects nest a few levels at most; the bound only guards a cycle.
+    for _ in 0..8 {
+        for rel in to_read.drain(..) {
+            if read_texts.insert(rel.clone())
+                && let Ok(t) = fs::read(dir.join(&rel))
+            {
+                texts.push(t);
+            }
+        }
+        for text in texts.drain(..) {
+            let hay = expand_haystack(&text);
+            for m in ac.find_overlapping_iter(&hay) {
+                let i = m.pattern().as_usize();
+                if !keep[i] {
+                    keep[i] = true;
+                    let path = &files[i].path;
+                    if path.to_ascii_lowercase().ends_with(".rpp") && !read_texts.contains(path) {
+                        to_read.push(path.clone());
+                    }
+                }
+            }
+        }
+        if to_read.is_empty() {
+            break;
+        }
+    }
+    files.into_iter().zip(keep).filter_map(|(f, k)| k.then_some(f)).collect()
+}
+
+/// Project text prepared for the name search in `referenced_files`: the text
+/// itself with Windows separators turned into '/', followed by every run of
+/// base64 lines (binary plugin state) decoded, the same way.
+fn expand_haystack(text: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = text.iter().map(|&b| if b == b'\\' { b'/' } else { b }).collect();
+    let mut decoded = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for line in text.split(|&b| b == b'\n') {
+        let t = line.trim_ascii();
+        let is_b64 = t.len() >= 4
+            && t.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=');
+        if !is_b64 {
+            if bits != 0 || decoded.last().is_some_and(|&b| b != b'\n') {
+                decoded.push(b'\n');
+            }
+            acc = 0;
+            bits = 0;
+            continue;
+        }
+        for &c in t {
+            let v = match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => {
+                    // Padding ends an encoded segment; the next one starts fresh.
+                    acc = 0;
+                    bits = 0;
+                    continue;
+                }
+            };
+            acc = (acc << 6) | v as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                decoded.push((acc >> bits) as u8);
+                acc &= (1 << bits) - 1;
+            }
+        }
+    }
+    out.push(b'\n');
+    out.extend(decoded.into_iter().map(|b| if b == b'\\' { b'/' } else { b }));
+    out
+}
+
+/// Every string field of every live (non-deleted) track and item in the doc,
+/// newline-joined: what the session currently references, for
+/// `referenced_files` and `doc_references`.
+fn doc_text(doc: &Doc) -> String {
+    let roots: Vec<MapRef> = [TRACKS_ROOT, ITEMS_ROOT].iter().map(|s| doc.get_or_insert_map(*s)).collect();
+    let txn = doc.transact();
+    let mut out = String::new();
+    for root in roots {
+        for (_, value) in root.iter(&txn) {
+            let Out::YMap(entity) = value else { continue };
+            if let Some(Out::Any(Any::Bool(false))) = entity.get(&txn, "present") {
+                continue;
+            }
+            for (_, v) in entity.iter(&txn) {
+                if let Out::Any(Any::String(text)) = v {
+                    out.push_str(&text);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Owner-side serving check for a path no manifest has listed yet: whether
+/// the live doc references it (media added since the last manifest refresh).
+fn doc_references(doc: &Doc, path: &str) -> bool {
+    let probe = FileMeta { path: path.to_string(), size: 0, hash: String::new() };
+    !referenced_files(vec![probe], Path::new(""), "", &doc_text(doc)).is_empty()
+}
+
 /// Owner-side hash cache: project-relative path -> (size, mtime, blake3) as of
 /// the last time we hashed it. Never crosses the wire; it exists so a manifest
 /// refresh only re-hashes the files that actually changed.
@@ -2649,6 +2806,8 @@ fn hash_manifest(
 /// Exits when the network task's command receiver is gone (the session ended).
 fn manifest_worker(
     dir: PathBuf,
+    project_file: String,
+    shared: std::sync::Weak<Shared>,
     files: Vec<FileMeta>,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<Command>,
 ) {
@@ -2677,9 +2836,12 @@ fn manifest_worker(
             waited += Duration::from_millis(500);
         }
         // A momentarily unreadable project folder keeps the previous walk
-        // rather than publishing an empty manifest.
+        // rather than publishing an empty manifest. The live doc counts as
+        // project text too: media the host added since the last save is
+        // listed for a late joiner without waiting for a Ctrl+S.
         if let Ok(v) = build_manifest(&dir) {
-            walked = v;
+            let live = shared.upgrade().map(|sh| doc_text(&sh.doc.lock().unwrap().doc)).unwrap_or_default();
+            walked = referenced_files(v, &dir, &project_file, &live);
         }
     }
 }
@@ -3261,13 +3423,15 @@ fn set_status(shared: &Shared, f: impl FnOnce(&mut StatusState)) {
 /// token, checked against `auth_token` (empty = open session) before anything
 /// is served. `Manifest` is owner-only; `File` is served by every peer that
 /// has a project copy (which powers both the windowed initial download and
-/// mid-session media fetch). Project text chunks are returned zstd-compressed.
+/// mid-session media fetch), limited to the paths `may_serve` admits.
+/// Project text chunks are returned zstd-compressed.
 fn serve_xfer(
     hosting: Option<&Hosting>,
     serve_dir: Option<&Path>,
     auth_token: &str,
     banned: bool,
     req: &XferRequest,
+    may_serve: &dyn Fn(&str) -> bool,
 ) -> XferResponse {
     // A banned peer gets a distinct answer (a probe/join reports "banned",
     // not "wrong password"), and it gets it whether or not it still holds
@@ -3297,6 +3461,11 @@ fn serve_xfer(
                     message: format!("unsafe path: {path}"),
                 };
             };
+            if !may_serve(path) {
+                return XferResponse::Error {
+                    message: format!("not part of this session: {path}"),
+                };
+            }
             let full = dir.join(rel);
             let compress = is_compressible(path);
             let read = || -> std::io::Result<(u64, bool, Vec<u8>)> {
@@ -3818,6 +3987,7 @@ async fn run_network(
                 Some(Command::ManifestReady(files)) => {
                     if let Some(h) = hosting.as_mut() {
                         eprintln!("[reamesh] manifest updated ({} files)", files.len());
+                        h.ever_listed.extend(files.iter().map(|f| f.path.clone()));
                         h.files = files;
                     }
                 }
@@ -4660,7 +4830,24 @@ async fn run_network(
                             } else {
                                 shared.banned.lock().unwrap().contains(&peer.to_string())
                             };
-                            let resp = serve_xfer(hosting.as_ref(), serve_dir.as_deref(), &token, banned, &request);
+                            // The owner serves only what the session uses: files a
+                            // manifest listed, or media the live doc references
+                            // (added since the last manifest refresh). A client's
+                            // copy holds nothing but session files anyway.
+                            let may_serve = |p: &str| match hosting.as_ref() {
+                                Some(h) => {
+                                    h.ever_listed.contains(p)
+                                        || doc_references(&shared.doc.lock().unwrap().doc, p)
+                                }
+                                None => true,
+                            };
+                            let resp = serve_xfer(hosting.as_ref(), serve_dir.as_deref(), &token, banned, &request, &may_serve);
+                            // Remember an admitted path so its further pieces skip the doc scan.
+                            if let (Some(h), XferRequest::File { path, .. }, XferResponse::FileChunk { .. }) =
+                                (hosting.as_mut(), &request, &resp)
+                            {
+                                h.ever_listed.insert(path.clone());
+                            }
                             let _ = swarm.behaviour_mut().xfer.send_response(channel, resp);
                         }
                         request_response::Message::Response { request_id, response } => {
@@ -5935,6 +6122,85 @@ pub extern "C" fn reamesh_shutdown(handle: *mut Reamesh) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metas(paths: &[&str]) -> Vec<FileMeta> {
+        paths.iter().map(|p| FileMeta { path: p.to_string(), size: 1, hash: String::new() }).collect()
+    }
+
+    fn kept(files: Vec<FileMeta>) -> Vec<String> {
+        files.into_iter().map(|f| f.path).collect()
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+            for i in 0..4 {
+                if i <= c.len() {
+                    out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn referenced_files_keeps_only_what_the_project_uses() {
+        let dir = std::env::temp_dir().join(format!("reamesh-refs-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // A sampler's state names its sample in base64; a sub-project brings its own media.
+        let sampler = b64(b"\x00\x01C:\\Users\\me\\Song\\Samples\\Hit.WAV\x00");
+        let rpp = format!(
+            "<REAPER_PROJECT\n<TRACK\n  <FXCHAIN\n    <VST \"VSTi: ReaSamplOmatic5000\" rs5k.vst 0\n      {sampler}\n      AAAAAA==\n    >\n  >\n  <ITEM\n    <SOURCE WAVE\n      FILE \"Audio\\kick.wav\"\n    >\n  >\n  <ITEM\n    <SOURCE RPP_PROJECT\n      FILE \"Sub/inner.rpp\"\n    >\n  >\n>\n>\n"
+        );
+        fs::write(dir.join("Song.rpp"), rpp).unwrap();
+        fs::create_dir_all(dir.join("Sub")).unwrap();
+        fs::write(dir.join("Sub/inner.rpp"), "<REAPER_PROJECT\n  FILE \"/abs/elsewhere/Sub/Audio/vox.wav\"\n>\n").unwrap();
+        let files = metas(&[
+            "Song.rpp",
+            "Audio/kick.wav",
+            "Old/kick.wav",
+            "Samples/hit.wav",
+            "Sub/inner.rpp",
+            "Sub/Audio/vox.wav",
+            "Unused/outtake.wav",
+            "notes.txt",
+        ]);
+        let got = kept(referenced_files(files.clone(), &dir, "Song.rpp", ""));
+        assert_eq!(
+            got,
+            ["Song.rpp", "Audio/kick.wav", "Samples/hit.wav", "Sub/inner.rpp", "Sub/Audio/vox.wav"],
+            "same-named files match by path, plugin state and sub-projects count"
+        );
+        // The live doc references media the saved project doesn't know yet.
+        let live = "<ITEM\n  <SOURCE WAVE\n    FILE \"Unused/outtake.wav\"\n  >\n>\n";
+        assert!(kept(referenced_files(files, &dir, "Song.rpp", live)).contains(&"Unused/outtake.wav".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doc_references_sees_live_item_media() {
+        let mut ds = DocState {
+            doc: Doc::new(),
+            last_state: StateMap::new(),
+            locks: HashMap::new(),
+            pending: HashMap::new(),
+        };
+        apply_changeset_to_doc(
+            &mut ds,
+            &json!({ "items": {
+                "{I1}": { "present": true, "chunk": "<ITEM\n  <SOURCE WAVE\n    FILE \"Audio/snare.wav\"\n  >\n>\n" },
+                "{I2}": { "present": false, "chunk": "<ITEM\n  <SOURCE WAVE\n    FILE \"Audio/deleted.wav\"\n  >\n>\n" },
+            }}),
+        );
+        let doc = &ds.doc;
+        assert!(doc_references(doc, "Audio/snare.wav"));
+        assert!(!doc_references(doc, "Audio/deleted.wav"), "a deleted item references nothing");
+        assert!(!doc_references(doc, "Private/secret.txt"));
+    }
 
     #[test]
     fn media_order_follows_item_positions() {

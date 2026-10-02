@@ -38,9 +38,17 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 /// A small but realistic project directory: .rpp, a subdirectory with a
-/// multi-chunk media file, an empty file, and files that must NOT transfer.
+/// multi-chunk media file, an empty file, and files that must NOT transfer
+/// (a backup, a dotfile, and media lying in the folder that the project
+/// never uses).
 fn make_project(dir: &Path) {
-    fs::write(dir.join("Song.rpp"), b"<REAPER_PROJECT 0.1\n>\n").unwrap();
+    fs::write(
+        dir.join("Song.rpp"),
+        "<REAPER_PROJECT 0.1\n<TRACK\n  <ITEM\n    POSITION 0\n    <SOURCE WAVE\n      FILE \"Audio/kick.wav\"\n    >\n  >\n>\n<NOTES 0 2\n  |see notes.txt\n>\n>\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("Unused")).unwrap();
+    fs::write(dir.join("Unused/outtake.wav"), b"not part of the song").unwrap();
     fs::create_dir_all(dir.join("Audio")).unwrap();
     let kick: Vec<u8> = (0..KICK_SIZE).map(|i| (i % 251) as u8).collect();
     fs::write(dir.join("Audio/kick.wav"), kick).unwrap();
@@ -155,6 +163,7 @@ fn client_join_downloads_project_files() {
     assert_eq!(fs::read(dest.join("notes.txt")).unwrap(), b"");
     assert!(!dest.join("Song.rpp-bak").exists(), "backup file should not transfer");
     assert!(!dest.join(".DS_Store").exists(), "hidden file should not transfer");
+    assert!(!dest.join("Unused/outtake.wav").exists(), "media the project doesn't use should not transfer");
 
     drop(client);
     drop(owner);
@@ -796,6 +805,18 @@ fn mid_session_media_fetch() {
     let snare: Vec<u8> = (0..KICK_SIZE).map(|i| (i % 241) as u8).collect();
     fs::write(project.join("Audio/snare.wav"), &snare).unwrap();
 
+    // A file in the host's folder that the session doesn't use is refused.
+    assert!(client.fetch_file("Unused/outtake.wav"));
+    std::thread::sleep(Duration::from_secs(2));
+    client.fetch_file("Unused/outtake.wav");
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(!client_dir.join("Unused/outtake.wav").exists(), "unused file was served");
+
+    // The owner puts the new file on the timeline: now it is part of the session.
+    owner.push_local(
+        r#"{"items":{"{SNARE}":{"present":true,"track":"{T1}","chunk":"<ITEM\n  <SOURCE WAVE\n    FILE \"Audio/snare.wav\"\n  >\n>\n"}}}"#,
+    );
+
     // The client notices an item referencing it and fetches; idempotent calls
     // while missing must be safe.
     assert!(client.fetch_file("Audio/snare.wav"));
@@ -856,7 +877,8 @@ fn progressive_join_reports_ready_before_media() {
     }
     fs::write(
         project.join("Song.rpp"),
-        "<REAPER_PROJECT 0.1\n<TRACK\n  <ITEM\n    POSITION 30\n    <SOURCE WAVE\n      FILE \"Audio/stem0.wav\"\n    >\n  >\n  <ITEM\n    POSITION 10\n    <SOURCE WAVE\n      FILE \"Audio/stem2.wav\"\n    >\n  >\n>\n>\n",
+        // stem1 is loaded by a plugin (its state names it), not by an item.
+        "<REAPER_PROJECT 0.1\n<TRACK\n  <FXCHAIN\n    <VST \"VSTi: Sampler\" s.vst 0\n      L1VzZXJzL21lL1NvbmcvQXVkaW8vc3RlbTEud2F2AA==\n    >\n  >\n  <ITEM\n    POSITION 30\n    <SOURCE WAVE\n      FILE \"Audio/stem0.wav\"\n    >\n  >\n  <ITEM\n    POSITION 10\n    <SOURCE WAVE\n      FILE \"Audio/stem2.wav\"\n    >\n  >\n>\n<NOTES 0 2\n  |notes.txt\n>\n>\n",
     )
     .unwrap();
 
