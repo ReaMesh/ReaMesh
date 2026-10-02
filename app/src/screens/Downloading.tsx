@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Check } from "lucide-react";
+import { Check, Crown } from "lucide-react";
 import {
   AnimatePresence,
   motion,
@@ -17,7 +17,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ArcRing } from "@/components/ArcRing";
-import { HostCrown } from "@/components/HostCrown";
+import { Hint, HintProvider } from "@/components/Hint";
 import { SlowHostLine } from "@/components/LinkNotice";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { PluginBox, PluginRow } from "@/components/TrustDialog";
@@ -26,7 +26,6 @@ import { send } from "@/lib/connection";
 import { formatBytes, useTransfer } from "@/lib/format";
 import { resolveLang, t } from "@/lib/i18n";
 import { displayName, type ExtState } from "@/lib/types";
-import { cn } from "@/lib/utils";
 
 // The beacon covers three stages: connecting, downloading, and opening the
 // project in REAPER. Phase 3 is the brief completion state owned by App.
@@ -123,41 +122,42 @@ function CurrentFile({ path }: { path?: string }) {
   );
 }
 
-/** Stands in for the host's name in a sentence, where their crown goes. */
-const HOST_SLOT = "\u0001";
+/** How many faces fit before the rest collapse into a count. */
+const MAX_FACES = 5;
 
-/** Who is already there, as one line: their faces and one sentence, the host
- *  first and crowned. */
+/** Who is already there: just their faces, the host first with a crown badge,
+ *  names on hover. */
 function WhoIsThere({ state }: { state: ExtState }) {
   const others = state.peers.filter((p) => !p.is_self);
   const host = others.find((p) => p.is_owner);
   if (!host) return null;
-  const guests = others.filter((p) => !p.is_owner);
-  const sentence =
-    guests.length === 0
-      ? t("alreadyHereOne", { name: HOST_SLOT })
-      : guests.length === 1
-        ? t("alreadyHereTwo", { a: HOST_SLOT, b: displayName(guests[0]) })
-        : t("alreadyHereMany", { a: HOST_SLOT, count: guests.length });
-  const [before, after = ""] = sentence.split(HOST_SLOT);
+  const people = [host, ...others.filter((p) => !p.is_owner)];
+  const shown = people.slice(0, MAX_FACES);
+  const rest = people.length - shown.length;
   return (
-    <div className="flex max-w-full items-center gap-2.5">
-      <div className="flex shrink-0 items-center">
-        {[host, ...guests].slice(0, 3).map((p, i) => (
-          <div key={p.id} className={cn("relative", i > 0 && "-ml-1.5")} style={{ zIndex: 3 - i }}>
-            <PeerAvatar peer={p} size="sm" className="ring-2 ring-background" />
-          </div>
+    <HintProvider>
+      <div className="flex items-center gap-2">
+        {shown.map((p) => (
+          <Hint
+            key={p.id}
+            label={p.is_owner ? `${displayName(p)} · ${t("sessionHost")}` : displayName(p)}
+          >
+            <span className="relative">
+              <PeerAvatar peer={p} size="sm" />
+              {p.is_owner && (
+                <span className="absolute -top-1.5 -right-1.5 grid size-3.5 place-items-center rounded-full bg-background">
+                  <Crown className="size-2.5 text-amber-400" aria-hidden="true" />
+                  <span className="sr-only">{t("sessionHost")}</span>
+                </span>
+              )}
+            </span>
+          </Hint>
         ))}
+        {rest > 0 && (
+          <span className="text-[12px] tabular-nums text-muted-foreground">+{rest}</span>
+        )}
       </div>
-      <p className="min-w-0 truncate text-[13px] text-foreground/65">
-        {before}
-        <span className="inline-flex items-center gap-1 align-bottom">
-          {displayName(host)}
-          <HostCrown hint={false} />
-        </span>
-        {after}
-      </p>
-    </div>
+    </HintProvider>
   );
 }
 
