@@ -199,10 +199,15 @@ static ReaMeshSettingsController *gController = nil;
     y += 36;
 
     int32_t mask = self.cb.get_overlay(self.cb.ctx);
+    BOOL shown = !(mask & kReaMeshOverlayHidden);
+    // The first row is the HUD itself; the HUD-only rows grey out while it is
+    // off. The tint is drawn by REAPER, not the HUD, so it stays independent.
     NSArray *rows = @[
-        @[ @(kReaMeshOverlayRoster), L(@"Participants", @"Teilnehmer") ],
-        @[ @(kReaMeshOverlayTint), L(@"Tint locked items", @"Gesperrte Items einfärben") ],
-        @[ @(kReaMeshOverlayRememberPos), L(@"Remember HUD position", @"HUD-Position merken") ],
+        @[ @(kReaMeshOverlayHidden), L(@"Show overlay", @"Overlay anzeigen"), @NO ],
+        @[ @(kReaMeshOverlayRoster), L(@"Participants", @"Teilnehmer"), @YES ],
+        @[ @(kReaMeshOverlayRememberPos), L(@"Remember HUD position", @"HUD-Position merken"),
+           @YES ],
+        @[ @(kReaMeshOverlayTint), L(@"Tint locked items", @"Gesperrte Items einfärben"), @NO ],
     ];
     for (NSArray *row in rows) {
         int32_t bit = (int32_t)[row[0] integerValue];
@@ -210,7 +215,9 @@ static ReaMeshSettingsController *gController = nil;
                                             target:self
                                             action:@selector(overlayToggled:)];
         cb.tag = bit;
-        cb.state = (mask & bit) ? NSControlStateValueOn : NSControlStateValueOff;
+        BOOL on = bit == kReaMeshOverlayHidden ? shown : (mask & bit) != 0;
+        cb.state = on ? NSControlStateValueOn : NSControlStateValueOff;
+        cb.enabled = ![row[2] boolValue] || shown;
         cb.frame = NSMakeRect(kMargin, y, w, 22);
         [self.container addSubview:cb];
         y += 28;
@@ -227,12 +234,16 @@ static ReaMeshSettingsController *gController = nil;
 - (void)overlayToggled:(NSButton *)sender {
     int32_t mask = self.cb.get_overlay(self.cb.ctx);
     int32_t bit = (int32_t)sender.tag;
-    if (sender.state == NSControlStateValueOn) {
+    // The HUD bit is stored inverted ("hidden").
+    BOOL set = (sender.state == NSControlStateValueOn) != (bit == kReaMeshOverlayHidden);
+    if (set) {
         mask |= bit;
     } else {
         mask &= ~bit;
     }
     self.cb.set_overlay(self.cb.ctx, mask);
+    // Grey the HUD-only rows in or out.
+    if (bit == kReaMeshOverlayHidden) [self showTab:self.selectedTab];
 }
 
 - (void)buildGeneralPane:(ReaperStatusC)st {

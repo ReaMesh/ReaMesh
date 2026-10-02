@@ -17,6 +17,7 @@ import { Settings } from "@/screens/Settings";
 import { startScanning, send, useActiveInstance } from "@/lib/connection";
 import { offerInvite } from "@/lib/invite";
 import { openOverlay, closeOverlay, setSessionState } from "@/lib/overlay";
+import { useOverlaySettings } from "@/lib/overlaySettings";
 import { buildDiagnostics } from "@/lib/diagnostics";
 import { loadReaperPath, refreshStatus, useReaperStatus } from "@/lib/install";
 import { t, useLang } from "@/lib/i18n";
@@ -423,11 +424,13 @@ export default function App() {
   // Give the overlay the active instance's port and process. A port change must
   // rebuild the HUD even when both instances are already in sessions.
   const inSession = mode === "hosting" || mode === "client";
+  // Switching the overlay off in Settings closes it on the spot.
   const pid = instance?.pid;
+  const hud = useOverlaySettings().hud;
   useEffect(() => {
-    if (inSession && port != null) openOverlay(port, pid ?? null);
+    if (hud && inSession && port != null) openOverlay(port, pid ?? null);
     else closeOverlay();
-  }, [inSession, port, pid]);
+  }, [hud, inSession, port, pid]);
 
   // Auto-install updates the file, but a running REAPER keeps using the copy it
   // loaded at startup. Prompt for a restart just like the manual install flow.

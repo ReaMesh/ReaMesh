@@ -154,9 +154,13 @@ fn store_lang_pref(app: &AppHandle, pref: &str) {
 // the locked-item tint so existing installs keep it on without a migration.
 // Bit 4 is "remember HUD position" (it was the retired peer-playheads toggle,
 // on by default, so existing installs start with it on as well). Bit 8
-// (time-selection) is retired and masked off.
-const OVERLAY_ALL: u8 = 0b111;
+// (time-selection) is retired and masked off. Bit 16 is set when the HUD is
+// switched off altogether (inverted so existing installs keep it on); the
+// webview just stops opening the window.
+const OVERLAY_ALL: u8 = 0b1_0111;
 const OVERLAY_REMEMBER_POS: u8 = 0b100;
+/// Fresh install: HUD shown, every toggle on.
+const OVERLAY_DEFAULT: u8 = 0b111;
 
 /// Hand the "remember HUD position" toggle to the native panel layer.
 fn sync_overlay_remember(app: &AppHandle, mask: u8) {
@@ -186,7 +190,7 @@ fn load_overlay(app: &AppHandle) -> u8 {
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| s.trim().parse::<u8>().ok())
         .map(|m| m & OVERLAY_ALL)
-        .unwrap_or(OVERLAY_ALL) // default: everything on
+        .unwrap_or(OVERLAY_DEFAULT)
 }
 
 fn store_overlay(app: &AppHandle, mask: u8) {

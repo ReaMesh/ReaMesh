@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { ArrowLeft, Check, ChevronRight, ExternalLink } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ArrowLeft, Check, Copy, ExternalLink } from "lucide-react";
+import { motion } from "motion/react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -28,10 +29,13 @@ import {
 import { isWindows } from "@/lib/platform";
 import { cn, focusRing } from "@/lib/utils";
 
-const OVERLAY_TOGGLES: { key: keyof OverlaySettings; label: () => string }[] = [
-  { key: "roster", label: () => t("olRoster") },
+// `hud` rows only mean something while the HUD is shown and grey out without it.
+// The tint is drawn by REAPER itself, so it stays independent.
+const OVERLAY_TOGGLES: { key: keyof OverlaySettings; label: () => string; hud?: true }[] = [
+  { key: "hud", label: () => t("olShow") },
+  { key: "roster", label: () => t("olRoster"), hud: true },
+  { key: "rememberPos", label: () => t("olRememberPos"), hud: true },
   { key: "tint", label: () => t("olItemTint") },
-  { key: "rememberPos", label: () => t("olRememberPos") },
 ];
 
 /** A settings row: label (and optional status line) left, one control right. */
@@ -59,10 +63,12 @@ function Switch({
   checked,
   onChange,
   label,
+  disabled,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
   label: string;
+  disabled?: boolean;
 }) {
   return (
     <button
@@ -70,9 +76,10 @@ function Switch({
       role="switch"
       aria-checked={checked}
       aria-label={label}
+      disabled={disabled}
       onClick={() => onChange(!checked)}
       className={cn(
-        "relative h-[22px] w-[38px] shrink-0 rounded-full transition-colors",
+        "relative h-[22px] w-[38px] shrink-0 rounded-full transition-colors disabled:pointer-events-none",
         checked ? "bg-found" : "bg-white/15",
         focusRing,
       )}
@@ -174,14 +181,24 @@ export function Settings({ onBack }: { onBack: () => void }) {
   useEffect(() => {
     getVersion().then(setVersion).catch(() => {});
   }, []);
+  // Repeated clicks only extend the checkmark's stay, so spamming the row can't
+  // make it flicker; a click while a copy is still being built is ignored.
   const [copied, setCopied] = useState(false);
+  const copying = useRef(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(copiedTimer.current), []);
   const copyDiagnostics = async () => {
+    if (copying.current) return;
+    copying.current = true;
     try {
       await navigator.clipboard.writeText(await buildDiagnostics());
       setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      clearTimeout(copiedTimer.current);
+      copiedTimer.current = setTimeout(() => setCopied(false), 1600);
     } catch (e) {
       toast.error(String(e));
+    } finally {
+      copying.current = false;
     }
   };
   const ghost = "h-7 shrink-0 px-2.5 text-[12px]";
@@ -325,18 +342,24 @@ export function Settings({ onBack }: { onBack: () => void }) {
         <section className="space-y-2">
           <SectionLabel>{t("overlaySettingsTitle")}</SectionLabel>
           <Group>
-            {OVERLAY_TOGGLES.map((row, i) => (
-              <div key={row.key}>
-                {i > 0 && <Divider inset={false} />}
-                <Row label={row.label()}>
-                  <Switch
-                    checked={overlay[row.key]}
-                    onChange={(v) => setOverlaySetting(row.key, v)}
-                    label={row.label()}
-                  />
-                </Row>
-              </div>
-            ))}
+            {OVERLAY_TOGGLES.map((row, i) => {
+              const off = row.hud && !overlay.hud;
+              return (
+                <div key={row.key}>
+                  {i > 0 && <Divider inset={false} />}
+                  <div className={cn("transition-opacity", off && "opacity-40")}>
+                    <Row label={row.label()}>
+                      <Switch
+                        checked={overlay[row.key]}
+                        onChange={(v) => setOverlaySetting(row.key, v)}
+                        label={row.label()}
+                        disabled={off}
+                      />
+                    </Row>
+                  </div>
+                </div>
+              );
+            })}
           </Group>
         </section>
 
@@ -382,12 +405,28 @@ export function Settings({ onBack }: { onBack: () => void }) {
               onClick={copyDiagnostics}
               className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
             >
-              <Row label={copied ? t("diagnosticsCopied") : t("copyDiagnostics")}>
-                {copied ? (
-                  <Check className="size-3.5 text-foreground" aria-hidden="true" />
-                ) : (
-                  <ChevronRight className="size-3.5 text-muted-foreground" aria-hidden="true" />
-                )}
+              <Row label={t("copyDiagnostics")}>
+                <span className="relative size-3.5 shrink-0" aria-hidden="true">
+                  <motion.span
+                    className="absolute inset-0"
+                    initial={false}
+                    animate={copied ? { opacity: 0, scale: 0.5 } : { opacity: 1, scale: 1 }}
+                    transition={{ type: "spring", duration: 0.35, bounce: 0 }}
+                  >
+                    <Copy className="size-3.5 text-muted-foreground" />
+                  </motion.span>
+                  <motion.span
+                    className="absolute inset-0"
+                    initial={false}
+                    animate={copied ? { opacity: 1, scale: 1 } : { opacity: 0, scale: 0.5 }}
+                    transition={{ type: "spring", duration: 0.35, bounce: copied ? 0.4 : 0 }}
+                  >
+                    <Check className="size-3.5 text-found" strokeWidth={2.5} />
+                  </motion.span>
+                </span>
+                <span className="sr-only" aria-live="polite">
+                  {copied ? t("diagnosticsCopied") : ""}
+                </span>
               </Row>
             </button>
           </Group>

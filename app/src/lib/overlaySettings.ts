@@ -8,6 +8,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 export interface OverlaySettings {
+  /** The HUD window at all. Off = no overlay window in a session, whatever the
+   *  toggles below say (the tint is drawn by REAPER and stays separate). Stored
+   *  inverted as bit 16 ("hidden"), so every existing install keeps it on. */
+  hud: boolean;
   /** The participant roster (avatars + names + track numbers). */
   roster: boolean;
   /**
@@ -26,21 +30,24 @@ export interface OverlaySettings {
 const KEY = "reamesh.overlay";
 const EVENT = "reamesh:overlay-settings";
 const DEFAULTS: OverlaySettings = {
+  hud: true,
   roster: true,
   tint: true,
   rememberPos: true,
 };
 
 // Bit layout: must match the Rust `OVERLAY_ALL` mask. Bit 8 (time-selection)
-// is retired.
-const BITS: Record<keyof OverlaySettings, number> = {
+// is retired. Bit 16 is set when the HUD is switched off (inverted, see `hud`).
+const BITS: Record<Exclude<keyof OverlaySettings, "hud">, number> = {
   roster: 1,
   tint: 2,
   rememberPos: 4,
 };
+const HUD_HIDDEN = 16;
 
 function maskToSettings(mask: number): OverlaySettings {
   return {
+    hud: !(mask & HUD_HIDDEN),
     roster: !!(mask & BITS.roster),
     tint: !!(mask & BITS.tint),
     rememberPos: !!(mask & BITS.rememberPos),
@@ -48,8 +55,8 @@ function maskToSettings(mask: number): OverlaySettings {
 }
 
 function settingsToMask(s: OverlaySettings): number {
-  let m = 0;
-  for (const k of Object.keys(BITS) as (keyof OverlaySettings)[]) {
+  let m = s.hud ? 0 : HUD_HIDDEN;
+  for (const k of Object.keys(BITS) as (keyof typeof BITS)[]) {
     if (s[k]) m |= BITS[k];
   }
   return m;
