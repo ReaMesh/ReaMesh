@@ -700,7 +700,8 @@ struct ReaperFirewall {
 
 /// Parse `reg query … /f reaper.exe /d` output. Value lines look like
 /// `  <name>  REG_SZ  v2.33|Action=Block|Active=TRUE|Dir=In|…|App=C:\…\reaper.exe|…`
-/// and the format is locale-independent.
+/// and the format is locale-independent. Pure, so the tests run it everywhere.
+#[cfg(any(target_os = "windows", test))]
 fn parse_reaper_firewall(text: &str) -> ReaperFirewall {
     let mut out = ReaperFirewall::default();
     for line in text.lines() {
