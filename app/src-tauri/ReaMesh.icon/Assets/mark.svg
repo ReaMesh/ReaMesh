@@ -1,8 +1,0 @@
-<!-- The ReaMesh mark. One geometry everywhere: four bars, width 10, gap 6,
-     heights 22/34/28/38, fully rounded, bottom-aligned. Scale it, never redraw it. -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 58 38" width="58" height="38">
-  <rect x="0"  y="16" width="10" height="22" rx="5" fill="#f0846b"/>
-  <rect x="16" y="4"  width="10" height="34" rx="5" fill="#e8d35c"/>
-  <rect x="32" y="10" width="10" height="28" rx="5" fill="#7bd88f"/>
-  <rect x="48" y="0"  width="10" height="38" rx="5" fill="#5b8def"/>
-</svg>
