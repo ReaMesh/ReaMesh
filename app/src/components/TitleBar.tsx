@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Copy, Minus, Settings, Square, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { BarMark } from "@/components/BarMark";
+import { RMark } from "@/components/RMark";
 import { useConnections, setActivePort } from "@/lib/connection";
 import { t } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
@@ -100,7 +100,7 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
 function Wordmark() {
   return (
     <span className="pointer-events-none flex select-none items-center gap-[7px] text-[12px] font-semibold tracking-[0.01em] text-muted-foreground">
-      <BarMark height={11} />
+      <RMark height={12} />
       ReaMesh
     </span>
   );

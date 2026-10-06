@@ -4,7 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { BarMark } from "@/components/BarMark";
+import { RMark } from "@/components/RMark";
 import { FirewallNotice } from "@/components/FirewallNotice";
 import { Group } from "@/components/Group";
 import { PathField } from "@/components/PathField";
@@ -98,7 +98,7 @@ export function Onboarding({ status }: { status: ReaperStatus }) {
   return (
     <div className="flex flex-1 flex-col [justify-content:safe_center] gap-5 overflow-y-auto px-4 pb-6">
       <div className="space-y-3 px-1">
-        <BarMark height={38} />
+        <RMark height={40} />
         <div className="space-y-1">
           <h1 className="text-[21px] leading-tight font-semibold tracking-[-0.015em]">{t("welcome")}</h1>
           <p className="text-[13px] text-muted-foreground">{t("tagline")}</p>
