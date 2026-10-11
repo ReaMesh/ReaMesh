@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Copy, Minus, Settings, Square, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { RMark } from "@/components/RMark";
+import { Lockup } from "@/components/RMark";
 import { useConnections, setActivePort } from "@/lib/connection";
 import { t } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
@@ -98,12 +98,7 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
 }
 
 function Wordmark() {
-  return (
-    <span className="pointer-events-none flex select-none items-center gap-[7px] text-[12px] font-semibold tracking-[0.01em] text-muted-foreground">
-      <RMark height={12} />
-      ReaMesh
-    </span>
-  );
+  return <Lockup height={18} className="pointer-events-none select-none text-muted-foreground" />;
 }
 
 // Windows caption buttons. Full-height, 46px wide, square (no rounding) like

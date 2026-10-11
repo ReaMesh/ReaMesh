@@ -1,4 +1,5 @@
-// Render windows-mark.svg into icon.ico for the Windows executable and taskbar.
+// Render windows-mark.svg into icon.ico for the Windows executable and taskbar,
+// and into the Square*/StoreLogo tiles.
 // Run `bun run icons:windows` after editing the SVG. macOS uses icon.icns.
 //
 // An ICO has a 6-byte header and a 16-byte directory entry per image.
@@ -11,7 +12,11 @@ import { Resvg } from "@resvg/resvg-js";
 // the 200% Explorer tile. Leaving them out is what makes an icon look
 // pixelated: Windows resamples the nearest entry it does find rather than
 // rendering the right size.
-const SIZES = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256];
+//
+// Largest first: Tauri takes the ICO's *first* entry as the window icon, which
+// is also what the taskbar shows for the running app. With 16 first, Windows
+// blew a 16px image up to 24-40px and the taskbar icon came out blurry.
+const SIZES = [256, 128, 96, 64, 48, 40, 32, 24, 20, 16];
 
 // fileURLToPath, not URL.pathname: on Windows the latter yields "/C:/..." with
 // a leading slash, which no file API accepts.
@@ -45,6 +50,12 @@ pngs.forEach(({ size, png }, i) => {
   header.writeUInt32LE(offset, at + 12);
   offset += png.length;
 });
+
+for (const size of [30, 44, 71, 89, 107, 142, 150, 284, 310, 50]) {
+  const name = size === 50 ? "StoreLogo.png" : `Square${size}x${size}Logo.png`;
+  const png = new Resvg(svg, { fitTo: { mode: "width", value: size } }).render().asPng();
+  await Bun.write(resolve(`../src-tauri/icons/${name}`), png);
+}
 
 const out = resolve("../src-tauri/icons/icon.ico");
 await Bun.write(out, Buffer.concat([header, ...pngs.map((p) => p.png)]));
