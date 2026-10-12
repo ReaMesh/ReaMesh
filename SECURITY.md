@@ -9,8 +9,8 @@ Security reports are taken seriously and handled quickly.
 **Please do not open a public issue for security problems.**
 
 Use GitHub's private vulnerability reporting:
-[Report a vulnerability](https://github.com/ReaMesh/ReaMesh/security/advisories/new).
-You will get an acknowledgement within a few days. Once a fix is released the
+[Report a vulnerability](https://github.com/ReaMesh/ReaMesh/security/advisories/new),
+or email [contact@reamesh.com](mailto:contact@reamesh.com). You will get an acknowledgement within a few days. Once a fix is released the
 advisory is published with credit to you, unless you prefer otherwise.
 
 Please include what you can of: the affected component (extension, Rust core,
