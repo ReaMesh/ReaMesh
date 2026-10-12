@@ -1,20 +1,28 @@
 {
   "fill" : {
-    "solid" : "srgb:0.10196,0.10196,0.10588,1.00000"
+    "linear-gradient" : [
+      "srgb:0.12157,0.12157,0.12157,1.00000",
+      "srgb:0.05882,0.05882,0.05882,1.00000"
+    ],
+    "orientation" : {
+      "start" : {
+        "x" : 0.5,
+        "y" : 0
+      },
+      "stop" : {
+        "x" : 0.5,
+        "y" : 1
+      }
+    }
   },
   "groups" : [
     {
       "blur-material" : null,
       "layers" : [
         {
-          "fill-specializations" : [
-            {
-              "appearance" : "dark",
-              "value" : {
-                "solid" : "srgb:1.00000,1.00000,1.00000,1.00000"
-              }
-            }
-          ],
+          "fill" : {
+            "solid" : "srgb:1.00000,1.00000,1.00000,1.00000"
+          },
           "image-name" : "reamesh-R-weiss.svg",
           "name" : "reamesh-R-weiss",
           "position" : {
