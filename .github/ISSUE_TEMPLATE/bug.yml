@@ -1,0 +1,23 @@
+name: Bug report
+description: Something in ReaMesh doesn't work as it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: ReaMesh, REAPER and operating system.
+      placeholder: ReaMesh 0.1.0, REAPER 7.27, macOS 26.1
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Optional. Paste what "Copy diagnostics" in the app's settings puts on the clipboard.
+      render: text
