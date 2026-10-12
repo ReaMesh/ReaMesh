@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { Check, ExternalLink } from "lucide-react";
+import { AnimatePresence, motion } from "motion/react";
+import { Check, ExternalLink, LoaderCircle } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -20,6 +21,34 @@ import { cn } from "@/lib/utils";
 // First-run setup as one checklist: find REAPER, install the extension,
 // restart REAPER. All three steps stay visible; only the current one opens.
 
+const FOLD = { type: "spring", stiffness: 400, damping: 38 } as const;
+
+/** Unfolds and folds its content on the spring. Spacing lives inside the
+ *  content (padding, not a gap or margin), so it travels with the fold. */
+function Fold({ show, children }: { show: boolean; children: React.ReactNode }) {
+  return (
+    <AnimatePresence initial={false}>
+      {show && (
+        <motion.div
+          initial={{ height: 0, opacity: 0 }}
+          animate={{ height: "auto", opacity: 1 }}
+          exit={{ height: 0, opacity: 0 }}
+          transition={FOLD}
+          className="overflow-hidden"
+        >
+          {children}
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+// The header and the checklist rise in one after the other on first show.
+const enter = {
+  hidden: { opacity: 0, y: 8 },
+  shown: { opacity: 1, y: 0, transition: { duration: 0.32, ease: "easeOut" } },
+} as const;
+
 function Step({
   n,
   state,
@@ -36,24 +65,48 @@ function Step({
       <span
         aria-hidden="true"
         className={cn(
-          "mt-px grid size-[22px] shrink-0 place-items-center rounded-full text-[11px] font-semibold tabular-nums",
+          "mt-px grid size-[22px] shrink-0 place-items-center rounded-full text-[11px] font-semibold tabular-nums transition-colors duration-300",
           state === "done" && "bg-foreground/10 text-foreground",
           state === "current" && "bg-foreground text-background",
           state === "todo" && "bg-white/[0.07] text-muted-foreground",
         )}
       >
-        {state === "done" ? <Check className="size-3" strokeWidth={3} /> : n}
+        <AnimatePresence initial={false}>
+          <motion.span
+            key={state === "done" ? "done" : "n"}
+            className="col-start-1 row-start-1"
+            initial={{ opacity: 0, scale: 0.4 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.4 }}
+            transition={{ type: "spring", stiffness: 500, damping: 26 }}
+          >
+            {state === "done" ? <Check className="size-3" strokeWidth={3} /> : n}
+          </motion.span>
+        </AnimatePresence>
       </span>
-      <div className="min-w-0 flex-1 space-y-2.5">
+      <div className="min-w-0 flex-1">
         <h2
           className={cn(
-            "text-[13px] leading-[22px] font-semibold",
+            "grid text-[13px] leading-[22px] font-semibold transition-colors duration-300",
             state === "todo" && "text-muted-foreground",
           )}
         >
-          {title}
+          <AnimatePresence initial={false}>
+            <motion.span
+              key={title}
+              className="col-start-1 row-start-1"
+              initial={{ opacity: 0, y: 4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
+            >
+              {title}
+            </motion.span>
+          </AnimatePresence>
         </h2>
-        {state !== "todo" && children}
+        <Fold show={state !== "todo" && !!children}>
+          <div className="pt-2.5">{children}</div>
+        </Fold>
       </div>
     </li>
   );
@@ -96,75 +149,91 @@ export function Onboarding({ status }: { status: ReaperStatus }) {
   };
 
   return (
-    <div className="flex flex-1 flex-col [justify-content:safe_center] gap-5 overflow-y-auto px-4 pb-6">
-      <div className="space-y-3 px-1">
-        <RMark height={40} />
-        <div className="space-y-1">
+    <motion.div
+      className="flex flex-1 flex-col [justify-content:safe_center] gap-5 overflow-y-auto px-4 pb-6"
+      initial="hidden"
+      animate="shown"
+      transition={{ staggerChildren: 0.07, delayChildren: 0.05 }}
+    >
+      <motion.div className="space-y-3 px-1" variants={{ hidden: {}, shown: {} }} transition={{ staggerChildren: 0.07 }}>
+        <motion.div variants={enter}>
+          <RMark height={40} />
+        </motion.div>
+        <motion.div className="space-y-1" variants={enter}>
           <h1 className="text-[21px] leading-tight font-semibold tracking-[-0.015em]">{t("welcome")}</h1>
           <p className="text-[13px] text-muted-foreground">{t("tagline")}</p>
-        </div>
-      </div>
+        </motion.div>
+      </motion.div>
 
-      <Group>
-        <ol className="divide-y divide-white/[0.07]">
-          <Step
-            n={1}
-            state={found ? "done" : "current"}
-            title={found ? t("reaperFound") : t("reaperNotFound")}
-          >
-            <PathField
-              path={status.resourcePath}
-              action={
-                <Button variant="ghost" size="sm" className="h-7 shrink-0 px-2.5 text-[12px]" onClick={pick}>
-                  {t("change")}
-                </Button>
-              }
-            />
-            {!found && (
-              <div className="flex gap-2">
-                <Button
-                  size="sm"
-                  className="h-8 flex-1 gap-1.5 text-[12px]"
-                  onClick={() => openUrl("https://www.reaper.fm/download.php")}
-                >
-                  {t("downloadReaper")}
-                  <ExternalLink className="size-3" aria-hidden="true" />
-                </Button>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className="h-8 flex-1 text-[12px]"
-                  onClick={() => refreshStatus()}
-                >
-                  {t("checkAgain")}
-                </Button>
-              </div>
-            )}
-          </Step>
-          <Step
-            n={2}
-            state={done ? "done" : found ? "current" : "todo"}
-            title={done ? t("allSet") : t("installExtTitle")}
-          >
-            {!done && (
-              <>
-                {!status.isReaperDir && (
-                  <p className="text-[12px] leading-normal text-amber-500">{t("notReaperDirWarning")}</p>
-                )}
-                <Button size="sm" className="h-8 w-full text-[13px]" disabled={busy} onClick={install}>
-                  {busy ? t("installing") : t("installExtension")}
-                </Button>
-              </>
-            )}
-          </Step>
-          <Step n={3} state={done ? "current" : "todo"} title={t("restartReaperStep")}>
-            <FirewallNotice />
-            <Button size="sm" className="h-8 w-full text-[13px]" onClick={() => refreshStatus()}>
-              {t("finish")}
-            </Button>
-          </Step>
-        </ol>
-      </Group>
-    </div>
+      <motion.div variants={enter}>
+        <Group>
+          <ol className="divide-y divide-white/[0.07]">
+            <Step
+              n={1}
+              state={found ? "done" : "current"}
+              title={found ? t("reaperFound") : t("reaperNotFound")}
+            >
+              <PathField
+                path={status.resourcePath}
+                action={
+                  <Button variant="ghost" size="sm" className="h-7 shrink-0 px-2.5 text-[12px]" onClick={pick}>
+                    {t("change")}
+                  </Button>
+                }
+              />
+              <Fold show={!found}>
+                <div className="flex gap-2 pt-2.5">
+                  <Button
+                    size="sm"
+                    className="h-8 flex-1 gap-1.5 text-[12px]"
+                    onClick={() => openUrl("https://www.reaper.fm/download.php")}
+                  >
+                    {t("downloadReaper")}
+                    <ExternalLink className="size-3" aria-hidden="true" />
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    className="h-8 flex-1 text-[12px]"
+                    onClick={() => refreshStatus()}
+                  >
+                    {t("checkAgain")}
+                  </Button>
+                </div>
+              </Fold>
+            </Step>
+            <Step
+              n={2}
+              state={done ? "done" : found ? "current" : "todo"}
+              title={done ? t("allSet") : t("installExtTitle")}
+            >
+              {!done && (
+                <>
+                  <Fold show={!status.isReaperDir}>
+                    <p className="pb-2.5 text-[12px] leading-normal text-amber-500">{t("notReaperDirWarning")}</p>
+                  </Fold>
+                  <Button
+                    size="sm"
+                    className="h-8 w-full gap-1.5 text-[13px]"
+                    disabled={busy}
+                    aria-busy={busy || undefined}
+                    onClick={install}
+                  >
+                    {busy && <LoaderCircle className="size-3.5 motion-safe:animate-spin" aria-hidden="true" />}
+                    {busy ? t("installing") : t("installExtension")}
+                  </Button>
+                </>
+              )}
+            </Step>
+            <Step n={3} state={done ? "current" : "todo"} title={t("restartReaperStep")}>
+              <FirewallNotice className="pb-2.5" />
+              <Button size="sm" className="h-8 w-full text-[13px]" onClick={() => refreshStatus()}>
+                {t("finish")}
+              </Button>
+            </Step>
+          </ol>
+        </Group>
+      </motion.div>
+    </motion.div>
   );
 }
