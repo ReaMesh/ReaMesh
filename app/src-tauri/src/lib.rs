@@ -1196,12 +1196,12 @@ fn build_menu(app: &AppHandle) -> tauri::Result<()> {
     let quit = MenuItemBuilder::with_id("quit", tr(lang, "Quit ReaMesh", "ReaMesh beenden"))
         .accelerator("Cmd+Q")
         .build(app)?;
+    // Custom About (instead of the predefined item) so it opens the native
+    // about_window.m with build details, links and the app's own language.
+    let about = MenuItemBuilder::with_id("about", tr(lang, "About ReaMesh", "Über ReaMesh"))
+        .build(app)?;
     let app_menu = SubmenuBuilder::new(app, "ReaMesh")
-        .item(&PredefinedMenuItem::about(
-            app,
-            Some(tr(lang, "About ReaMesh", "Über ReaMesh")),
-            None,
-        )?)
+        .item(&about)
         .separator()
         .item(&settings)
         .separator()
@@ -1410,6 +1410,14 @@ pub fn run() {
                         let _ = win.set_focus();
                     }
                     let _ = app.emit("menu:settings", ());
+                }
+            } else if event.id() == "about" {
+                #[cfg(target_os = "macos")]
+                {
+                    let app = app.clone();
+                    let _ = app
+                        .clone()
+                        .run_on_main_thread(move || native_about::open(&app));
                 }
             } else if event.id() == "quit" {
                 // Funnel into the ExitRequested handler (stops hosting first).
@@ -1659,7 +1667,7 @@ mod native_settings {
 
     // The acknowledgements are a screen of the main window (the list is long
     // and lives in the webview bundle): bring it forward and switch to it.
-    extern "C" fn show_credits(ctx: *mut c_void) {
+    pub(super) extern "C" fn show_credits(ctx: *mut c_void) {
         use tauri::Manager;
         let app = handle(ctx);
         if let Some(win) = app.get_webview_window("main") {
@@ -1732,6 +1740,59 @@ mod native_settings {
     pub fn set_pasteboard(text: &str) {
         let c = CString::new(text.replace('\0', "")).unwrap_or_default();
         unsafe { reamesh_pasteboard_set(c.as_ptr()) };
+    }
+}
+
+/// Bridge to the native About window (src/about_window.m).
+#[cfg(target_os = "macos")]
+mod native_about {
+    use super::{native_settings, resolved_lang, Lang, PROTO};
+    use std::ffi::{c_char, c_void, CString};
+    use std::sync::OnceLock;
+    use tauri::AppHandle;
+
+    #[repr(C)]
+    struct AboutInfo {
+        ctx: *mut c_void,
+        version: *const c_char,
+        commit: *const c_char,
+        build_time: i64,
+        release: i32,
+        proto: u32,
+        german: i32,
+        icon_png: *const u8,
+        icon_png_len: usize,
+        show_credits: extern "C" fn(*mut c_void),
+    }
+
+    extern "C" {
+        fn reamesh_about_open(info: AboutInfo);
+    }
+
+    // A dev binary isn't inside a .app, so it has no bundle icon to show.
+    static ICON: &[u8] = include_bytes!("../icons/128x128@2x.png");
+
+    // Leaked once, like the settings window's, for the show_credits callback.
+    static APP_PTR: OnceLock<usize> = OnceLock::new();
+
+    /// Main thread only.
+    pub fn open(app: &AppHandle) {
+        let ptr = *APP_PTR.get_or_init(|| Box::into_raw(Box::new(app.clone())) as usize);
+        let version = CString::new(app.package_info().version.to_string()).unwrap_or_default();
+        let commit = CString::new(env!("REAMESH_COMMIT")).unwrap_or_default();
+        let info = AboutInfo {
+            ctx: ptr as *mut c_void,
+            version: version.as_ptr(),
+            commit: commit.as_ptr(),
+            build_time: env!("REAMESH_BUILD_TIME").parse().unwrap_or(0),
+            release: !cfg!(debug_assertions) as i32,
+            proto: PROTO,
+            german: matches!(resolved_lang(app), Lang::De) as i32,
+            icon_png: ICON.as_ptr(),
+            icon_png_len: ICON.len(),
+            show_credits: native_settings::show_credits,
+        };
+        unsafe { reamesh_about_open(info) };
     }
 }
 
