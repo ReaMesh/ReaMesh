@@ -447,32 +447,36 @@ static ReaMeshSettingsController *gController = nil;
         statusColor = [NSColor systemOrangeColor];
     }
 
-    NSString *btnTitle = !st.installed
-        ? L(@"Install extension", @"Erweiterung installieren")
-        : st.up_to_date ? L(@"Reinstall extension", @"Erweiterung neu installieren")
-                        : L(@"Update extension", @"Erweiterung aktualisieren");
-    CGFloat btnW = 200;
-    NSButton *installBtn = [NSButton buttonWithTitle:btnTitle
-                                              target:self
-                                              action:@selector(install:)];
-    installBtn.frame = NSMakeRect(kMargin + w - btnW, y, btnW, 28);
-    installBtn.bezelStyle = NSBezelStyleRounded;
-    installBtn.keyEquivalent = @"\r";
-    installBtn.enabled = st.reaper_found ? YES : NO;
-    [self.container addSubview:installBtn];
+    // Installed and current: nothing to install, only removal is offered.
+    CGFloat usedW = 0;
+    if (!st.installed || !st.up_to_date) {
+        NSString *btnTitle = !st.installed
+            ? L(@"Install extension", @"Erweiterung installieren")
+            : L(@"Update extension", @"Erweiterung aktualisieren");
+        CGFloat btnW = 200;
+        NSButton *installBtn = [NSButton buttonWithTitle:btnTitle
+                                                  target:self
+                                                  action:@selector(install:)];
+        installBtn.frame = NSMakeRect(kMargin + w - btnW, y, btnW, 28);
+        installBtn.bezelStyle = NSBezelStyleRounded;
+        installBtn.keyEquivalent = @"\r";
+        installBtn.enabled = st.reaper_found ? YES : NO;
+        [self.container addSubview:installBtn];
+        usedW = btnW;
+    }
 
     // Explicit removal: uninstalling the app leaves the extension in REAPER's
     // UserPlugins folder.
-    CGFloat usedW = btnW;
     if (st.installed) {
         CGFloat rmW = 96;
+        CGFloat gap = usedW > 0 ? 4 : 0;
         NSButton *removeBtn = [NSButton buttonWithTitle:L(@"Remove", @"Entfernen")
                                                  target:self
                                                  action:@selector(removeExtension:)];
-        removeBtn.frame = NSMakeRect(kMargin + w - btnW - 4 - rmW, y, rmW, 28);
+        removeBtn.frame = NSMakeRect(kMargin + w - usedW - gap - rmW, y, rmW, 28);
         removeBtn.bezelStyle = NSBezelStyleRounded;
         [self.container addSubview:removeBtn];
-        usedW += rmW + 4;
+        usedW += rmW + gap;
     }
 
     NSTextField *statusLabel =

@@ -384,21 +384,21 @@ export function Settings({
                 <span className={cn(extWarn && "text-amber-500")}>{extStatus}</span>
               }
             >
-              <Button
-                size="sm"
-                variant={status?.installed && status.upToDate ? "secondary" : "default"}
-                className={ghost}
-                disabled={busy || !status?.reaperFound}
-                onClick={install}
-              >
-                {busy
-                  ? t("installing")
-                  : !status?.installed
-                    ? t("installShort")
-                    : status.upToDate
-                      ? t("repairShort")
+              {/* Installed and current: nothing to install, only removal. */}
+              {!(status?.installed && status.upToDate) && (
+                <Button
+                  size="sm"
+                  className={ghost}
+                  disabled={busy || !status?.reaperFound}
+                  onClick={install}
+                >
+                  {busy
+                    ? t("installing")
+                    : !status?.installed
+                      ? t("installShort")
                       : t("updateShort")}
-              </Button>
+                </Button>
+              )}
               {/* Offer explicit removal because uninstalling the app leaves the
                   extension in REAPER's UserPlugins folder. */}
               {status?.installed && (
