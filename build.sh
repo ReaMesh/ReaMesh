@@ -25,6 +25,15 @@ fi
 STEPS=3
 [[ "$PLATFORM" != other ]] && STEPS=4
 
+# Link against the SDK of the selected Xcode, not whatever xcrun resolves to:
+# a Command Line Tools SDK newer than the Xcode toolchain carries .tbd
+# architectures that toolchain's ld rejects ("tapi error: unknown
+# architecture"), and cmake's compiler check fails before the extension builds.
+if [[ "$PLATFORM" == macos && -z "${SDKROOT:-}" ]]; then
+  XCODE_SDK="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+  [[ -d "$XCODE_SDK" ]] && export SDKROOT="$XCODE_SDK"
+fi
+
 echo "==> [1/$STEPS] Building Rust library (release)"
 (cd rust && cargo build --release)
 
