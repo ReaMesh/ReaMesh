@@ -10,7 +10,7 @@ import { Divider, Group, SectionLabel } from "@/components/Group";
 import { PathField } from "@/components/PathField";
 import { ProfileEditor } from "@/components/ProfileEditor";
 import { buildDiagnostics } from "@/lib/diagnostics";
-import { getLangPref, setLangPref, t, useLang, type LangPref } from "@/lib/i18n";
+import { getLangPref, resolveLang, setLangPref, t, useLang, type LangPref } from "@/lib/i18n";
 import {
   getReaperPath,
   installExtension,
@@ -34,7 +34,13 @@ import {
   useOverlaySettings,
 } from "@/lib/overlaySettings";
 import { isWindows } from "@/lib/platform";
+import { PROTO } from "@/lib/version";
 import { cn, focusRing } from "@/lib/utils";
+
+const SOURCE_URL = "https://github.com/ReaMesh/ReaMesh";
+
+/** What this binary was built from (backend `build_info`). */
+type BuildInfo = { commit: string; buildTime: number; release: boolean };
 
 // `hud` rows only mean something while the HUD is shown and grey out without it.
 // The tint is drawn by REAPER itself, so it stays independent.
@@ -120,6 +126,17 @@ export function Settings({
   const version = useAppVersion();
   const instance = useActiveInstance();
   useLang(); // re-render when the language changes
+  const [build, setBuild] = useState<BuildInfo | null>(null);
+  useEffect(() => {
+    invoke<BuildInfo>("build_info").then(setBuild, () => {});
+  }, []);
+  const buildDate =
+    build && build.buildTime > 0
+      ? new Date(build.buildTime * 1000).toLocaleString(resolveLang(), {
+          dateStyle: "medium",
+          timeStyle: "short",
+        })
+      : "";
 
   const pickFolder = async () => {
     const dir = await open({
@@ -517,6 +534,62 @@ export function Settings({
               </Row>
             </button>
           </Group>
+        </section>
+
+        <section className="space-y-2">
+          <SectionLabel>{t("aboutTitle")}</SectionLabel>
+          <Group>
+            <Row label={t("aboutVersion")}>
+              <span className="shrink-0 text-[12px] text-muted-foreground tabular-nums">
+                {version}
+                {build?.commit &&
+                  (build.release ? (
+                    // A release build's commit is on GitHub; a dev build's may
+                    // exist only locally, so it stays plain text there.
+                    <>
+                      {" ("}
+                      <button
+                        type="button"
+                        onClick={() => openUrl(`${SOURCE_URL}/commit/${build.commit}`)}
+                        className={cn("rounded-sm text-primary hover:underline", focusRing)}
+                      >
+                        {build.commit}
+                      </button>
+                      {")"}
+                    </>
+                  ) : (
+                    ` (${build.commit})`
+                  ))}
+              </span>
+            </Row>
+            <Divider inset={false} />
+            <Row label={t("aboutBuild")}>
+              <span className="shrink-0 text-[12px] text-muted-foreground tabular-nums">
+                {build && [t(build.release ? "releaseBuild" : "devBuild"), buildDate]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </span>
+            </Row>
+            <Divider inset={false} />
+            <Row label={t("aboutProtocol")}>
+              <span className="shrink-0 text-[12px] text-muted-foreground tabular-nums">{PROTO}</span>
+            </Row>
+            <Divider inset={false} />
+            <button
+              type="button"
+              onClick={() => openUrl(SOURCE_URL)}
+              className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
+            >
+              <Row label={t("sourceCode")}>
+                <ExternalLink className="size-3.5 text-muted-foreground" aria-hidden="true" />
+              </Row>
+            </button>
+          </Group>
+          <div className="space-y-1 px-1 text-[11px] leading-snug text-muted-foreground">
+            <p>{t("aboutTagline")}</p>
+            <p>{t("cockosNotice")}</p>
+            <p>© 2026 tiszu · GPL-3.0</p>
+          </div>
         </section>
 
       </div>

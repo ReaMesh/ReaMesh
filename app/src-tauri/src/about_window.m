@@ -24,6 +24,7 @@ static NSString *AL(NSString *en, NSString *de) {
 @interface ReaMeshAboutController : NSObject
 @property (strong) ReaMeshAboutWindow *window;
 @property (assign) AboutInfo info;
+@property (copy) NSString *commit;
 @end
 
 static ReaMeshAboutController *gAbout = nil;
@@ -105,6 +106,11 @@ static NSTextField *aboutLabel(NSString *text, NSFont *font, NSColor *color) {
     [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:kSourceURL]];
 }
 
+- (void)openCommit:(id)sender {
+    NSString *url = [NSString stringWithFormat:@"%@/commit/%@", kSourceURL, _commit];
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:url]];
+}
+
 - (void)openCredits:(id)sender {
     if (_info.show_credits) _info.show_credits(_info.ctx);
 }
@@ -124,9 +130,34 @@ static NSTextField *aboutLabel(NSString *text, NSFont *font, NSColor *color) {
         ? [NSString stringWithFormat:@"Version %@ (%@)", version, commit]
         : [NSString stringWithFormat:@"Version %@", version];
 
+    _commit = commit;
+
     NSTextField *name = aboutLabel(@"ReaMesh", [NSFont boldSystemFontOfSize:14], NSColor.labelColor);
-    NSTextField *ver = aboutLabel(versionText, small, NSColor.labelColor);
-    ver.selectable = YES; // so the commit can be copied for a bug report
+    NSView *ver;
+    if (_info.release && commit.length) {
+        // A release build's commit is on GitHub: the hash links to it. A dev
+        // build's may exist only locally, so it stays plain text there.
+        NSString *pre = [NSString stringWithFormat:@"Version %@ (", version];
+        NSMutableAttributedString *title = [[NSMutableAttributedString alloc]
+            initWithString:[NSString stringWithFormat:@"%@%@)", pre, commit]
+                attributes:@{
+                    NSFontAttributeName : small,
+                    NSForegroundColorAttributeName : NSColor.labelColor,
+                }];
+        [title addAttribute:NSForegroundColorAttributeName
+                      value:NSColor.linkColor
+                      range:NSMakeRange(pre.length, commit.length)];
+        NSButton *link = [NSButton buttonWithTitle:title.string
+                                            target:self
+                                            action:@selector(openCommit:)];
+        link.bordered = NO;
+        link.attributedTitle = title;
+        ver = link;
+    } else {
+        NSTextField *plain = aboutLabel(versionText, small, NSColor.labelColor);
+        plain.selectable = YES; // so the commit can be copied for a bug report
+        ver = plain;
+    }
     NSTextField *subtitle = aboutLabel(
         AL(@"Realtime, peer-to-peer collaboration for REAPER",
            @"Zusammenarbeit in Echtzeit für REAPER, Peer-to-Peer"),

@@ -219,6 +219,26 @@ fn apply_overlay(app: &AppHandle, mask: u8) {
     let _ = app.emit("overlay-settings-changed", mask);
 }
 
+/// What this binary was built from, for the About section of the Settings
+/// screen (macOS shows the same in its native About window).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildInfo {
+    commit: &'static str,
+    /// Unix seconds, 0 when unknown.
+    build_time: u64,
+    release: bool,
+}
+
+#[tauri::command]
+fn build_info() -> BuildInfo {
+    BuildInfo {
+        commit: env!("REAMESH_COMMIT"),
+        build_time: env!("REAMESH_BUILD_TIME").parse().unwrap_or(0),
+        release: !cfg!(debug_assertions),
+    }
+}
+
 #[tauri::command]
 fn get_overlay_settings(app: AppHandle) -> u8 {
     load_overlay(&app)
@@ -1355,7 +1375,8 @@ pub fn run() {
             open_firewall_settings,
             port_trouble,
             reset_network_identity,
-            copy_diagnostics_text
+            copy_diagnostics_text,
+            build_info
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

@@ -390,6 +390,15 @@ const en = {
   credits: "Acknowledgements",
   builtWith: "Built with",
   allPackages: "All packages",
+  aboutTitle: "About ReaMesh",
+  aboutVersion: "Version",
+  aboutBuild: "Build",
+  aboutProtocol: "Protocol",
+  releaseBuild: "Release build",
+  devBuild: "Dev build",
+  sourceCode: "Source code",
+  aboutTagline: "Realtime, peer-to-peer collaboration for REAPER",
+  cockosNotice: "REAPER is a trademark of Cockos Incorporated. ReaMesh is not affiliated with or endorsed by Cockos.",
 } as const;
 
 export type MsgKey = keyof typeof en;
@@ -746,6 +755,15 @@ const de: Record<MsgKey, string> = {
   credits: "Danksagungen",
   builtWith: "Gebaut mit",
   allPackages: "Alle Pakete",
+  aboutTitle: "Über ReaMesh",
+  aboutVersion: "Version",
+  aboutBuild: "Build",
+  aboutProtocol: "Protokoll",
+  releaseBuild: "Release-Build",
+  devBuild: "Dev-Build",
+  sourceCode: "Quellcode",
+  aboutTagline: "Zusammenarbeit in Echtzeit für REAPER, Peer-to-Peer",
+  cockosNotice: "REAPER ist eine Marke von Cockos Incorporated. ReaMesh ist unabhängig und nicht mit Cockos verbunden.",
 };
 
 function readStoredPref(): LangPref {
