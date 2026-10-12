@@ -9,6 +9,18 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/**
+ * Compatibility number shared by everything a ReaMesh build talks to: the
+ * session wire format (gossip, transfer, changeset JSON) and the control
+ * server the companion app drives. Bump it on *any* change one side could
+ * misread. Peers only join sessions announcing the same number, and the app
+ * only drives an extension reporting it, so mismatched builds are refused
+ * instead of tested. Mirrored in the app (`app/src/lib/version.ts`,
+ * `app/src-tauri/src/lib.rs`); app/src/lib/version.test.ts checks the copies
+ * agree.
+ */
+#define PROTO 1
+
 typedef struct ReameshHandle ReameshHandle;
 
 /**
