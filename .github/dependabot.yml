@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories: ["/rust", "/app/src-tauri"]
+    schedule:
+      interval: weekly
+    ignore:
+      # yrs stays on 0.26 until the full test suite and a two-instance session
+      # pass on a newer release.
+      - dependency-name: yrs
+        versions: [">=0.27"]
+    groups:
+      cargo:
+        update-types: [minor, patch]
+
+  - package-ecosystem: bun
+    directory: /app
+    schedule:
+      interval: weekly
+    groups:
+      bun:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
