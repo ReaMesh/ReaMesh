@@ -28,6 +28,7 @@ import { t } from "@/lib/i18n";
 import { useProfile } from "@/lib/profile";
 import { decodeTicket, normalizeTicket } from "@/lib/ticket";
 import { initials, type ExtState, type SessionAd } from "@/lib/types";
+import { protoSkew } from "@/lib/version";
 import { cn, focusRing } from "@/lib/utils";
 
 /// Shortest passphrase accepted by the host form. This is only a minimum for
@@ -47,13 +48,14 @@ const TICKET_CHECK_TIMEOUT_MS = 35_000;
  *  no hard start, no overshoot, settled after about 0.3 s. */
 const FOLD = { type: "spring", stiffness: 400, damping: 38 } as const;
 
-type CheckOutcome = "ok" | "bad" | "banned" | "unknown";
+type CheckOutcome = "ok" | "bad" | "banned" | "version" | "unknown";
 type CheckError = "" | Exclude<CheckOutcome, "ok">;
 
 /** Inline text under the passphrase field for a failed check. */
 function checkErrorText(error: CheckError): string {
   if (error === "bad") return t("wrongPassword");
   if (error === "banned") return t("bannedFromSession");
+  if (error === "version") return t("hostOtherVersion");
   return t("checkNoAnswer");
 }
 
@@ -98,7 +100,9 @@ function usePassphraseCheck(
           ? "bad"
           : probe.reason === "banned"
             ? "banned"
-            : "unknown",
+            : probe.reason === "version"
+              ? "version"
+              : "unknown",
     );
   }, [probe, checking, sid]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -333,6 +337,8 @@ function SessionCard({
   // found-blue wash so the eye catches it. Cards present when the lobby
   // mounts (or arriving in its first moments) just enter normally.
   const fresh = useRef(Date.now() - lobbyMountedAt > 1500).current;
+  // Another build can't be joined: say which side needs the update instead.
+  const skew = protoSkew(session.proto);
 
   const join = (nofx: boolean) => {
     if (joining) return;
@@ -360,7 +366,9 @@ function SessionCard({
       if (outcome === "ok") return setConfirmOpen(true);
       // A refused probe for an open session means the host did not answer,
       // unless the host said outright that this device is blocked.
-      setError(session.auth || outcome === "banned" ? outcome : "unknown");
+      setError(
+        session.auth || outcome === "banned" || outcome === "version" ? outcome : "unknown",
+      );
       shake();
     },
   );
@@ -385,7 +393,7 @@ function SessionCard({
         "shrink-0 px-3",
         besideField ? "h-8 min-w-[84px] text-[13px]" : "h-7 min-w-[76px] text-[12px]",
       )}
-      disabled={(session.auth && !pass) || busy}
+      disabled={(session.auth && !pass) || busy || skew !== "same"}
       busy={busy}
       label={t("join")}
       onClick={beginJoin}
@@ -429,6 +437,10 @@ function SessionCard({
             {session.contested ? (
               <p role="status" className="truncate text-[12px] text-amber-500">
                 {t("sessionContested")}
+              </p>
+            ) : skew !== "same" ? (
+              <p className="truncate text-[12px] text-amber-500">
+                {t(skew === "newer" ? "hostNewerVersion" : "hostOlderVersion")}
               </p>
             ) : (
               <p className="truncate text-[12px] text-muted-foreground" title={session.project_file}>
@@ -517,7 +529,9 @@ function InviteCard({ probe, port }: { probe?: ExtState["probe"]; port: number |
     TICKET_CHECK_TIMEOUT_MS,
     (outcome) => {
       if (outcome === "ok") return setConfirmOpen(true);
-      setError(ticket?.auth || outcome === "banned" ? outcome : "unknown");
+      setError(
+        ticket?.auth || outcome === "banned" || outcome === "version" ? outcome : "unknown",
+      );
       shake();
     },
   );

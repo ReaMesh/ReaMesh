@@ -31,6 +31,9 @@ fn ctl_server_round_trip() {
         let v: Value = serde_json::from_str(hello.to_text().unwrap()).unwrap();
         assert_eq!(v["type"], "hello");
         assert!(v["pid"].as_u64().unwrap() > 0);
+        // The app checks these before driving anything.
+        assert_eq!(v["version"], reamesh::VERSION);
+        assert_eq!(v["proto"].as_u64(), Some(reamesh::PROTO as u64));
 
         // set_profile is handled server-side, not queued for the extension.
         ws.send(Message::Text(

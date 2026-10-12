@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Copy, Minus, Settings, Square, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Lockup } from "@/components/RMark";
+import { UpdateIndicator } from "@/components/UpdateIndicator";
 import { useConnections, setActivePort } from "@/lib/connection";
 import { t } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
@@ -60,6 +61,7 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
         className="relative flex h-11 shrink-0 select-none items-center bg-background/80 pl-3"
       >
         <Wordmark />
+        <UpdateIndicator className="ml-2.5" />
         <div className="ml-auto flex h-full items-center gap-1">
           {tabs}
           <button
@@ -89,10 +91,20 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
           their tabs take its place. */}
       {!tabs && (
         <div className="pointer-events-none absolute inset-0 grid place-items-center">
-          <Wordmark />
+          {/* The update ring/chip hangs off the wordmark's right edge, so the
+              wordmark itself never moves off centre. */}
+          <div className="relative">
+            <Wordmark />
+            <UpdateIndicator className="pointer-events-auto absolute top-1/2 left-full ml-2.5 -translate-y-1/2" />
+          </div>
         </div>
       )}
-      {tabs && <div className="ml-auto flex items-center gap-2">{tabs}</div>}
+      {tabs && (
+        <div className="ml-auto flex items-center gap-2">
+          <UpdateIndicator />
+          {tabs}
+        </div>
+      )}
     </header>
   );
 }

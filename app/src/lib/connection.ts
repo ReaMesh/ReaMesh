@@ -89,6 +89,8 @@ function connect(port: number) {
     const inst = live.get(port) ?? { port };
     if (msg.type === "hello") {
       inst.pid = Number(msg.pid) || undefined;
+      inst.version = typeof msg.version === "string" ? msg.version : undefined;
+      inst.proto = typeof msg.proto === "number" ? msg.proto : undefined;
     } else if (msg.type === "state") {
       inst.state = normalizeState(msg);
     } else if (msg.type === "busy") {

@@ -1,11 +1,12 @@
 #import "settings_window.h"
 #import <Cocoa/Cocoa.h>
 
-// Native macOS Settings window with General, Overlay and Advanced panes.
+// Native macOS Settings window with General, Overlay, Updates and Advanced panes.
 // REAPER access goes through the Rust SettingsCallbacks interface.
 
 static NSString *const kTabGeneral = @"general";
 static NSString *const kTabOverlay = @"overlay";
+static NSString *const kTabUpdates = @"updates";
 static NSString *const kTabAdvanced = @"advanced";
 static NSString *const kReaperDownloadURL = @"https://www.reaper.fm/download.php";
 static NSString *const kDocsURL = @"https://reamesh.com/docs";
@@ -98,13 +99,13 @@ static ReaMeshSettingsController *gController = nil;
 #pragma mark - NSToolbarDelegate
 
 - (NSArray<NSToolbarItemIdentifier> *)toolbarDefaultItemIdentifiers:(NSToolbar *)t {
-    return @[ kTabGeneral, kTabOverlay, kTabAdvanced ];
+    return @[ kTabGeneral, kTabOverlay, kTabUpdates, kTabAdvanced ];
 }
 - (NSArray<NSToolbarItemIdentifier> *)toolbarAllowedItemIdentifiers:(NSToolbar *)t {
-    return @[ kTabGeneral, kTabOverlay, kTabAdvanced ];
+    return @[ kTabGeneral, kTabOverlay, kTabUpdates, kTabAdvanced ];
 }
 - (NSArray<NSToolbarItemIdentifier> *)toolbarSelectableItemIdentifiers:(NSToolbar *)t {
-    return @[ kTabGeneral, kTabOverlay, kTabAdvanced ];
+    return @[ kTabGeneral, kTabOverlay, kTabUpdates, kTabAdvanced ];
 }
 
 - (NSToolbarItem *)toolbar:(NSToolbar *)toolbar
@@ -117,6 +118,12 @@ static ReaMeshSettingsController *gController = nil;
         item.label = L(@"Advanced", @"Erweitert");
         if (@available(macOS 11.0, *)) {
             item.image = [NSImage imageWithSystemSymbolName:@"gearshape.2"
+                                   accessibilityDescription:item.label];
+        }
+    } else if ([identifier isEqualToString:kTabUpdates]) {
+        item.label = L(@"Updates", @"Updates");
+        if (@available(macOS 11.0, *)) {
+            item.image = [NSImage imageWithSystemSymbolName:@"arrow.down.circle"
                                    accessibilityDescription:item.label];
         }
     } else if ([identifier isEqualToString:kTabOverlay]) {
@@ -170,6 +177,8 @@ static ReaMeshSettingsController *gController = nil;
         [self buildAdvancedPane];
     } else if ([identifier isEqualToString:kTabOverlay]) {
         [self buildOverlayPane];
+    } else if ([identifier isEqualToString:kTabUpdates]) {
+        [self buildUpdatesPane];
     } else {
         [self buildGeneralPane:st];
     }
@@ -224,11 +233,105 @@ static ReaMeshSettingsController *gController = nil;
     }
 }
 
-- (void)autoInstallToggled:(NSButton *)sender {
-    self.cb.set_auto_install(self.cb.ctx,
-                             sender.state == NSControlStateValueOn ? 1 : 0);
-    // Turning it on may have just installed/updated: rebuild to refresh status.
-    [self showTab:self.selectedTab];
+// The in-app updater. Rust owns the state (and pushes a refresh on every
+// phase change); a found update downloads in the background and installs only
+// when the user clicks Restart.
+- (void)buildUpdatesPane {
+    CGFloat w = kWindowWidth - 2 * kMargin;
+    CGFloat y = kMargin;
+
+    [self.container addSubview:[self headerWithString:L(@"Updates", @"Updates") y:y]];
+    y += 28;
+
+    UpdateStatusC u = self.cb.get_update(self.cb.ctx);
+    NSString *offered = u.version ? @(u.version) : @"";
+
+    CGFloat btnW = 160;
+    NSString *btnTitle;
+    SEL action = @selector(checkUpdate:);
+    BOOL enabled = YES;
+    if (u.phase == kReaMeshUpdateReady) {
+        btnTitle = L(@"Restart", @"Neu starten");
+        action = @selector(restartUpdate:);
+        enabled = u.can_restart != 0;
+    } else {
+        btnTitle = L(@"Check now", @"Jetzt suchen");
+        enabled = u.phase != kReaMeshUpdateChecking && u.phase != kReaMeshUpdateDownloading;
+    }
+    NSButton *btn = [NSButton buttonWithTitle:btnTitle target:self action:action];
+    btn.frame = NSMakeRect(kMargin + w - btnW, y, btnW, 28);
+    btn.bezelStyle = NSBezelStyleRounded;
+    btn.enabled = enabled;
+    if (u.phase == kReaMeshUpdateReady) btn.keyEquivalent = @"\r";
+    [self.container addSubview:btn];
+
+    const char *ver = self.cb.get_version(self.cb.ctx);
+    NSTextField *name =
+        [self labelWithString:[NSString stringWithFormat:@"ReaMesh %s", ver ? ver : ""]
+                        frame:NSMakeRect(kMargin, y + 1, w - btnW - 12, 18)];
+    name.font = [NSFont systemFontOfSize:13];
+    [self.container addSubview:name];
+
+    NSString *status = @"";
+    NSColor *statusColor = [NSColor secondaryLabelColor];
+    switch (u.phase) {
+        case kReaMeshUpdateChecking:
+            status = L(@"Checking…", @"Suche…");
+            break;
+        case kReaMeshUpdateCurrent:
+            status = L(@"Up to date", @"Auf dem neuesten Stand");
+            break;
+        case kReaMeshUpdateDownloading:
+            status = [NSString stringWithFormat:L(@"Downloading %@…", @"%@ wird geladen…"), offered];
+            break;
+        case kReaMeshUpdateReady:
+            status = u.can_restart
+                ? [NSString stringWithFormat:L(@"%@ is ready", @"%@ ist bereit"), offered]
+                : [NSString stringWithFormat:L(@"%@ is ready. You can restart after the session.",
+                                               @"%@ ist bereit. Neustart nach der Session möglich."),
+                                             offered];
+            statusColor = [NSColor labelColor];
+            break;
+        case kReaMeshUpdateFailed:
+            status = L(@"Couldn't check for updates", @"Suche fehlgeschlagen");
+            statusColor = [NSColor systemOrangeColor];
+            break;
+        default:
+            break;
+    }
+    NSTextField *statusLabel = [self labelWithString:status
+                                               frame:NSMakeRect(kMargin, y + 19, w - btnW - 12, 16)];
+    statusLabel.textColor = statusColor;
+    statusLabel.font = [NSFont systemFontOfSize:11];
+    statusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.container addSubview:statusLabel];
+    y += 48;
+
+    NSButton *autoBox =
+        [NSButton checkboxWithTitle:L(@"Check for updates automatically",
+                                      @"Automatisch nach Updates suchen")
+                             target:self
+                             action:@selector(updateAutoToggled:)];
+    autoBox.state =
+        self.cb.get_update_auto(self.cb.ctx) ? NSControlStateValueOn : NSControlStateValueOff;
+    autoBox.frame = NSMakeRect(kMargin, y, w, 22);
+    [self.container addSubview:autoBox];
+}
+
+- (void)checkUpdate:(id)sender {
+    self.cb.check_update(self.cb.ctx);
+}
+
+- (void)restartUpdate:(id)sender {
+    self.cb.restart_update(self.cb.ctx);
+}
+
+- (void)updateAutoToggled:(NSButton *)sender {
+    self.cb.set_update_auto(self.cb.ctx, sender.state == NSControlStateValueOn ? 1 : 0);
+}
+
+- (void)showCredits:(id)sender {
+    self.cb.show_credits(self.cb.ctx);
 }
 
 - (void)overlayToggled:(NSButton *)sender {
@@ -381,20 +484,6 @@ static ReaMeshSettingsController *gController = nil;
     [self.container addSubview:statusLabel];
     y += 36;
 
-    // Auto-install toggle. On (the default), the extension is installed and kept
-    // up to date automatically: on launch, after a folder change, and the
-    // moment this is switched on. Off restores the manual install button above.
-    NSButton *autoBox =
-        [NSButton checkboxWithTitle:L(@"Install and update automatically",
-                                      @"Automatisch installieren und aktualisieren")
-                             target:self
-                             action:@selector(autoInstallToggled:)];
-    autoBox.state =
-        self.cb.get_auto_install(self.cb.ctx) ? NSControlStateValueOn : NSControlStateValueOff;
-    autoBox.frame = NSMakeRect(kMargin, y, w, 22);
-    [self.container addSubview:autoBox];
-    y += 30;
-
     NSTextField *help = [self
         labelWithString:L(@"REAPER only loads the extension when it starts. Restart REAPER "
                           @"after installing or updating it.",
@@ -446,16 +535,14 @@ static ReaMeshSettingsController *gController = nil;
     diag.frame = NSMakeRect(kMargin + 188, y, 180, 28);
     diag.bezelStyle = NSBezelStyleRounded;
     [self.container addSubview:diag];
-    y += 44;
+    y += 36;
 
-    const char *ver = self.cb.get_version(self.cb.ctx);
-    if (ver && *ver) {
-        NSTextField *v = [self labelWithString:[NSString stringWithFormat:@"ReaMesh %s", ver]
-                                         frame:NSMakeRect(kMargin, y, w, 16)];
-        v.textColor = [NSColor secondaryLabelColor];
-        v.font = [NSFont systemFontOfSize:11];
-        [self.container addSubview:v];
-    }
+    NSButton *credits = [NSButton buttonWithTitle:L(@"Acknowledgements", @"Danksagungen")
+                                           target:self
+                                           action:@selector(showCredits:)];
+    credits.frame = NSMakeRect(kMargin, y, 180, 28);
+    credits.bezelStyle = NSBezelStyleRounded;
+    [self.container addSubview:credits];
 }
 
 #pragma mark - Actions

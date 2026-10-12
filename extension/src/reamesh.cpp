@@ -4465,6 +4465,9 @@ static void pollDownload() {
     if (msg.find("banned from this session") != std::string::npos)
       leaveSession("banned", {{"minutes", 30}},
                    "the host has blocked you from this session");
+    else if (msg.find("version mismatch") != std::string::npos)
+      leaveSession("version_mismatch", json::object(),
+                   "the host runs a different ReaMesh version");
     else if (msg.find("passphrase") != std::string::npos)
       leaveSession("wrong_password", json::object(), "join failed: " + msg);
     else if (msg.find("ticket host unreachable") != std::string::npos)

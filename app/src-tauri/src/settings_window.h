@@ -15,6 +15,25 @@ typedef struct {
     int32_t has_custom_path;
 } ReaperStatusC;
 
+// The in-app updater's state, mirrored from the Rust `updater::UpdateState`.
+// `version` is owned by Rust and only valid for the duration of the
+// get_update call: the window copies it immediately.
+typedef struct {
+    int32_t phase;       // kReaMeshUpdate*
+    double progress;     // 0..1 while downloading (0 = size unknown)
+    const char *version; // the version on offer, "" until a check found one
+    int32_t can_restart; // 1 = the restart button may install it now
+} UpdateStatusC;
+
+enum {
+    kReaMeshUpdateIdle = 0,
+    kReaMeshUpdateChecking = 1,
+    kReaMeshUpdateCurrent = 2,
+    kReaMeshUpdateDownloading = 3,
+    kReaMeshUpdateReady = 4,
+    kReaMeshUpdateFailed = 5,
+};
+
 // Language preference values shared with Rust (the stored *preference*, not
 // the resolved language: "system" resolves through the device locale).
 enum {
@@ -47,8 +66,12 @@ typedef struct {
     void (*set_language)(void *ctx, int32_t pref);
     int32_t (*get_overlay)(void *ctx);        // kReaMeshOverlay* bitmask
     void (*set_overlay)(void *ctx, int32_t mask);
-    int32_t (*get_auto_install)(void *ctx);   // 1 = auto-install/update on
-    void (*set_auto_install)(void *ctx, int32_t enabled);
+    UpdateStatusC (*get_update)(void *ctx);
+    void (*check_update)(void *ctx);          // check now (and download)
+    void (*restart_update)(void *ctx);        // install the download, relaunch
+    int32_t (*get_update_auto)(void *ctx);    // 1 = check automatically
+    void (*set_update_auto)(void *ctx, int32_t enabled);
+    void (*show_credits)(void *ctx);          // acknowledgements, main window
     int32_t (*reset_identity)(void *ctx);     // 1 = reset, 0 = none stored, -1 = failed
     void (*copy_diagnostics)(void *ctx);      // the webview assembles + copies them
     const char *(*get_version)(void *ctx);    // static, owned by Rust

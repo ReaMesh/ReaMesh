@@ -1,0 +1,146 @@
+# Release: builds the signed app for both platforms (the extension rides
+# inside it) and publishes it, with the updater manifest, as a release of the
+# public ReaMesh/releases repository, which is where installed apps look for
+# updates (plugins.updater.endpoints in tauri.conf.json). This repository stays
+# private; only the built artifacts go out.
+#
+# Trigger: push a tag `v<version>` matching the version in every manifest
+# (bun scripts/set-version.ts), or run it by hand on such a tag.
+#
+# Secrets:
+#   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#       the updater key (bun tauri signer generate); its public half is
+#       plugins.updater.pubkey
+#   RELEASES_TOKEN   a token with contents:write on ReaMesh/releases
+#   APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
+#   APPLE_SIGNING_IDENTITY ("Developer ID Application: …"),
+#   APPLE_API_ISSUER, APPLE_API_KEY, APPLE_API_KEY_P8 (contents of the .p8)
+#       Developer ID signing + notarization of the macOS app
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  RELEASES_REPO: ReaMesh/releases
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Build Rust staticlib
+        run: cargo build --release
+        working-directory: rust
+      - name: Rust tests
+        run: cargo test --release -- --test-threads=1
+        working-directory: rust
+      - name: Build extension DLL
+        run: |
+          cmake -S extension -B extension/build
+          cmake --build extension/build --config Release
+      - name: App checks
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+          bun run test
+        working-directory: app
+      - name: Build signed installer + updater artifacts
+        run: bun run tauri build --config src-tauri/tauri.release.conf.json
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            app/src-tauri/target/release/bundle/nsis/*-setup.exe
+            app/src-tauri/target/release/bundle/nsis/*-setup.exe.sig
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p ci "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p ci "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+      - name: Build Rust staticlib
+        run: cargo build --release
+        working-directory: rust
+      - name: Rust tests
+        run: cargo test --release -- --test-threads=1
+        working-directory: rust
+      - name: Build + sign extension dylib
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          cmake -S extension -B extension/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build extension/build --config Release
+          # Notarization rejects an unsigned Mach-O anywhere in the bundle.
+          codesign --force --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY" extension/build/reaper_reamesh.dylib
+      - name: App checks
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+          bun run test
+        working-directory: app
+      - name: Build, sign + notarize the app and updater artifacts
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          echo "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH"
+          bun run tauri build \
+            --config src-tauri/tauri.release.conf.json \
+            --config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$APPLE_SIGNING_IDENTITY\"}}}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            app/src-tauri/target/release/bundle/macos/*.app.tar.gz
+            app/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
+
+  publish:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Updater manifest
+        run: |
+          VERSION="$(jq -r .version app/package.json)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          bun app/scripts/release-manifest.ts dist "$VERSION" \
+            "https://github.com/$RELEASES_REPO/releases/download/v$VERSION"
+      - name: Publish to ReaMesh/releases
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          gh release create "v$VERSION" dist/* \
+            --repo "$RELEASES_REPO" \
+            --title "ReaMesh $VERSION" \
+            --notes "ReaMesh $VERSION"

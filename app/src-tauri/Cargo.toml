@@ -32,6 +32,12 @@ tauri-plugin-dialog = "2"
 # open-url event the plugin fires everywhere else.
 tauri-plugin-deep-link = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+# In-app updates (src/updater.rs): checks a signed manifest, downloads in the
+# background and installs only when the user clicks restart.
+tauri-plugin-updater = "2"
+# Restores the main window's position and size, so the restart after an update
+# brings the window back where it was.
+tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Local WebSocket client for leaving the session before exit (ws://127.0.0.1).

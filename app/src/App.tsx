@@ -14,6 +14,8 @@ import { Onboarding } from "@/screens/Onboarding";
 import { Outdated } from "@/screens/Outdated";
 import { Session } from "@/screens/Session";
 import { Settings } from "@/screens/Settings";
+import { Credits } from "@/screens/Credits";
+import { ExtMismatch } from "@/screens/ExtMismatch";
 import { startScanning, send, useActiveInstance } from "@/lib/connection";
 import { offerInvite } from "@/lib/invite";
 import { openOverlay, closeOverlay, setSessionState } from "@/lib/overlay";
@@ -27,6 +29,9 @@ import { pluginStatus, useInstalledPlugins } from "@/lib/plugins";
 import { isInviteLink } from "@/lib/ticket";
 import { displayName, type ExtState, type LogEntry, type Mode } from "@/lib/types";
 import { cn, focusRing } from "@/lib/utils";
+import { listenForRestart, revealWindow, takeResume, trackScreen } from "@/lib/resume";
+import { useAppVersion } from "@/lib/updater";
+import { protoSkew } from "@/lib/version";
 
 // How long a fresh launch waits for REAPER to answer before showing the
 // waiting screen (see `holdBlank`).
@@ -34,6 +39,10 @@ const LAUNCH_GRACE_MS = 1200;
 
 startScanning();
 loadReaperPath().then(refreshStatus);
+listenForRestart();
+/** Set when this launch is the restart after an update: put the screen back
+ *  and show the window only once REAPER's state is in. */
+const resumed = takeResume();
 
 /** Show join and leave toasts during a session.
  *  Ignore mode changes so existing peers are not announced as new. If both
@@ -260,8 +269,49 @@ export default function App() {
   const instance = useActiveInstance();
   const state = instance?.state;
   const reaper = useReaperStatus();
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  // Settings is a webview screen on Windows only (macOS has the native
+  // window), so the acknowledgements return to it only there.
+  const [settingsOpen, setSettingsOpen] = useState(
+    resumed?.screen === "settings" || (resumed?.screen === "credits" && isWindows),
+  );
+  const [creditsOpen, setCreditsOpen] = useState(resumed?.screen === "credits");
   useLang(); // re-render the whole tree when the language changes
+  const appVersion = useAppVersion();
+
+  // Remembered across the restart after an update.
+  const screenRef = useRef({ settingsOpen, creditsOpen });
+  screenRef.current = { settingsOpen, creditsOpen };
+  useEffect(() => {
+    trackScreen(() =>
+      screenRef.current.creditsOpen
+        ? "credits"
+        : screenRef.current.settingsOpen
+          ? "settings"
+          : null,
+    );
+  }, []);
+
+  // The window starts hidden (no blank flash). A normal launch shows it once
+  // the first frame is up; the restart after an update waits for REAPER's
+  // state too (briefly), so it comes back looking as it left.
+  const hasInstanceState = !!instance?.state;
+  const revealed = useRef(false);
+  useEffect(() => {
+    if (revealed.current) return;
+    if (!resumed || hasInstanceState) {
+      revealed.current = true;
+      // After this commit has painted; a timer, since a hidden window may not
+      // run animation frames.
+      setTimeout(() => revealWindow(!!resumed), 0);
+      return;
+    }
+    const id = setTimeout(() => {
+      if (revealed.current) return;
+      revealed.current = true;
+      revealWindow(true);
+    }, 1500);
+    return () => clearTimeout(id);
+  }, [hasInstanceState]);
   // Every cross-render hook below is keyed to the instance as well as the mode:
   // the active instance swaps wholesale on a tab click or when a REAPER quits,
   // and none of this state carries across.
@@ -320,6 +370,7 @@ export default function App() {
   const hasState = !!state;
   const waiting =
     !settingsOpen &&
+    !creditsOpen &&
     reaper !== undefined &&
     !holdBlank &&
     !state &&
@@ -382,6 +433,7 @@ export default function App() {
         refreshStatus();
         setSettingsOpen(true);
       }),
+      listen("menu:credits", () => setCreditsOpen(true)),
       listen("menu:settings-changed", () => {
         loadReaperPath().then(refreshStatus);
       }),
@@ -445,7 +497,13 @@ export default function App() {
       un.then((f) => f());
     };
   }, []);
-  const needsRestart = installedThisRun && hasState && !restartDismissed;
+  // Also when REAPER still runs an older build of the same protocol (e.g. this
+  // is the restart after an app update, whose install happened at launch).
+  const loadedOld =
+    !!instance?.version && !!appVersion && instance.version !== appVersion;
+  const skew = instance?.state ? protoSkew(instance.proto) : "same";
+  const needsRestart =
+    (installedThisRun || loadedOld) && hasState && !restartDismissed && skew === "same";
 
   // A fresh state frame proves the main thread responded, even before the
   // watchdog clears `busy` on its next tick.
@@ -464,10 +522,17 @@ export default function App() {
   // Run onboarding until the bundled extension is installed. Skip the gate
   // while the check is pending and in plain-browser development.
   let screen: { key: string; node: React.ReactNode };
-  if (settingsOpen) {
+  if (creditsOpen) {
+    screen = { key: "credits", node: <Credits onBack={() => setCreditsOpen(false)} /> };
+  } else if (settingsOpen) {
     screen = {
       key: "settings",
-      node: <Settings onBack={() => setSettingsOpen(false)} />,
+      node: (
+        <Settings
+          onBack={() => setSettingsOpen(false)}
+          onOpenCredits={() => setCreditsOpen(true)}
+        />
+      ),
     };
   } else if (reaper === undefined || (holdBlank && !(reaper && !reaper.installed))) {
     screen = { key: "checking", node: null };
@@ -482,6 +547,8 @@ export default function App() {
     };
   } else if (unsupported) {
     screen = { key: "outdated", node: <Outdated info={unsupported} /> };
+  } else if (skew !== "same") {
+    screen = { key: "mismatch", node: <ExtMismatch skew={skew} /> };
   } else if (mode === "downloading") {
     screen = { key: "downloading", node: <Downloading state={state} port={port} /> };
   } else if (beatActive && mode === "client") {

@@ -35,6 +35,7 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   bad_ticket: "logBadTicket",
   bad_changeset: "logBadChangeset",
   ticket_unreachable: "ticketUnreachable",
+  version_mismatch: "logVersionMismatch",
   manifest_timeout: "logManifestTimeout",
   download_stalled: "logDownloadStalled",
   host_unreachable: "logHostUnreachable",

@@ -98,6 +98,14 @@ if (import.meta.env.DEV && params.get("mock") === "tauri") {
           return 3; // roster + tint on, like a fresh install
         case "firewall_allowed":
           return params.get("fw") === "allowed"; // ?fw=allowed hides the firewall notice
+        case "update_state": {
+          // ?update=downloading|ready|current previews the update indicator.
+          const phase = params.get("update");
+          if (!phase) return undefined;
+          return { phase, version: "0.2.0", progress: 0.43, can_restart: true };
+        }
+        case "get_update_auto":
+          return true;
         default:
           return undefined;
       }

@@ -12,6 +12,13 @@ use tauri::{AppHandle, Manager};
 
 #[cfg(target_os = "windows")]
 mod overlay_panel_win;
+mod updater;
+
+/// The compatibility number this build speaks, mirrored from the core's
+/// `PROTO` (rust/src/lib.rs; app/src/lib/version.test.ts checks the copies
+/// agree). An update is restarted into mid-session only when its manifest
+/// names the same number.
+pub(crate) const PROTO: u32 = 1;
 
 #[cfg(target_os = "macos")]
 const PLUGIN_NAME: &str = "reaper_reamesh.dylib";
@@ -225,14 +232,12 @@ fn set_overlay_settings(app: AppHandle, mask: u8) {
 
 // ---------- auto-install ----------
 //
-// When enabled (the default), the bundled extension is installed into REAPER's
-// UserPlugins automatically: on app launch, after the REAPER folder changes,
-// and the moment the toggle is switched on. Because "up to date" is a byte
-// comparison against the bundled copy, this also silently *updates* the
-// installed extension whenever a newer app build ships a newer dylib. Turning
-// it off restores the old manual install/update-button workflow. Persisted
-// backend-side (like the language/overlay prefs) so the webview Settings screen
-// and the native macOS settings window share one source of truth.
+// The bundled extension is installed into REAPER's UserPlugins automatically:
+// on app launch and after the REAPER folder changes. "Up to date" is a byte
+// comparison against the bundled copy, so an app update also updates the
+// extension: the two release together and must match (see `PROTO`). There is
+// no switch for it any more; the only state is "the user removed it", set by
+// Remove so it stays removed and cleared again by an explicit install.
 fn auto_install_file(app: &AppHandle) -> Option<PathBuf> {
     app.path()
         .app_config_dir()
@@ -262,7 +267,7 @@ fn store_auto_install(app: &AppHandle, enabled: bool) {
 /// installed copy is missing or stale. Best-effort and silent: onboarding and
 /// the manual install button still cover the case where REAPER can't be written
 /// (e.g. a folder that isn't there yet, or permissions).
-fn maybe_auto_install(app: &AppHandle) {
+pub(crate) fn maybe_auto_install(app: &AppHandle) {
     if !load_auto_install(app) {
         return;
     }
@@ -280,31 +285,6 @@ fn maybe_auto_install(app: &AppHandle) {
             let _ = app.emit("extension-installed", ());
         }
     }
-}
-
-/// Persist the auto-install preference, install right away when turning it on,
-/// and tell the webview(s) so the toggle and the install status re-render.
-/// Shared by the webview command and the native settings window callback.
-fn apply_auto_install(app: &AppHandle, enabled: bool) {
-    store_auto_install(app, enabled);
-    if enabled {
-        maybe_auto_install(app);
-    }
-    use tauri::Emitter;
-    let _ = app.emit("auto-install-changed", enabled);
-    // Nudge the main window to re-read status (an enable may have just installed).
-    let _ = app.emit("menu:settings-changed", ());
-}
-
-#[tauri::command]
-fn get_auto_install(app: AppHandle) -> bool {
-    load_auto_install(&app)
-}
-
-#[tauri::command]
-fn set_auto_install(app: AppHandle, enabled: bool) {
-    apply_auto_install(&app, enabled);
-    refresh_native_settings(&app);
 }
 
 fn device_lang() -> Lang {
@@ -442,12 +422,11 @@ fn do_remove(app: &AppHandle, custom_path: &Option<String>) -> Result<ReaperStat
     compute_status(app, custom_path)
 }
 
-/// Remove the extension and disable auto-install so it stays removed on the
-/// next launch. Shared by the webview command and the native settings window.
+/// Remove the extension and stop auto-install from putting it back on the
+/// next launch (until the user installs it again). Shared by the webview
+/// command and the native settings window.
 fn apply_remove(app: &AppHandle) -> Result<ReaperStatus, String> {
     store_auto_install(app, false);
-    use tauri::Emitter;
-    let _ = app.emit("auto-install-changed", false);
     do_remove(app, &load_custom_path(app))
 }
 
@@ -505,6 +484,8 @@ fn reaper_status(app: AppHandle) -> Result<ReaperStatus, String> {
 #[tauri::command]
 fn install_extension(app: AppHandle) -> Result<ReaperStatus, String> {
     let st = do_install(&app, &load_custom_path(&app))?;
+    // An explicit install undoes an earlier Remove: keep it current again.
+    store_auto_install(&app, true);
     // A running REAPER keeps the copy it loaded at startup: the webview shows
     // its "restart REAPER" banner for a manual install too.
     use tauri::Emitter;
@@ -846,8 +827,8 @@ fn get_reaper_path(app: AppHandle) -> Option<String> {
 #[tauri::command]
 fn set_reaper_path(app: AppHandle, path: Option<String>) -> Result<(), String> {
     store_custom_path(&app, path)?;
-    // A freshly located REAPER folder should pick up the extension on its own
-    // when auto-install is on (no-op in manual mode).
+    // A freshly located REAPER folder picks up the extension on its own
+    // (unless the user removed it).
     maybe_auto_install(&app);
     refresh_native_settings(&app);
     Ok(())
@@ -870,7 +851,7 @@ fn copy_diagnostics_text(app: AppHandle, text: String) {
 
 /// Re-read state into the native macOS settings window if it is open, after a
 /// change made from the webview (or anywhere but the window itself).
-fn refresh_native_settings(app: &AppHandle) {
+pub(crate) fn refresh_native_settings(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     {
         let _ = app.run_on_main_thread(native_settings::refresh);
@@ -1084,11 +1065,21 @@ fn clear_join_badge(app: AppHandle) {
 /// in a session on: pushed by the webview whenever the session mode changes.
 /// Read by the quit handler to leave the session (and confirm, if hosting)
 /// before the app exits.
-static SESSION: std::sync::Mutex<(bool, Option<u16>)> = std::sync::Mutex::new((false, None));
+pub(crate) static SESSION: std::sync::Mutex<(bool, Option<u16>)> = std::sync::Mutex::new((false, None));
 
 #[tauri::command]
-fn set_session_state(hosting: bool, port: Option<u16>) {
+fn set_session_state(app: AppHandle, hosting: bool, port: Option<u16>) {
     *SESSION.lock().unwrap() = (hosting, port);
+    // A pending update's restart may have become possible (or not).
+    updater::session_changed(&app);
+}
+
+/// The webview painted its first frame: show the (initially hidden) window.
+#[tauri::command]
+fn show_main_window(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+    }
 }
 
 /// Tell the extension to leave/stop the session over its control server. A
@@ -1116,7 +1107,7 @@ fn send_leave(port: u16) {
 }
 
 /// Allow the second exit pass after sending leave without another confirmation.
-static QUIT_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static QUIT_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A quit confirmation is already on screen. Without this a second Cmd+Q
 /// stacks a second native dialog, since the first one prevented the exit.
 static QUIT_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1298,6 +1289,18 @@ pub fn run() {
     }));
     builder
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // Main window only (the HUD keeps its own position logic), and never
+        // its visibility: the webview decides when to show it.
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_denylist(&["overlay"])
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all()
+                        - tauri_plugin_window_state::StateFlags::VISIBLE,
+                )
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -1314,9 +1317,13 @@ pub fn run() {
             set_language,
             get_overlay_settings,
             set_overlay_settings,
-            get_auto_install,
-            set_auto_install,
             set_session_state,
+            updater::update_state,
+            updater::update_check,
+            updater::update_restart,
+            updater::get_update_auto,
+            updater::set_update_auto,
+            show_main_window,
             notify_join,
             clear_join_badge,
             installed_plugins,
@@ -1341,9 +1348,23 @@ pub fn run() {
                     eprintln!("[reamesh] deep link registration: {e}");
                 }
             }
-            // Keep the bundled extension installed/updated automatically unless
-            // the user opted into the manual workflow.
+            // Keep the bundled extension installed and matching this build
+            // (unless the user removed it).
             maybe_auto_install(app.handle());
+            updater::start(app.handle());
+            // The main window starts hidden and the webview shows it once its
+            // first frame is painted (no blank flash, and a restart after an
+            // update comes back in one piece). Show it anyway if that never
+            // arrives, so a broken frontend can't leave an invisible app.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(4));
+                if let Some(win) = handle.get_webview_window("main") {
+                    if !win.is_visible().unwrap_or(true) {
+                        let _ = win.show();
+                    }
+                }
+            });
             Ok(())
         })
         .on_menu_event(|app, event| {
@@ -1416,9 +1437,9 @@ pub fn run() {
 #[cfg(target_os = "macos")]
 mod native_settings {
     use super::{
-        apply_auto_install, apply_language, apply_overlay, apply_remove, compute_status, do_install,
-        do_reset_identity, load_auto_install, load_custom_path, load_lang_pref, load_overlay,
-        maybe_auto_install, store_custom_path, ReaperStatus,
+        apply_language, apply_overlay, apply_remove, compute_status, do_install, do_reset_identity,
+        load_custom_path, load_lang_pref, load_overlay, maybe_auto_install, store_auto_install,
+        store_custom_path, updater, ReaperStatus,
     };
     use std::cell::RefCell;
     use std::ffi::{c_char, c_void, CStr, CString};
@@ -1435,6 +1456,16 @@ mod native_settings {
         has_custom_path: i32,
     }
 
+    /// Mirrors `UpdateStatusC` in settings_window.h. `version` is owned by Rust
+    /// and only valid for the duration of the get_update call.
+    #[repr(C)]
+    struct UpdateStatusC {
+        phase: i32,
+        progress: f64,
+        version: *const c_char,
+        can_restart: i32,
+    }
+
     #[repr(C)]
     struct SettingsCallbacks {
         ctx: *mut c_void,
@@ -1446,8 +1477,12 @@ mod native_settings {
         set_language: extern "C" fn(*mut c_void, i32),
         get_overlay: extern "C" fn(*mut c_void) -> i32,
         set_overlay: extern "C" fn(*mut c_void, i32),
-        get_auto_install: extern "C" fn(*mut c_void) -> i32,
-        set_auto_install: extern "C" fn(*mut c_void, i32),
+        get_update: extern "C" fn(*mut c_void) -> UpdateStatusC,
+        check_update: extern "C" fn(*mut c_void),
+        restart_update: extern "C" fn(*mut c_void),
+        get_update_auto: extern "C" fn(*mut c_void) -> i32,
+        set_update_auto: extern "C" fn(*mut c_void, i32),
+        show_credits: extern "C" fn(*mut c_void),
         reset_identity: extern "C" fn(*mut c_void) -> i32,
         copy_diagnostics: extern "C" fn(*mut c_void),
         get_version: extern "C" fn(*mut c_void) -> *const c_char,
@@ -1463,6 +1498,8 @@ mod native_settings {
         // Keeps the resource-path C string alive for the duration of the
         // get_status call (the window copies it into an NSString immediately).
         static PATH_BUF: RefCell<Option<CString>> = const { RefCell::new(None) };
+        // Same for the offered update's version string.
+        static UPDATE_VERSION_BUF: RefCell<Option<CString>> = const { RefCell::new(None) };
     }
 
     fn handle<'a>(ctx: *mut c_void) -> &'a AppHandle {
@@ -1497,6 +1534,8 @@ mod native_settings {
         let app = handle(ctx);
         let ok = do_install(app, &load_custom_path(app)).is_ok();
         if ok {
+            // An explicit install undoes an earlier Remove.
+            store_auto_install(app, true);
             // A running REAPER keeps the copy it loaded: the webview shows its
             // "restart REAPER" banner.
             let _ = app.emit("extension-installed", ());
@@ -1552,13 +1591,60 @@ mod native_settings {
         apply_overlay(handle(ctx), mask as u8);
     }
 
-    // Auto-install toggle (1 = keep the extension installed/updated automatically).
-    extern "C" fn get_auto_install(ctx: *mut c_void) -> i32 {
-        load_auto_install(handle(ctx)) as i32
+    // Updates (kReaMeshUpdate* phases in settings_window.h).
+    extern "C" fn get_update(_ctx: *mut c_void) -> UpdateStatusC {
+        let st = updater::snapshot();
+        let phase = match st.phase {
+            updater::Phase::Idle => 0,
+            updater::Phase::Checking => 1,
+            updater::Phase::Current => 2,
+            updater::Phase::Downloading => 3,
+            updater::Phase::Ready => 4,
+            updater::Phase::Failed => 5,
+        };
+        let cstr = CString::new(st.version).unwrap_or_default();
+        let ptr = cstr.as_ptr();
+        UPDATE_VERSION_BUF.with(|b| *b.borrow_mut() = Some(cstr));
+        UpdateStatusC {
+            phase,
+            progress: st.progress,
+            version: ptr,
+            can_restart: st.can_restart as i32,
+        }
     }
 
-    extern "C" fn set_auto_install(ctx: *mut c_void, enabled: i32) {
-        apply_auto_install(handle(ctx), enabled != 0);
+    extern "C" fn check_update(ctx: *mut c_void) {
+        updater::spawn_check(handle(ctx));
+    }
+
+    extern "C" fn restart_update(ctx: *mut c_void) {
+        // Off the main thread: the restart waits for the webview to fade out,
+        // which needs the event loop this callback runs on.
+        let app = handle(ctx).clone();
+        std::thread::spawn(move || {
+            let _ = updater::restart(&app);
+        });
+    }
+
+    extern "C" fn get_update_auto(ctx: *mut c_void) -> i32 {
+        updater::load_auto(handle(ctx)) as i32
+    }
+
+    extern "C" fn set_update_auto(ctx: *mut c_void, enabled: i32) {
+        updater::store_auto(handle(ctx), enabled != 0);
+    }
+
+    // The acknowledgements are a screen of the main window (the list is long
+    // and lives in the webview bundle): bring it forward and switch to it.
+    extern "C" fn show_credits(ctx: *mut c_void) {
+        use tauri::Manager;
+        let app = handle(ctx);
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.unminimize();
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        let _ = app.emit("menu:credits", ());
     }
 
     extern "C" fn reset_identity(ctx: *mut c_void) -> i32 {
@@ -1601,8 +1687,12 @@ mod native_settings {
             set_language,
             get_overlay,
             set_overlay,
-            get_auto_install,
-            set_auto_install,
+            get_update,
+            check_update,
+            restart_update,
+            get_update_auto,
+            set_update_auto,
+            show_credits,
             reset_identity,
             copy_diagnostics,
             get_version,

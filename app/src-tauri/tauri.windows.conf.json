@@ -11,7 +11,8 @@
         "resizable": true,
         "decorations": false,
         "shadow": true,
-        "backgroundColor": "#101013"
+        "backgroundColor": "#101013",
+        "visible": false
       }
     ]
   },

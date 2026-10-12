@@ -1020,6 +1020,10 @@ fn passphrase_gates_download() {
         .find(|s| s["session_id"] == sid)
         .expect("our session in the listing");
     assert_eq!(ours["auth"], true);
+    // The host's build rides the announce, so the lobby can grey out a
+    // session from another PROTO before anyone tries to join it.
+    assert_eq!(ours["proto"].as_u64(), Some(reamesh::PROTO as u64));
+    assert_eq!(ours["version"], reamesh::VERSION);
 
     assert!(wrong.join_session(&sid, "wrong"));
     let failed = wait_until(Duration::from_secs(15), || {

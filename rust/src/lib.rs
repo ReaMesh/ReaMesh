@@ -64,6 +64,18 @@ const PROJECT_ROOT: &str = "project";
 /// `{ "<section>": { "<id>": { fields... } } }` with any subset of sections.
 const SECTIONS: [&str; 3] = [TRACKS_ROOT, ITEMS_ROOT, PROJECT_ROOT];
 const LOBBY_TOPIC: &str = "reamesh/v2/lobby";
+/// Compatibility number shared by everything a ReaMesh build talks to: the
+/// session wire format (gossip, transfer, changeset JSON) and the control
+/// server the companion app drives. Bump it on *any* change one side could
+/// misread. Peers only join sessions announcing the same number, and the app
+/// only drives an extension reporting it, so mismatched builds are refused
+/// instead of tested. Mirrored in the app (`app/src/lib/version.ts`,
+/// `app/src-tauri/src/lib.rs`); app/src/lib/version.test.ts checks the copies
+/// agree.
+pub const PROTO: u32 = 1;
+/// This build's version, the same number across the core, the extension and
+/// the companion app (they release together).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const XFER_PROTOCOL: &str = "/reamesh/xfer/1";
 /// Max payload per file chunk over the transfer protocol. Each chunk is one
 /// request-response round trip on its own substream, so bigger chunks mean
@@ -320,6 +332,10 @@ struct SessionInfo {
     /// a session id is public, so an impostor can otherwise re-point a card at
     /// itself simply by announcing faster than the real host.
     contested: bool,
+    /// The host build's `PROTO` and version, from its announce (0 / "" from a
+    /// build that predates them). A different `proto` can't be joined.
+    proto: u32,
+    version: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1970,6 +1986,8 @@ impl Reamesh {
                     "files": s.files,
                     "bytes": s.bytes,
                     "contested": s.contested,
+                    "proto": s.proto,
+                    "version": s.version,
                 })
             })
             .collect();
@@ -2192,7 +2210,8 @@ impl Reamesh {
         let probe = match &*self.shared.probe_result.lock().unwrap() {
             // `reason` says why a probe came back false: "rejected" (wrong
             // passphrase: the only one the app may call that), "timeout",
-            // "unreachable" or "gone" (the session vanished from the lobby).
+            // "unreachable" or "gone" (the session vanished from the lobby),
+            // or "version" (the host runs a build with another PROTO).
             Some((sid, ok, preview, reason)) => {
                 json!({ "session_id": sid, "ok": ok, "preview": preview, "reason": reason })
             }
@@ -3721,6 +3740,19 @@ fn start_join(
         });
         return None;
     };
+    if info.proto != PROTO {
+        // The app greys such a session out; this covers a ticket join (whose
+        // link carries no version) and anything that got past the lobby.
+        set_status(shared, |s| {
+            s.state = "failed".into();
+            s.message = Some(format!(
+                "version mismatch: host {} (proto {}), here {VERSION} (proto {PROTO})",
+                if info.version.is_empty() { "?" } else { &info.version },
+                info.proto
+            ));
+        });
+        return None;
+    }
     let Ok(owner) = info.owner.parse::<PeerId>() else {
         set_status(shared, |s| {
             s.state = "failed".into();
@@ -3834,6 +3866,8 @@ async fn run_network(
             "owner": swarm.local_peer_id().to_string(),
             "auth": h.auth,
             "salt": h.salt,
+            "proto": PROTO,
+            "ver": VERSION,
         })
     });
 
@@ -3920,8 +3954,12 @@ async fn run_network(
                 }
                 Some(Command::ProbeAuth { session_id, passphrase }) => {
                     let info = shared.sessions.lock().unwrap().get(&session_id).cloned();
-                    match info.and_then(|i| i.owner.parse::<PeerId>().ok().map(|o| (o, i.salt))) {
-                        Some((owner, salt)) => {
+                    match info.and_then(|i| i.owner.parse::<PeerId>().ok().map(|o| (o, i.salt, i.proto))) {
+                        Some((_, _, proto)) if proto != PROTO => {
+                            *shared.probe_result.lock().unwrap() =
+                                Some((session_id, Some(false), JsonValue::Null, "version"));
+                        }
+                        Some((owner, salt, _)) => {
                             probe = Some(send_probe(&mut swarm, &owner, &salt, session_id, &passphrase));
                         }
                         None => {
@@ -4113,10 +4151,13 @@ async fn run_network(
                         .unwrap()
                         .get(&pj.info.session_id)
                         .filter(|i| i.owner == pj.info.peer.to_string())
-                        .map(|i| i.salt.clone());
-                    if let Some(salt) = pinned_salt {
+                        .map(|i| (i.salt.clone(), i.proto));
+                    if let Some((salt, proto)) = pinned_salt {
                         let pj = pending_join.take().unwrap();
-                        if pj.probe_only {
+                        if pj.probe_only && proto != PROTO {
+                            *shared.probe_result.lock().unwrap() =
+                                Some((pj.info.session_id, Some(false), JsonValue::Null, "version"));
+                        } else if pj.probe_only {
                             probe = Some(send_probe(
                                 &mut swarm,
                                 &pj.info.peer,
@@ -4507,6 +4548,8 @@ async fn run_network(
                                 bytes: v.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0),
                                 last_seen: Instant::now(),
                                 contested: false,
+                                proto: v.get("proto").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+                                version: get("ver"),
                             };
                             if signer_is_owner && valid_session_id(&info.session_id) {
                                 let mut sessions = shared.sessions.lock().unwrap();

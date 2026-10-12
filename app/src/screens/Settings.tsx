@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, Check, Copy, ExternalLink } from "lucide-react";
+import { ArrowLeft, Check, ChevronRight, Copy, ExternalLink } from "lucide-react";
 import { motion } from "motion/react";
-import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -20,7 +19,15 @@ import {
   setReaperPath,
   useReaperStatus,
 } from "@/lib/install";
-import { setAutoInstall, useAutoInstall } from "@/lib/autoInstall";
+import { useActiveInstance } from "@/lib/connection";
+import {
+  checkForUpdate,
+  restartToUpdate,
+  setUpdateAuto,
+  useAppVersion,
+  useUpdate,
+  useUpdateAuto,
+} from "@/lib/updater";
 import {
   type OverlaySettings,
   setOverlaySetting,
@@ -97,19 +104,22 @@ function Switch({
 // Full-screen app settings, reached from the Windows title-bar gear or Ctrl+,
 // (macOS has the native AppKit settings window instead, from Cmd+,). Grouped rows with one
 // control each; your name and colour on top (the Lobby edits them too).
-export function Settings({ onBack }: { onBack: () => void }) {
+export function Settings({
+  onBack,
+  onOpenCredits,
+}: {
+  onBack: () => void;
+  onOpenCredits: () => void;
+}) {
   const [busy, setBusy] = useState(false);
   const status = useReaperStatus();
   const hasCustom = !!getReaperPath();
   const overlay = useOverlaySettings();
-  const autoInstall = useAutoInstall() ?? true;
+  const update = useUpdate();
+  const updateAuto = useUpdateAuto() ?? true;
+  const version = useAppVersion();
+  const instance = useActiveInstance();
   useLang(); // re-render when the language changes
-
-  const toggleAuto = async (next: boolean) => {
-    await setAutoInstall(next);
-    // Enabling may have just installed/updated; reflect the new status.
-    await refreshStatus();
-  };
 
   const pickFolder = async () => {
     const dir = await open({
@@ -163,13 +173,48 @@ export function Settings({ onBack }: { onBack: () => void }) {
     }
   };
 
+  // The extension releases with the app. Once installed it only needs a word
+  // when the REAPER that answers still runs an older copy (it loads plugins at
+  // startup only), or when the file on disk somehow differs from ours.
+  const loadedOld =
+    !!instance?.version && !!version && instance.version !== version && !!status?.installed;
   const extStatus = !status
     ? ""
     : !status.installed
       ? t("notInstalled")
-      : status.upToDate
-        ? t("installed")
-        : t("updateAvailable");
+      : !status.upToDate
+        ? t("updateAvailable")
+        : loadedOld
+          ? t("extRestartToLoad", { version })
+          : version
+            ? t("versionLabel", { version })
+            : t("installed");
+  const extWarn = !!status?.installed && (!status.upToDate || loadedOld);
+
+  const updateSub =
+    update.phase === "checking"
+      ? t("updateChecking")
+      : update.phase === "downloading"
+        ? t("updateDownloading", { version: update.version })
+        : update.phase === "ready"
+          ? update.can_restart
+            ? t("updateReady", { version: update.version })
+            : t("updateReadyAfterSession", { version: update.version })
+          : update.phase === "failed"
+            ? t("updateCheckFailed")
+            : update.phase === "current"
+              ? t("upToDate")
+              : "";
+  const [restarting, setRestarting] = useState(false);
+  const restartNow = async () => {
+    setRestarting(true);
+    try {
+      await restartToUpdate();
+    } catch (e) {
+      setRestarting(false);
+      toast.error(String(e));
+    }
+  };
 
   const langOptions: { value: LangPref; label: string }[] = [
     { value: "system", label: t("languageSystem") },
@@ -177,10 +222,6 @@ export function Settings({ onBack }: { onBack: () => void }) {
     { value: "de", label: "Deutsch" },
   ];
 
-  const [version, setVersion] = useState("");
-  useEffect(() => {
-    getVersion().then(setVersion).catch(() => {});
-  }, []);
   // Repeated clicks only extend the checkmark's stay, so spamming the row can't
   // make it flicker; a click while a copy is still being built is ignored.
   const [copied, setCopied] = useState(false);
@@ -254,6 +295,48 @@ export function Settings({ onBack }: { onBack: () => void }) {
         </section>
 
         <section className="space-y-2">
+          <SectionLabel>{t("updates")}</SectionLabel>
+          <Group>
+            <Row
+              label={version ? `ReaMesh ${version}` : "ReaMesh"}
+              sub={
+                updateSub && (
+                  <span className={cn(update.phase === "failed" && "text-amber-500")}>
+                    {updateSub}
+                  </span>
+                )
+              }
+            >
+              {update.phase === "ready" ? (
+                update.can_restart && (
+                  <Button size="sm" className={ghost} disabled={restarting} onClick={restartNow}>
+                    {t("restartNow")}
+                  </Button>
+                )
+              ) : (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  className={ghost}
+                  disabled={update.phase === "checking" || update.phase === "downloading"}
+                  onClick={checkForUpdate}
+                >
+                  {t("checkUpdates")}
+                </Button>
+              )}
+            </Row>
+            <Divider inset={false} />
+            <Row label={t("autoCheckUpdates")}>
+              <Switch
+                checked={updateAuto}
+                onChange={setUpdateAuto}
+                label={t("autoCheckUpdates")}
+              />
+            </Row>
+          </Group>
+        </section>
+
+        <section className="space-y-2">
           <SectionLabel>REAPER</SectionLabel>
           <Group>
             <div className="space-y-2 p-3">
@@ -297,10 +380,8 @@ export function Settings({ onBack }: { onBack: () => void }) {
             <Row
               label={t("reaperExtension")}
               sub={
-                // Neutral when all is well; only an available update is worth a colour.
-                <span className={cn(status?.installed && !status.upToDate && "text-amber-500")}>
-                  {extStatus}
-                </span>
+                // Neutral when all is well; only something to do is worth a colour.
+                <span className={cn(extWarn && "text-amber-500")}>{extStatus}</span>
               }
             >
               <Button
@@ -315,7 +396,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
                   : !status?.installed
                     ? t("installShort")
                     : status.upToDate
-                      ? t("reinstallShort")
+                      ? t("repairShort")
                       : t("updateShort")}
               </Button>
               {/* Offer explicit removal because uninstalling the app leaves the
@@ -331,10 +412,6 @@ export function Settings({ onBack }: { onBack: () => void }) {
                   {t("removeShort")}
                 </Button>
               )}
-            </Row>
-            <Divider inset={false} />
-            <Row label={t("autoInstallExt")}>
-              <Switch checked={autoInstall} onChange={toggleAuto} label={t("autoInstallExt")} />
             </Row>
           </Group>
         </section>
@@ -429,12 +506,19 @@ export function Settings({ onBack }: { onBack: () => void }) {
                 </span>
               </Row>
             </button>
+            <Divider inset={false} />
+            <button
+              type="button"
+              onClick={onOpenCredits}
+              className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
+            >
+              <Row label={t("credits")}>
+                <ChevronRight className="size-3.5 text-muted-foreground" aria-hidden="true" />
+              </Row>
+            </button>
           </Group>
         </section>
 
-        {version && (
-          <p className="text-center text-[11.5px] text-muted-foreground">ReaMesh {version}</p>
-        )}
       </div>
     </div>
   );

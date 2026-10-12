@@ -259,9 +259,17 @@ async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<CtlShared>) 
             };
             let (mut ws_tx, mut ws_rx) = ws.split();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            // Greet, then replay the last known state so the app paints now.
+            // Greet (with this build's version + PROTO, which the app checks
+            // against its own before driving anything), then replay the last
+            // known state so the app paints now.
             let _ = tx.send(
-                json!({"type": "hello", "pid": std::process::id()}).to_string(),
+                json!({
+                    "type": "hello",
+                    "pid": std::process::id(),
+                    "version": crate::VERSION,
+                    "proto": crate::PROTO,
+                })
+                .to_string(),
             );
             {
                 let last = shared.last_state.lock().unwrap().clone();

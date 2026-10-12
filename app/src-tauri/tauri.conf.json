@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "bun scripts/check-extension.ts --warn && bun run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bun scripts/check-extension.ts && bun run build",
+    "beforeBuildCommand": "bun scripts/check-extension.ts && bun scripts/gen-credits.ts && bun run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -20,7 +20,8 @@
         "resizable": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "backgroundColor": "#101013"
+        "backgroundColor": "#101013",
+        "visible": false
       }
     ],
     "macOSPrivateApi": true,
@@ -29,6 +30,15 @@
     }
   },
   "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://github.com/ReaMesh/releases/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "quiet"
+      }
+    },
     "deep-link": {
       "desktop": {
         "schemes": ["reamesh"]

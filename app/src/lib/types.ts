@@ -66,6 +66,10 @@ export interface SessionAd {
    *  the entry, but someone on the network is impersonating the session, so the
    *  lobby warns before a join. */
   contested?: boolean;
+  /** The host build's compatibility number and version (absent from a build
+   *  that predates them). A different `proto` can't be joined. */
+  proto?: number;
+  version?: string;
 }
 
 /** One entry of the host's ban table. `expires_at` is unix ms (absolute, so
@@ -174,6 +178,10 @@ export interface ExtState {
 export interface Instance {
   port: number;
   pid?: number;
+  /** The extension build's version and compatibility number, from its hello
+   *  (absent from a build that predates them). */
+  version?: string;
+  proto?: number;
   state?: ExtState;
   /** True while REAPER's main thread isn't ticking (modal dialog open there). */
   busy?: boolean;
