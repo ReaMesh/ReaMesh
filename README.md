@@ -1,4 +1,4 @@
-# ReaMesh
+<h1><picture><source media="(prefers-color-scheme: dark)" srcset="docs/logo/lockup-dark.png"><img alt="ReaMesh" src="docs/logo/lockup-light.png" height="48"></picture></h1>
 
 <a href="LICENSE"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/License-GPL--3.0--only-3f3f46.svg?variant=outline&amp;logo=ri%3AGoLaw&amp;mode=dark&amp;valueColor=f0f6fc&amp;labelTextColor=f0f6fc&amp;logoColor=f0f6fc&amp;labelOpacity=1"><img alt="License: GPL-3.0-only" src="https://shieldcn.dev/badge/License-GPL--3.0--only-d4d4d8.svg?variant=outline&amp;logo=ri%3AGoLaw&amp;mode=light&amp;valueColor=1f2328&amp;labelTextColor=1f2328&amp;logoColor=1f2328&amp;labelOpacity=1"></picture></a>
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/badges/platforms-dark.svg"><img alt="Platforms: Windows and macOS" src="docs/badges/platforms-light.svg"></picture>
