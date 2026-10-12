@@ -118,7 +118,9 @@ const en = {
   downloadReady: "Ready",
   etaAboutSeconds: "About {s}s to go",
   etaAboutMinutes: "About {m} min to go",
-  reaperBusyBanner: "REAPER isn't responding. A dialog may be waiting there.",
+  reaperBusyTitle: "REAPER isn't responding",
+  reaperBusyHint: "A dialog is probably open there.",
+  reaperBusyShow: "Show REAPER",
 
   // Onboarding
   welcome: "Set up ReaMesh",
@@ -483,7 +485,9 @@ const de: Record<MsgKey, string> = {
   downloadReady: "Bereit",
   etaAboutSeconds: "Noch etwa {s} s",
   etaAboutMinutes: "Noch etwa {m} Min.",
-  reaperBusyBanner: "REAPER reagiert nicht. Vielleicht wartet dort ein Dialog.",
+  reaperBusyTitle: "REAPER reagiert nicht",
+  reaperBusyHint: "Vermutlich ist dort ein Dialog offen.",
+  reaperBusyShow: "Zu REAPER",
 
   welcome: "ReaMesh einrichten",
   tagline: "Gemeinsam in Echtzeit an REAPER-Projekten arbeiten",

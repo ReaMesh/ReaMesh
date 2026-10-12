@@ -23,10 +23,11 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOSIZE,
-    SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    EnumWindows, GetForegroundWindow, GetLastActivePopup, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, SET_WINDOW_POS_FLAGS,
+    SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE, SW_RESTORE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW,
 };
 
 /// How often the follow loop looks at REAPER's window. 60 Hz is wasted on a
@@ -210,6 +211,61 @@ pub fn any_reaper_is_foreground() -> bool {
         return false;
     }
     process_name(fg).is_some_and(|p| p.ends_with("\\reaper.exe") || p.ends_with("/reaper.exe"))
+}
+
+struct MainSearch {
+    pid: u32,
+    best: HWND,
+    best_area: i64,
+}
+
+unsafe extern "system" fn main_window_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+    let search = &mut *(lparam.0 as *mut MainSearch);
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return TRUE;
+    }
+    let mine = if search.pid != 0 {
+        pid_of(hwnd) == search.pid
+    } else {
+        process_name(hwnd).is_some_and(|p| p.ends_with("\\reaper.exe") || p.ends_with("/reaper.exe"))
+    };
+    if !mine {
+        return TRUE;
+    }
+    // A minimised window reports a token rect, so count it as tiny but still
+    // eligible: a minimised REAPER must be restorable too.
+    let area = rect_of(hwnd).map_or(1, |r| ((r.right - r.left) as i64 * (r.bottom - r.top) as i64).max(1));
+    if area > search.best_area {
+        search.best_area = area;
+        search.best = hwnd;
+    }
+    TRUE
+}
+
+/// Bring a REAPER instance to the front (pid 0 = any REAPER), for the
+/// "REAPER isn't responding" banner. Activates the modal dialog it is waiting
+/// on when there is one, so the user lands right on it. The app is in the
+/// foreground when the user clicks, which is what lets SetForegroundWindow
+/// hand focus over.
+pub fn activate_reaper(pid: u32) -> bool {
+    let mut search = MainSearch {
+        pid,
+        best: HWND::default(),
+        best_area: 0,
+    };
+    let _ = unsafe { EnumWindows(Some(main_window_proc), LPARAM(&mut search as *mut MainSearch as isize)) };
+    if search.best.is_invalid() || search.best_area == 0 {
+        return false;
+    }
+    let main = search.best;
+    unsafe {
+        if IsIconic(main).as_bool() {
+            let _ = ShowWindow(main, SW_RESTORE);
+        }
+        let target = GetLastActivePopup(main);
+        let target = if target.is_invalid() { main } else { target };
+        SetForegroundWindow(target).as_bool()
+    }
 }
 
 /// Turn the Tauri window into a non-activating tool window and start following

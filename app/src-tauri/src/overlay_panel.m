@@ -508,3 +508,19 @@ int reamesh_frontmost_is_reaper(void) {
     NSRunningApplication *front = [[NSWorkspace sharedWorkspace] frontmostApplication];
     return [front.bundleIdentifier isEqualToString:kReaperBundleId] ? 1 : 0;
 }
+
+// Bring a REAPER instance to the front (pid 0 = the first one running), for the
+// "REAPER isn't responding" banner: the dialog it is waiting on comes with it.
+// Returns 0 when no such REAPER runs.
+int reamesh_activate_reaper(int pid) {
+    NSRunningApplication *app = nil;
+    if (pid > 0) {
+        app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    } else {
+        app = [[NSRunningApplication
+            runningApplicationsWithBundleIdentifier:kReaperBundleId] firstObject];
+    }
+    if (!app) return 0;
+    if (app.hidden) [app unhide];
+    return [app activateWithOptions:NSApplicationActivateAllWindows] ? 1 : 0;
+}

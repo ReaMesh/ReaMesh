@@ -531,6 +531,28 @@ fn launch_reaper(app: AppHandle) -> Result<(), String> {
     }
 }
 
+/// Bring the REAPER instance with this pid to the front (0 = any REAPER), so
+/// the dialog it is stuck on can be answered. False when it isn't running.
+#[tauri::command]
+fn focus_reaper(pid: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn reamesh_activate_reaper(pid: i32) -> i32;
+        }
+        unsafe { reamesh_activate_reaper(pid as i32) != 0 }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        overlay_panel_win::activate_reaper(pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 // ---------- installed-plugin scan ----------
 //
 // The trust dialog marks each plugin a session would load as installed /
@@ -1308,6 +1330,7 @@ pub fn run() {
             install_extension,
             remove_extension,
             launch_reaper,
+            focus_reaper,
             open_overlay,
             close_overlay,
             set_overlay_interactive,

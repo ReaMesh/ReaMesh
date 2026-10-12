@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { TitleBar } from "@/components/TitleBar";
@@ -612,8 +613,26 @@ export default function App() {
             exit={{ height: 0, opacity: 0 }}
             className="overflow-hidden"
           >
-            <div role="status" className="mx-4 mt-2 rounded-xl bg-card px-3 py-2.5">
-              <span className="text-[12px] text-amber-500">{t("reaperBusyBanner")}</span>
+            <div
+              role="status"
+              className="mx-4 mt-2 flex items-center gap-3 rounded-xl bg-card px-3 py-2.5"
+            >
+              <span className="flex min-w-0 flex-1 flex-col">
+                <span className="text-[12.5px] font-medium leading-tight text-foreground">
+                  {t("reaperBusyTitle")}
+                </span>
+                <span className="text-[11.5px] leading-snug text-muted-foreground">
+                  {t("reaperBusyHint")}
+                </span>
+              </span>
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-7 shrink-0 px-2.5 text-[12px]"
+                onClick={() => invoke("focus_reaper", { pid: instance?.pid ?? 0 }).catch(() => {})}
+              >
+                {t("reaperBusyShow")}
+              </Button>
             </div>
           </motion.div>
         )}
