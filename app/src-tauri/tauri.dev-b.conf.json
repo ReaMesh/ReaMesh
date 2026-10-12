@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "identifier": "app.reamesh.companion.b",
+  "identifier": "com.reamesh.ReaMesh.b",
   "build": {
     "devUrl": "http://localhost:1421",
     "beforeDevCommand": "bun scripts/check-extension.ts --warn && bun run dev -- --port 1421"

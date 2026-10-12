@@ -1,5 +1,5 @@
 // Launch two companion-app dev instances side by side (`bun run dev:ab`):
-// A: plain `tauri dev` (Vite 1420, identifier app.reamesh.companion)
+// A: plain `tauri dev` (Vite 1420, identifier com.reamesh.ReaMesh)
 // B: `tauri dev --config src-tauri/tauri.dev-b.conf.json` (Vite 1421,
 //    separate identifier and localStorage/config for a second profile)
 // Both scan all control ports. Run two REAPER instances to test two peers
