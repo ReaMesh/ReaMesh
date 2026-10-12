@@ -191,8 +191,8 @@ static ReaMeshSettingsController *gController = nil;
     CGFloat w = kWindowWidth - 2 * kMargin;
     CGFloat y = kMargin;
 
-    [self.container addSubview:[self headerWithString:L(@"Presence overlay",
-                                                        @"Präsenz-Overlay")
+    [self.container addSubview:[self headerWithString:L(@"Overlay",
+                                                        @"Overlay")
                                                     y:y]];
     y += 26;
 
@@ -213,7 +213,7 @@ static ReaMeshSettingsController *gController = nil;
     // off. The tint is drawn by REAPER, not the HUD, so it stays independent.
     NSArray *rows = @[
         @[ @(kReaMeshOverlayHidden), L(@"Show overlay", @"Overlay anzeigen"), @NO ],
-        @[ @(kReaMeshOverlayRoster), L(@"Participants", @"Teilnehmer"), @YES ],
+        @[ @(kReaMeshOverlayRoster), L(@"Participants", @"Teilnehmende"), @YES ],
         @[ @(kReaMeshOverlayRememberPos), L(@"Remember HUD position", @"HUD-Position merken"),
            @YES ],
         @[ @(kReaMeshOverlayTint), L(@"Tint locked items", @"Gesperrte Items einfärben"), @NO ],
@@ -255,7 +255,7 @@ static ReaMeshSettingsController *gController = nil;
         action = @selector(restartUpdate:);
         enabled = u.can_restart != 0;
     } else {
-        btnTitle = L(@"Check now", @"Jetzt suchen");
+        btnTitle = L(@"Check", @"Suchen");
         enabled = u.phase != kReaMeshUpdateChecking && u.phase != kReaMeshUpdateDownloading;
     }
     NSButton *btn = [NSButton buttonWithTitle:btnTitle target:self action:action];
@@ -276,7 +276,7 @@ static ReaMeshSettingsController *gController = nil;
     NSColor *statusColor = [NSColor secondaryLabelColor];
     switch (u.phase) {
         case kReaMeshUpdateChecking:
-            status = L(@"Checking…", @"Suche…");
+            status = L(@"Checking…", @"Suche nach Updates…");
             break;
         case kReaMeshUpdateCurrent:
             status = L(@"Up to date", @"Auf dem neuesten Stand");
@@ -293,7 +293,7 @@ static ReaMeshSettingsController *gController = nil;
             statusColor = [NSColor labelColor];
             break;
         case kReaMeshUpdateFailed:
-            status = L(@"Couldn't check for updates", @"Suche fehlgeschlagen");
+            status = L(@"Couldn't check for updates", @"Update-Suche fehlgeschlagen");
             statusColor = [NSColor systemOrangeColor];
             break;
         default:
@@ -491,7 +491,7 @@ static ReaMeshSettingsController *gController = nil;
     NSTextField *help = [self
         labelWithString:L(@"REAPER only loads the extension when it starts. Restart REAPER "
                           @"after installing or updating it.",
-                          @"REAPER lädt die Erweiterung nur beim Start. Öffne REAPER nach "
+                          @"REAPER lädt die Erweiterung nur beim Start. Starte REAPER nach "
                           @"einer Installation oder einem Update neu.")
                   frame:NSMakeRect(kMargin, y, w, 40)];
     help.textColor = [NSColor secondaryLabelColor];
@@ -669,7 +669,7 @@ static ReaMeshSettingsController *gController = nil;
         alert.messageText = L(@"Extension installed", @"Erweiterung installiert");
         alert.informativeText =
             L(@"Start or restart REAPER to load the latest ReaMesh extension.",
-              @"Starte REAPER oder öffne es neu, um die aktuelle ReaMesh-Erweiterung zu laden.");
+              @"Starte REAPER (neu), um die aktuelle ReaMesh-Erweiterung zu laden.");
     } else {
         alert.alertStyle = NSAlertStyleWarning;
         alert.messageText = L(@"Installation failed", @"Installation fehlgeschlagen");

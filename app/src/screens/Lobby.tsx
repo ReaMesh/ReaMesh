@@ -926,8 +926,8 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
       {/* Blocks outlive the session they were made in: keep them revocable. */}
       <BanList bans={state.bans ?? []} port={port} />
 
+      {/* No section label: the card's own Host button already says it. */}
       <section className="flex shrink-0 flex-col gap-2">
-        <SectionLabel>{t("hostSection")}</SectionLabel>
         <HostCard
           project={state.project}
           error={state.error}
