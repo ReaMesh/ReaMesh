@@ -11,6 +11,11 @@ One person hosts a project, the others join and get a local copy. Everyone can
 then edit tracks, arrange audio and MIDI, and work on effects. A desktop app
 handles sessions, invitations and setup alongside REAPER.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hero-dark.png">
+  <img alt="REAPER on a MacBook during a shared ReaMesh session: the people overlay over the arrange, an item another person is editing shown in grey, and the ReaMesh app beside it" src="docs/screenshots/hero-light.png">
+</picture>
+
 ## Getting started
 
 You'll need REAPER and the ReaMesh app on each computer. See
@@ -33,6 +38,13 @@ Sessions are discovered automatically on the LAN. For a VPN or a network where
 discovery doesn't work, use an invite code. Both computers still need a direct
 network route to each other; ReaMesh has no relay or NAT traversal. An invite
 code is valid only while that hosting session is running.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/screens-dark.png">
+  <img alt="The ReaMesh app: sessions on the network, the check before joining with host, size and plugins, the project download, and the session with who is editing what" src="docs/screenshots/screens-light.png">
+</picture>
+
+<sub>Backgrounds by Pawel Czerwinski and Andrew Kliatskyi on Unsplash.</sub>
 
 ## What syncs
 
