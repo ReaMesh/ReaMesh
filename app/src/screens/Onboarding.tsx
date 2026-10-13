@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { Check, ExternalLink, LoaderCircle } from "lucide-react";
+import { Check, ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -161,6 +161,9 @@ export function Onboarding({ status }: { status: ReaperStatus }) {
     }
   };
   const install = async () => {
+    // Installing takes a moment at most, so the button shows no busy state;
+    // the flag only swallows a double click.
+    if (busy) return;
     setBusy(true);
     try {
       await installExtension();
@@ -238,13 +241,10 @@ export function Onboarding({ status }: { status: ReaperStatus }) {
                   </Fold>
                   <Button
                     size="sm"
-                    className="h-8 w-full gap-1.5 text-[13px]"
-                    disabled={busy}
-                    aria-busy={busy || undefined}
+                    className="h-8 w-full text-[13px]"
                     onClick={install}
                   >
-                    {busy && <LoaderCircle className="size-3.5 motion-safe:animate-spin" aria-hidden="true" />}
-                    {busy ? t("installing") : t("installExtension")}
+                    {t("installExtension")}
                   </Button>
                 </>
               )}
