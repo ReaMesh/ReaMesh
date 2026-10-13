@@ -498,7 +498,15 @@ function SessionCard({
 // pasted here, or opened from a chat/browser (the OS hands it to the app, see
 // lib/invite). A quiet link under the list that opens into a card in place:
 // the link stays put and becomes the card's head.
-function InviteCard({ probe, port }: { probe?: ExtState["probe"]; port: number | null }) {
+function InviteCard({
+  sessions,
+  probe,
+  port,
+}: {
+  sessions: SessionAd[];
+  probe?: ExtState["probe"];
+  port: number | null;
+}) {
   const [open, setOpen] = useState(false);
   const [raw, setRaw] = useState("");
   const [pass, setPass] = useState("");
@@ -510,6 +518,12 @@ function InviteCard({ probe, port }: { probe?: ExtState["probe"]; port: number |
   const code = normalizeTicket(raw);
   const invalid = code.length > 0 && !ticket;
   const name = ticket?.name || t("sessionFallback");
+  // The code names no host, but the check waits for the pinned host's own
+  // signed announce, and that carries the name it goes by. Matched on the
+  // pinned peer id, so another device announcing the same id can't lend it one.
+  const hostName = ticket
+    ? sessions.find((s) => s.session_id === ticket.sid && s.owner === ticket.peer)?.owner_name
+    : undefined;
 
   const join = (nofx: boolean) => {
     if (!ticket || joining) return;
@@ -733,6 +747,7 @@ function InviteCard({ probe, port }: { probe?: ExtState["probe"]; port: number |
         onOpenChange={setConfirmOpen}
         name={name}
         hostId={ticket?.peer}
+        hostName={hostName}
         preview={ticket && probe?.session_id === ticket.sid ? probe?.preview : undefined}
         onJoin={join}
       />
@@ -920,7 +935,7 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
           )}
         </Group>
         {/* A session you can't see here is still a session. */}
-        <InviteCard probe={state.probe} port={port} />
+        <InviteCard sessions={state.sessions} probe={state.probe} port={port} />
       </section>
 
       {/* Blocks outlive the session they were made in: keep them revocable. */}
