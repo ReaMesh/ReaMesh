@@ -9,7 +9,7 @@ opening a pull request.
   Contributions are accepted under the same licence.
 - The name **ReaMesh** and its logo are not covered by the licence. See the
   trademark note in the [README](README.md#license-and-trademark). All logo,
-  icon and installer artwork lives in [`proprietary/`](proprietary/), which is
+  icon, installer and screenshot artwork lives in [`proprietary/`](proprietary/), which is
   outside the GPL.
 
 ## Before you start
