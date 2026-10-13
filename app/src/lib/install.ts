@@ -1,5 +1,6 @@
-import { useSyncExternalStore } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 // Extension-install plumbing: the Tauri backend checks REAPER's resource
 // folder and copies the bundled reaper_reamesh.dylib into UserPlugins.
@@ -87,4 +88,34 @@ export function useReaperStatus(): ReaperStatus | null | undefined {
     },
     () => status,
   );
+}
+
+/** Whether the REAPER running as `pid` still runs an older copy of the
+ *  extension than the one installed (it was replaced after REAPER started;
+ *  REAPER loads plugins only at startup). A REAPER started after an install
+ *  already runs the new copy, so it is never asked to restart. Rechecked
+ *  whenever the app installs. */
+export function useExtensionStale(pid: number | undefined): boolean {
+  const [stale, setStale] = useState(false);
+  const [installs, setInstalls] = useState(0);
+  useEffect(() => {
+    const un = listen("extension-installed", () => setInstalls((n) => n + 1));
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
+  useEffect(() => {
+    if (pid == null) {
+      setStale(false);
+      return;
+    }
+    let live = true;
+    invoke<boolean>("extension_stale", { pid })
+      .then((v) => live && setStale(v))
+      .catch(() => live && setStale(false));
+    return () => {
+      live = false;
+    };
+  }, [pid, installs]);
+  return stale;
 }

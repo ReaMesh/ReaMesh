@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::SystemTime;
 
 use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Manager};
@@ -407,6 +408,12 @@ fn do_install(app: &AppHandle, custom_path: &Option<String>) -> Result<ReaperSta
     let dest = user_plugins.join(PLUGIN_NAME);
     let tmp = user_plugins.join(format!(".{PLUGIN_NAME}.tmp"));
     fs::copy(&src, &tmp).map_err(|e| format!("copy failed: {e}"))?;
+    // The copy keeps the bundled file's timestamp. Stamp it with the install
+    // time instead: `extension_stale` compares it with REAPER's start to tell
+    // whether a running REAPER already loaded this copy.
+    if let Ok(f) = fs::File::options().write(true).open(&tmp) {
+        let _ = f.set_modified(SystemTime::now());
+    }
     // Try the plain rename first: on macOS it always works, and on Windows it
     // works whenever REAPER isn't holding the old copy, which avoids the
     // displacement dance (and its leftovers) entirely.
@@ -499,6 +506,78 @@ fn displace_loaded_plugin(_user_plugins: &Path, dest: &Path) -> Option<PathBuf> 
 #[tauri::command]
 fn reaper_status(app: AppHandle) -> Result<ReaperStatus, String> {
     compute_status(&app, &load_custom_path(&app))
+}
+
+/// When the process `pid` started; `None` if it can't be read.
+#[cfg(target_os = "macos")]
+fn process_started(pid: u32) -> Option<SystemTime> {
+    use std::ffi::c_void;
+    use std::time::{Duration, UNIX_EPOCH};
+    // `struct proc_bsdinfo` from <sys/proc_info.h>, down to the start time.
+    #[repr(C)]
+    struct ProcBsdInfo {
+        _ids: [u32; 12],
+        _comm: [u8; 16],
+        _name: [u8; 32],
+        _misc: [u32; 6],
+        start_sec: u64,
+        start_usec: u64,
+    }
+    extern "C" {
+        fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buf: *mut c_void, size: i32) -> i32;
+    }
+    const PROC_PIDTBSDINFO: i32 = 3;
+    let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<ProcBsdInfo>() as i32;
+    let n = unsafe {
+        proc_pidinfo(pid as i32, PROC_PIDTBSDINFO, 0, &mut info as *mut _ as *mut c_void, size)
+    };
+    if n != size {
+        return None;
+    }
+    Some(UNIX_EPOCH + Duration::from_micros(info.start_sec * 1_000_000 + info.start_usec))
+}
+
+#[cfg(target_os = "windows")]
+fn process_started(pid: u32) -> Option<SystemTime> {
+    use std::time::{Duration, UNIX_EPOCH};
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut created = FILETIME::default();
+    let (mut exited, mut kernel, mut user) = (created, created, created);
+    let ok = unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) };
+    let _ = unsafe { CloseHandle(handle) };
+    ok.ok()?;
+    // 100ns ticks since 1601-01-01.
+    let ticks = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+    let unix = ticks.checked_sub(116_444_736_000_000_000)?;
+    Some(UNIX_EPOCH + Duration::from_nanos(unix * 100))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn process_started(_pid: u32) -> Option<SystemTime> {
+    None
+}
+
+/// The REAPER running as `pid` loaded its extension before the installed file
+/// was last replaced, so it still runs the previous copy and needs a restart.
+/// REAPER loads plugins only at startup, so "installed after REAPER started"
+/// is exactly that; a REAPER started after the install already has the new one.
+#[tauri::command]
+fn extension_stale(app: AppHandle, pid: u32) -> bool {
+    let Ok(dir) = resource_dir(&load_custom_path(&app)) else {
+        return false;
+    };
+    let installed = fs::metadata(dir.join("UserPlugins").join(PLUGIN_NAME))
+        .and_then(|m| m.modified())
+        .ok();
+    match (installed, process_started(pid)) {
+        (Some(installed), Some(started)) => installed > started,
+        _ => false,
+    }
 }
 
 #[tauri::command]
@@ -1369,6 +1448,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             reaper_status,
             install_extension,
+            extension_stale,
             remove_extension,
             launch_reaper,
             reaper_running,

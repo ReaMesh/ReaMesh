@@ -17,6 +17,7 @@ import {
   refreshStatus,
   removeExtension,
   setReaperPath,
+  useExtensionStale,
   useReaperStatus,
 } from "@/lib/install";
 import { useActiveInstance } from "@/lib/connection";
@@ -193,8 +194,10 @@ export function Settings({
   // The extension releases with the app. Once installed it only needs a word
   // when the REAPER that answers still runs an older copy (it loads plugins at
   // startup only), or when the file on disk somehow differs from ours.
+  const stale = useExtensionStale(instance?.pid);
   const loadedOld =
-    !!instance?.version && !!version && instance.version !== version && !!status?.installed;
+    !!status?.installed &&
+    (stale || (!!instance?.version && !!version && instance.version !== version));
   const extStatus = !status
     ? ""
     : !status.installed

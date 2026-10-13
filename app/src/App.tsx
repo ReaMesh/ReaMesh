@@ -22,7 +22,7 @@ import { offerInvite } from "@/lib/invite";
 import { openOverlay, closeOverlay, setSessionState } from "@/lib/overlay";
 import { useOverlaySettings } from "@/lib/overlaySettings";
 import { buildDiagnostics } from "@/lib/diagnostics";
-import { loadReaperPath, refreshStatus, useReaperStatus } from "@/lib/install";
+import { loadReaperPath, refreshStatus, useExtensionStale, useReaperStatus } from "@/lib/install";
 import { t, useLang } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
 import { localizeLogEntry } from "@/lib/log";
@@ -485,15 +485,13 @@ export default function App() {
     else closeOverlay();
   }, [hud, inSession, port, pid]);
 
-  // Auto-install updates the file, but a running REAPER keeps using the copy it
-  // loaded at startup. Prompt for a restart just like the manual install flow.
-  const [installedThisRun, setInstalledThisRun] = useState(false);
+  // REAPER loads plugins only at startup: after an install it needs a restart
+  // only if it was already running then (the app installs at launch, so a
+  // REAPER started afterwards already has the new copy).
+  const stale = useExtensionStale(instance?.pid);
   const [restartDismissed, setRestartDismissed] = useState(false);
   useEffect(() => {
-    const un = listen("extension-installed", () => {
-      setInstalledThisRun(true);
-      setRestartDismissed(false);
-    });
+    const un = listen("extension-installed", () => setRestartDismissed(false));
     return () => {
       un.then((f) => f());
     };
@@ -504,7 +502,7 @@ export default function App() {
     !!instance?.version && !!appVersion && instance.version !== appVersion;
   const skew = instance?.state ? protoSkew(instance.proto) : "same";
   const needsRestart =
-    (installedThisRun || loadedOld) && hasState && !restartDismissed && skew === "same";
+    (stale || loadedOld) && hasState && !restartDismissed && skew === "same";
 
   // A fresh state frame proves the main thread responded, even before the
   // watchdog clears `busy` on its next tick.
