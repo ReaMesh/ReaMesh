@@ -24,12 +24,23 @@ You'll need REAPER 7.12 or newer and the ReaMesh app on each computer. See
 
 1. Open ReaMesh and follow the setup to install its bundled REAPER extension.
    If your REAPER resource folder isn't found, select it manually.
+
+   <picture>
+     <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/setup-dark.png">
+     <img alt="ReaMesh setup: the REAPER folder it found, a button that installs the REAPER extension, then opening REAPER" src="proprietary/screenshots/setup-light.png" width="360">
+   </picture>
+
 2. Restart (or open) REAPER so it loads the extension. ReaMesh connects
    automatically.
 3. Save a project in its own folder, then host it from the app. You can set a
    passphrase when creating the session.
 4. On the other computer, join from the lobby, open the host's invite link or
    paste it in the lobby. ReaMesh downloads the project and opens it in REAPER.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/screens-dark.png">
+  <img alt="The ReaMesh app: sessions on the network, the check before joining with host, size and plugins, the project download, and the session with who is editing what" src="proprietary/screenshots/screens-light.png">
+</picture>
 
 Everyone needs a compatible ReaMesh version. Sessions hosted with an
 incompatible one are greyed out in the lobby.
@@ -47,13 +58,18 @@ network route to each other; ReaMesh has no relay or NAT traversal. An invite
 code is valid only while that hosting session is running.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/screens-dark.png">
-  <img alt="The ReaMesh app: sessions on the network, the check before joining with host, size and plugins, the project download, and the session with who is editing what" src="proprietary/screenshots/screens-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/invite-dark.png">
+  <img alt="Inviting by link: the host copies the invite code from the session, the guest pastes it in the lobby and confirms the join" src="proprietary/screenshots/invite-light.png">
 </picture>
 
 <sub>Backgrounds by Pawel Czerwinski and Andrew Kliatskyi on Unsplash.</sub>
 
 ## What syncs
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/live-sync-dark.webp">
+  <img alt="Two REAPER windows side by side, Ben's and Lena's: Ben moves a vocal item and it moves on Lena's screen, then Lena moves a pad item and it moves on Ben's" src="proprietary/screenshots/live-sync-light.webp">
+</picture>
 
 | Part of the project | Shared edits |
 | --- | --- |
@@ -79,6 +95,11 @@ Whoever edits a field first holds it until two seconds after their last change.
 Competing edits snap back, including the host's. Whole items, FX chains and sets
 of track envelopes each count as one field, so working on different tracks or
 items avoids conflicts.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/edit-lock-dark.png">
+  <img alt="Lena is editing the Lead Vox item and its volume: on Ben's screen the item is grey, and the overlay tells Ben that Lena is editing Lead Vox right now after his change snapped back" src="proprietary/screenshots/edit-lock-light.png">
+</picture>
 
 Remote edits don't create undo points. Undoing an earlier local action can still
 roll back received changes because REAPER uses snapshots for undo. That rollback

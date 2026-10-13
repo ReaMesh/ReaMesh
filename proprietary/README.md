@@ -14,7 +14,7 @@ everything up from this folder and the code needs no changes.
 | `logo/mark.svg` | The R in the app UI (`app/src/components/RMark.tsx` reads its paths at build time) |
 | `logo/lockup-on-*.svg` | Source artwork for the lockup (R + wordmark) |
 | `logo/lockup-*.png` | The README header |
-| `screenshots/*.png` | README screenshots and the social preview images |
+| `screenshots/*.png`, `screenshots/*.webp` | README screenshots, the README animation and the social preview images |
 | `icons/*.png`, `icons/icon.icns`, `icons/icon.ico` | App bundle and window icons (`bundle.icon` in `app/src-tauri/tauri.conf.json`) |
 | `icons/Assets.car` | The macOS 26+ app icon, compiled from `icons/ReaMesh.icon` |
 | `icons/ReaMesh.icon` | Icon Composer source; `bun run icons:mac` renders the legacy macOS icons from it |
