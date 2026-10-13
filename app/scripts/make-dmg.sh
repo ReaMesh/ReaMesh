@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the styled ReaMesh installer DMG: app-themed background with a
-# drag-to-Applications layout, compressed UDZO image.
+# drag-to-Applications layout, LZFSE-compressed (ULFO) image. The output
+# folders keep only the deliverables: macos/ the .app, dmg/ this version's DMG.
 #
 # Run from app/ (or anywhere): bun run dmg
 # Needs a prior `bun run tauri build` (the .app bundle) and a GUI session
@@ -64,6 +65,9 @@ cleanup() {
 trap cleanup EXIT
 
 cp -R "$APP_BUNDLE" "$STAGE/ReaMesh.app"
+# Show "ReaMesh", not "ReaMesh.app" (Finder's own "extension hidden" does not
+# stick on a bundle through AppleScript).
+SetFile -a E "$STAGE/ReaMesh.app"
 ln -s /Applications "$STAGE/Applications"
 mkdir "$STAGE/.background"
 cp scripts/.build/dmg-background.png "$STAGE/.background/background.png"
@@ -85,17 +89,15 @@ tell application "Finder"
     try
       set pathbar visible of container window to false
     end try
-    set the bounds of container window to {200, 120, 860, 548}
+    -- 660x320 content (the background's size) plus the 28pt title bar
+    set the bounds of container window to {200, 120, 860, 468}
     set theViewOptions to the icon view options of container window
     set arrangement of theViewOptions to not arranged
     set icon size of theViewOptions to 110
     set text size of theViewOptions to 13
     set background picture of theViewOptions to file ".background:background.png"
-    set position of item "ReaMesh.app" of container window to {165, 193}
-    set position of item "Applications" of container window to {495, 193}
-    try
-      set extension hidden of item "ReaMesh.app" to true
-    end try
+    set position of item "ReaMesh.app" of container window to {165, 180}
+    set position of item "Applications" of container window to {495, 180}
     -- park dotfiles outside the visible area for people who show hidden files
     repeat with h in {".background", ".fseventsd", ".DS_Store"}
       try
@@ -132,7 +134,7 @@ for i in 1 2 3 4 5; do
   [ "$i" = 5 ] && hdiutil detach "$DEV" -force >/dev/null 2>&1
 done
 DEV=""
-hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -ov -o "$OUT" >/dev/null
+hdiutil convert "$RW" -format ULFO -ov -o "$OUT" >/dev/null
 
 # 6. Sign the DMG container (the .app inside was already signed by
 #    `tauri build`). Skipped when SIGN_ID is empty.
@@ -142,28 +144,11 @@ if [ -n "$SIGN_ID" ]; then
   echo "signed $OUT with: $SIGN_ID"
 fi
 
-# 7. Launchers next to the image, so the output folder is self-contained even
-#    after a cargo clean (target/ is gitignored). Each just forwards to the
-#    matching script in app/scripts/:
-#      bundle_dmg.sh → make-dmg.sh   package the already-built ReaMesh.app
-#      make_dmg.sh   → build-dmg.sh  build a fresh ReaMesh.app, then package it
-#      sign_dmg.sh   → sign-dmg.sh   Developer-ID-sign the newest DMG
-#    bundle_dmg.sh is Tauri's own create-dmg script when the dmg target is
-#    bundled, so it is only written here when missing.
-write_launcher() { # <file> <target script> <one-line description>
-  cat > "$1" <<LAUNCHER
-#!/usr/bin/env bash
-# $3
-# Forwards to app/scripts/$2 (run with --help where supported).
-set -euo pipefail
-APP_DIR="\$( cd "\$( dirname "\${BASH_SOURCE[0]}" )/../../../../.." && pwd )"
-[ -f "\$APP_DIR/scripts/$2" ] || { echo "error: cannot find scripts/$2 (expected the app dir at \$APP_DIR)" >&2; exit 1; }
-exec bash "\$APP_DIR/scripts/$2" "\$@"
-LAUNCHER
-  chmod +x "$1"
-}
-write_launcher "$OUT_DIR/make_dmg.sh" build-dmg.sh "Builds a fresh ReaMesh.app (bun run tauri build), then packages it into ReaMesh_<version>.dmg in this folder."
-write_launcher "$OUT_DIR/sign_dmg.sh" sign-dmg.sh "Signs the newest ReaMesh_*.dmg in this folder with your Apple Developer ID (--identity, --notarize, --profile, --force)."
-[ -f "$OUT_DIR/bundle_dmg.sh" ] || write_launcher "$OUT_DIR/bundle_dmg.sh" make-dmg.sh "Packages the already-built ReaMesh.app (../macos) into ReaMesh_<version>.dmg in this folder, without rebuilding."
+# 7. Leave only the deliverables behind: this DMG in dmg/ and the .app in
+#    macos/. Tauri's dmg bundler and earlier runs drop scratch images, its
+#    create-dmg scripts, icon copies and Finder .DS_Store files there.
+find "$OUT_DIR" -mindepth 1 -maxdepth 1 ! -name "$(basename "$OUT")" -exec rm -rf {} +
+find "$(dirname "$APP_BUNDLE")" -mindepth 1 -maxdepth 1 ! -name "$(basename "$APP_BUNDLE")" -exec rm -rf {} +
+rm -rf "$(dirname "$OUT_DIR")/share" "$(dirname "$OUT_DIR")/.DS_Store"
 
 echo "built $OUT"
