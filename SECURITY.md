@@ -14,7 +14,7 @@ or email [contact@reamesh.com](mailto:contact@reamesh.com). You will get an ackn
 advisory is published with credit to you, unless you prefer otherwise.
 
 Please include what you can of: the affected component (extension, Rust core,
-companion app, website), REAPER and OS version, steps to reproduce, and what
+ReaMesh app, website), REAPER and OS version, steps to reproduce, and what
 an attacker gains.
 
 ## Scope
@@ -40,7 +40,7 @@ In scope, and especially interesting:
 
 - **Joining a session runs the host's plugins.** A joiner downloads and opens
   the host's `.rpp`, and the host can stream new FX chains mid-session. That
-  is arbitrary code execution and it is the product; the companion app warns
+  is arbitrary code execution and it is the product; the ReaMesh app warns
   before joining. Reports that "the host can load a plugin on my machine" are
   not vulnerabilities. Reports that a *non-host* can do this are.
 - Open (no-passphrase) sessions are plaintext on the LAN. Confidentiality is

@@ -115,7 +115,7 @@ From the repository root:
 ./build.sh
 ```
 
-This builds the Rust core, REAPER extension and companion app. `cbindgen` is
+This builds the Rust core, REAPER extension and ReaMesh app. `cbindgen` is
 optional; without it, the build uses the checked-in FFI header.
 
 | Output | Location |
@@ -158,9 +158,9 @@ Rust session tests use real sockets and must run serially. There are also
   on its main thread.
 - [`rust/`](rust/): networking, file transfers and shared state using libp2p,
   Tokio and yrs. The host coordinates edits and editing locks.
-- [`app/`](app/): desktop companion built with Tauri 2, React and shadcn/ui.
+- [`app/`](app/): the ReaMesh desktop app, built with Tauri 2, React and shadcn/ui.
 
-The extension and Rust core communicate through a C ABI. The companion app
+The extension and Rust core communicate through a C ABI. The ReaMesh app
 talks to the extension over a localhost WebSocket.
 
 ## Contributing

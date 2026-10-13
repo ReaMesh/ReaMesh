@@ -24,10 +24,10 @@ noticing, so read the comments around the code you change, especially in
 
 | Part | Command |
 | --- | --- |
-| Everything (Rust core, extension, companion app) | `./build.sh` (macOS, or Windows from Git Bash) |
+| Everything (Rust core, extension, ReaMesh app) | `./build.sh` (macOS, or Windows from Git Bash) |
 | Rust core only | `cd rust && cargo build --release` |
 | Rust tests | `cd rust && cargo test -- --test-threads=1` |
-| Companion app | `cd app && bun install && bun run build` |
+| ReaMesh app | `cd app && bun install && bun run build` |
 | App unit tests | `cd app && bun run test` |
 | Live app | `cd app && bun run tauri dev` (needs REAPER with the extension) |
 | Two app instances for two-person testing | `cd app && bun run dev:ab` (start two REAPER instances first) |
@@ -64,7 +64,7 @@ Any change to the wire format or the app↔extension control protocol needs a
 ## Reporting bugs
 
 Use GitHub issues. Include your REAPER version, OS, whether you were host or
-guest, and what **Settings → Copy diagnostics** in the companion app puts on
+guest, and what **Settings → Copy diagnostics** in the ReaMesh app puts on
 your clipboard. Network-level logs go to stderr; launching REAPER from a
 terminal shows them.
 
