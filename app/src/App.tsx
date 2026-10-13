@@ -391,7 +391,7 @@ export default function App() {
       setFoundBeat(false);
       return;
     }
-    const id = setTimeout(() => setFoundBeat(false), 850);
+    const id = setTimeout(() => setFoundBeat(false), 1750);
     return () => clearTimeout(id);
   }, [foundBeat, hasState]);
 

@@ -2,14 +2,13 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
+import { AnimatePresence, motion } from "motion/react";
 import { Button } from "@/components/ui/button";
 import { ArcRing } from "@/components/ArcRing";
+import { RMarkFill } from "@/components/RMark";
 import { FirewallNotice } from "@/components/FirewallNotice";
 import { isWindows } from "@/lib/platform";
-// Concrete color values (mirrors of index.css variables) because Motion can
-// only interpolate between real colors: a CSS variable would snap instead of
-// easing grey→blue.
-import { FG_COLOR, FOUND_COLOR } from "@/lib/colors";
+import { FG_COLOR } from "@/lib/colors";
 import { t } from "@/lib/i18n";
 
 async function launchReaper() {
@@ -87,20 +86,65 @@ export function Disconnected({
   );
 }
 
-// Spin while searching for REAPER. On connection, finish the turn,
-// close the ring, and transition to the success color.
+// Spin while searching for REAPER. On connection the ring runs on to the R's
+// foot (FOOT_ANGLE) and its arc draws itself into that point while the ring
+// shrinks towards it and fades; the R inks in from that same foot, so the
+// spinner pours into the mark. A small swell when the ink is full closes it.
+// App holds this screen (`foundBeat`) until all of it has played.
+const MARK_H = 26;
+// Where the foot of the R's left stroke sits in the 44px box with the mark
+// centred at MARK_H: (18.5, 34), i.e. on the ring at 196° from 12 o'clock.
+const FOOT_ORIGIN = "42% 77%";
+const FOOT_ANGLE = 196;
+const INK_DELAY = 0.3;
+const INK_DURATION = 0.9;
+
 function ScanSpinner({ found }: { found: boolean }) {
   return (
-    <div className="relative size-11">
-      <ArcRing
-        size={44}
-        radius={11}
-        strokeWidth={2.5}
-        spinning={!found}
-        progress={1}
-        color={found ? FOUND_COLOR : FG_COLOR}
-        track={false}
-      />
+    <div className="relative grid size-11 place-items-center">
+      <motion.div
+        className="absolute inset-0"
+        style={{ transformOrigin: FOOT_ORIGIN }}
+        initial={false}
+        animate={
+          found
+            ? {
+                scale: 0.5,
+                opacity: [1, 1, 0],
+                filter: "blur(2px)",
+                transition: {
+                  duration: 0.55,
+                  ease: [0.4, 0, 0.6, 1],
+                  opacity: { duration: 0.55, times: [0, 0.45, 1] },
+                },
+              }
+            : { scale: 1, opacity: 1, filter: "blur(0px)", transition: { duration: 0.3 } }
+        }
+      >
+        <ArcRing
+          size={44}
+          radius={11}
+          strokeWidth={2.5}
+          spinning={!found}
+          progress={0}
+          color={FG_COLOR}
+          track={false}
+          restAngle={FOOT_ANGLE}
+        />
+      </motion.div>
+      <AnimatePresence>
+        {found && (
+          <motion.div
+            key="mark"
+            initial={{ scale: 1 }}
+            animate={{ scale: [1, 1.04, 1] }}
+            exit={{ opacity: 0, transition: { duration: 0.2 } }}
+            transition={{ delay: INK_DELAY + INK_DURATION - 0.05, duration: 0.4, ease: "easeInOut" }}
+          >
+            <RMarkFill height={MARK_H} delay={INK_DELAY} duration={INK_DURATION} />
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

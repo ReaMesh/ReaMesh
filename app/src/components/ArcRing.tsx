@@ -17,11 +17,17 @@ const MIN_ARC = 0.03;
 const STILL_ARC = 0.75; // reduced motion: a resting open arc
 const BLEND_MS = 400; // eases whatever the ring showed into the spin
 
+// Critically damped: no overshoot past the rest angle.
+const REST_SPRING = { type: "spring", stiffness: 80, damping: 18 } as const;
+
 const easeInOut = (x: number) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
 
 /** Shared progress ring. While spinning, the arc grows and shrinks as it turns.
  *  On transition to determinate progress, finish the rotation at 12 o'clock
- *  and animate the arc length to the progress value. */
+ *  and animate the arc length to the progress value. With `restAngle` the
+ *  ring stops there instead (degrees clockwise from 12 o'clock), and rotation
+ *  and arc length ride one spring that carries on from the spin's speed, so
+ *  with `progress` 0 the arc draws itself into that point. */
 export function ArcRing({
   size,
   radius,
@@ -30,6 +36,7 @@ export function ArcRing({
   progress = 0,
   color,
   track = true,
+  restAngle,
 }: {
   size: number;
   radius: number;
@@ -38,6 +45,7 @@ export function ArcRing({
   progress?: number;
   color: string;
   track?: boolean;
+  restAngle?: number;
 }) {
   const reduce = useReducedMotion();
   const circ = 2 * Math.PI * radius;
@@ -71,25 +79,32 @@ export function ArcRing({
     dashoffset.set(circ * (1 - (s.fromArc + (arc - s.fromArc) * blend)));
   });
 
+  const resting = restAngle != null;
   useEffect(() => {
     if (moving) return;
-    const settle = animate(rotate, Math.ceil(rotate.get() / 360) * 360, {
-      duration: 0.5,
-      ease: "easeOut",
-    });
+    const r = rotate.get();
+    if (restAngle == null) {
+      const settle = animate(rotate, Math.ceil(r / 360) * 360, { duration: 0.5, ease: "easeOut" });
+      return () => settle.stop();
+    }
+    // The next time the arc's start passes the rest angle, with a little
+    // run-out so a ring already there doesn't stop dead.
+    let to = r + ((((restAngle - r) % 360) + 360) % 360);
+    if (to - r < 30) to += 360;
+    const settle = animate(rotate, to, REST_SPRING);
     return () => settle.stop();
-  }, [moving, rotate]);
+  }, [moving, rotate, restAngle]);
 
   const fill = spinning ? STILL_ARC : Math.min(1, Math.max(0, progress));
   useEffect(() => {
     if (moving) return;
-    const glide = animate(dashoffset, circ * (1 - fill), {
-      type: "spring",
-      stiffness: 80,
-      damping: 20,
-    });
+    const glide = animate(
+      dashoffset,
+      circ * (1 - fill),
+      resting ? REST_SPRING : { type: "spring", stiffness: 80, damping: 20 },
+    );
     return () => glide.stop();
-  }, [moving, fill, dashoffset, circ]);
+  }, [moving, fill, dashoffset, circ, resting]);
 
   return (
     <motion.div

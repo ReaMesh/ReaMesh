@@ -1,4 +1,5 @@
-import type { CSSProperties } from "react";
+import { useEffect, useId, type CSSProperties } from "react";
+import { animate, motion, useMotionValue, useReducedMotion, useTransform, type MotionValue } from "motion/react";
 import { cn } from "@/lib/utils";
 
 // The ReaMesh logo: the calligraphic R, alone or with the wordmark. One
@@ -25,6 +26,164 @@ export function RMark({ height = 12, className }: { height?: number; className?:
       className={className}
     >
       <Paths ds={MARK} />
+    </svg>
+  );
+}
+
+// The R filling in like ink: up the left stroke from the foot, then down the
+// right one from the top, as one eased motion. Plays once on mount. Each
+// stroke is masked by a level with a soft feathered edge whose geometry is
+// rebuilt from one progress value, so nothing is transformed inside the mask
+// (WebKit is unreliable there) and nothing keeps ticking once it is full.
+//
+// The level moves at a constant rate of ink, not of height: it slows down
+// where a stroke is wide (the bowl's top arc, the foot) and speeds up where it
+// is thin, and since both strokes share one rate there is no jump in speed at
+// the handoff. The ink per row is measured once from the paths themselves.
+const [RIGHT, LEFT] = MARK;
+const FEATHER = 12;
+const SCALE = 4;
+
+/** Where the band's centre sits, from the start of the stroke's travel, for
+ *  each 1/SCALE unit step: cumulative ink, normalised later. */
+type Profile = { cum: Float64Array; total: number };
+
+function profile(d: string, up: boolean): Profile {
+  const rows = Math.ceil(H * SCALE);
+  const ink = new Float64Array(rows);
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.ceil(MARK_W * SCALE);
+    canvas.height = rows;
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.scale(SCALE, SCALE);
+      ctx.fill(new Path2D(d));
+      const px = ctx.getImageData(0, 0, canvas.width, rows).data;
+      for (let y = 0; y < rows; y++) {
+        let sum = 0;
+        for (let x = 0; x < canvas.width; x++) sum += px[(y * canvas.width + x) * 4 + 3];
+        ink[y] = sum / 255;
+      }
+    }
+  } catch {
+    // No canvas: every row weighs the same, i.e. a plain linear sweep.
+  }
+  // The travel runs half a feather past both ends so the band starts and
+  // ends fully outside the stroke. Every step carries a floor of ink, so the
+  // edge never stalls in an empty row nor races through a thin one.
+  const pad = Math.round((FEATHER / 2) * SCALE);
+  const steps = rows + 2 * pad;
+  const mean = ink.reduce((a, b) => a + b, 0) / rows || 1;
+  const cum = new Float64Array(steps + 1);
+  for (let i = 0; i < steps; i++) {
+    const row = up ? rows - 1 - (i - pad) : i - pad;
+    cum[i + 1] = cum[i] + (row >= 0 && row < rows ? ink[row] : 0) + 0.25 * mean;
+  }
+  return { cum, total: cum[steps] };
+}
+
+/** The band's centre (in mark units) once `ink` of the stroke's total has
+ *  been laid down. */
+function centre(pr: Profile, ink: number, up: boolean) {
+  const { cum } = pr;
+  let lo = 0;
+  let hi = cum.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (cum[mid] <= ink) lo = mid;
+    else hi = mid;
+  }
+  const f = cum[hi] > cum[lo] ? (ink - cum[lo]) / (cum[hi] - cum[lo]) : 0;
+  const travelled = (lo + Math.min(1, Math.max(0, f))) / SCALE - FEATHER / 2;
+  return up ? H - travelled : travelled;
+}
+
+// The solid part reaches half a unit into the band so their antialiased
+// edges don't leave a hairline seam.
+function solid(c: number, up: boolean) {
+  const t = c - FEATHER / 2;
+  return up ? `M0,${t + FEATHER - 0.5}H${MARK_W}V${H + 1}H0Z` : `M0,-1H${MARK_W}V${t + 0.5}H0Z`;
+}
+const band = (c: number) => `M0,${c - FEATHER / 2}H${MARK_W}V${c + FEATHER / 2}H0Z`;
+
+let profiles: { left: Profile; right: Profile } | null = null;
+function getProfiles() {
+  profiles ??= { left: profile(LEFT, true), right: profile(RIGHT, false) };
+  return profiles;
+}
+
+function Stroke({
+  d,
+  ink,
+  pr,
+  up,
+  id,
+}: {
+  d: string;
+  ink: MotionValue<number>;
+  pr: Profile;
+  up: boolean;
+  id: string;
+}) {
+  const fill = useTransform(ink, (v) => solid(centre(pr, v, up), up));
+  const feather = useTransform(ink, (v) => band(centre(pr, v, up)));
+  return (
+    <>
+      <mask id={id}>
+        <motion.path d={fill} fill="#fff" />
+        <motion.path d={feather} fill={`url(#${id}-edge)`} />
+      </mask>
+      <linearGradient id={`${id}-edge`} x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stopColor={up ? "#000" : "#fff"} />
+        <stop offset="1" stopColor={up ? "#fff" : "#000"} />
+      </linearGradient>
+      <path d={d} fill="currentColor" mask={`url(#${id})`} />
+    </>
+  );
+}
+
+export function RMarkFill({
+  height = 40,
+  delay = 0.15,
+  duration = 2,
+  className,
+}: {
+  height?: number;
+  delay?: number;
+  duration?: number;
+  className?: string;
+}) {
+  const reduce = useReducedMotion();
+  const { left, right } = getProfiles();
+  const total = left.total + right.total;
+  // One ink value for the whole mark; each stroke reads its own share.
+  const ink = useMotionValue(reduce ? total : 0);
+  const leftInk = useTransform(ink, (v) => Math.min(v, left.total));
+  const rightInk = useTransform(ink, (v) => Math.max(0, v - left.total));
+  const id = `rmark-fill-${useId().replace(/[^a-zA-Z0-9]/g, "")}`;
+
+  useEffect(() => {
+    if (reduce) {
+      ink.set(total);
+      return;
+    }
+    // Soft at both ends, close to linear in the middle: the handoff between
+    // the strokes sits mid-way and must not be the fastest moment.
+    const controls = animate(ink, total, { duration, delay, ease: [0.25, 0.1, 0.75, 0.9] });
+    return () => controls.stop();
+  }, [reduce, delay, duration, ink, total]);
+
+  return (
+    <svg
+      viewBox={`0 0 ${MARK_W} ${H}`}
+      height={height}
+      width={(height * MARK_W) / H}
+      aria-hidden="true"
+      className={className}
+    >
+      <Stroke d={LEFT} ink={leftInk} pr={left} up id={`${id}-l`} />
+      <Stroke d={RIGHT} ink={rightInk} pr={right} up={false} id={`${id}-r`} />
     </svg>
   );
 }
