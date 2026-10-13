@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Manager};
@@ -58,8 +58,12 @@ struct ReaperStatus {
     resource_path: String,
     user_plugins: String,
     installed: bool,
-    /// Installed copy is byte-identical to the bundled one.
+    /// Installed copy is byte-identical to the bundled one, or the newer
+    /// build's copy pre-installed from a downloaded update.
     up_to_date: bool,
+    /// Version of the pre-installed copy from a downloaded update, while it
+    /// is newer than this app.
+    preinstalled: Option<String>,
 }
 
 fn resource_dir(custom_path: &Option<String>) -> Result<PathBuf, String> {
@@ -296,6 +300,10 @@ pub(crate) fn maybe_auto_install(app: &AppHandle) {
     let Ok(st) = compute_status(app, &custom) else {
         return;
     };
+    // This app has caught up with a pre-installed copy (or it was replaced).
+    if st.preinstalled.is_none() {
+        clear_preinstalled(app);
+    }
     // Only auto-install into a recognized REAPER resource folder.
     // The manual install button also accepts unrecognized folders.
     if st.reaper_found && st.is_reaper_dir && (!st.installed || !st.up_to_date) {
@@ -369,10 +377,12 @@ fn compute_status(app: &AppHandle, custom_path: &Option<String>) -> Result<Reape
     let user_plugins = dir.join("UserPlugins");
     let dest = user_plugins.join(PLUGIN_NAME);
     let installed = dest.is_file();
+    let preinstalled = if installed { preinstalled_newer(app, &dest) } else { None };
     let up_to_date = installed
-        && bundled_plugin(app)
-            .map(|src| files_equal(&src, &dest))
-            .unwrap_or(false);
+        && (preinstalled.is_some()
+            || bundled_plugin(app)
+                .map(|src| files_equal(&src, &dest))
+                .unwrap_or(false));
     Ok(ReaperStatus {
         reaper_found: dir.is_dir(),
         // Deliberately NOT `user_plugins.is_dir()`: do_install creates that
@@ -389,6 +399,7 @@ fn compute_status(app: &AppHandle, custom_path: &Option<String>) -> Result<Reape
         user_plugins: user_plugins.to_string_lossy().into_owned(),
         installed,
         up_to_date,
+        preinstalled,
     })
 }
 
@@ -404,12 +415,23 @@ fn do_install(app: &AppHandle, custom_path: &Option<String>) -> Result<ReaperSta
     let user_plugins = dir.join("UserPlugins");
     fs::create_dir_all(&user_plugins)
         .map_err(|e| format!("could not create {}: {e}", user_plugins.display()))?;
-    // Copy via temp + rename so a running REAPER never loads a half-written file.
+    place_plugin(&user_plugins, |tmp| fs::copy(&src, tmp).map(|_| ()))?;
+    clear_preinstalled(app);
+    compute_status(app, custom_path)
+}
+
+/// Put a new extension file in place: `write` fills a temp file, which is
+/// then renamed over the installed one so a running REAPER never loads a
+/// half-written file.
+fn place_plugin(
+    user_plugins: &Path,
+    write: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
     let dest = user_plugins.join(PLUGIN_NAME);
     let tmp = user_plugins.join(format!(".{PLUGIN_NAME}.tmp"));
-    fs::copy(&src, &tmp).map_err(|e| format!("copy failed: {e}"))?;
-    // The copy keeps the bundled file's timestamp. Stamp it with the install
-    // time instead: `extension_stale` compares it with REAPER's start to tell
+    write(&tmp).map_err(|e| format!("copy failed: {e}"))?;
+    // A copy keeps the source's timestamp. Stamp it with the install time
+    // instead: `extension_stale` compares it with REAPER's start to tell
     // whether a running REAPER already loaded this copy.
     if let Ok(f) = fs::File::options().write(true).open(&tmp) {
         let _ = f.set_modified(SystemTime::now());
@@ -418,7 +440,7 @@ fn do_install(app: &AppHandle, custom_path: &Option<String>) -> Result<ReaperSta
     // works whenever REAPER isn't holding the old copy, which avoids the
     // displacement dance (and its leftovers) entirely.
     if let Err(first) = fs::rename(&tmp, &dest) {
-        let parked = displace_loaded_plugin(&user_plugins, &dest);
+        let parked = displace_loaded_plugin(user_plugins, &dest);
         if let Err(second) = fs::rename(&tmp, &dest) {
             // The working extension has already been moved aside at this point.
             // Leaving it there would mean an *update* had uninstalled ReaMesh,
@@ -430,7 +452,105 @@ fn do_install(app: &AppHandle, custom_path: &Option<String>) -> Result<ReaperSta
             return Err(format!("install failed: {second} (and: {first})"));
         }
     }
-    compute_status(app, custom_path)
+    Ok(())
+}
+
+// ---------- pre-install from a downloaded update ----------
+//
+// An update downloads in the background and is installed when the user
+// restarts the app, which then installs its own extension. A REAPER started
+// in between would load the old extension and want another restart after the
+// app's. So the update's extension (a separately signed release asset, see
+// updater.rs) goes in as soon as no REAPER has ReaMesh loaded. A marker
+// remembers that copy, so this older app neither puts its own copy back at
+// its next launch nor calls the newer one out of date.
+
+fn preinstall_marker(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|d| d.join("ext_preinstalled"))
+}
+
+fn clear_preinstalled(app: &AppHandle) {
+    if let Some(p) = preinstall_marker(app) {
+        let _ = fs::remove_file(p);
+    }
+}
+
+/// Size and modification time identify the file a pre-install wrote: any
+/// later replacement (an install, a manual copy) changes the time.
+fn file_stamp(path: &Path) -> Option<(u64, u128)> {
+    let m = fs::metadata(path).ok()?;
+    let t = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+    Some((m.len(), t))
+}
+
+/// The version of the pre-installed copy, while `dest` is still that copy and
+/// it belongs to a newer build than this app.
+fn preinstalled_newer(app: &AppHandle, dest: &Path) -> Option<String> {
+    let text = fs::read_to_string(preinstall_marker(app)?).ok()?;
+    let mut lines = text.lines();
+    let version = lines.next()?;
+    let len: u64 = lines.next()?.parse().ok()?;
+    let time: u128 = lines.next()?.parse().ok()?;
+    if file_stamp(dest)? != (len, time) {
+        return None;
+    }
+    let newer = semver::Version::parse(version).ok()? > app.package_info().version;
+    newer.then(|| version.to_string())
+}
+
+/// Some REAPER has the extension loaded: its control server answers on one of
+/// the ports, or it is up but couldn't get one.
+fn extension_loaded() -> bool {
+    let listening = (47415..=47418u16).any(|port| {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
+    });
+    listening || port_trouble()
+}
+
+/// Install a downloaded update's extension (`bytes`, from release `version`)
+/// unless a REAPER still has ReaMesh loaded. Returns false to be asked again
+/// later; true once it is in place or there is nothing to do (the user
+/// removed the extension, no REAPER folder, already that copy).
+pub(crate) fn preinstall_extension(app: &AppHandle, version: &str, bytes: &[u8]) -> bool {
+    if !load_auto_install(app) {
+        return true;
+    }
+    let custom = load_custom_path(app);
+    let Ok(st) = compute_status(app, &custom) else {
+        return true;
+    };
+    if !(st.reaper_found && st.is_reaper_dir) {
+        return true;
+    }
+    let user_plugins = PathBuf::from(&st.user_plugins);
+    let dest = user_plugins.join(PLUGIN_NAME);
+    if fs::read(&dest).map(|b| b == bytes).unwrap_or(false) {
+        return true;
+    }
+    if extension_loaded() {
+        return false;
+    }
+    if fs::create_dir_all(&user_plugins).is_err() {
+        return true;
+    }
+    if let Err(e) = place_plugin(&user_plugins, |tmp| fs::write(tmp, bytes)) {
+        eprintln!("[reamesh] pre-installing the update's extension: {e}");
+        return false;
+    }
+    if let (Some(marker), Some((len, time))) = (preinstall_marker(app), file_stamp(&dest)) {
+        if let Some(parent) = marker.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(marker, format!("{version}\n{len}\n{time}\n"));
+    }
+    use tauri::Emitter;
+    let _ = app.emit("extension-installed", ());
+    refresh_native_settings(app);
+    true
 }
 
 /// Remove the installed extension (and any displaced copies). Best-effort on
@@ -446,6 +566,7 @@ fn do_remove(app: &AppHandle, custom_path: &Option<String>) -> Result<ReaperStat
         displace_loaded_plugin(&user_plugins, &dest);
     }
     sweep_displaced(&user_plugins);
+    clear_preinstalled(app);
     compute_status(app, custom_path)
 }
 
@@ -512,7 +633,6 @@ fn reaper_status(app: AppHandle) -> Result<ReaperStatus, String> {
 #[cfg(target_os = "macos")]
 fn process_started(pid: u32) -> Option<SystemTime> {
     use std::ffi::c_void;
-    use std::time::{Duration, UNIX_EPOCH};
     // `struct proc_bsdinfo` from <sys/proc_info.h>, down to the start time.
     #[repr(C)]
     struct ProcBsdInfo {
@@ -540,7 +660,6 @@ fn process_started(pid: u32) -> Option<SystemTime> {
 
 #[cfg(target_os = "windows")]
 fn process_started(pid: u32) -> Option<SystemTime> {
-    use std::time::{Duration, UNIX_EPOCH};
     use windows::Win32::Foundation::{CloseHandle, FILETIME};
     use windows::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -1670,6 +1789,7 @@ mod native_settings {
             user_plugins: String::new(),
             installed: false,
             up_to_date: false,
+            preinstalled: None,
         });
         let cstr = CString::new(st.resource_path).unwrap_or_default();
         let ptr = cstr.as_ptr();

@@ -8,6 +8,13 @@
 // A restart while a session is up is only offered when that number matches
 // ours: the session runs in REAPER and survives the app restarting, but an app
 // with another PROTO would refuse the extension REAPER still has loaded.
+//
+// Each release also publishes its extension on its own (`extension.json` next
+// to the app artifacts, the same updater manifest format and signing key).
+// Once the app update is downloaded, that copy is fetched and installed as
+// soon as no REAPER has ReaMesh loaded (`crate::preinstall_extension`), so a
+// REAPER started before the user restarts the app already runs the new
+// extension and doesn't need another restart afterwards.
 
 use std::fs;
 use std::path::PathBuf;
@@ -24,6 +31,11 @@ const FIRST_CHECK_DELAY: Duration = Duration::from_secs(8);
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// How long the webview gets to fade out before the process goes away.
 const FADE_OUT: Duration = Duration::from_millis(220);
+/// How often a pending pre-install looks again whether REAPER has quit. Short:
+/// a quick REAPER restart must not slip through with the old extension.
+const PREINSTALL_RETRY: Duration = Duration::from_secs(1);
+/// The extension's manifest, next to the app artifacts of the same release.
+const EXTENSION_MANIFEST: &str = "extension.json";
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -214,12 +226,57 @@ async fn check_and_download(app: &AppHandle) -> Result<(), String> {
         )
         .await
         .map_err(|e| e.to_string())?;
+    let version = update.version.clone();
+    let release = update.download_url.clone();
     set(app, |i| {
         i.state.phase = Phase::Ready;
         i.state.progress = 1.0;
         i.pending = Some((update, bytes));
     });
+    // Best-effort: without it the extension simply updates with the app.
+    match fetch_extension(app, &release, &version).await {
+        Ok(ext) => spawn_preinstall(app, version, ext),
+        Err(e) => eprintln!("[reamesh] update's extension not fetched: {e}"),
+    }
     Ok(())
+}
+
+/// Download and verify the extension of the release whose app artifact lives
+/// at `release`. The updater does the fetch and the signature check; the
+/// comparator accepts the release unconditionally because it was already
+/// chosen by the app check, and the version must match that one.
+async fn fetch_extension(
+    app: &AppHandle,
+    release: &tauri::Url,
+    version: &str,
+) -> Result<Vec<u8>, String> {
+    let manifest = release.join(EXTENSION_MANIFEST).map_err(|e| e.to_string())?;
+    let ext = app
+        .updater_builder()
+        .endpoints(vec![manifest])
+        .map_err(|e| e.to_string())?
+        .version_comparator(|_, _| true)
+        .build()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("no extension in this release")?;
+    if ext.version != version {
+        return Err(format!("extension is {}, update is {version}", ext.version));
+    }
+    ext.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())
+}
+
+/// Keep trying to put the update's extension in place until it is there (or
+/// nothing is to be done); this process ends at the restart anyway.
+fn spawn_preinstall(app: &AppHandle, version: String, bytes: Vec<u8>) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        while !crate::preinstall_extension(&app, &version, &bytes) {
+            std::thread::sleep(PREINSTALL_RETRY);
+        }
+    });
 }
 
 /// Background loop: one check shortly after launch, then every few hours,

@@ -1,5 +1,7 @@
 # Release: builds the signed app for both platforms (the extension rides
-# inside it) and publishes it, with the updater manifest, as a release of the
+# inside it, and is also published on its own, signed, so a downloaded update
+# can install it before the app restarts) and publishes it, with the updater
+# manifests, as a release of the
 # public ReaMesh/releases repository, which is where installed apps look for
 # updates (plugins.updater.endpoints in tauri.conf.json). This repository stays
 # private; only the built artifacts go out.
@@ -53,12 +55,26 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # The same DLL the installer carries, byte for byte, so the app's install
+      # check sees no difference once the update itself is installed.
+      - name: Sign the extension for pre-install
+        shell: bash
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          cp ../extension/build/Release/reaper_reamesh.dll src-tauri/target/release/bundle/nsis/
+          bun run tauri signer sign --app-version "$(bun -p 'require("./package.json").version')" \
+            src-tauri/target/release/bundle/nsis/reaper_reamesh.dll
       - uses: actions/upload-artifact@v4
         with:
           name: windows
           path: |
             app/src-tauri/target/release/bundle/nsis/*-setup.exe
             app/src-tauri/target/release/bundle/nsis/*-setup.exe.sig
+            app/src-tauri/target/release/bundle/nsis/reaper_reamesh.dll
+            app/src-tauri/target/release/bundle/nsis/reaper_reamesh.dll.sig
 
   macos:
     runs-on: macos-latest
@@ -113,12 +129,25 @@ jobs:
           bun run tauri build \
             --config src-tauri/tauri.release.conf.json \
             --config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$APPLE_SIGNING_IDENTITY\"}}}"
+      # Taken out of the finished bundle, so it is the copy the app installs.
+      - name: Sign the extension for pre-install
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          B=src-tauri/target/release/bundle/macos
+          cp "$B/ReaMesh.app/Contents/Resources/reaper_reamesh.dylib" "$B/"
+          bun run tauri signer sign --app-version "$(bun -p 'require("./package.json").version')" \
+            "$B/reaper_reamesh.dylib"
       - uses: actions/upload-artifact@v4
         with:
           name: macos
           path: |
             app/src-tauri/target/release/bundle/macos/*.app.tar.gz
             app/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
+            app/src-tauri/target/release/bundle/macos/reaper_reamesh.dylib
+            app/src-tauri/target/release/bundle/macos/reaper_reamesh.dylib.sig
 
   publish:
     needs: [windows, macos]

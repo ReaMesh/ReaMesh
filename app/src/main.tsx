@@ -31,6 +31,7 @@ if (import.meta.env.DEV && params.get("mock") === "onboarding") {
     userPlugins: "/Users/you/Library/Application Support/REAPER/UserPlugins",
     installed,
     upToDate: installed,
+    preinstalled: null,
   });
   let cbId = 0;
   // deno-lint-ignore no-explicit-any
@@ -87,6 +88,7 @@ if (import.meta.env.DEV && params.get("mock") === "tauri") {
             userPlugins: "/Users/you/Library/Application Support/REAPER/UserPlugins",
             installed: true,
             upToDate: true,
+            preinstalled: null,
           };
         case "installed_plugins":
           return plugins;

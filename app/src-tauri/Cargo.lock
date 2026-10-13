@@ -52,6 +52,7 @@ name = "app"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "semver",
  "serde",
  "serde_json",
  "sys-locale",

@@ -8,6 +8,10 @@
 // leaves them. Next to Tauri's own fields it records the release's PROTO: the
 // app offers a restart in the middle of a session only when that matches the
 // running build (see src-tauri/src/updater.rs).
+//
+// It also writes `extension.json`, the same format for the extension binaries
+// (`reaper_reamesh.dylib` / `.dll` with their `.sig`): the app fetches it next
+// to the downloaded update to install the new extension before it restarts.
 
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -24,17 +28,21 @@ const proto = Number(
 if (!proto) throw new Error("PROTO not found in rust/src/lib.rs");
 
 const files = readdirSync(dir);
-const platforms: Record<string, { signature: string; url: string }> = {};
-const entry = (key: string, test: (f: string) => boolean) => {
+type Platforms = Record<string, { signature: string; url: string }>;
+const platforms: Platforms = {};
+const extension: Platforms = {};
+const entry = (key: string, test: (f: string) => boolean, into = platforms) => {
   const file = files.find((f) => test(f) && files.includes(`${f}.sig`));
   if (!file) return;
-  platforms[key] = {
+  into[key] = {
     signature: readFileSync(join(dir, `${file}.sig`), "utf8").trim(),
     url: `${base.replace(/\/$/, "")}/${encodeURIComponent(file)}`,
   };
 };
 entry("darwin-aarch64", (f) => f.endsWith(".app.tar.gz"));
 entry("windows-x86_64", (f) => f.endsWith("-setup.exe"));
+entry("darwin-aarch64", (f) => f === "reaper_reamesh.dylib", extension);
+entry("windows-x86_64", (f) => f === "reaper_reamesh.dll", extension);
 if (!Object.keys(platforms).length) throw new Error(`no signed updater artifacts in ${dir}`);
 
 const manifest = {
@@ -46,3 +54,11 @@ const manifest = {
 };
 writeFileSync(join(dir, "latest.json"), JSON.stringify(manifest, null, 2) + "\n");
 console.log(`latest.json: ${version}, proto ${proto}, ${Object.keys(platforms).join(", ")}`);
+
+// Optional: a release without it still updates; the extension then only
+// changes when the app restarts into the update.
+if (Object.keys(extension).length) {
+  const ext = { ...manifest, platforms: extension };
+  writeFileSync(join(dir, "extension.json"), JSON.stringify(ext, null, 2) + "\n");
+  console.log(`extension.json: ${Object.keys(extension).join(", ")}`);
+}

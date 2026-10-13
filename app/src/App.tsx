@@ -491,15 +491,22 @@ export default function App() {
   const stale = useExtensionStale(instance?.pid);
   const [restartDismissed, setRestartDismissed] = useState(false);
   useEffect(() => {
-    const un = listen("extension-installed", () => setRestartDismissed(false));
+    const un = listen("extension-installed", () => {
+      setRestartDismissed(false);
+      refreshStatus();
+    });
     return () => {
       un.then((f) => f());
     };
   }, []);
   // Also when REAPER still runs an older build of the same protocol (e.g. this
   // is the restart after an app update, whose install happened at launch).
+  // Not when it runs the newer copy pre-installed from a downloaded update.
   const loadedOld =
-    !!instance?.version && !!appVersion && instance.version !== appVersion;
+    !!instance?.version &&
+    !!appVersion &&
+    instance.version !== appVersion &&
+    instance.version !== reaper?.preinstalled;
   const skew = instance?.state ? protoSkew(instance.proto) : "same";
   const needsRestart =
     (stale || loadedOld) && hasState && !restartDismissed && skew === "same";

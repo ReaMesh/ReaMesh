@@ -197,7 +197,11 @@ export function Settings({
   const stale = useExtensionStale(instance?.pid);
   const loadedOld =
     !!status?.installed &&
-    (stale || (!!instance?.version && !!version && instance.version !== version));
+    (stale ||
+      (!!instance?.version &&
+        !!version &&
+        instance.version !== version &&
+        instance.version !== status.preinstalled));
   const extStatus = !status
     ? ""
     : !status.installed
@@ -206,8 +210,8 @@ export function Settings({
         ? t("updateAvailable")
         : loadedOld
           ? t("extRestartToLoad", { version })
-          : version
-            ? t("versionLabel", { version })
+          : status.preinstalled || version
+            ? t("versionLabel", { version: status.preinstalled || version })
             : t("installed");
   const extWarn = !!status?.installed && (!status.upToDate || loadedOld);
 

@@ -15,6 +15,9 @@ export interface ReaperStatus {
   userPlugins: string;
   installed: boolean;
   upToDate: boolean;
+  /** Version of a newer build's extension, pre-installed from a downloaded
+   *  update before this app restarted into it. */
+  preinstalled: string | null;
 }
 
 let cachedPath: string | null = null;
