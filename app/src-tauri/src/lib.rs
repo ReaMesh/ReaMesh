@@ -1813,7 +1813,7 @@ mod native_about {
     }
 
     // A dev binary isn't inside a .app, so it has no bundle icon to show.
-    static ICON: &[u8] = include_bytes!("../icons/128x128@2x.png");
+    static ICON: &[u8] = include_bytes!("../../../proprietary/icons/128x128@2x.png");
 
     // Leaked once, like the settings window's, for the show_credits callback.
     static APP_PTR: OnceLock<usize> = OnceLock::new();

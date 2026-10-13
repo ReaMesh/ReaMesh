@@ -8,7 +8,9 @@ opening a pull request.
 - ReaMesh is published under the **GPL-3.0** (see [LICENSE](LICENSE)).
   Contributions are accepted under the same licence.
 - The name **ReaMesh** and its logo are not covered by the licence. See the
-  trademark note in the [README](README.md#license-and-trademark).
+  trademark note in the [README](README.md#license-and-trademark). All logo,
+  icon and installer artwork lives in [`proprietary/`](proprietary/), which is
+  outside the GPL.
 
 ## Before you start
 

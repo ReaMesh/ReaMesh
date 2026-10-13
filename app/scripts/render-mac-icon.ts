@@ -1,14 +1,14 @@
-// Render the legacy macOS icons (icon.icns, icons/*.png, ReaMesh-icon.png;
-// the Windows Square*/StoreLogo tiles come from render-windows-icon.ts)
-// from the Icon Composer layer in ReaMesh.icon. Run `bun run icons:mac` after
-// editing the layer or icon.json.
+// Render the legacy macOS icons in proprietary/icons/ (icon.icns, the *.png
+// sizes, ReaMesh-icon.png; the Windows Square*/StoreLogo tiles come from
+// render-windows-icon.ts) from the Icon Composer layer in ReaMesh.icon. Run
+// `bun run icons:mac` after editing the layer or icon.json.
 //
-// macOS 26+ draws the icon from resources/Assets.car, which only Xcode's
+// macOS 26+ draws the icon from Assets.car, which only Xcode's
 // actool can compile (on a Mac):
-//   xcrun actool src-tauri/ReaMesh.icon --compile <out> --app-icon ReaMesh \
+//   xcrun actool ../proprietary/icons/ReaMesh.icon --compile <out> --app-icon ReaMesh \
 //     --platform macosx --target-device mac --minimum-deployment-target 26.0 \
 //     --output-partial-info-plist <out>/partial.plist
-// then copy <out>/Assets.car to src-tauri/resources/. Everything older reads
+// then copy <out>/Assets.car to proprietary/icons/. Everything older reads
 // the icns this script writes, so it approximates the system render on its
 // own: the near-black tile on Apple's 824/1024 grid with its lit rim and drop
 // shadow, the white layer with the light-to-grey falloff, dark edge and shadow
@@ -20,8 +20,8 @@ import { Resvg } from "@resvg/resvg-js";
 
 const resolve = (rel: string) => fileURLToPath(new URL(rel, import.meta.url));
 
-const layerSvg = await Bun.file(resolve("../src-tauri/ReaMesh.icon/Assets/reamesh-R-weiss.svg")).text();
-const icon = await Bun.file(resolve("../src-tauri/ReaMesh.icon/icon.json")).json();
+const layerSvg = await Bun.file(resolve("../../proprietary/icons/ReaMesh.icon/Assets/reamesh-R-weiss.svg")).text();
+const icon = await Bun.file(resolve("../../proprietary/icons/ReaMesh.icon/icon.json")).json();
 
 const attr = (name: string) => Number(layerSvg.match(new RegExp(`\\s${name}="([\\d.]+)"`))![1]);
 const [, , vbW, vbH] = layerSvg.match(/viewBox="([^"]+)"/)![1].split(/\s+/).map(Number);
@@ -122,12 +122,12 @@ const cache = (svg: string) => {
 const png = cache(svgFor(false));
 const icnsPng = cache(svgFor(true));
 
-const out = (rel: string, data: Buffer) => Bun.write(resolve(`../src-tauri/${rel}`), data);
+const out = (rel: string, data: Buffer) => Bun.write(resolve(`../../proprietary/icons/${rel}`), data);
 
 await out("ReaMesh-icon.png", png(1024));
-await out("icons/icon.png", png(512));
-for (const s of [32, 64, 128]) await out(`icons/${s}x${s}.png`, png(s));
-await out("icons/128x128@2x.png", png(256));
+await out("icon.png", png(512));
+for (const s of [32, 64, 128]) await out(`${s}x${s}.png`, png(s));
+await out("128x128@2x.png", png(256));
 
 // icns: 'icns' + total length, then (type, length incl. 8-byte header, PNG).
 const ICNS: [string, number][] = [
@@ -153,5 +153,5 @@ const entries = ICNS.map(([type, size]) => {
 const head = Buffer.alloc(8);
 head.write("icns", 0, "ascii");
 head.writeUInt32BE(8 + entries.reduce((n, e) => n + e.length, 0), 4);
-await out("icons/icon.icns", Buffer.concat([head, ...entries]));
-console.log("wrote icon.icns, ReaMesh-icon.png and the icons/*.png sizes");
+await out("icon.icns", Buffer.concat([head, ...entries]));
+console.log("wrote icon.icns, ReaMesh-icon.png and the *.png sizes");

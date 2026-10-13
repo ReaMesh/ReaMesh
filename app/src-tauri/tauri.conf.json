@@ -48,15 +48,15 @@
   "bundle": {
     "active": true,
     "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
+      "../../proprietary/icons/32x32.png",
+      "../../proprietary/icons/128x128.png",
+      "../../proprietary/icons/128x128@2x.png",
+      "../../proprietary/icons/icon.icns",
+      "../../proprietary/icons/icon.ico"
     ],
     "macOS": {
       "files": {
-        "Resources/Assets.car": "resources/Assets.car"
+        "Resources/Assets.car": "../../proprietary/icons/Assets.car"
       },
       "signingIdentity": "-",
       "hardenedRuntime": true,

@@ -1,4 +1,4 @@
-// Render windows-mark.svg into icon.ico for the Windows executable and taskbar,
+// Render proprietary/icons/windows-mark.svg into icon.ico for the Windows executable and taskbar,
 // and into the Square*/StoreLogo tiles.
 // Run `bun run icons:windows` after editing the SVG. macOS uses icon.icns.
 //
@@ -22,7 +22,7 @@ const SIZES = [256, 128, 96, 64, 48, 40, 32, 24, 20, 16];
 // a leading slash, which no file API accepts.
 const resolve = (rel: string) => fileURLToPath(new URL(rel, import.meta.url));
 
-const svg = await Bun.file(resolve("../src-tauri/icons/windows-mark.svg")).text();
+const svg = await Bun.file(resolve("../../proprietary/icons/windows-mark.svg")).text();
 
 const pngs = SIZES.map((size) => {
   const png = new Resvg(svg, { fitTo: { mode: "width", value: size } }).render().asPng();
@@ -54,9 +54,9 @@ pngs.forEach(({ size, png }, i) => {
 for (const size of [30, 44, 71, 89, 107, 142, 150, 284, 310, 50]) {
   const name = size === 50 ? "StoreLogo.png" : `Square${size}x${size}Logo.png`;
   const png = new Resvg(svg, { fitTo: { mode: "width", value: size } }).render().asPng();
-  await Bun.write(resolve(`../src-tauri/icons/${name}`), png);
+  await Bun.write(resolve(`../../proprietary/icons/${name}`), png);
 }
 
-const out = resolve("../src-tauri/icons/icon.ico");
+const out = resolve("../../proprietary/icons/icon.ico");
 await Bun.write(out, Buffer.concat([header, ...pngs.map((p) => p.png)]));
 console.log(`wrote icon.ico (${pngs.map((p) => p.size).join(", ")}px)`);

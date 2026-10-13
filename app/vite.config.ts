@@ -13,6 +13,9 @@ export default defineConfig(async () => ({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      // The logo and icons live outside the app, in the repo-root proprietary/
+      // folder (not GPL); the UI reads them from there at build time.
+      "@proprietary": path.resolve(__dirname, "../proprietary"),
     },
   },
 
@@ -35,6 +38,10 @@ export default defineConfig(async () => ({
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
+    },
+    // 4. let the dev server read the repo-root proprietary/ folder
+    fs: {
+      allow: [__dirname, path.resolve(__dirname, "../proprietary")],
     },
   },
 }));
