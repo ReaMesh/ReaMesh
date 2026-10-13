@@ -1,6 +1,7 @@
 // Unit test for the pure state-chunk parsing/splicing helpers in
 // extension/src/reamesh.cpp (normalizeChunk, extractTrackBlocks,
-// replaceTrackBlocks, transformRecvUnits, chunkFilePaths, isRelativePath).
+// replaceTrackBlocks, transformRecvUnits, chunkFilePaths, isRelativePath,
+// pathInsideDir, relativizeChunkFiles).
 // No REAPER needed.
 //
 // Build & run:
@@ -457,6 +458,80 @@ int main() {
     assert(itemChunkHasColor("<ITEM\n  POSITION 1\n  COLOR 21036910 R\n  <SOURCE WAVE\n  >\n>\n"));
     assert(!itemChunkHasColor("<ITEM\n  POSITION 1\n  TAKECOLOR 123 B\n  <SOURCE WAVE\n  >\n>\n"));
     assert(!itemChunkHasColor("<ITEM\n  <TAKEFX\n    COLOR 5\n  >\n>\n"));
+  }
+
+  // Item media paths go on the wire project-relative: REAPER serializes them
+  // absolute, and an absolute path from a peer on the same machine resolves to
+  // that peer's file (which the receiver then copied into its project root).
+  {
+    assert(pathInsideDir("/Songs/Nightfall/Audio/Kick_01.wav", "/Songs/Nightfall") ==
+           "Audio/Kick_01.wav");
+    assert(pathInsideDir("/Songs/Nightfall/Kick.wav", "/Songs/Nightfall/") == "Kick.wav");
+    // A sibling folder sharing the prefix is outside, so is the folder itself.
+    assert(pathInsideDir("/Songs/Nightfall2/Kick.wav", "/Songs/Nightfall").empty());
+    assert(pathInsideDir("/Songs/Nightfall", "/Songs/Nightfall").empty());
+    assert(pathInsideDir("/Songs/Nightfall/", "/Songs/Nightfall").empty());
+    assert(pathInsideDir("/Other/Audio/Kick.wav", "/Songs/Nightfall").empty());
+    // Case matters on POSIX paths, not on drive-letter ones; separators never do.
+    assert(pathInsideDir("/songs/nightfall/Kick.wav", "/Songs/Nightfall").empty());
+    assert(pathInsideDir("c:/Users/Ben/Song/Media/Kick.wav", "C:\\Users\\Ben\\Song") ==
+           "Media/Kick.wav");
+    assert(pathInsideDir("C:\\Users\\Ben\\Song\\Kick.wav", "C:\\Users\\Ben\\Song") ==
+           "Kick.wav");
+    // Never a path that climbs back out, never a relative base.
+    assert(pathInsideDir("/Songs/Nightfall/../Elsewhere/Kick.wav", "/Songs/Nightfall").empty());
+    assert(pathInsideDir("/Songs/Nightfall/./Kick.wav", "/Songs/Nightfall").empty());
+    assert(pathInsideDir("Audio/Kick.wav", "Audio").empty());
+    assert(pathInsideDir("/Songs/Nightfall/Audio/Kick.wav", "").empty());
+
+    const std::string item =
+        "<ITEM\n"
+        "  POSITION 1\n"
+        "  <SOURCE SECTION\n"
+        "    LENGTH 2\n"
+        "    <SOURCE WAVE\n"
+        "      FILE \"/Songs/Nightfall/Audio/Kick_01.wav\" 1\n"
+        "    >\n"
+        "  >\n"
+        "  <SOURCE WAVE\n"
+        "    FILE \"/Samples/OneShots/Clap.wav\"\n"
+        "  >\n"
+        "  <SOURCE WAVE\n"
+        "    FILE '/Songs/Nightfall/Audio/Say \"hi\".wav'\n"
+        "  >\n"
+        "  <SOURCE WAVE\n"
+        "    FILE \"Audio/Snare.wav\"\n"
+        "  >\n"
+        ">\n";
+    const std::vector<std::string> dirs = {"/Songs/Nightfall"};
+    const std::string rel = relativizeChunkFiles(item, dirs);
+    // In-project media becomes relative, the rest of the line survives.
+    assert(rel.find("      FILE \"Audio/Kick_01.wav\" 1\n") != std::string::npos);
+    // Media outside the project stays absolute (internalizeExternalMedia
+    // copies it in first), and so do paths that are already relative or quoted
+    // with something other than a double quote.
+    assert(rel.find("FILE \"/Samples/OneShots/Clap.wav\"") != std::string::npos);
+    assert(rel.find("FILE '/Songs/Nightfall/Audio/Say \"hi\".wav'") != std::string::npos);
+    assert(rel.find("FILE \"Audio/Snare.wav\"") != std::string::npos);
+    // Nothing else moves; idempotent, so a recapture of an applied chunk is
+    // byte-identical (no ping-pong between peers).
+    assert(rel.size() == item.size() - std::string("/Songs/Nightfall/").size());
+    assert(relativizeChunkFiles(rel, dirs) == rel);
+    // A peer in another folder maps ITS absolute spelling to the same text.
+    std::string other = item;
+    other.replace(other.find("/Songs/Nightfall/Audio/Kick_01"), std::string("/Songs/Nightfall").size(),
+                  "/Users/lena/ReaMesh/Nightfall-1a2b");
+    assert(relativizeChunkFiles(other, {"/Users/lena/ReaMesh/Nightfall-1a2b"}).find(
+               "FILE \"Audio/Kick_01.wav\" 1") != std::string::npos);
+    // Second candidate dir (the canonical spelling) is honoured too.
+    assert(relativizeChunkFiles(item, {"/elsewhere", "/Songs/Nightfall"}) == rel);
+    // No dirs (unsaved project), or no trailing newline: unchanged / preserved.
+    assert(relativizeChunkFiles(item, {}) == item);
+    assert(relativizeChunkFiles("FILE \"/Songs/Nightfall/a.wav\"", dirs) == "FILE \"a.wav\"");
+    // The wire form then reads as fetchable project-relative media.
+    auto relFiles = chunkFilePaths(rel);
+    assert(relFiles.size() == 4 && relFiles[0] == "Audio/Kick_01.wav" &&
+           isRelativePath(relFiles[0]) && !isRelativePath(relFiles[1]));
   }
 
   // REAPER version gate: releases order as decimals, not as integer pairs.

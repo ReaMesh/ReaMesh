@@ -892,6 +892,84 @@ static bool isRelativePath(const std::string& p) {
   return true;
 }
 
+// `path` relative to `dir` ('/'-separated) when it lies strictly inside it,
+// else "". Purely lexical: both come from REAPER (the project path and the
+// paths it resolved against it), so they share their spelling. Separators
+// compare equal either way; drive-letter paths compare case-insensitively.
+static std::string pathInsideDir(std::string path, std::string dir) {
+  std::replace(path.begin(), path.end(), '\\', '/');
+  std::replace(dir.begin(), dir.end(), '\\', '/');
+  while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+  if (dir.empty() || isRelativePath(dir) || path.size() <= dir.size() + 1) return "";
+  if (path[dir.size()] != '/') return "";
+  const bool drive = dir.size() >= 2 && dir[1] == ':';
+  for (size_t i = 0; i < dir.size(); ++i) {
+    const char a = path[i], b = dir[i];
+    if (a == b) continue;
+    if (!drive || tolower((unsigned char)a) != tolower((unsigned char)b)) return "";
+  }
+  std::string rel = path.substr(dir.size() + 1);
+  // A ".." component would climb back out; "." components are noise REAPER
+  // never writes. Either way: not a clean in-project path, leave it alone.
+  size_t start = 0;
+  while (start <= rel.size()) {
+    size_t end = rel.find('/', start);
+    if (end == std::string::npos) end = rel.size();
+    const std::string_view part(rel.data() + start, end - start);
+    if (part.empty() || part == "." || part == "..") return "";
+    start = end + 1;
+  }
+  return rel;
+}
+
+// REAPER serializes an item's media as an ABSOLUTE path (`FILE
+// "/Users/ben/Song/Audio/kick.wav"`), whatever the .rpp says. Sent like that, a
+// peer on the same machine (two REAPER instances, or a joined copy next to the
+// original) resolves it to the OTHER peer's file, which exists there: its take
+// then reads from outside its own project, internalizeExternalMedia copies the
+// file into its project root and repoints, its next edit sends that absolute
+// path back, and the other side does the same. Every in-project source ended
+// up duplicated in the project root. On the wire media paths are therefore
+// project-relative: each REAPER resolves `Audio/kick.wav` against its own
+// project folder (and writes it back absolute, which this maps again, so the
+// round trip stays byte-stable). Paths outside every `dirs` entry are left
+// as they are. Only double-quoted FILE paths are rewritten; REAPER uses ' or `
+// only for a path that itself contains a double quote, which stays absolute.
+static std::string relativizeChunkFiles(const std::string& chunk,
+                                        const std::vector<std::string>& dirs) {
+  std::string out;
+  out.reserve(chunk.size());
+  size_t pos = 0;
+  while (pos < chunk.size()) {
+    size_t eol = chunk.find('\n', pos);
+    const bool hasEol = eol != std::string::npos;
+    if (!hasEol) eol = chunk.size();
+    const std::string_view line(chunk.data() + pos, eol - pos);
+    const std::string_view t = ltrim(line);
+    std::string rel;
+    size_t q1 = std::string_view::npos, q2 = std::string_view::npos;
+    if (t.rfind("FILE \"", 0) == 0) {
+      q1 = line.find('"');
+      q2 = line.find('"', q1 + 1);
+      if (q2 != std::string_view::npos) {
+        const std::string path(line.substr(q1 + 1, q2 - q1 - 1));
+        for (const std::string& d : dirs)
+          if (!(rel = pathInsideDir(path, d)).empty()) break;
+      }
+    }
+    if (rel.empty()) {
+      out.append(line);
+    } else {
+      out.append(line.substr(0, q1 + 1));
+      out.append(rel);
+      out.append(line.substr(q2));
+    }
+    if (hasEol) out.push_back('\n');
+    pos = eol + 1;
+  }
+  return out;
+}
+
 // ---------- plugin inventory / FX stripping (pure text helpers) ----------
 //
 // Both sides of the join-preview story parse RPP text with the same helper:
@@ -1478,6 +1556,30 @@ static void applyGroupNames(const std::string& s) {
   }
 }
 
+// The folder(s) an item's media paths are made relative to on capture (see
+// relativizeChunkFiles): the active project's folder as REAPER spells it, plus
+// its canonical form when that differs (a project opened through a symlink).
+// Taken from the project being snapshotted, not g_sessionProjectPath: a client
+// takes its baseline snapshot before that is set. Cached per project path.
+static const std::vector<std::string>& mediaPathDirs() {
+  static std::string forPath;
+  static std::vector<std::string> dirs;
+  char fn[4096] = "";
+  EnumProjects(-1, fn, sizeof(fn));
+  if (forPath != fn) {
+    forPath = fn;
+    dirs.clear();
+    if (fn[0]) {
+      const fs::path dir = fsPath(fn).parent_path();
+      dirs.push_back(fsUtf8(dir));
+      std::error_code ec;
+      const fs::path canon = fs::weakly_canonical(dir, ec);
+      if (!ec && !canon.empty() && fsUtf8(canon) != dirs.front()) dirs.push_back(fsUtf8(canon));
+    }
+  }
+  return dirs;
+}
+
 static Snapshot snapshotProject() {
   Snapshot snap;
   snap.project.tempo = captureTempo();
@@ -1545,12 +1647,13 @@ static Snapshot snapshotProject() {
     });
     snap.tracks[trackGuid(tr)] = std::move(ts);
   }
+  const std::vector<std::string>& mediaDirs = mediaPathDirs();
   const int ni = CountMediaItems(nullptr);
   for (int i = 0; i < ni; ++i) {
     MediaItem* item = GetMediaItem(nullptr, i);
     ItemState is;
     is.track = trackGuid(GetMediaItem_Track(item));
-    is.chunk = normalizeChunk(objectStateChunk(item));
+    is.chunk = relativizeChunkFiles(normalizeChunk(objectStateChunk(item)), mediaDirs);
     snap.items[itemGuid(item)] = std::move(is);
   }
   return snap;
