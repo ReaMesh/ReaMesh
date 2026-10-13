@@ -551,6 +551,27 @@ fn launch_reaper(app: AppHandle) -> Result<(), String> {
     }
 }
 
+/// Whether any REAPER is running: the setup checklist asks the user to restart
+/// it while it runs and to open it once it is closed.
+#[tauri::command]
+fn reaper_running() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn reamesh_reaper_running() -> i32;
+        }
+        unsafe { reamesh_reaper_running() != 0 }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        overlay_panel_win::reaper_running()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
+}
+
 /// Bring the REAPER instance with this pid to the front (0 = any REAPER), so
 /// the dialog it is stuck on can be answered. False when it isn't running.
 #[tauri::command]
@@ -1350,6 +1371,7 @@ pub fn run() {
             install_extension,
             remove_extension,
             launch_reaper,
+            reaper_running,
             focus_reaper,
             open_overlay,
             close_overlay,

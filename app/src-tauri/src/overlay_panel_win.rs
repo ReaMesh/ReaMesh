@@ -242,22 +242,29 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, lparam: LPARAM) -> window
     TRUE
 }
 
-/// Bring a REAPER instance to the front (pid 0 = any REAPER), for the
-/// "REAPER isn't responding" banner. Activates the modal dialog it is waiting
-/// on when there is one, so the user lands right on it. The app is in the
-/// foreground when the user clicks, which is what lets SetForegroundWindow
-/// hand focus over.
-pub fn activate_reaper(pid: u32) -> bool {
+/// The main window of the REAPER with this pid (0 = any REAPER).
+fn main_window(pid: u32) -> Option<HWND> {
     let mut search = MainSearch {
         pid,
         best: HWND::default(),
         best_area: 0,
     };
     let _ = unsafe { EnumWindows(Some(main_window_proc), LPARAM(&mut search as *mut MainSearch as isize)) };
-    if search.best.is_invalid() || search.best_area == 0 {
-        return false;
-    }
-    let main = search.best;
+    (!search.best.is_invalid() && search.best_area > 0).then_some(search.best)
+}
+
+/// Whether any REAPER has a window up, for the setup checklist's last step.
+pub fn reaper_running() -> bool {
+    main_window(0).is_some()
+}
+
+/// Bring a REAPER instance to the front (pid 0 = any REAPER), for the
+/// "REAPER isn't responding" banner. Activates the modal dialog it is waiting
+/// on when there is one, so the user lands right on it. The app is in the
+/// foreground when the user clicks, which is what lets SetForegroundWindow
+/// hand focus over.
+pub fn activate_reaper(pid: u32) -> bool {
+    let Some(main) = main_window(pid) else { return false };
     unsafe {
         if IsIconic(main).as_bool() {
             let _ = ShowWindow(main, SW_RESTORE);

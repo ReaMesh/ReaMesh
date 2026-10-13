@@ -509,6 +509,12 @@ int reamesh_frontmost_is_reaper(void) {
     return [front.bundleIdentifier isEqualToString:kReaperBundleId] ? 1 : 0;
 }
 
+// Whether any REAPER is running, for the setup checklist's last step
+// ("Restart REAPER" while it runs, "Open REAPER" once it is closed).
+int reamesh_reaper_running(void) {
+    return [[NSRunningApplication runningApplicationsWithBundleIdentifier:kReaperBundleId] count] > 0 ? 1 : 0;
+}
+
 // Bring a REAPER instance to the front (pid 0 = the first one running), for the
 // "REAPER isn't responding" banner: the dialog it is waiting on comes with it.
 // Returns 0 when no such REAPER runs.

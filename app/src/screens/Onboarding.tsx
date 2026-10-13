@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Check, ExternalLink, LoaderCircle } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -19,7 +20,7 @@ import {
 import { cn } from "@/lib/utils";
 
 // First-run setup as one checklist: find REAPER, install the extension,
-// restart REAPER. All three steps stay visible; only the current one opens.
+// restart (or open) REAPER. All three steps stay visible; only the current one opens.
 
 const FOLD = { type: "spring", stiffness: 400, damping: 38 } as const;
 
@@ -112,6 +113,28 @@ function Step({
   );
 }
 
+/** Whether REAPER is running, polled while the setup is on screen. Unknown
+ *  (no backend, or no answer yet) reads as running, the common case. */
+function useReaperRunning(): boolean {
+  const [running, setRunning] = useState(true);
+  useEffect(() => {
+    let alive = true;
+    const check = () =>
+      invoke<boolean>("reaper_running")
+        .then((v) => {
+          if (alive) setRunning(v);
+        })
+        .catch(() => {});
+    check();
+    const id = setInterval(check, 1500);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
+  return running;
+}
+
 export function Onboarding({ status }: { status: ReaperStatus }) {
   // Local "installed just now" flag so the last step stays visible until
   // Finish refreshes the status and the App-level gate moves on. Dev-only:
@@ -122,6 +145,7 @@ export function Onboarding({ status }: { status: ReaperStatus }) {
       new URLSearchParams(window.location.search).get("step") === "done",
   );
   const [busy, setBusy] = useState(false);
+  const reaperRunning = useReaperRunning();
   const found = status.reaperFound;
 
   const pick = async () => {
@@ -225,7 +249,11 @@ export function Onboarding({ status }: { status: ReaperStatus }) {
                 </>
               )}
             </Step>
-            <Step n={3} state={done ? "current" : "todo"} title={t("restartReaperStep")}>
+            <Step
+              n={3}
+              state={done ? "current" : "todo"}
+              title={reaperRunning ? t("restartReaperStep") : t("openReaper")}
+            >
               <FirewallNotice className="pb-2.5" />
               <Button size="sm" className="h-8 w-full text-[13px]" onClick={() => refreshStatus()}>
                 {t("finish")}
