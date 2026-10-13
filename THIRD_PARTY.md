@@ -17,11 +17,15 @@ source by cbindgen and is not third-party.
 ## Dependencies
 
 The Rust crates (`rust/Cargo.lock`, `app/src-tauri/Cargo.lock`) and npm
-packages (`app/bun.lock`) are all under permissive licences (MIT, Apache-2.0,
-BSD, ISC, Zlib, Unicode, MPL-2.0 for a few build tools). None of the code
-shipped in the extension or the companion app is under a strong-copyleft
+packages (`app/bun.lock`) are under permissive licences (MIT, Apache-2.0, BSD,
+ISC, Zlib, Unicode and similar). A few shipped crates use MPL-2.0, a weak
+file-level copyleft that covers only their own files: `cssparser`, `selectors`
+and `dtoa-short` (pulled in by Tauri), `attohttpc` and `option-ext`. None of the
+code shipped in the extension or the companion app is under a strong-copyleft
 licence. This is enforced in CI by `cargo deny check licenses` with the
-allow-list in [deny.toml](deny.toml) and by `tools/check-npm-licenses.ts`.
+allow-list in [deny.toml](deny.toml) and by `tools/check-npm-licenses.ts`. The
+companion app lists every shipped package on the Acknowledgements page in its
+settings.
 
 Build-time-only tools that are not distributed with ReaMesh and carry
 non-permissive terms: `lightningcss` and `@resvg/resvg-js` (MPL-2.0).

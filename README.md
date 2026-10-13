@@ -18,21 +18,28 @@ handles sessions, invitations and setup alongside REAPER.
 
 ## Getting started
 
-You'll need REAPER and the ReaMesh app on each computer. See
+You'll need REAPER 7.12 or newer and the ReaMesh app on each computer. See
 [Releases](https://github.com/ReaMesh/ReaMesh/releases) for packaged builds, or
 [build from source](#building-from-source).
 
 1. Open ReaMesh and follow the setup to install its bundled REAPER extension.
    If your REAPER resource folder isn't found, select it manually.
-2. Restart REAPER so it loads the extension. ReaMesh connects automatically.
+2. Restart (or open) REAPER so it loads the extension. ReaMesh connects
+   automatically.
 3. Save a project in its own folder, then host it from the app. You can set a
    passphrase when creating the session.
-4. On the other computer, join from the lobby or paste the host's invite code.
-   ReaMesh downloads the project and opens it in REAPER.
+4. On the other computer, join from the lobby, open the host's invite link or
+   paste it in the lobby. ReaMesh downloads the project and opens it in REAPER.
 
-**Hosting shares the project folder**, including files that aren't used in the
-project. Dotfiles, `.rpp-bak` backups and `.reapeaks` caches are excluded.
-Referenced media outside the folder is copied into it for sharing.
+Everyone needs a compatible ReaMesh version. Sessions hosted with an
+incompatible one are greyed out in the lobby.
+
+**Hosting shares only the files the project uses**: the project file, the media
+its items play, files that plugin state points to (a sampler's samples, an
+impulse response) and sub-projects. Other files in the folder stay private.
+Media items that point outside the project folder are copied into it so they
+can be shared; files a plugin loads from outside the folder aren't shared.
+Dotfiles, `.rpp-bak` backups and `.reapeaks` caches are never sent.
 
 Sessions are discovered automatically on the LAN. For a VPN or a network where
 discovery doesn't work, use an invite code. Both computers still need a direct
@@ -62,8 +69,9 @@ does sync. Master-track state, hardware outputs, pooled automation items, marker
 ruler lanes and project extension state aren't synced.
 
 An optional floating roster shows who's connected. You can follow someone's
-playback and track focus or share a marker at your cursor. Hosts can remove
-guests or block their peer identity for 30 minutes.
+playback, selected track, view, item selection and open effect window, or share
+a marker at your cursor. Hosts can remove guests or block their device for 30
+minutes.
 
 ## Working together
 

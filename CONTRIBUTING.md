@@ -22,12 +22,13 @@ noticing, so read the comments around the code you change, especially in
 
 | Part | Command |
 | --- | --- |
-| Everything (Rust core + extension) | `./build.sh` (macOS, or Windows from Git Bash) |
+| Everything (Rust core, extension, companion app) | `./build.sh` (macOS, or Windows from Git Bash) |
 | Rust core only | `cd rust && cargo build --release` |
 | Rust tests | `cd rust && cargo test -- --test-threads=1` |
 | Companion app | `cd app && bun install && bun run build` |
 | App unit tests | `cd app && bun run test` |
 | Live app | `cd app && bun run tauri dev` (needs REAPER with the extension) |
+| Two app instances for two-person testing | `cd app && bun run dev:ab` (start two REAPER instances first) |
 
 The Rust session tests use real sockets and mDNS and **must run serially**;
 in parallel about half of them fail spuriously. The app is managed with
@@ -37,6 +38,11 @@ Both macOS and Windows are first-class. Keep the Rust core free of
 `cfg(target_os)`, and keep platform-specific C++ behind small helpers rather
 than `#ifdef`s in the capture/apply logic. Anything that changes what goes on
 the wire has to round-trip identically on both platforms.
+
+Any change to the wire format or the app↔extension control protocol needs a
+`PROTO` bump (`rust/src/lib.rs`, mirrored in `app/src-tauri/src/lib.rs` and
+`app/src/lib/version.ts`; a test keeps them equal). Builds with different
+`PROTO` values refuse to talk to each other instead of half-working.
 
 ## Pull requests
 

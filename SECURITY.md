@@ -25,6 +25,10 @@ In scope, and especially interesting:
   roster without the token.
 - Reading or forging session traffic on a passphrase-protected session
   (the sealed gossip envelopes, the presence MAC, replay of proposals).
+- Staying in or rejoining a session after the host blocked your device.
+- Hijacking an invite-code join, so a host other than the one named in the
+  code is joined.
+- Downloading files the host's project doesn't use.
 - Path traversal or arbitrary file write through the transfer protocol.
 - Memory-safety bugs reachable from a peer (state-chunk parsing, transfer
   decoding, zstd bounds).
