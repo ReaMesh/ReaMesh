@@ -1,5 +1,5 @@
-# Build the extension on Windows and macOS, the Windows installer, and an
-# unbundled macOS app. Run Rust tests serially because they share sockets
+# Build the extension on Windows and macOS (universal), the Windows installer,
+# and an unbundled macOS app; check the Intel half natively on an Intel runner. Run Rust tests serially because they share sockets
 # and mDNS. Type-check and test the frontend on both platforms.
 name: build
 on:
@@ -49,16 +49,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
-      - name: Build Rust staticlib
-        run: cargo build --release
-        working-directory: rust
       - name: Rust tests
         run: cargo test --release -- --test-threads=1
         working-directory: rust
+      # Universal (Apple silicon + Intel), macOS 11+.
       - name: Build extension dylib
-        run: |
-          cmake -S extension -B extension/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build extension/build --config Release
+        run: ./build.sh --no-app
       - uses: actions/upload-artifact@v4
         with:
           name: reaper_reamesh-macos
@@ -74,3 +70,15 @@ jobs:
       - name: Build companion app (unbundled)
         run: bun run tauri build --no-bundle
         working-directory: app
+
+  # Runs the Intel half of the universal build natively: architectures and
+  # minimum macOS, loading the x86_64 extension, the C++ tests and the Rust
+  # tests, all as x86_64.
+  macos-intel:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal extension
+        run: ./build.sh --no-app
+      - name: Intel check
+        run: tools/check-intel.sh

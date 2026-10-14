@@ -5,7 +5,7 @@
 // --warn only reports the mismatch during development.
 // REAMESH_SKIP_EXT_CHECK=1 bypasses the check.
 
-import { readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 const root = resolve(import.meta.dirname, "../..");
@@ -65,4 +65,26 @@ if (sources[0] > built) {
   fail(
     `the REAPER extension binary is older than its sources (${age} min behind ${sources[1]})`,
   );
+}
+
+// macOS: the app ships one extension for Apple silicon and Intel, and REAPER
+// refuses a dylib whose minimum macOS is newer than the running one.
+if (process.platform === "darwin") {
+  const run = (cmd: string[]) => {
+    const r = Bun.spawnSync(cmd);
+    return r.exitCode === 0 ? r.stdout.toString() : "";
+  };
+  const archs = run(["lipo", "-archs", binary]).trim().split(/\s+/);
+  const missing = ["arm64", "x86_64"].filter((a) => !archs.includes(a));
+  if (missing.length) {
+    fail(`the REAPER extension binary is not universal (has ${archs.join(" ") || "?"}, lacks ${missing.join(" ")})`);
+  }
+  const conf = JSON.parse(readFileSync(join(root, "app/src-tauri/tauri.conf.json"), "utf8"));
+  const min: string = conf.bundle?.macOS?.minimumSystemVersion ?? "11.0";
+  const key = (v: string) => v.split(".").map(Number).reduce((acc, n, i) => acc + n / 1000 ** i, 0);
+  for (const m of run(["vtool", "-show-build", binary]).matchAll(/minos (\S+)/g)) {
+    if (key(m[1]) > key(min)) {
+      fail(`the REAPER extension binary needs macOS ${m[1]}, the app supports ${min}`);
+    }
+  }
 }

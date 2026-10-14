@@ -3,7 +3,8 @@
 //
 //   bun scripts/release-manifest.ts <artifacts-dir> <version> <download-base-url>
 //
-// Looks for `*.app.tar.gz` (macOS, Apple silicon) and `*-setup.exe` (Windows)
+// Looks for `*.app.tar.gz` (macOS, universal: Apple silicon and Intel get the
+// same entry) and `*-setup.exe` (Windows)
 // with their `.sig` files, as `tauri build --config src-tauri/tauri.release.conf.json`
 // leaves them. Next to Tauri's own fields it records the release's PROTO: the
 // app offers a restart in the middle of a session only when that matches the
@@ -39,9 +40,11 @@ const entry = (key: string, test: (f: string) => boolean, into = platforms) => {
     url: `${base.replace(/\/$/, "")}/${encodeURIComponent(file)}`,
   };
 };
-entry("darwin-aarch64", (f) => f.endsWith(".app.tar.gz"));
+for (const mac of ["darwin-aarch64", "darwin-x86_64"]) {
+  entry(mac, (f) => f.endsWith(".app.tar.gz"));
+  entry(mac, (f) => f === "reaper_reamesh.dylib", extension);
+}
 entry("windows-x86_64", (f) => f.endsWith("-setup.exe"));
-entry("darwin-aarch64", (f) => f === "reaper_reamesh.dylib", extension);
 entry("windows-x86_64", (f) => f === "reaper_reamesh.dll", extension);
 if (!Object.keys(platforms).length) throw new Error(`no signed updater artifacts in ${dir}`);
 

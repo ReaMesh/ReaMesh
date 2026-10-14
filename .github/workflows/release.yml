@@ -94,18 +94,15 @@ jobs:
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-      - name: Build Rust staticlib
-        run: cargo build --release
-        working-directory: rust
       - name: Rust tests
         run: cargo test --release -- --test-threads=1
         working-directory: rust
+      # Universal (Apple silicon + Intel), macOS 11+.
       - name: Build + sign extension dylib
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          cmake -S extension -B extension/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build extension/build --config Release
+          ./build.sh --no-app
           # Notarization rejects an unsigned Mach-O anywhere in the bundle.
           codesign --force --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY" extension/build/reaper_reamesh.dylib
       - name: App checks
@@ -126,7 +123,7 @@ jobs:
         run: |
           export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
           echo "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH"
-          bun run tauri build \
+          bun run tauri build --target universal-apple-darwin \
             --config src-tauri/tauri.release.conf.json \
             --config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$APPLE_SIGNING_IDENTITY\"}}}"
       # Taken out of the finished bundle, so it is the copy the app installs.
@@ -136,7 +133,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          B=src-tauri/target/release/bundle/macos
+          B=src-tauri/target/universal-apple-darwin/release/bundle/macos
           cp "$B/ReaMesh.app/Contents/Resources/reaper_reamesh.dylib" "$B/"
           bun run tauri signer sign --app-version "$(bun -p 'require("./package.json").version')" \
             "$B/reaper_reamesh.dylib"
@@ -144,13 +141,25 @@ jobs:
         with:
           name: macos
           path: |
-            app/src-tauri/target/release/bundle/macos/*.app.tar.gz
-            app/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
-            app/src-tauri/target/release/bundle/macos/reaper_reamesh.dylib
-            app/src-tauri/target/release/bundle/macos/reaper_reamesh.dylib.sig
+            app/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+            app/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+            app/src-tauri/target/universal-apple-darwin/release/bundle/macos/reaper_reamesh.dylib
+            app/src-tauri/target/universal-apple-darwin/release/bundle/macos/reaper_reamesh.dylib.sig
+
+  # The macOS build is universal; this runs its Intel half natively on an
+  # Intel Mac (binaries, x86_64 load, C++ tests, Rust tests) before anything
+  # is published.
+  macos-intel:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal extension
+        run: ./build.sh --no-app
+      - name: Intel check
+        run: tools/check-intel.sh
 
   publish:
-    needs: [windows, macos]
+    needs: [windows, macos, macos-intel]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

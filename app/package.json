@@ -10,6 +10,7 @@
     "test": "vitest run",
     "preview": "vite preview",
     "tauri": "tauri",
+    "build:universal": "tauri build --target universal-apple-darwin",
     "dev:b": "tauri dev --config src-tauri/tauri.dev-b.conf.json",
     "dev:ab": "bun scripts/dev-ab.ts",
     "dmg": "bash scripts/make-dmg.sh",

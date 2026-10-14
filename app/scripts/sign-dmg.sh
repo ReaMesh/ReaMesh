@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Signs a built ReaMesh installer DMG with your Apple Developer ID.
 #
-#   bun run dmg:sign                      # newest src-tauri/target/release/bundle/dmg/ReaMesh_*.dmg
+#   bun run dmg:sign                      # newest src-tauri/target/universal-apple-darwin/release/bundle/dmg/ReaMesh_*.dmg
 #   bash scripts/sign-dmg.sh path/to.dmg  # a specific image
 #
 # Options
@@ -21,7 +21,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-OUT_DIR="src-tauri/target/release/bundle/dmg"
+OUT_DIR="src-tauri/target/universal-apple-darwin/release/bundle/dmg"
 DMG=""
 IDENTITY="${APPLE_SIGNING_IDENTITY:-}"
 NOTARIZE=0

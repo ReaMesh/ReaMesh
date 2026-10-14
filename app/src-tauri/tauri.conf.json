@@ -55,6 +55,7 @@
       "../../proprietary/icons/icon.ico"
     ],
     "macOS": {
+      "minimumSystemVersion": "11.0",
       "files": {
         "Resources/Assets.car": "../../proprietary/icons/Assets.car"
       },

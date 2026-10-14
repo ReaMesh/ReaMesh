@@ -1,4 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
+
+# macOS: one universal binary (Apple silicon + Intel) for macOS 11 and later,
+# matching the app's minimumSystemVersion. Both must be known before project().
+# Without a deployment target clang stamps the build machine's macOS version
+# as the minimum, and an older macOS refuses to load the extension.
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
+  set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "macOS architectures")
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
+endif()
+
 project(reaper_reamesh CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -23,16 +33,19 @@ if(MSVC)
   target_compile_options(reaper_reamesh PRIVATE /utf-8)
 endif()
 
-# Rust static library, built by build.sh or cargo before CMake runs.
+# Rust static library, built by build.sh or cargo before CMake runs. A
+# universal macOS build needs the lipo'd library build.sh puts together.
 if(WIN32)
   set(REAMESH_RUST_LIB_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../rust/target/release/reamesh.lib")
+elseif(APPLE AND CMAKE_OSX_ARCHITECTURES MATCHES ";")
+  set(REAMESH_RUST_LIB_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../rust/target/universal-apple-darwin/release/libreamesh.a")
 else()
   set(REAMESH_RUST_LIB_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../rust/target/release/libreamesh.a")
 endif()
 set(REAMESH_RUST_LIB "${REAMESH_RUST_LIB_DEFAULT}"
     CACHE FILEPATH "Path to the Rust staticlib")
 if(NOT EXISTS "${REAMESH_RUST_LIB}")
-  message(FATAL_ERROR "Rust library not found at ${REAMESH_RUST_LIB}; run 'cargo build --release' in rust/ first (or use ../build.sh)")
+  message(FATAL_ERROR "Rust library not found at ${REAMESH_RUST_LIB}; run ../build.sh first (or 'cargo build --release' in rust/ for a single-architecture build)")
 endif()
 target_link_libraries(reaper_reamesh PRIVATE "${REAMESH_RUST_LIB}")
 

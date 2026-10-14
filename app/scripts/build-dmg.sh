@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One-shot installer build: compiles the ReaMesh .app bundle at the current
 # version, then wraps it in the styled drag-to-Applications DMG:
-#   src-tauri/target/release/bundle/dmg/ReaMesh_<version>.dmg
+#   src-tauri/target/universal-apple-darwin/release/bundle/dmg/ReaMesh_<version>.dmg
+# The app is universal (Apple silicon + Intel).
 #
 # Run from app/ (or anywhere): bun run dmg:full   (or: bash scripts/build-dmg.sh)
 # Needs a GUI session: make-dmg.sh scripts Finder for the icon layout.
@@ -38,12 +39,12 @@ fi
 # then has no embedded files to watch and may reuse the incomplete binary.
 touch src-tauri/src/lib.rs
 
-echo "==> Building ReaMesh.app (bun run tauri build)…"
-bun run tauri build "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"
+echo "==> Building the universal ReaMesh.app (bun run tauri build --target universal-apple-darwin)…"
+bun run tauri build --target universal-apple-darwin "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"
 
 echo "==> Packaging styled DMG (scripts/make-dmg.sh)…"
 bash scripts/make-dmg.sh
 
 echo
-echo "Done: src-tauri/target/release/bundle/dmg/ReaMesh_${VERSION}.dmg"
+echo "Done: src-tauri/target/universal-apple-darwin/release/bundle/dmg/ReaMesh_${VERSION}.dmg"
 echo "Sign it for distribution with: bun run dmg:sign"

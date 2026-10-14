@@ -4,13 +4,27 @@
 # folders keep only the deliverables: macos/ the .app, dmg/ this version's DMG.
 #
 # Run from app/ (or anywhere): bun run dmg
-# Needs a prior `bun run tauri build` (the .app bundle) and a GUI session
+# Needs a prior `bun run build:universal` (the universal .app bundle) and a GUI session
 # (Finder is scripted to set icon positions).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-APP_BUNDLE="src-tauri/target/release/bundle/macos/ReaMesh.app"
-[ -d "$APP_BUNDLE" ] || { echo "error: $APP_BUNDLE not found; run 'bun run tauri build' first" >&2; exit 1; }
+BUNDLE_DIR="src-tauri/target/universal-apple-darwin/release/bundle"
+APP_BUNDLE="$BUNDLE_DIR/macos/ReaMesh.app"
+[ -d "$APP_BUNDLE" ] || { echo "error: $APP_BUNDLE not found; run 'bun run build:universal' first" >&2; exit 1; }
+
+# The installer serves Apple silicon and Intel Macs alike: refuse an app or a
+# bundled extension that lacks either architecture.
+for f in "$APP_BUNDLE/Contents/MacOS/app" "$APP_BUNDLE/Contents/Resources/reaper_reamesh.dylib"; do
+  ARCHS=$(lipo -archs "$f" 2>/dev/null || true)
+  case " $ARCHS " in *" arm64 "*) ;; *) ARCHS="" ;; esac
+  case " $ARCHS " in *" x86_64 "*) ;; *) ARCHS="" ;; esac
+  if [ -z "$ARCHS" ]; then
+    echo "error: $f is not universal (arm64 + x86_64): $(lipo -archs "$f" 2>/dev/null)" >&2
+    echo "       Rebuild with ./build.sh, then 'bun run build:universal'." >&2
+    exit 1
+  fi
+done
 
 # Refuse to package an app whose binary does not embed the frontend. Tauri
 # embeds dist/ at compile time as a table keyed "/index.html", "/assets/…";
@@ -47,7 +61,7 @@ VERSION=$(bun -e 'console.log(JSON.parse(await Bun.file("src-tauri/tauri.conf.js
 # Volume label shown when the installer image is mounted.
 VOL="ReaMesh Installer"
 # Use the standard macOS disk-image icon by omitting a custom volume icon.
-OUT_DIR="src-tauri/target/release/bundle/dmg"
+OUT_DIR="$BUNDLE_DIR/dmg"
 OUT="$OUT_DIR/ReaMesh_${VERSION}.dmg"
 mkdir -p "$OUT_DIR"
 
