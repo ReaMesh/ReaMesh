@@ -1,71 +1,51 @@
 # Contributing to ReaMesh
 
-Thanks for wanting to help. This page covers what you need to know before
-opening a pull request.
+Thanks for wanting to help. Pull requests are welcome straight away, no issue
+needed first; rough edges get sorted out in review.
 
-## Licensing
+## Ground rules
 
-- ReaMesh is published under the **GPL-3.0** (see [LICENSE](LICENSE)).
-  Contributions are accepted under the same licence.
-- The name **ReaMesh** and its logo are not covered by the licence. See the
-  trademark note in the [README](README.md#license-and-trademark). All logo,
-  icon, installer and screenshot artwork lives in [`proprietary/`](proprietary/), which is
-  outside the GPL.
+1. **Run the build and tests before pushing.** CI runs the same checks.
+2. **Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/)**
+   (`feat:`, `fix:`, `refactor:`, `docs:`).
+3. **Changed the wire format or the app↔extension protocol? Bump `PROTO`**
+   (`rust/src/lib.rs`, `app/src-tauri/src/lib.rs`, `app/src/lib/version.ts`).
+4. **Keep both platforms working.** macOS and Windows peers share sessions,
+   so no `cfg(target_os)` in the Rust core and no `#ifdef`s in the
+   capture/apply logic.
+5. **No copyleft dependencies** (GPL, LGPL, AGPL, SSPL, …). CI enforces the
+   [allow-list](deny.toml).
+6. **Don't edit vendored code**: `extension/sdk/`, `extension/WDL/`,
+   `extension/include/json.hpp`, `extension/include/reamesh_ffi.h`.
 
-## Before you start
-
-Talk first for anything bigger than a bug fix. Open an issue describing what
-you want to change and why. Sync coverage, the wire format, and the
-concurrency model have a lot of invariants that are easy to break without
-noticing, so read the comments around the code you change, especially in
+Sync, the wire format and the concurrency model carry invariants that break
+quietly. Read the comments around what you change, especially in
 `reamesh.cpp` and `lib.rs`.
 
 ## Building
 
 | Part | Command |
 | --- | --- |
-| Everything (Rust core, extension, ReaMesh app) | `./build.sh` (macOS, or Windows from Git Bash) |
-| Rust core only | `cd rust && cargo build --release` |
+| Everything | `./build.sh` (macOS, or Windows from Git Bash) |
 | Rust tests | `cd rust && cargo test -- --test-threads=1` |
-| ReaMesh app | `cd app && bun install && bun run build` |
-| App unit tests | `cd app && bun run test` |
+| App build | `cd app && bun install && bun run build` |
+| App tests | `cd app && bun run test` |
 | Live app | `cd app && bun run tauri dev` (needs REAPER with the extension) |
-| Two app instances for two-person testing | `cd app && bun run dev:ab` (start two REAPER instances first) |
+| Two instances | `cd app && bun run dev:ab` (start two REAPER instances first) |
 
-The Rust session tests use real sockets and mDNS and **must run serially**;
-in parallel about half of them fail spuriously. The app is managed with
-**bun**, never npm or pnpm.
-
-Both macOS and Windows are first-class. Keep the Rust core free of
-`cfg(target_os)`, and keep platform-specific C++ behind small helpers rather
-than `#ifdef`s in the capture/apply logic. Anything that changes what goes on
-the wire has to round-trip identically on both platforms.
-
-Any change to the wire format or the app↔extension control protocol needs a
-`PROTO` bump (`rust/src/lib.rs`, mirrored in `app/src-tauri/src/lib.rs` and
-`app/src/lib/version.ts`; a test keeps them equal). Builds with different
-`PROTO` values refuse to talk to each other instead of half-working.
-
-## Pull requests
-
-- One topic per pull request. Small is good.
-- Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/)
-  (`feat:`, `fix:`, `refactor:`, `docs:`).
-- Run the relevant build and tests before pushing. CI runs the Rust tests
-  serially, the app's `tsc` + vitest gate, and a dependency-licence check.
-- New user-facing extension messages need a `code` and an i18n entry in
-  `app/src/lib/log.ts`; the extension never writes to the REAPER console.
-- Don't add dependencies under GPL, LGPL, AGPL, SSPL or other strong-copyleft
-  licences. `cargo deny check licenses` and `bun tools/check-npm-licenses.ts`
-  enforce this in CI; see [deny.toml](deny.toml) for the allow-list.
-- Don't edit vendored code (`extension/sdk/`, `extension/WDL/`,
-  `extension/include/json.hpp`, `extension/include/reamesh_ffi.h`).
+The Rust tests must run serially; in parallel they fail spuriously. The app
+uses **bun**, never npm or pnpm.
 
 ## Reporting bugs
 
-Use GitHub issues. Include your REAPER version, OS, whether you were host or
-guest, and what **Settings → Copy diagnostics** in the ReaMesh app puts on
-your clipboard. Network-level logs go to stderr; launching REAPER from a
-terminal shows them.
+Open a GitHub issue with your REAPER version, OS, whether you hosted or
+joined, and the output of **Settings → Copy diagnostics** in the app.
 
 Security issues go through [SECURITY.md](SECURITY.md), not public issues.
+
+## Licensing
+
+ReaMesh is [GPL-3.0](LICENSE); contributions are accepted under the same
+licence. The ReaMesh name, logo and everything in [`proprietary/`](proprietary/)
+are not covered by it (see the
+[trademark note](README.md#license-and-trademark)).
