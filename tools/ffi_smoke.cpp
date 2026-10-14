@@ -58,7 +58,9 @@ int main() {
   const auto staging = base / "staging";
   fs::create_directories(proj / "Audio");
   fs::create_directories(staging);
-  std::ofstream(proj / "Smoke.rpp") << "<REAPER_PROJECT 0.1\n>\n";
+  // Only files the project references are shared, so the project names the wav.
+  std::ofstream(proj / "Smoke.rpp")
+      << "<REAPER_PROJECT 0.1\n  <ITEM\n    <SOURCE WAVE\n      FILE \"Audio/kick.wav\"\n    >\n  >\n>\n";
   {
     std::ofstream wav(proj / "Audio" / "kick.wav", std::ios::binary);
     for (int i = 0; i < 1500000; ++i) wav.put((char)(i % 251));
@@ -153,10 +155,12 @@ int main() {
     return 1;
   }
 
+  // The item references the snare the owner records next: the owner serves a
+  // file outside the manifest only while the live doc references it.
   printf("owner pushes a media item...\n");
   reamesh_push_local(owner,
       "{\"items\":{\"{SMOKE-I1}\":{\"present\":true,\"track\":\"{SMOKE-1}\","
-      "\"chunk\":\"<ITEM\\nPOSITION 2.5\\n>\"}}}");
+      "\"chunk\":\"<ITEM\\nPOSITION 2.5\\n<SOURCE WAVE\\nFILE \\\"Audio/snare.wav\\\"\\n>\\n>\"}}}");
   if (!drainUntil(client, "POSITION 2.5", 10)) {
     fprintf(stderr, "FAIL: client never drained the owner's item\n");
     return 1;
