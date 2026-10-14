@@ -14,7 +14,8 @@
 #   APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
 #   APPLE_SIGNING_IDENTITY ("Developer ID Application: …"),
 #   APPLE_API_ISSUER, APPLE_API_KEY, APPLE_API_KEY_P8 (contents of the .p8)
-#       Developer ID signing + notarization of the macOS app
+#       Developer ID signing + notarization of the macOS app (optional: without
+#       them the app is signed ad-hoc and not notarized)
 name: release
 on:
   push:
@@ -75,10 +76,15 @@ jobs:
 
   macos:
     runs-on: macos-latest
+    env:
+      # Without the Developer ID secrets the app keeps the ad-hoc signature
+      # from tauri.conf.json and is not notarized.
+      DEVELOPER_ID: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - name: Import signing certificate
+        if: env.DEVELOPER_ID == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -101,7 +107,9 @@ jobs:
         run: |
           ./build.sh --no-app
           # Notarization rejects an unsigned Mach-O anywhere in the bundle.
-          codesign --force --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY" extension/build/reaper_reamesh.dylib
+          if [ "$DEVELOPER_ID" = true ]; then
+            codesign --force --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY" extension/build/reaper_reamesh.dylib
+          fi
       - name: App checks
         run: |
           bun install --frozen-lockfile
@@ -118,11 +126,19 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
         run: |
-          export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
-          echo "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH"
-          bun run tauri build --target universal-apple-darwin \
-            --config src-tauri/tauri.release.conf.json \
-            --config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$APPLE_SIGNING_IDENTITY\"}}}"
+          if [ "$DEVELOPER_ID" = true ]; then
+            export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+            echo "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH"
+            bun run tauri build --target universal-apple-darwin \
+              --config src-tauri/tauri.release.conf.json \
+              --config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$APPLE_SIGNING_IDENTITY\"}}}"
+          else
+            # Tauri reads these even when empty; unset, it signs ad-hoc and
+            # skips notarization.
+            unset APPLE_SIGNING_IDENTITY APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_P8
+            bun run tauri build --target universal-apple-darwin \
+              --config src-tauri/tauri.release.conf.json
+          fi
       # Taken out of the finished bundle, so it is the copy the app installs.
       - name: Sign the extension for pre-install
         working-directory: app
