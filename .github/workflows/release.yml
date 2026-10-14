@@ -31,7 +31,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - name: Build Rust staticlib
         run: cargo build --release
@@ -67,7 +67,7 @@ jobs:
           cp ../extension/build/Release/reaper_reamesh.dll src-tauri/target/release/bundle/nsis/
           bun run tauri signer sign --app-version "$(bun -p 'require("./package.json").version')" \
             src-tauri/target/release/bundle/nsis/reaper_reamesh.dll
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: |
@@ -79,7 +79,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - name: Import signing certificate
         env:
@@ -137,7 +137,7 @@ jobs:
           cp "$B/ReaMesh.app/Contents/Resources/reaper_reamesh.dylib" "$B/"
           bun run tauri signer sign --app-version "$(bun -p 'require("./package.json").version')" \
             "$B/reaper_reamesh.dylib"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: |
@@ -152,7 +152,7 @@ jobs:
   macos-intel:
     runs-on: macos-15-intel
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build universal extension
         run: ./build.sh --no-app
       - name: Intel check
@@ -162,9 +162,9 @@ jobs:
     needs: [windows, macos, macos-intel]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

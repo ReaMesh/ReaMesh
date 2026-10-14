@@ -12,10 +12,10 @@ export default defineConfig(async () => ({
 
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
+      "@": path.resolve(import.meta.dirname, "./src"),
       // The logo and icons live outside the app, in the repo-root proprietary/
       // folder (not GPL); the UI reads them from there at build time.
-      "@proprietary": path.resolve(__dirname, "../proprietary"),
+      "@proprietary": path.resolve(import.meta.dirname, "../proprietary"),
     },
   },
 
@@ -41,7 +41,7 @@ export default defineConfig(async () => ({
     },
     // 4. let the dev server read the repo-root proprietary/ folder
     fs: {
-      allow: [__dirname, path.resolve(__dirname, "../proprietary")],
+      allow: [import.meta.dirname, path.resolve(import.meta.dirname, "../proprietary")],
     },
   },
 }));

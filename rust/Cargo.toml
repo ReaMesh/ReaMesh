@@ -20,7 +20,7 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "
 tokio-tungstenite = "0.27"
 yrs = "0.26"
 blake3 = "1.5"
-zstd = "0.13"
+zstd = "0.14"
 # Memory-hard KDF for the session passphrase token: the per-session salt is
 # announced publicly, so a plain fast hash would be brute-forceable offline.
 argon2 = "0.5"

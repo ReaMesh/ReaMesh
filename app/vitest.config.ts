@@ -7,7 +7,7 @@ import { defineConfig } from "vitest/config";
 // package: nothing under test renders.
 export default defineConfig({
   resolve: {
-    alias: { "@": path.resolve(__dirname, "src") },
+    alias: { "@": path.resolve(import.meta.dirname, "src") },
   },
   test: {
     environment: "node",

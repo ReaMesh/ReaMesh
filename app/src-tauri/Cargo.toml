@@ -41,7 +41,7 @@ tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Local WebSocket client for leaving the session before exit (ws://127.0.0.1).
-tungstenite = "0.24"
+tungstenite = "0.30"
 # Version compare for an extension pre-installed from a downloaded update.
 semver = "1"
 # Device language for the "system" language preference (native menus/dialogs).
@@ -53,7 +53,7 @@ sys-locale = "0.3"
 # compiled by build.rs. Version pinned to the one tao already pulls in, so this
 # does not build a second copy of the crate.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_Threading",
