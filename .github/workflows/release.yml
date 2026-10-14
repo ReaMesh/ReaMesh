@@ -1,10 +1,8 @@
 # Release: builds the signed app for both platforms (the extension rides
 # inside it, and is also published on its own, signed, so a downloaded update
 # can install it before the app restarts) and publishes it, with the updater
-# manifests, as a release of the
-# public ReaMesh/releases repository, which is where installed apps look for
-# updates (plugins.updater.endpoints in tauri.conf.json). This repository stays
-# private; only the built artifacts go out.
+# manifests, as a release of this repository, which is where installed apps
+# look for updates (plugins.updater.endpoints in tauri.conf.json).
 #
 # Trigger: push a tag `v<version>` matching the version in every manifest
 # (bun scripts/set-version.ts), or run it by hand on such a tag.
@@ -13,7 +11,6 @@
 #   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 #       the updater key (bun tauri signer generate); its public half is
 #       plugins.updater.pubkey
-#   RELEASES_TOKEN   a token with contents:write on ReaMesh/releases
 #   APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
 #   APPLE_SIGNING_IDENTITY ("Developer ID Application: …"),
 #   APPLE_API_ISSUER, APPLE_API_KEY, APPLE_API_KEY_P8 (contents of the .p8)
@@ -24,8 +21,8 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-env:
-  RELEASES_REPO: ReaMesh/releases
+permissions:
+  contents: read
 
 jobs:
   windows:
@@ -161,6 +158,8 @@ jobs:
   publish:
     needs: [windows, macos, macos-intel]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
@@ -173,12 +172,13 @@ jobs:
           VERSION="$(jq -r .version app/package.json)"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           bun app/scripts/release-manifest.ts dist "$VERSION" \
-            "https://github.com/$RELEASES_REPO/releases/download/v$VERSION"
-      - name: Publish to ReaMesh/releases
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION"
+      - name: Publish the release
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "v$VERSION" dist/* \
-            --repo "$RELEASES_REPO" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
             --title "ReaMesh $VERSION" \
             --notes "ReaMesh $VERSION"
