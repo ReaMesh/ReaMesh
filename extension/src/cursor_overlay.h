@@ -30,6 +30,10 @@ struct Host {
   // The visible track under an arrange y, with the 0..1 position inside it.
   // false over the empty area below the last track.
   bool (*trackAt)(double y, std::string* guid, double* fy);
+  // Exchange cursors with the session: feeds arrived updates to update() and
+  // sends the local pointer. The layer calls it right before it draws, so a
+  // cursor that arrived this pass is on screen in this frame.
+  void (*pump)();
   // Test scaffolding only: move the arrange to [t0, t1]; the GUID of the
   // track at an index.
   void (*setTimeAxis)(double t0, double t1);

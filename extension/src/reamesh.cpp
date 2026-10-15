@@ -5609,17 +5609,14 @@ static void cursorStop() {
   g_cursorAttached = false;
 }
 
-// Sends the local pointer at most every 50ms and only while it changes (plus a
-// keep-alive every 3s while it rests in the arrange, so peers don't fade it as
-// stale). A click goes out at once.
-static void cursorTick() {
-  if (!g_cursorAttached) {
-    static const cursor_overlay::Host host = {cursorReady, cursorTimeAxis, cursorTrackSpan,
-                                              cursorTrackAt, cursorSetTimeAxis, cursorTrackGuidAt,
-                                              cursorTestNudge};
-    g_cursorAttached = cursor_overlay::attach(GetMainHwnd(), host);
-    if (!g_cursorAttached) return;
-  }
+// Network side of the cursors, pumped by the layer in every run-loop pass
+// right before it draws (and from the timer as a fallback): hands arrived
+// cursor updates to the layer, and sends the local pointer, sampled at most
+// every 16ms and sent at most every 33ms while it changes (plus a keep-alive
+// every 3s while it rests in the arrange, so peers don't fade it as stale).
+// A click goes out with the next sample.
+static void cursorPump() {
+  if (!g_cursorAttached || !g_handle || !cursorReady()) return;
   char* raw = reamesh_drain_cursors(g_handle);
   const std::string payload = raw ? raw : "[]";
   reamesh_free_string(raw);
@@ -5640,24 +5637,38 @@ static void cursorTick() {
         cursor_overlay::update(r);
       }
   }
-  cursor_overlay::tick();
 
   static cursor_overlay::Local last;
   static auto lastSent = std::chrono::steady_clock::time_point{};
+  static auto lastSample = std::chrono::steady_clock::time_point{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - lastSample < std::chrono::milliseconds(16)) return;
+  lastSample = now;
   cursor_overlay::Local l;
   if (!cursor_overlay::sampleLocal(&l)) return;
-  const auto now = std::chrono::steady_clock::now();
   const auto since = now - lastSent;
   const bool changed = l.in != last.in ||
                        (l.in && (std::fabs(l.px - last.px) >= 1 || std::fabs(l.py - last.py) >= 1 ||
                                  l.guid != last.guid || l.t != last.t));
-  const bool send = l.click || (changed && since >= std::chrono::milliseconds(50)) ||
+  const bool send = l.click || (changed && since >= std::chrono::milliseconds(33)) ||
                     (l.in && since >= std::chrono::seconds(3));
   if (!send) return;
   const json m = {{"t", l.t}, {"g", l.guid}, {"fy", l.fy}, {"in", l.in}, {"click", l.click}};
   reamesh_send_cursor(g_handle, dumpJson(m).c_str());
   last = l;
   lastSent = now;
+}
+
+static void cursorTick() {
+  if (!g_cursorAttached) {
+    static const cursor_overlay::Host host = {cursorReady,       cursorTimeAxis,    cursorTrackSpan,
+                                              cursorTrackAt,     cursorPump,        cursorSetTimeAxis,
+                                              cursorTrackGuidAt, cursorTestNudge};
+    g_cursorAttached = cursor_overlay::attach(GetMainHwnd(), host);
+    if (!g_cursorAttached) return;
+  }
+  cursorPump();
+  cursor_overlay::tick();
 }
 
 static void timerTickBody() {

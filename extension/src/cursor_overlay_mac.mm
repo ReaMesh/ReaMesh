@@ -21,6 +21,7 @@
 //   REAMESH_CURSOR_KNOBS=<file>    re-read `busy=ms:every` from this file every second
 //   REAMESH_CURSOR_SCROLLTEST=scroll|zoom|height|vscroll  animate the arrange view at 60 Hz
 //   REAMESH_CURSOR_STATS=1         print timing stats to stderr every 5s
+//   REAMESH_CURSOR_TRACE=1         log each local sample and each arrival (latency)
 //   REAMESH_CURSOR_PARK=t:track:fy:#rrggbb  one synthetic peer parked at a spot
 
 #import <Cocoa/Cocoa.h>
@@ -85,12 +86,12 @@ constexpr Style kStyle = {
     .tagFont = 11,
     .tagHeight = 18,
     .tagPadX = 7,
-    .tagDX = 15,
-    .tagDY = 18,
+    .tagDX = 12,
+    .tagDY = 14,
     .tagIdleAfter = 2.0,
     .tagFadeOut = 0.6,
     .tagFadeIn = 0.15,
-    .springStiffness = 420,
+    .springStiffness = 800,
     .fadeIn = 0.18,
     .fadeOut = 0.35,
     .staleAfter = 8,
@@ -168,6 +169,7 @@ NSTimer* g_scrollTimer = nil;
 double g_scrollT0 = 0, g_scrollT1 = 0, g_scrollStart = 0;
 double g_lastFake = 0;
 bool g_stats = false;
+bool g_trace = false;  // REAMESH_CURSOR_TRACE: log every sample/arrival (latency measurement)
 std::string g_park;
 
 // Stats: glue lag (geometry change seen → layers moved), pass cost.
@@ -258,7 +260,10 @@ double setPill(CALayer* pill, CATextLayer* text, const std::string& label, const
   pill.cornerRadius = height / 2;
   pill.backgroundColor = parseColor(color).CGColor;
   text.string = as;
-  text.frame = CGRectMake(padX, std::round((height - lh) / 2), tw, lh);
+  // Centre the capitals, not the line box: the baseline sits half a cap
+  // height below the pill's middle.
+  const double top = (height + f.capHeight) / 2 - f.ascender;
+  text.frame = CGRectMake(padX, std::round(top * g_scale) / g_scale, tw, lh);
   [CATransaction commit];
   return w;
 }
@@ -589,7 +594,17 @@ void glue(const char* why, bool onlyPending = false) {
 }
 
 void onObserver() {
-  if (!g_attached || g_peers.empty()) return;
+  if (!g_attached) return;
+  if (g_host.pump) {
+    // Network in/out at most every 4ms; the observer itself runs ~1000x/s.
+    static double lastPump = 0;
+    const double t = now();
+    if (t - lastPump >= 0.004) {
+      lastPump = t;
+      g_host.pump();
+    }
+  }
+  if (g_peers.empty()) return;
   ++g_observerPasses;
   if (g_sync == Sync::Commit) {
     glue("commit");
@@ -813,6 +828,7 @@ bool attach(void* mainWindow, const Host& host) {
     if (const char* b = getenv("REAMESH_CURSOR_BUSY")) sscanf(b, "%lf:%lf", &g_busyMs, &g_busyEvery);
     g_scrollTest = getenv("REAMESH_CURSOR_SCROLLTEST") ? getenv("REAMESH_CURSOR_SCROLLTEST") : "";
     g_stats = getenv("REAMESH_CURSOR_STATS") != nullptr;
+    g_trace = getenv("REAMESH_CURSOR_TRACE") != nullptr;
     g_park = getenv("REAMESH_CURSOR_PARK") ? getenv("REAMESH_CURSOR_PARK") : "";
 
     ReaMeshCursorView* v = [[ReaMeshCursorView alloc] initWithFrame:tv.bounds];
@@ -913,6 +929,8 @@ void update(const Remote& r) {
     p.pendingSpring = p.pendingSpring || moved;
     p.pendingClick = p.pendingClick || r.click;
     ++g_netUpdates;
+    if (g_trace)
+      fprintf(stderr, "[trace] rx %.3f %.9f\n", [[NSDate date] timeIntervalSince1970] * 1000, r.t);
   }
 }
 
@@ -974,6 +992,8 @@ bool sampleLocal(Local* out) {
       ++g_clicksOut;
     }
     out->in = semanticAt(vp, g, &out->t, &out->guid, &out->fy);
+    if (g_trace && out->in)
+      fprintf(stderr, "[trace] tx %.3f %.9f\n", [[NSDate date] timeIntervalSince1970] * 1000, out->t);
     out->px = vp.x;
     out->py = vp.y;
   }
