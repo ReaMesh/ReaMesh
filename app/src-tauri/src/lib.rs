@@ -257,8 +257,9 @@ fn set_overlay_settings(app: AppHandle, mask: u8) {
 
 // ---------- auto-install ----------
 //
-// The bundled extension is installed into REAPER's UserPlugins automatically:
-// on app launch and after the REAPER folder changes. "Up to date" is a byte
+// The first install is always the user's click (onboarding or Settings). Once
+// the extension is in UserPlugins it is kept current automatically: on app
+// launch and after the REAPER folder changes. "Up to date" is a byte
 // comparison against the bundled copy, so an app update also updates the
 // extension: the two release together and must match (see `PROTO`). There is
 // no switch for it any more; the only state is "the user removed it", set by
@@ -288,10 +289,9 @@ fn store_auto_install(app: &AppHandle, enabled: bool) {
     let _ = fs::write(p, if enabled { "1" } else { "0" });
 }
 
-/// Install/update the bundled extension when auto-install is on and the
-/// installed copy is missing or stale. Best-effort and silent: onboarding and
-/// the manual install button still cover the case where REAPER can't be written
-/// (e.g. a folder that isn't there yet, or permissions).
+/// Update an installed extension that is stale, unless the user removed it.
+/// Never installs where there is no copy yet: that is the onboarding's (or
+/// Settings') install button. Best-effort and silent.
 pub(crate) fn maybe_auto_install(app: &AppHandle) {
     if !load_auto_install(app) {
         return;
@@ -306,7 +306,7 @@ pub(crate) fn maybe_auto_install(app: &AppHandle) {
     }
     // Only auto-install into a recognized REAPER resource folder.
     // The manual install button also accepts unrecognized folders.
-    if st.reaper_found && st.is_reaper_dir && (!st.installed || !st.up_to_date) {
+    if st.reaper_found && st.is_reaper_dir && st.installed && !st.up_to_date {
         if do_install(app, &custom).is_ok() {
             // The installed file changed, but a running REAPER still uses
             // the copy loaded at startup. Notify the frontend to request a restart.
@@ -514,7 +514,8 @@ fn extension_loaded() -> bool {
 /// Install a downloaded update's extension (`bytes`, from release `version`)
 /// unless a REAPER still has ReaMesh loaded. Returns false to be asked again
 /// later; true once it is in place or there is nothing to do (the user
-/// removed the extension, no REAPER folder, already that copy).
+/// removed the extension or never installed it, no REAPER folder, already
+/// that copy).
 pub(crate) fn preinstall_extension(app: &AppHandle, version: &str, bytes: &[u8]) -> bool {
     if !load_auto_install(app) {
         return true;
@@ -523,7 +524,7 @@ pub(crate) fn preinstall_extension(app: &AppHandle, version: &str, bytes: &[u8])
     let Ok(st) = compute_status(app, &custom) else {
         return true;
     };
-    if !(st.reaper_found && st.is_reaper_dir) {
+    if !(st.reaper_found && st.is_reaper_dir && st.installed) {
         return true;
     }
     let user_plugins = PathBuf::from(&st.user_plugins);
@@ -1114,8 +1115,7 @@ fn get_reaper_path(app: AppHandle) -> Option<String> {
 #[tauri::command]
 fn set_reaper_path(app: AppHandle, path: Option<String>) -> Result<(), String> {
     store_custom_path(&app, path)?;
-    // A freshly located REAPER folder picks up the extension on its own
-    // (unless the user removed it).
+    // A copy already in the newly chosen folder is brought up to date.
     maybe_auto_install(&app);
     refresh_native_settings(&app);
     Ok(())
@@ -1642,8 +1642,8 @@ pub fn run() {
                     eprintln!("[reamesh] deep link registration: {e}");
                 }
             }
-            // Keep the bundled extension installed and matching this build
-            // (unless the user removed it).
+            // Keep an installed extension matching this build (unless the
+            // user removed it).
             maybe_auto_install(app.handle());
             updater::start(app.handle());
             // The main window starts hidden and the webview shows it once its
