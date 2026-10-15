@@ -1007,6 +1007,32 @@ fn firewall_allowed() -> bool {
     fw.allowed && fw.block.is_none()
 }
 
+/// Whether a VPN (or a proxy app running in tunnel mode, which looks the same
+/// to the OS) is up: a running tunnel interface with a routable IPv4 address.
+/// macOS keeps a few `utun`s for its own services, but those carry only IPv6
+/// link-local addresses, so the IPv4 requirement keeps them out. Windows marks
+/// PPP/IPsec tunnels as point-to-point but not WireGuard/Wintun or TAP
+/// adapters, so those are recognised by name. A plain HTTP/SOCKS proxy setting
+/// is deliberately not reported: ReaMesh dials peers directly and never goes
+/// through one. The Lobby uses this for one quiet line under an empty session
+/// list (a VPN can keep LAN discovery from seeing anyone).
+#[tauri::command]
+fn vpn_active() -> bool {
+    const HINTS: [&str; 12] = [
+        "vpn", "tailscale", "wireguard", "wintun", "tap", "tun", "zerotier", "warp",
+        "nordlynx", "mullvad", "proton", "ipsec",
+    ];
+    let Ok(ifaces) = if_addrs::get_if_addrs() else { return false };
+    ifaces.iter().any(|i| {
+        let if_addrs::IfAddr::V4(v4) = &i.addr else { return false };
+        if !i.is_oper_up() || v4.ip.is_loopback() || v4.ip.is_link_local() {
+            return false;
+        }
+        let name = i.name.to_ascii_lowercase();
+        i.is_p2p() || name.starts_with("utun") || HINTS.iter().any(|h| name.contains(h))
+    })
+}
+
 /// Open the Windows Firewall control panel (the allowed-apps surface) so the
 /// user can fix a block themselves: the app never touches firewall rules.
 #[tauri::command]
@@ -1593,6 +1619,7 @@ pub fn run() {
             installed_plugins,
             firewall_block,
             firewall_allowed,
+            vpn_active,
             open_firewall_settings,
             port_trouble,
             reset_network_identity,

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useAnimate, useReducedMotion } from "motion/react";
 import { ChevronDown, ClipboardPaste, LoaderCircle, LockKeyhole, Ticket, X } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -25,7 +26,7 @@ import { takeInvite, useInviteSeq } from "@/lib/invite";
 import { recordHostJoin } from "@/lib/knownHosts";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
-import { useProfile } from "@/lib/profile";
+import { getProfile, useProfile } from "@/lib/profile";
 import { decodeTicket, normalizeTicket } from "@/lib/ticket";
 import { initials, type ExtState, type SessionAd } from "@/lib/types";
 import { protoSkew } from "@/lib/version";
@@ -222,6 +223,16 @@ function AutoHeight({ children }: { children: React.ReactNode }) {
   );
 }
 
+// Hosting or joining without a name would put a nameless face in everyone
+// else's roster. The Host / Join buttons ask the name card to open instead.
+const nameAsks = new Set<() => void>();
+/** True (and the name card asked to open) when there is no name yet. */
+function needName(): boolean {
+  if (getProfile().name.trim()) return false;
+  nameAsks.forEach((ask) => ask());
+  return true;
+}
+
 /** Who you are, as the Lobby's first row. The row itself becomes the head of
  *  the name + colour card: the card's background fades in around it, the head
  *  eases into its padding, and the fields grow in below on the spring. A
@@ -232,6 +243,19 @@ function NameCard() {
   const named = profile.name.trim().length > 0;
   // Decided once per visit, so typing the first letter doesn't fold it away.
   const [open, setOpen] = useState(() => !named);
+  // Bumped by a Host / Join click without a name: remounts the fields so the
+  // name input takes focus again, and shows why the click did nothing else.
+  const [asked, setAsked] = useState(0);
+  useEffect(() => {
+    const ask = () => {
+      setOpen(true);
+      setAsked((n) => n + 1);
+    };
+    nameAsks.add(ask);
+    return () => {
+      nameAsks.delete(ask);
+    };
+  }, []);
   return (
     <div className={cn("shrink-0 rounded-xl transition-colors duration-300", open && "bg-card")}>
       <button
@@ -281,7 +305,16 @@ function NameCard() {
           >
             {/* Indented to the name above, past the avatar. */}
             <div className="pt-1 pr-3 pb-3 pl-[46px]">
-              <ProfileFields autoFocus onDone={() => setOpen(false)} />
+              <ProfileFields
+                key={asked}
+                autoFocus
+                onDone={() => named && setOpen(false)}
+              />
+              {asked > 0 && !named && (
+                <p role="status" className="mt-2 text-[12px] text-amber-500">
+                  {t("nameFirst")}
+                </p>
+              )}
             </div>
           </motion.div>
         )}
@@ -377,6 +410,7 @@ function SessionCard({
   const beginJoin = () => {
     if (checking || joining) return;
     if (session.auth && !pass) return;
+    if (needName()) return;
     setError("");
     begin();
     send({ cmd: "check", session_id: session.session_id, passphrase: pass }, port ?? undefined);
@@ -559,6 +593,7 @@ function InviteCard({
   const beginJoin = () => {
     if (!ticket || checking || joining) return;
     if (ticket.auth && !pass) return;
+    if (needName()) return;
     startCheck(code, pass);
   };
   const busy = checking || joining;
@@ -576,7 +611,7 @@ function InviteCard({
     setRaw(link);
     setPass("");
     setError("");
-    if (info && !info.auth && !joining) startCheck(normalizeTicket(link), "");
+    if (info && !info.auth && !joining && !needName()) startCheck(normalizeTicket(link), "");
   }, [inviteSeq]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // The X in the head: fold back to the one-line link and forget the code, so
@@ -797,6 +832,7 @@ function HostCard({
     if (pending || tooShort) return;
     // Do not enter a pending state if there is no socket to send through.
     if (port === null) return;
+    if (needName()) return;
     setPending(true);
     // Stage the passphrase locally; commit it only after hosting starts.
     stageHostPass(port, pass);
@@ -868,12 +904,41 @@ function HostCard({
                 host(true);
               }}
             >
-              {t("hostAnyway")}
+              {/* Copying media is just what hosting this project takes; only a
+                  real problem (no room, a syncing cloud folder) gets "anyway". */}
+              {w && (w.cloud || (w.files > 0 && w.free_known && !w.enough))
+                ? t("hostAnyway")
+                : t("hostCopyAndHost")}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>
+  );
+}
+
+/** A VPN can hide the sessions on this network (LAN discovery doesn't cross
+ *  it, and a full tunnel may cut the local network off). Said once, quietly,
+ *  where it explains something: under an empty session list. Re-checked while
+ *  that list stays empty, so switching the VPN off makes it go away. */
+function VpnHint() {
+  const [on, setOn] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    const check = () =>
+      invoke<boolean>("vpn_active")
+        .then((v) => alive && setOn(v))
+        .catch(() => {}); // plain-browser development: no backend
+    check();
+    const id = setInterval(check, 10_000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
+  if (!on) return null;
+  return (
+    <p className="mt-1.5 text-[11.5px] leading-normal text-muted-foreground/80">{t("vpnHint")}</p>
   );
 }
 
@@ -929,9 +994,10 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
             </div>
           ) : (
             /* Quiet on purpose: no permanent discovery spinner. */
-            <p className="px-6 py-6 text-center text-[13px] text-muted-foreground">
-              {t("noSessionsYet")}
-            </p>
+            <div className="px-6 py-6 text-center">
+              <p className="text-[13px] text-muted-foreground">{t("noSessionsYet")}</p>
+              <VpnHint />
+            </div>
           )}
         </Group>
         {/* A session you can't see here is still a session. */}

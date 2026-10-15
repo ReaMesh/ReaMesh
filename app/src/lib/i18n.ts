@@ -23,8 +23,10 @@ const en = {
 
   // Lobby
   yourName: "Your name",
+  nameFirst: "Enter your name first, so the others know who you are.",
   sessionsOnNetwork: "Sessions on this network",
   noSessionsYet: "No sessions yet",
+  vpnHint: "A VPN is on, which can hide sessions on this network. An invite code still works.",
   join: "Join",
   password: "Password",
   passwordOptional: "Password (optional)",
@@ -66,6 +68,7 @@ const en = {
   hostCopyTitle: "Before you host",
   hostCloudWarning: "The project is in a cloud folder. Pause syncing while you host.",
   hostAnyway: "Host anyway",
+  hostCopyAndHost: "Copy and host",
 
   // Post-download plugin verification
   verifyTitle: "The plugin list was incomplete",
@@ -410,8 +413,10 @@ const de: Record<MsgKey, string> = {
   reaperFound: "REAPER gefunden",
 
   yourName: "Dein Name",
+  nameFirst: "Gib zuerst deinen Namen ein, damit die anderen wissen, wer du bist.",
   sessionsOnNetwork: "Sessions in diesem Netzwerk",
   noSessionsYet: "Noch keine Sessions",
+  vpnHint: "Ein VPN ist aktiv. Dadurch sind Sessions im Netzwerk eventuell nicht sichtbar. Ein Einladungscode funktioniert trotzdem.",
   join: "Beitreten",
   password: "Passwort",
   passwordOptional: "Passwort (optional)",
@@ -451,6 +456,7 @@ const de: Record<MsgKey, string> = {
   hostCopyTitle: "Bevor du hostest",
   hostCloudWarning: "Das Projekt liegt in einem Cloud-Ordner. Pausiere den Sync, solange du hostest.",
   hostAnyway: "Trotzdem hosten",
+  hostCopyAndHost: "Kopieren und hosten",
 
   verifyTitle: "Plugin-Liste unvollständig",
   verifyBodyListed: "Diese Plugins standen nicht in der Liste des Hosts:",
