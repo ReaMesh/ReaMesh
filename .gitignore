@@ -1,3 +1,13 @@
 .DS_Store
 rust/target/
 extension/build/
+
+# Secrets: environment files, signing and API keys, certificates.
+.env
+.env.*
+!.env.example
+*.key
+*.p8
+*.p12
+*.pem
+AuthKey_*

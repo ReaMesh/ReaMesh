@@ -62,6 +62,12 @@ In scope, and especially interesting:
 
 ## Supported versions
 
-Only the latest release receives fixes; a fix ships as a new release on the
-Beta and Stable update channels. ReaMesh is pre-1.0, so expect fixes to land
-in the next release rather than as backports.
+| Version                                  | Supported |
+| ---------------------------------------- | --------- |
+| Latest release on the Stable channel     | Yes       |
+| Latest release on the Beta channel       | Yes       |
+| Anything older                           | No        |
+
+Fixes ship as a new release on the update channels rather than as
+backports to older versions; the ReaMesh app installs it, together with
+the matching extension, through its built-in updater.
