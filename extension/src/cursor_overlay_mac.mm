@@ -45,8 +45,11 @@ namespace {
 // ---------- every visual parameter, in one table ----------
 
 struct Style {
-  // Pointer: a small arrow in the peer's colour with a thin light edge.
-  double pointerSize;    // height of the arrow, pt
+  // Pointer: a soft arrowhead in the peer's colour with a thin light edge,
+  // symmetric about its diagonal, with a curved notch at the back.
+  double pointerSize;    // extent of the arrowhead along each axis, pt
+  double pointerNotch;   // where the notch sits on the diagonal, 0..1 of the size
+  double tipRadius, wingRadius, notchRadius;  // corner rounding, pt
   double outline;        // white edge, pt
   double shadowOpacity;
   double shadowRadius;
@@ -70,16 +73,20 @@ struct Style {
 };
 
 constexpr Style kStyle = {
-    .pointerSize = 17,
-    .outline = 1.5,
+    .pointerSize = 20,
+    .pointerNotch = 0.8,
+    .tipRadius = 1.6,
+    .wingRadius = 1.8,
+    .notchRadius = 2.4,
+    .outline = 1.75,
     .shadowOpacity = 0.22,
     .shadowRadius = 2.5,
     .shadowOffsetY = 1,
     .tagFont = 11,
     .tagHeight = 18,
     .tagPadX = 7,
-    .tagDX = 10,
-    .tagDY = 17,
+    .tagDX = 15,
+    .tagDY = 18,
     .tagIdleAfter = 2.0,
     .tagFadeOut = 0.6,
     .tagFadeIn = 0.15,
@@ -201,15 +208,27 @@ bool isLight(const std::string& hex) {
 }
 
 CGPathRef pointerPath() {
-  // Tip at (0,0), y down: a rounded arrowhead without a tail.
+  // Hotspot at (0,0), y down. Four corners: the tip, two wings and the notch
+  // between them, every one rounded. The rounding pulls the drawn tip inwards,
+  // so the shape is shifted back by that amount to keep the hotspot on it.
   static CGPathRef path = nullptr;
   if (!path) {
-    const double s = kStyle.pointerSize / 17.0;
+    const double z = kStyle.pointerSize;
+    const double wing = 0.37 * z;  // how far each wing leans off its axis
+    const CGPoint tip = CGPointMake(0, 0), left = CGPointMake(wing, z), right = CGPointMake(z, wing);
+    const double n = kStyle.pointerNotch * (z + wing) / 2;
+    const CGPoint notch = CGPointMake(n, n);
+    // The rounded tip sits r/sin(a/2) - r in from the corner along the
+    // diagonal (a = the angle between the two edges at the tip).
+    const double half = std::atan2(z, wing) - M_PI / 4;
+    const double inset = (kStyle.tipRadius / std::sin(half) - kStyle.tipRadius) / std::sqrt(2.0);
+    CGAffineTransform t = CGAffineTransformMakeTranslation(-inset, -inset);
     CGMutablePathRef p = CGPathCreateMutable();
-    CGPathMoveToPoint(p, nullptr, 0, 0);
-    CGPathAddLineToPoint(p, nullptr, 0, 15.5 * s);
-    CGPathAddLineToPoint(p, nullptr, 4.4 * s, 11.6 * s);
-    CGPathAddLineToPoint(p, nullptr, 11.2 * s, 11.2 * s);
+    CGPathMoveToPoint(p, &t, (tip.x + left.x) / 2, (tip.y + left.y) / 2);
+    CGPathAddArcToPoint(p, &t, left.x, left.y, notch.x, notch.y, kStyle.wingRadius);
+    CGPathAddArcToPoint(p, &t, notch.x, notch.y, right.x, right.y, kStyle.notchRadius);
+    CGPathAddArcToPoint(p, &t, right.x, right.y, tip.x, tip.y, kStyle.wingRadius);
+    CGPathAddArcToPoint(p, &t, tip.x, tip.y, left.x, left.y, kStyle.tipRadius);
     CGPathCloseSubpath(p);
     path = p;
   }
