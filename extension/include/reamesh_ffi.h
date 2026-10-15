@@ -19,7 +19,7 @@
  * `app/src-tauri/src/lib.rs`); app/src/lib/version.test.ts checks the copies
  * agree.
  */
-#define PROTO 1
+#define PROTO 2
 
 typedef struct ReameshHandle ReameshHandle;
 
@@ -96,6 +96,11 @@ char *reamesh_session_ticket(struct ReameshHandle *handle);
  * connecting/downloading/ready/failed.
  */
 bool reamesh_join_ticket(struct ReameshHandle *handle, const char *ticket, const char *passphrase);
+
+/**
+ * Dial a nearby host from an address hint (see `Reamesh::dial_hint`).
+ */
+bool reamesh_dial_hint(struct ReameshHandle *handle, const char *json);
 
 /**
  * Pre-check a passphrase against a ticket's host without joining: the ticket

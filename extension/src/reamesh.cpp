@@ -4236,6 +4236,21 @@ static void ctlDispatch(const json& cmd) {
                                  jsonStr(cmd, "passphrase").c_str());
       }
     }
+  } else if (c == "hint") {
+    // A nearby host's addresses, read by the app off its Bluetooth
+    // advertisement: dial them so the host's signed lobby announce can arrive.
+    // Only meaningful in the Lobby; the core filters to our own subnets and
+    // rate-limits, and nothing shows up unless a real session answers.
+    if (g_handle && g_mode == Mode::Browsing) {
+      auto port = [&](const char* k) {
+        const double p = jsonNum(cmd, k, 0);
+        return (p >= 1 && p <= 65535) ? (int)p : 0;
+      };
+      json hint = {{"ips", cmd.contains("ips") && cmd["ips"].is_array() ? cmd["ips"] : json::array()},
+                   {"tcp", port("tcp")},
+                   {"quic", port("quic")}};
+      reamesh_dial_hint(g_handle, hint.dump().c_str());
+    }
   } else if (c == "leave") {
     onLeave();
   } else if (c == "reveal_peer") {
@@ -4737,6 +4752,9 @@ static void pollDownload() {
     else if (msg.find("version mismatch") != std::string::npos)
       leaveSession("version_mismatch", json::object(),
                    "the host runs a different ReaMesh version");
+    else if (msg.find("could not prove the session passphrase") != std::string::npos)
+      leaveSession("host_unverified", json::object(),
+                   "the host could not prove it knows the session password");
     else if (msg.find("passphrase") != std::string::npos)
       leaveSession("wrong_password", json::object(), "join failed: " + msg);
     else if (msg.find("ticket host unreachable") != std::string::npos)

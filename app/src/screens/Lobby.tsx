@@ -49,7 +49,7 @@ const TICKET_CHECK_TIMEOUT_MS = 35_000;
  *  no hard start, no overshoot, settled after about 0.3 s. */
 const FOLD = { type: "spring", stiffness: 400, damping: 38 } as const;
 
-type CheckOutcome = "ok" | "bad" | "banned" | "version" | "unknown";
+type CheckOutcome = "ok" | "bad" | "banned" | "version" | "unverified" | "unknown";
 type CheckError = "" | Exclude<CheckOutcome, "ok">;
 
 /** Inline text under the passphrase field for a failed check. */
@@ -57,6 +57,7 @@ function checkErrorText(error: CheckError): string {
   if (error === "bad") return t("wrongPassword");
   if (error === "banned") return t("bannedFromSession");
   if (error === "version") return t("hostOtherVersion");
+  if (error === "unverified") return t("hostUnverified");
   return t("checkNoAnswer");
 }
 
@@ -103,7 +104,9 @@ function usePassphraseCheck(
             ? "banned"
             : probe.reason === "version"
               ? "version"
-              : "unknown",
+              : probe.reason === "unverified"
+                ? "unverified"
+                : "unknown",
     );
   }, [probe, checking, sid]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -400,7 +403,9 @@ function SessionCard({
       // A refused probe for an open session means the host did not answer,
       // unless the host said outright that this device is blocked.
       setError(
-        session.auth || outcome === "banned" || outcome === "version" ? outcome : "unknown",
+        session.auth || outcome === "banned" || outcome === "version" || outcome === "unverified"
+          ? outcome
+          : "unknown",
       );
       shake();
     },
@@ -578,7 +583,9 @@ function InviteCard({
     (outcome) => {
       if (outcome === "ok") return setConfirmOpen(true);
       setError(
-        ticket?.auth || outcome === "banned" || outcome === "version" ? outcome : "unknown",
+        ticket?.auth || outcome === "banned" || outcome === "version" || outcome === "unverified"
+          ? outcome
+          : "unknown",
       );
       shake();
     },

@@ -72,7 +72,7 @@ const LOBBY_TOPIC: &str = "reamesh/v2/lobby";
 /// instead of tested. Mirrored in the app (`app/src/lib/version.ts`,
 /// `app/src-tauri/src/lib.rs`); app/src/lib/version.test.ts checks the copies
 /// agree.
-pub const PROTO: u32 = 1;
+pub const PROTO: u32 = 2;
 /// This build's version, the same number across the core, the extension and
 /// the ReaMesh app (they release together).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -264,8 +264,9 @@ struct FileMeta {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum XferRequest {
-    /// Initial project manifest. `auth` is the session token (empty for open
-    /// sessions); the owner refuses to serve without the right one.
+    /// Initial project manifest. `auth` is the requester's `xfer_proof` for
+    /// this (requester, server) pair, never the session token itself; the
+    /// owner refuses to serve without the right one.
     Manifest { auth: String },
     /// Fetch of a single project-relative file at `offset`. Served by every
     /// session peer (not just the owner) from its project copy: this is what
@@ -286,6 +287,12 @@ enum XferResponse {
         /// project before it opens. `default` keeps older peers decodable.
         #[serde(default)]
         meta: String,
+        /// The host's `xfer_proof` for (host, requester): proves the host
+        /// knows the session passphrase, so a look-alike session can't pose
+        /// as the real one. The requester checks it before trusting anything
+        /// else in the manifest.
+        #[serde(default)]
+        host_proof: String,
     },
     /// Response to `File`: `size` is the file's full *uncompressed* length so
     /// the requester knows when it is done; `data` is one chunk, zstd-deflated
@@ -1049,6 +1056,53 @@ fn presence_mac(auth_token: &str, peer_id: &str) -> String {
     blake3::keyed_hash(&key, peer_id.as_bytes()).to_hex().to_string()
 }
 
+/// Proof of the session passphrase for one transfer exchange, bound to the
+/// two transport-authenticated peer ids and the direction. A requester sends
+/// `xfer_proof(token, PROOF_REQUEST, me, server)` instead of the token, and
+/// the owner answers a manifest with `xfer_proof(token, PROOF_HOST, owner,
+/// requester)`. Whoever receives a proof learns nothing usable elsewhere: it
+/// only verifies between exactly those two peers in that direction, so a
+/// look-alike host (or any topic member a download asks for a piece) can't
+/// lift the session token out of a request, and a host that doesn't know the
+/// passphrase can't produce the answer a joiner checks. Open sessions derive
+/// from the empty token: the check degrades to "speaks ReaMesh".
+fn xfer_proof(auth_token: &str, direction: &str, from: &PeerId, to: &PeerId) -> String {
+    let key = blake3::derive_key("reamesh/v4/xfer-proof", auth_token.as_bytes());
+    let mut h = blake3::Hasher::new_keyed(&key);
+    h.update(direction.as_bytes());
+    h.update(b"\0");
+    h.update(&from.to_bytes());
+    h.update(b"\0");
+    h.update(&to.to_bytes());
+    h.finalize().to_hex().to_string()
+}
+
+const PROOF_REQUEST: &str = "request";
+const PROOF_HOST: &str = "host";
+
+/// `req` with its `auth` set to the requester's proof for `to`.
+fn prove_request(mut req: XferRequest, auth_token: &str, me: &PeerId, to: &PeerId) -> XferRequest {
+    let proof = xfer_proof(auth_token, PROOF_REQUEST, me, to);
+    match &mut req {
+        XferRequest::Manifest { auth } | XferRequest::File { auth, .. } => *auth = proof,
+    }
+    req
+}
+
+/// Whether a manifest answer from `owner` carries a valid host proof.
+fn host_proof_ok(response: &XferResponse, auth_token: &str, owner: &PeerId, me: &PeerId) -> bool {
+    match response {
+        XferResponse::Manifest { host_proof, .. } => {
+            ct_eq(host_proof.as_bytes(), xfer_proof(auth_token, PROOF_HOST, owner, me).as_bytes())
+        }
+        _ => true,
+    }
+}
+
+/// The status message a join fails with when the host couldn't prove the
+/// passphrase; the extension maps it to a stable code.
+const HOST_UNVERIFIED_MESSAGE: &str = "the host could not prove the session passphrase";
+
 /// Symmetric key sealing this session's gossip, derived from the session
 /// token. `None` for open sessions (empty token: nothing secret to derive
 /// from), whose gossip stays plaintext. Deriving per message is a single
@@ -1395,6 +1449,12 @@ enum Command {
     ProbeAuth { session_id: String, passphrase: String },
     FetchFile(String),
     Dial(Multiaddr),
+    /// Dial addresses a nearby host advertised (Bluetooth, through the app)
+    /// without knowing its peer id. Already filtered to our own subnets by
+    /// `hint_addrs`; the task rate-limits per address. Nothing is trusted from
+    /// the hint itself: a session only shows up once its signed lobby
+    /// announce arrives over the resulting connection.
+    Hint(Vec<Multiaddr>),
     /// Owner-side: the background hashing pass over the project finished;
     /// replace the served manifest with this hash-complete one. Hosting starts
     /// with an unhashed manifest so `host()` returns instantly (hashing a
@@ -2434,6 +2494,16 @@ impl Reamesh {
             .collect()
     }
 
+    /// Dial a nearby host from an address hint
+    /// `{"ips":["192.168.1.20"],"tcp":40123,"quic":40124}` (what the app reads
+    /// off a host's Bluetooth advertisement). Only addresses in one of our own
+    /// subnets are dialed; see `hint_addrs`. Returns whether anything was
+    /// left to dial.
+    pub fn dial_hint(&self, json: &str) -> bool {
+        let addrs = hint_addrs(json, &local_subnets());
+        !addrs.is_empty() && self.cmd_tx.send(Command::Hint(addrs)).is_ok()
+    }
+
     /// Explicitly dial a peer multiaddr. Production discovery is mDNS; this
     /// exists for tests and as an escape hatch on networks without multicast.
     pub fn dial(&self, addr: &str) -> bool {
@@ -3238,6 +3308,9 @@ struct Probe {
     req: request_response::OutboundRequestId,
     session_id: String,
     started: Instant,
+    /// The token the passphrase derived, to check the owner's host proof.
+    token: String,
+    owner: PeerId,
 }
 
 /// Deadline for a passphrase pre-check. Expiry reports a timeout,
@@ -3256,11 +3329,13 @@ fn send_probe(
     session_id: String,
     passphrase: &str,
 ) -> Probe {
+    let token = auth_token(salt, passphrase);
+    let me = *swarm.local_peer_id();
     let req = swarm.behaviour_mut().xfer.send_request(
         owner,
-        XferRequest::Manifest { auth: auth_token(salt, passphrase) },
+        prove_request(XferRequest::Manifest { auth: String::new() }, &token, &me, owner),
     );
-    Probe { req, session_id, started: Instant::now() }
+    Probe { req, session_id, started: Instant::now(), token, owner: *owner }
 }
 
 fn fetch_send(
@@ -3270,7 +3345,9 @@ fn fetch_send(
 ) -> bool {
     let Some(peer) = fetch.peer() else { return false };
     fetch.last_activity = Instant::now();
-    let id = swarm.behaviour_mut().xfer.send_request(&peer, fetch.request());
+    let me = *swarm.local_peer_id();
+    let req = prove_request(fetch.request(), &fetch.auth, &me, &peer);
+    let id = swarm.behaviour_mut().xfer.send_request(&peer, req);
     fetch.req = Some(id);
     fetch_reqs.insert(id, fetch.rel.clone());
     true
@@ -3458,6 +3535,8 @@ fn serve_xfer(
     hosting: Option<&Hosting>,
     serve_dir: Option<&Path>,
     auth_token: &str,
+    me: &PeerId,
+    requester: &PeerId,
     banned: bool,
     req: &XferRequest,
     may_serve: &dyn Fn(&str) -> bool,
@@ -3473,7 +3552,8 @@ fn serve_xfer(
     let presented = match req {
         XferRequest::Manifest { auth } | XferRequest::File { auth, .. } => auth.as_str(),
     };
-    if !ct_eq(presented.as_bytes(), auth_token.as_bytes()) {
+    let expected = xfer_proof(auth_token, PROOF_REQUEST, requester, me);
+    if !ct_eq(presented.as_bytes(), expected.as_bytes()) {
         return XferResponse::Error {
             message: "wrong or missing session passphrase".into(),
         };
@@ -3528,6 +3608,7 @@ fn serve_xfer(
                 project_file: h.project_file.clone(),
                 files: h.files.clone(),
                 meta: h.meta.clone(),
+                host_proof: xfer_proof(auth_token, PROOF_HOST, me, requester),
             },
             None => XferResponse::Error {
                 message: "not hosting".into(),
@@ -3699,6 +3780,83 @@ struct PendingJoin {
     connected: bool,
 }
 
+/// Most addresses one hint may name, and how soon the same address may be
+/// dialed again from a hint. A Bluetooth advertisement is readable by anyone
+/// nearby, so the hint path must not turn into "make every lobby dial
+/// whatever I advertise as often as I like".
+const HINT_MAX_ADDRS: usize = 8;
+const HINT_REDIAL: Duration = Duration::from_secs(15);
+
+/// Our non-loopback interface networks as (address, prefix mask) pairs.
+fn local_subnets() -> Vec<(std::net::IpAddr, std::net::IpAddr)> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| !i.is_loopback())
+        .filter_map(|i| match i.addr {
+            if_addrs::IfAddr::V4(a) => Some((a.ip.into(), a.netmask.into())),
+            if_addrs::IfAddr::V6(a) => Some((a.ip.into(), a.netmask.into())),
+        })
+        .collect()
+}
+
+/// Whether `ip` lies in one of `subnets` without being one of our own
+/// addresses. Unspecified, loopback, multicast and broadcast never pass.
+fn in_local_subnet(ip: std::net::IpAddr, subnets: &[(std::net::IpAddr, std::net::IpAddr)]) -> bool {
+    use std::net::IpAddr;
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    if let IpAddr::V4(v4) = ip
+        && v4.is_broadcast()
+    {
+        return false;
+    }
+    subnets.iter().any(|(net, mask)| match (ip, net, mask) {
+        (IpAddr::V4(a), IpAddr::V4(n), IpAddr::V4(m)) => {
+            let (a, n, m) = (u32::from(a), u32::from(*n), u32::from(*m));
+            // A host route (/32) is no subnet to share; nor is our own address
+            // or the network's broadcast address.
+            m != u32::MAX && a & m == n & m && a != n && a | m != u32::MAX
+        }
+        (IpAddr::V6(a), IpAddr::V6(n), IpAddr::V6(m)) => {
+            let (a, n, m) = (u128::from(a), u128::from(*n), u128::from(*m));
+            m != u128::MAX && a & m == n & m && a != n
+        }
+        _ => false,
+    })
+}
+
+/// Dialable addresses from a nearby-host hint (see `Reamesh::dial_hint`):
+/// each IP in our own subnets, expanded to its TCP and QUIC address. Malformed
+/// input, foreign subnets and zero ports yield nothing.
+fn hint_addrs(json: &str, subnets: &[(std::net::IpAddr, std::net::IpAddr)]) -> Vec<Multiaddr> {
+    let Ok(v) = serde_json::from_str::<JsonValue>(json) else { return Vec::new() };
+    let port = |k: &str| {
+        v.get(k).and_then(|p| p.as_u64()).filter(|p| (1..=u16::MAX as u64).contains(p)).map(|p| p as u16)
+    };
+    let (tcp, quic) = (port("tcp"), port("quic"));
+    let mut out = Vec::new();
+    let ips = v.get("ips").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+    for ip in ips.iter().filter_map(|x| x.as_str()).take(HINT_MAX_ADDRS) {
+        let Ok(ip) = ip.parse::<std::net::IpAddr>() else { continue };
+        if !in_local_subnet(ip, subnets) {
+            continue;
+        }
+        let base = match ip {
+            std::net::IpAddr::V4(a) => Multiaddr::empty().with(Protocol::Ip4(a)),
+            std::net::IpAddr::V6(a) => Multiaddr::empty().with(Protocol::Ip6(a)),
+        };
+        if let Some(p) = tcp {
+            out.push(base.clone().with(Protocol::Tcp(p)));
+        }
+        if let Some(p) = quic {
+            out.push(base.with(Protocol::Udp(p)).with(Protocol::QuicV1));
+        }
+    }
+    out
+}
+
 /// Dial a ticket's host: remember its addresses (request-response dials by
 /// peer id), mark it an explicit gossipsub peer, and connect. When one of the
 /// ticket's addresses is actually one of *our own* IPs (two instances on one
@@ -3815,10 +3973,11 @@ fn start_join(
     // otherwise time out and surface as phantom snap-backs the
     // moment we reconnect.
     shared.doc.lock().unwrap().pending.clear();
-    let req = swarm
-        .behaviour_mut()
-        .xfer
-        .send_request(&owner, XferRequest::Manifest { auth: token.clone() });
+    let me = *swarm.local_peer_id();
+    let req = swarm.behaviour_mut().xfer.send_request(
+        &owner,
+        prove_request(XferRequest::Manifest { auth: String::new() }, &token, &me, &owner),
+    );
     Some(Download {
         owner,
         session_id: session_id.to_string(),
@@ -3854,6 +4013,11 @@ async fn run_network(
     // IPs this host listens on; used to recognize same-host peers (see below).
     let mut local_ips: std::collections::HashSet<std::net::IpAddr> =
         std::collections::HashSet::new();
+    // Address-hint dials: when each address was last tried, and the
+    // connections they opened (made explicit gossipsub peers once
+    // established, like an mDNS discovery, so the lobby announce flows at once).
+    let mut hint_dialed: HashMap<Multiaddr, Instant> = HashMap::new();
+    let mut hint_conns: HashSet<libp2p::swarm::ConnectionId> = HashSet::new();
 
     let lobby = gossipsub::IdentTopic::new(LOBBY_TOPIC);
     let mut hosting = cfg.hosting;
@@ -4097,6 +4261,20 @@ async fn run_network(
                 Some(Command::Dial(addr)) => {
                     if let Err(e) = swarm.dial(addr) {
                         eprintln!("[reamesh] dial failed: {e}");
+                    }
+                }
+                Some(Command::Hint(addrs)) => {
+                    hint_dialed.retain(|_, at| at.elapsed() < HINT_REDIAL);
+                    for addr in addrs {
+                        if hint_dialed.contains_key(&addr) || hint_dialed.len() >= 4 * HINT_MAX_ADDRS {
+                            continue;
+                        }
+                        hint_dialed.insert(addr.clone(), Instant::now());
+                        let opts = DialOpts::unknown_peer_id().address(addr).allocate_new_port().build();
+                        let id = opts.connection_id();
+                        if swarm.dial(opts).is_ok() {
+                            hint_conns.insert(id);
+                        }
                     }
                 }
                 Some(Command::Shutdown) | None => {
@@ -4451,8 +4629,11 @@ async fn run_network(
                     }
                     shared.listen_addrs.lock().unwrap().push(address);
                 }
-                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
                     eprintln!("[reamesh] connection established with {peer_id} via {endpoint:?}");
+                    if hint_conns.remove(&connection_id) {
+                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    }
                     // A reachable ticket host: stop the fast-fail clock and let
                     // it have the full window to send its announce.
                     if let Some(pj) = &mut pending_join
@@ -4460,7 +4641,8 @@ async fn run_network(
                         pj.connected = true;
                     }
                 }
-                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                SwarmEvent::OutgoingConnectionError { peer_id, error, connection_id } => {
+                    hint_conns.remove(&connection_id);
                     eprintln!("[reamesh] outgoing connection error (peer {peer_id:?}): {error}");
                 }
                 SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
@@ -4913,7 +5095,16 @@ async fn run_network(
                                 }
                                 None => true,
                             };
-                            let resp = serve_xfer(hosting.as_ref(), serve_dir.as_deref(), &token, banned, &request, &may_serve);
+                            let resp = serve_xfer(
+                                hosting.as_ref(),
+                                serve_dir.as_deref(),
+                                &token,
+                                swarm.local_peer_id(),
+                                &peer,
+                                banned,
+                                &request,
+                                &may_serve,
+                            );
                             // Remember an admitted path so its further pieces skip the doc scan.
                             if let (Some(h), XferRequest::File { path, .. }, XferResponse::FileChunk { .. }) =
                                 (hosting.as_mut(), &request, &resp)
@@ -4927,7 +5118,12 @@ async fn run_network(
                                 // A successful pre-check supplies the join preview without downloading
                                 // files or subscribing. Errors distinguish a ban from a rejected token.
                                 let p = probe.take().unwrap();
+                                // A manifest from a host that can't prove the
+                                // passphrase is a look-alike, whatever it says.
+                                let me = *swarm.local_peer_id();
+                                let genuine = peer == p.owner && host_proof_ok(&response, &p.token, &p.owner, &me);
                                 let (ok, preview) = match &response {
+                                    XferResponse::Manifest { .. } if !genuine => (false, JsonValue::Null),
                                     XferResponse::Manifest { files, project_file, meta, .. } => {
                                         let parsed_meta = serde_json::from_str::<JsonValue>(meta)
                                             .unwrap_or(JsonValue::Null);
@@ -4945,12 +5141,24 @@ async fn run_network(
                                 };
                                 let reason = match &response {
                                     _ if ok => "",
+                                    XferResponse::Manifest { .. } => "unverified",
                                     XferResponse::Error { message } if message == BANNED_MESSAGE => "banned",
                                     _ => "rejected",
                                 };
                                 *shared.probe_result.lock().unwrap() =
                                     Some((p.session_id, Some(ok), preview, reason));
                             } else if download.as_ref().is_some_and(|dl| dl.manifest_req == Some(request_id)) {
+                                // Before anything else: the host must prove the
+                                // passphrase. A look-alike session never gets us
+                                // onto its topic or into the download.
+                                let me = *swarm.local_peer_id();
+                                let genuine = download.as_ref().is_some_and(|dl| {
+                                    peer == dl.owner && host_proof_ok(&response, &dl.auth, &dl.owner, &me)
+                                });
+                                if !genuine {
+                                    download_fail(&mut download, &shared, HOST_UNVERIFIED_MESSAGE.into());
+                                    continue;
+                                }
                                 // A manifest only arrives once the owner accepted
                                 // our session token: this is the moment we become
                                 // a legitimate session member, so join the topic
@@ -5149,7 +5357,8 @@ fn download_pump(swarm: &mut Swarm<Behaviour>, dl: &mut Download) {
                 }
             }
         };
-        let req = dl.request(piece);
+        let me = *swarm.local_peer_id();
+        let req = prove_request(dl.request(piece), &dl.auth, &me, &peer);
         let id = swarm.behaviour_mut().xfer.send_request(&peer, req);
         dl.inflight.insert(id, (piece, Instant::now()));
     }
@@ -5332,10 +5541,9 @@ fn download_tick(swarm: &mut Swarm<Behaviour>, shared: &Shared, download: &mut O
             return download_fail(download, shared, "the host did not respond".into());
         }
         if dl.manifest_req.is_none() {
-            let id = swarm
-                .behaviour_mut()
-                .xfer
-                .send_request(&dl.owner, XferRequest::Manifest { auth: dl.auth.clone() });
+            let me = *swarm.local_peer_id();
+            let req = prove_request(XferRequest::Manifest { auth: String::new() }, &dl.auth, &me, &dl.owner);
+            let id = swarm.behaviour_mut().xfer.send_request(&dl.owner, req);
             dl.manifest_req = Some(id);
             dl.last_activity = Instant::now();
         }
@@ -5897,6 +6105,16 @@ pub extern "C" fn reamesh_join_ticket(
         .unwrap_or(false)
 }
 
+/// Dial a nearby host from an address hint (see `Reamesh::dial_hint`).
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_dial_hint(handle: *mut Reamesh, json: *const c_char) -> bool {
+    let (false, Some(j)) = (handle.is_null(), cstr_arg(json)) else {
+        return false;
+    };
+    let r = unsafe { &*handle };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.dial_hint(&j))).unwrap_or(false)
+}
+
 /// Pre-check a passphrase against a ticket's host without joining: the ticket
 /// analogue of `reamesh_check_passphrase`, reporting through the same `probe`
 /// status field. An unreachable host reports ok=false rather than hanging.
@@ -6194,6 +6412,86 @@ pub extern "C" fn reamesh_shutdown(handle: *mut Reamesh) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hint_addrs_stay_in_our_subnets() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        // A /16 guest network plus an IPv6 /64.
+        let nets = vec![
+            (ip("172.29.16.14"), ip("255.255.0.0")),
+            (ip("fd00::1"), ip("ffff:ffff:ffff:ffff::")),
+        ];
+        let got = hint_addrs(
+            r#"{"ips":["172.29.3.7","10.0.0.5","172.29.16.14","172.29.255.255","fd00::9","127.0.0.1","nope"],"tcp":4001,"quic":4002}"#,
+            &nets,
+        );
+        let got: Vec<String> = got.iter().map(|a| a.to_string()).collect();
+        assert_eq!(
+            got,
+            vec![
+                "/ip4/172.29.3.7/tcp/4001",
+                "/ip4/172.29.3.7/udp/4002/quic-v1",
+                "/ip6/fd00::9/tcp/4001",
+                "/ip6/fd00::9/udp/4002/quic-v1",
+            ]
+        );
+        // Ports out of range or missing, and junk, give nothing to dial.
+        assert!(hint_addrs(r#"{"ips":["172.29.3.7"],"tcp":0,"quic":70000}"#, &nets).is_empty());
+        assert!(hint_addrs("not json", &nets).is_empty());
+        // Bounded no matter how many addresses a hint names.
+        let many: Vec<String> = (1..=50).map(|i| format!("\"172.29.0.{i}\"")).collect();
+        let j = format!(r#"{{"ips":[{}],"tcp":1}}"#, many.join(","));
+        assert_eq!(hint_addrs(&j, &nets).len(), HINT_MAX_ADDRS);
+        // A host route is no shared subnet.
+        assert!(hint_addrs(r#"{"ips":["100.64.0.2"],"tcp":1}"#, &[(ip("100.64.0.1"), ip("255.255.255.255"))]).is_empty());
+    }
+
+    #[test]
+    fn xfer_proof_binds_token_direction_and_peers() {
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let tok = auth_token("salt-1234", "hunter2");
+        let p = xfer_proof(&tok, PROOF_REQUEST, &a, &b);
+        assert_eq!(p, xfer_proof(&tok, PROOF_REQUEST, &a, &b));
+        // Useless to anyone else: another server, the reverse direction, the
+        // host role, or a host without the passphrase.
+        assert_ne!(p, xfer_proof(&tok, PROOF_REQUEST, &a, &c));
+        assert_ne!(p, xfer_proof(&tok, PROOF_REQUEST, &b, &a));
+        assert_ne!(p, xfer_proof(&tok, PROOF_HOST, &a, &b));
+        assert_ne!(p, xfer_proof(&auth_token("salt-1234", "guess"), PROOF_REQUEST, &a, &b));
+        assert_ne!(p, tok, "the proof must not be the token itself");
+    }
+
+    #[test]
+    fn serve_xfer_wants_a_proof_and_answers_with_one() {
+        let (host, guest, other) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let tok = auth_token("salt-1234", "hunter2");
+        let hosting = Hosting {
+            session_id: "sid".into(),
+            session_name: "S".into(),
+            project_file: "p.rpp".into(),
+            files: Vec::new(),
+            salt: "salt-1234".into(),
+            auth: true,
+            meta: String::new(),
+            ever_listed: HashSet::new(),
+        };
+        let serve = |req: &XferRequest, from: &PeerId| {
+            serve_xfer(Some(&hosting), None, &tok, &host, from, false, req, &|_| true)
+        };
+        // The bare token is refused now; so is a proof meant for another server.
+        assert!(matches!(serve(&XferRequest::Manifest { auth: tok.clone() }, &guest), XferResponse::Error { .. }));
+        let for_other = prove_request(XferRequest::Manifest { auth: String::new() }, &tok, &guest, &other);
+        assert!(matches!(serve(&for_other, &guest), XferResponse::Error { .. }));
+        // ...or one replayed by a different requester.
+        let good = prove_request(XferRequest::Manifest { auth: String::new() }, &tok, &guest, &host);
+        assert!(matches!(serve(&good, &other), XferResponse::Error { .. }));
+        let resp = serve(&good, &guest);
+        assert!(matches!(resp, XferResponse::Manifest { .. }));
+        assert!(host_proof_ok(&resp, &tok, &host, &guest));
+        // A look-alike host with a different identity or no passphrase fails.
+        assert!(!host_proof_ok(&resp, &tok, &other, &guest));
+        assert!(!host_proof_ok(&resp, &auth_token("salt-1234", "guess"), &host, &guest));
+    }
 
     fn metas(paths: &[&str]) -> Vec<FileMeta> {
         paths.iter().map(|p| FileMeta { path: p.to_string(), size: 1, hash: String::new() }).collect()
