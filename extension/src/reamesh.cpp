@@ -888,6 +888,66 @@ static std::vector<std::string> chunkFilePaths(const std::string& chunk) {
   return out;
 }
 
+// Whether a media path a peer sent could make this REAPER read a file outside
+// its own project folder (or reach another host): on the wire every in-project
+// path is project-relative (relativizeChunkFiles), so an absolute, UNC,
+// drive-letter or URL-like path, an empty / "." / ".." component, a leading
+// "~", a control character or a double quote (REAPER quotes such a path with '
+// or `, and it is never relativized) all mean "not a session file". An empty
+// path names no file. Mirrors media_path_unsafe in the Rust core.
+static bool mediaPathUnsafe(std::string_view path) {
+  if (path.empty()) return false;
+  for (const char c : path)
+    if (c == '"' || c == ':' || (unsigned char)c < 0x20 || c == 0x7f) return true;
+  if (path.front() == '/' || path.front() == '\\') return true;
+  size_t start = 0;
+  for (bool first = true; start <= path.size(); first = false) {
+    size_t end = path.find_first_of("/\\", start);
+    if (end == std::string_view::npos) end = path.size();
+    const std::string_view part = path.substr(start, end - start);
+    if (part.empty() || part == "." || part == ".." || (first && part == "~")) return true;
+    start = end + 1;
+  }
+  return false;
+}
+
+// Does `text` (an item chunk, or an FX chain / envelope / receive block) carry
+// a FILE line, at any nesting depth, whose path is unsafe (mediaPathUnsafe)?
+// The keyword is matched case-insensitively and the path may be quoted with
+// ", ' or `, or not at all; an unterminated quote counts as unsafe. Mirrors
+// chunk_has_unsafe_file_path in the Rust core. Unit-tested by chunk_test.cpp.
+static bool chunkHasUnsafeFilePath(const std::string& text) {
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t eol = text.find('\n', pos);
+    if (eol == std::string::npos) eol = text.size();
+    std::string_view t = ltrim(std::string_view(text.data() + pos, eol - pos));
+    pos = eol + 1;
+    if (t.size() < 4) continue;
+    bool kw = true;
+    for (size_t i = 0; i < 4; ++i)
+      if (toupper((unsigned char)t[i]) != "FILE"[i]) kw = false;
+    if (!kw) continue;
+    std::string_view rest = t.substr(4);
+    if (!rest.empty() && rest.front() != ' ' && rest.front() != '\t') continue;  // FILEX…
+    rest = ltrim(rest);
+    while (!rest.empty() && (rest.back() == '\r' || rest.back() == ' ' || rest.back() == '\t'))
+      rest.remove_suffix(1);
+    if (rest.empty()) continue;
+    std::string_view path;
+    const char q = rest.front();
+    if (q == '"' || q == '\'' || q == '`') {
+      const size_t close = rest.find(q, 1);
+      if (close == std::string_view::npos) return true;  // unterminated
+      path = rest.substr(1, close - 1);
+    } else {
+      path = rest.substr(0, rest.find_first_of(" \t"));
+    }
+    if (mediaPathUnsafe(path)) return true;
+  }
+  return false;
+}
+
 static bool isRelativePath(const std::string& p) {
   if (p.empty() || p.front() == '/' || p.front() == '\\') return false;
   if (p.size() >= 2 && isalpha((unsigned char)p[0]) && p[1] == ':') return false;
@@ -1910,6 +1970,31 @@ static bool repointTakes(const std::string& srcPath, const std::string& dest) {
   return repointed;
 }
 
+// Source files this REAPER got from the session rather than from its user:
+// every take source of the project a join opened, and of every item a remote
+// edit applied. internalizeExternalMedia never copies one of these into the
+// project folder, where it would be served to the session: only media the
+// local user brought in is internalized. (Remote chunks naming a file outside
+// the project are refused before they apply, see dropUnsafeMediaPaths; a
+// downloaded .rpp can still name one, and REAPER loads it locally.)
+static std::set<std::string> g_foreignSources;
+
+static void noteForeignSources(MediaItem* item) {
+  for (int t = 0, n = CountTakes(item); t < n; ++t) {
+    MediaItem_Take* take = GetMediaItemTake(item, t);
+    PCM_source* src = take ? GetMediaItemTake_Source(take) : nullptr;
+    if (!src) continue;
+    char fn[4096] = "";
+    GetMediaSourceFileName(src, fn, sizeof(fn));
+    if (fn[0]) g_foreignSources.insert(fn);
+  }
+}
+
+static void noteAllSourcesForeign() {
+  for (int i = 0, n = CountMediaItems(nullptr); i < n; ++i)
+    if (MediaItem* item = GetMediaItem(nullptr, i)) noteForeignSources(item);
+}
+
 static void internalizeExternalMedia() {
   const fs::path projDir = projectDir();
   if (projDir.empty()) return;
@@ -1958,6 +2043,10 @@ static void internalizeExternalMedia() {
     const bool outside = !rel.empty() && *rel.begin() == fs::path("..");
     if (!ec && !rel.empty() && !outside) continue;  // already inside
     if (g_copyFailed.count(fn)) continue;
+    // Only what the local user brought in, and only a regular file (never a
+    // device, pipe or folder REAPER happens to report as a source).
+    if (g_foreignSources.count(fn)) continue;
+    if (!g_copyInFlight.count(fn) && !fs::is_regular_file(fs::status(source, ec))) continue;
     if (g_copyInFlight.count(fn)) {
       g_itemsAwaitingCopy[itemGuid(item)] = fn;  // still copying: keep it off the wire
       continue;
@@ -2499,6 +2588,7 @@ static void applyItem(const std::string& guid, const json& fields, bool freshMed
     SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", static_cast<double>(tintedReal));
   }
   UpdateItemInProject(item);
+  noteForeignSources(item);  // never internalized and re-served by us
   // Media that only just reached this machine has no peaks yet: build them
   // and redraw once done, or the waveform only appears after a click.
   if (fileBacked && (freshMedia || created || resolvedPlaceholder)) queuePeakBuild(guid);
@@ -2636,6 +2726,45 @@ static json filterChangesetNoFx(json cs) {
     }
   }
   return cs;
+}
+
+// An incoming changeset must never point REAPER at a file outside this
+// project: drop every item whose chunk names one (an item without its chunk
+// would still be created, empty) and every track chunk field that does
+// (chunkHasUnsafeFilePath). The owner refuses such proposals already; this
+// covers whatever the owner itself sends. Logged once per changeset.
+static void dropUnsafeMediaPaths(json& cs) {
+  if (!cs.is_object()) return;
+  size_t dropped = 0;
+  if (cs.contains("items") && cs["items"].is_object()) {
+    json& items = cs["items"];
+    for (auto it = items.begin(); it != items.end();) {
+      const json& f = it.value();
+      if (f.is_object() && f.contains("chunk") && f["chunk"].is_string() &&
+          chunkHasUnsafeFilePath(f["chunk"].get_ref<const std::string&>())) {
+        it = items.erase(it);
+        ++dropped;
+      } else {
+        ++it;
+      }
+    }
+  }
+  if (cs.contains("tracks") && cs["tracks"].is_object()) {
+    for (auto& [guid, fields] : cs["tracks"].items()) {
+      (void)guid;
+      if (!fields.is_object()) continue;
+      for (const char* key : {"fxchain", "recfx", "env", "recv", "group", "lock"}) {
+        if (fields.contains(key) && fields[key].is_string() &&
+            chunkHasUnsafeFilePath(fields[key].get_ref<const std::string&>())) {
+          fields.erase(key);
+          ++dropped;
+        }
+      }
+    }
+  }
+  if (dropped)
+    logEvent("unsafe_media_path", {{"count", dropped}},
+             "ignored an incoming edit that points to a file outside the project");
 }
 
 static void applyChangeset(const json& changeset) {
@@ -2839,10 +2968,11 @@ static void applyRemoteChanges() {
   // as a normal local change next tick and synced back out; there is no
   // re-application loop because we re-baseline below.)
   PreventUIRefresh(1);
-  for (const auto& cs : changesets) {
+  for (auto& cs : changesets) {
     // A changeset is peer-authored JSON: a shape the apply code doesn't expect
     // drops that changeset, never unwinds through REAPER's timer.
     try {
+      dropUnsafeMediaPaths(cs);
       applyChangeset(g_noFx ? filterChangesetNoFx(cs) : cs);
     } catch (const std::exception& e) {
       logEvent("bad_changeset", {{"error", e.what()}},
@@ -3764,6 +3894,7 @@ static void leaveSession(const char* code, json params, const std::string& text)
   g_deferredItems.clear();
   g_deferredRecv.clear();
   g_placeholders.clear();
+  g_foreignSources.clear();
   g_peakJobs.clear();  // REAPER builds whatever is left on demand
   g_mediaLoading = false;
   g_downloadBackground = false;
@@ -4690,6 +4821,9 @@ static void openDownloadedProject(std::string path) {
   g_captureCost = {};   // new project: re-learn what a capture costs
   g_copyFailed.clear();
   g_itemsAwaitingCopy.clear();
+  // Everything this project loads came from the host, not from our user.
+  g_foreignSources.clear();
+  noteAllSourcesForeign();
   g_applyingRemote = false;
   g_openingProject = false;
   // Peak caches (.reapeaks) are deliberately not transferred, and REAPER
@@ -4746,7 +4880,13 @@ static void pollDownload() {
     // "Beitritt fehlgeschlagen: manifest timeout". `join_failed` with a
     // {reason} stays as the last-resort fallback for anything genuinely
     // unexpected.
-    if (msg.find("banned from this session") != std::string::npos)
+    if (msg.find("not enough disk space") != std::string::npos)
+      leaveSession("disk_space", json::object(),
+                   "not enough free disk space to download this project");
+    else if (msg.find("project too large") != std::string::npos)
+      leaveSession("project_too_large", json::object(),
+                   "the project is too large to download");
+    else if (msg.find("banned from this session") != std::string::npos)
       leaveSession("banned", {{"minutes", 30}},
                    "the host has blocked you from this session");
     else if (msg.find("version mismatch") != std::string::npos)

@@ -1111,7 +1111,7 @@ fn do_reset_identity(app: &AppHandle) -> Result<bool, String> {
 // ---------- joined projects ----------
 //
 // Every join downloads the host's project into a folder of its own under
-// `<REAPER resource>/ReaMesh/<session name>-<session id>` (the extension's
+// `<REAPER resource>/ReaMesh/<session name>-<hex tag>` (the extension's
 // staging root). The extension sweeps copies nothing has touched for three
 // days; this lists what is there so a big one can go to the Trash right away.
 
@@ -1137,12 +1137,15 @@ fn staging_root(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(resource_dir(&load_custom_path(app))?.join("ReaMesh"))
 }
 
-/// "Song-18c2f9a0" → "Song": the extension names each copy after the session
-/// plus the first 8 hex digits of its id.
+/// "Song-0f3a9c27d4e1b856" → "Song": the extension names each copy after the
+/// session plus 16 hex digits tying it to that session and its host (copies
+/// from older versions carry 8 digits of the session id instead).
 fn joined_name(dir: &str) -> String {
     match dir.rsplit_once('-') {
         Some((name, id))
-            if !name.is_empty() && id.len() == 8 && id.chars().all(|c| c.is_ascii_hexdigit()) =>
+            if !name.is_empty()
+                && (id.len() == 8 || id.len() == 16)
+                && id.chars().all(|c| c.is_ascii_hexdigit()) =>
         {
             name.to_string()
         }

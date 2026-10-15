@@ -302,6 +302,14 @@ enum XferResponse {
         compressed: bool,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
+        /// blake3 of the whole file when the server knows it (the owner, from
+        /// its hashed manifest, while the file still has the listed size); ""
+        /// otherwise. A mid-session fetch from the owner verifies against it.
+        #[serde(default)]
+        hash: String,
+        /// The server's `xfer_proof(token, PROOF_SERVE, server, requester)`.
+        #[serde(default)]
+        proof: String,
     },
     Error {
         message: String,
@@ -578,6 +586,12 @@ struct Shared {
     /// dispatch, the roster, and (on clients) file serving; the owner serves
     /// against the live table itself.
     banned: Mutex<HashSet<String>>,
+    /// Client only: `path_key`s of the files this copy may serve to other
+    /// peers besides what the live doc references: every path of the
+    /// manifest it downloaded, plus what it fetched mid-session. Anything
+    /// else in the folder (the user's own renders, a project they saved in
+    /// there) stays private.
+    servable: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1079,6 +1093,19 @@ fn xfer_proof(auth_token: &str, direction: &str, from: &PeerId, to: &PeerId) -> 
 
 const PROOF_REQUEST: &str = "request";
 const PROOF_HOST: &str = "host";
+/// A file piece's answer: the serving peer knows the passphrase too, so a
+/// topic member without it can't feed a download or fetch its own bytes.
+const PROOF_SERVE: &str = "serve";
+
+/// Whether a file piece from `server` carries a valid serve proof.
+fn serve_proof_ok(response: &XferResponse, auth_token: &str, server: &PeerId, me: &PeerId) -> bool {
+    match response {
+        XferResponse::FileChunk { proof, .. } => {
+            ct_eq(proof.as_bytes(), xfer_proof(auth_token, PROOF_SERVE, server, me).as_bytes())
+        }
+        _ => false,
+    }
+}
 
 /// `req` with its `auth` set to the requester's proof for `to`.
 fn prove_request(mut req: XferRequest, auth_token: &str, me: &PeerId, to: &PeerId) -> XferRequest {
@@ -1489,11 +1516,17 @@ struct Hosting {
     /// trust dialog can say what a join loads *before* any download. "" until
     /// the extension supplies it.
     meta: String,
-    /// Every path any manifest of this session has listed. Only these (and
-    /// media the live doc references) are served: a file in the project
-    /// folder the project never used stays private, and a joiner that planned
-    /// its download against an older manifest can still finish it.
+    /// Every path any manifest of this session has listed (`path_key`s).
+    /// Only these (and media the live doc references) are served: a file in
+    /// the project folder the project never used stays private, and a joiner
+    /// that planned its download against an older manifest can still finish
+    /// it.
     ever_listed: HashSet<String>,
+    /// Paths served because the live doc referenced them (`path_key`s), so
+    /// their further pieces skip the doc scan. Kept apart from `ever_listed`:
+    /// these were named by a peer, not found by our own folder walk, and are
+    /// only ever served from inside the project folder.
+    doc_admitted: HashSet<String>,
 }
 
 struct NetConfig {
@@ -1544,7 +1577,8 @@ impl Reamesh {
             session_id: session_id.clone(),
             session_name: session_name.to_string(),
             project_file: project_file.to_string(),
-            ever_listed: files.iter().map(|f| f.path.clone()).collect(),
+            ever_listed: files.iter().map(|f| path_key(&f.path)).collect(),
+            doc_admitted: HashSet::new(),
             files,
             salt,
             auth: !passphrase.is_empty(),
@@ -1676,6 +1710,7 @@ impl Reamesh {
             peer_locks: Mutex::new(HashMap::new()),
             peer_locks_at: Mutex::new(None),
             banned: Mutex::new(HashSet::new()),
+            servable: Mutex::new(HashSet::new()),
             force_revert: Mutex::new(Vec::new()),
             probe_result: Mutex::new(None),
             proposal_seq: AtomicU64::new(0),
@@ -1818,6 +1853,10 @@ impl Reamesh {
                         last.get(ITEMS_ROOT).and_then(|s| s.get(id)).and_then(|f| f.get("chunk")).cloned()
                     }, "local");
                 }
+                // A source the extension couldn't bring into the project
+                // folder still names its absolute path: the owner would refuse
+                // it, so it never leaves here.
+                reject_unsafe_media_paths(&mut parsed, "local");
                 if !SECTIONS.iter().any(|s| parsed.get(s).is_some()) {
                     return;
                 }
@@ -2586,6 +2625,98 @@ fn reject_media_blanking(
     }
 }
 
+/// The path token of an RPP `FILE` line, `None` when `line` isn't one. REAPER
+/// quotes with `"`, or with `'` / `` ` `` when the path itself holds a double
+/// quote, and accepts an unquoted token too. `Some(None)` = an unterminated
+/// quote (malformed: treated as unsafe by the callers).
+fn rpp_file_token(line: &str) -> Option<Option<&str>> {
+    let t = line.trim_start_matches([' ', '\t']);
+    if !t.get(..4)?.eq_ignore_ascii_case("FILE") {
+        return None;
+    }
+    let rest = &t[4..];
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return None; // FILEX, FILE_…: some other keyword
+    }
+    let rest = rest.trim_matches([' ', '\t', '\r']);
+    match rest.chars().next() {
+        None => Some(Some("")),
+        Some(q @ ('"' | '\'' | '`')) => Some(rest[1..].find(q).map(|end| &rest[1..1 + end])),
+        Some(_) => Some(rest.split([' ', '\t']).next()),
+    }
+}
+
+/// Whether a media path from a peer's chunk could make this machine read a
+/// file outside its own project folder (or contact another host): on the
+/// wire every in-project path is project-relative (the extension's
+/// `relativizeChunkFiles`), so an absolute, UNC, drive-letter or URL-like
+/// path, a `.`/`..`/empty component, a leading `~`, a control character or a
+/// double quote (REAPER only quotes with ' or ` around such a path, and that
+/// one is never relativized) all mean "not a session file". Empty = no file.
+fn media_path_unsafe(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    if path.contains(['"', ':']) || path.chars().any(char::is_control) {
+        return true;
+    }
+    let p = path.replace('\\', "/");
+    p.split('/')
+        .enumerate()
+        .any(|(i, c)| c.is_empty() || c == "." || c == ".." || (i == 0 && c == "~"))
+}
+
+/// Does `text` (an item chunk, or an FX chain / envelope / receive block)
+/// carry a `FILE` line, at any nesting depth, whose path is unsafe (see
+/// `media_path_unsafe`)? Mirrors `chunkHasUnsafeFilePath` in the extension.
+fn chunk_has_unsafe_file_path(text: &str) -> bool {
+    text.lines().any(|l| match rpp_file_token(l) {
+        None => false,
+        Some(None) => true,
+        Some(Some(path)) => media_path_unsafe(path),
+    })
+}
+
+/// Track fields that carry chunk text REAPER parses on apply.
+const TRACK_CHUNK_FIELDS: [&str; 6] = ["fxchain", "recfx", "env", "recv", "group", "lock"];
+
+/// Drop every part of `changeset` that names a media file by an unsafe path
+/// (see `media_path_unsafe`): a whole item (an item without its chunk would
+/// still be created, empty), or the offending chunk field of a track.
+/// Entities and sections left empty are removed too.
+fn reject_unsafe_media_paths(changeset: &mut JsonValue, who: &str) {
+    if let Some(items) = changeset.get_mut(ITEMS_ROOT).and_then(|v| v.as_object_mut()) {
+        items.retain(|id, fields| {
+            let bad = fields
+                .get("chunk")
+                .and_then(|v| v.as_str())
+                .is_some_and(chunk_has_unsafe_file_path);
+            if bad {
+                eprintln!("[reamesh] refused item {id} from {who}: media path outside the project");
+            }
+            !bad
+        });
+        if items.is_empty() {
+            changeset.as_object_mut().map(|o| o.remove(ITEMS_ROOT));
+        }
+    }
+    if let Some(tracks) = changeset.get_mut(TRACKS_ROOT).and_then(|v| v.as_object_mut()) {
+        tracks.retain(|id, fields| {
+            let Some(fields) = fields.as_object_mut() else { return true };
+            for key in TRACK_CHUNK_FIELDS {
+                if fields.get(key).and_then(|v| v.as_str()).is_some_and(chunk_has_unsafe_file_path) {
+                    eprintln!("[reamesh] refused track {id}.{key} from {who}: media path outside the project");
+                    fields.remove(key);
+                }
+            }
+            !fields.is_empty()
+        });
+        if tracks.is_empty() {
+            changeset.as_object_mut().map(|o| o.remove(TRACKS_ROOT));
+        }
+    }
+}
+
 fn apply_changeset_to_doc(ds: &mut DocState, changeset: &JsonValue) -> Option<Vec<u8>> {
     let roots: Vec<(&str, MapRef)> = SECTIONS
         .iter()
@@ -2832,11 +2963,60 @@ fn doc_text(doc: &Doc) -> String {
     out
 }
 
-/// Owner-side serving check for a path no manifest has listed yet: whether
-/// the live doc references it (media added since the last manifest refresh).
+/// Add the `path_key` of every safe project-relative `FILE` path in `chunk`
+/// to `out`.
+fn chunk_media_keys(chunk: &str, out: &mut HashSet<String>) {
+    for line in chunk.lines() {
+        if let Some(Some(path)) = rpp_file_token(line)
+            && !path.is_empty()
+            && !media_path_unsafe(path)
+        {
+            out.insert(path_key(path));
+        }
+    }
+}
+
+/// Serving check for a path no manifest has listed: whether a live item in
+/// the doc names exactly this project-relative file (media added since the
+/// last manifest refresh, or recorded by a guest). Exact, not the loose name
+/// search `referenced_files` does for the manifest: a file this check admits
+/// is one some session member deliberately put on the timeline.
 fn doc_references(doc: &Doc, path: &str) -> bool {
-    let probe = FileMeta { path: path.to_string(), size: 0, hash: String::new() };
-    !referenced_files(vec![probe], Path::new(""), "", &doc_text(doc)).is_empty()
+    let root = doc.get_or_insert_map(ITEMS_ROOT);
+    let txn = doc.transact();
+    let mut keys = HashSet::new();
+    for (_, value) in root.iter(&txn) {
+        let Out::YMap(entity) = value else { continue };
+        if let Some(Out::Any(Any::Bool(false))) = entity.get(&txn, "present") {
+            continue;
+        }
+        if let Some(Out::Any(Any::String(chunk))) = entity.get(&txn, "chunk") {
+            chunk_media_keys(&chunk, &mut keys);
+        }
+    }
+    keys.contains(&path_key(path))
+}
+
+/// `doc_references`, plus the item chunks this peer has proposed and not yet
+/// seen confirmed: a guest's fresh recording is fetched by the owner as soon
+/// as the proposal lands there, which can be before the owner's update
+/// carrying it has reached the guest's own doc.
+fn session_references(shared: &Shared, path: &str) -> bool {
+    let ds = shared.doc.lock().unwrap();
+    if doc_references(&ds.doc, path) {
+        return true;
+    }
+    let key = path_key(path);
+    let mut keys = HashSet::new();
+    for ((section, _, field), (value, _, _)) in &ds.pending {
+        if section == ITEMS_ROOT
+            && field == "chunk"
+            && let Some(chunk) = value.as_str()
+        {
+            chunk_media_keys(chunk, &mut keys);
+        }
+    }
+    keys.contains(&key)
 }
 
 /// Owner-side hash cache: project-relative path -> (size, mtime, blake3) as of
@@ -3066,6 +3246,22 @@ fn prune_staging(root: &Path, keep: &[PathBuf]) {
     }
 }
 
+/// Folder (under the staging root) a join downloads into: the session name
+/// plus 16 hex digits of a hash over the full session id and the owner's peer
+/// id. A host picks its session id and name freely but can't take another
+/// host's peer id, so it can't aim its download at a folder an earlier join
+/// of someone else's session left behind and overwrite files there. (Copies
+/// from before carried the session id's first 8 characters instead.)
+fn staging_dir_name(session_name: &str, session_id: &str, owner: &PeerId) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"reamesh/staging\0");
+    h.update(session_id.as_bytes());
+    h.update(b"\0");
+    h.update(&owner.to_bytes());
+    let tag = h.finalize().to_hex();
+    format!("{}-{}", sanitize_dir_name(session_name), &tag.as_str()[..16])
+}
+
 fn sanitize_dir_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -3081,17 +3277,62 @@ fn sanitize_dir_name(name: &str) -> String {
     if trimmed.is_empty() { "session".into() } else { trimmed.to_string() }
 }
 
-/// Reject manifest paths that could escape the staging directory.
+/// Reject transfer paths that could escape the project/staging directory or
+/// mean something else to some filesystem: only '/'-separated plain names,
+/// none empty, `.` or `..`. Also refused on every platform alike (a session
+/// mixes macOS and Windows peers, and the same path has to mean the same file
+/// on both): a backslash, a `:` (drive letter, NTFS alternate data stream), a
+/// control character, a trailing dot or space (Windows drops it, aliasing
+/// another file), and the Windows device names (`CON`, `NUL`, `COM1`, … with
+/// or without an extension).
 fn safe_relative_path(p: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(p);
-    if path
-        .components()
-        .all(|c| matches!(c, Component::Normal(_)))
-    {
-        Some(path)
-    } else {
-        None
+    if p.is_empty() || p.len() > 4096 {
+        return None;
     }
+    let mut out = PathBuf::new();
+    for part in p.split('/') {
+        if !safe_path_component(part) {
+            return None;
+        }
+        out.push(part);
+    }
+    // Belt and braces: whatever `push` made of it must still be plain names.
+    out.components().all(|c| matches!(c, Component::Normal(_))).then_some(out)
+}
+
+fn safe_path_component(c: &str) -> bool {
+    !c.is_empty()
+        && c != "."
+        && c != ".."
+        && !c.contains(['\\', ':'])
+        && !c.chars().any(char::is_control)
+        && !c.ends_with(['.', ' '])
+        && !windows_device_name(c)
+}
+
+/// `CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9` (and the
+/// superscript-digit forms), `CONIN$`, `CONOUT$`: Windows opens the device
+/// for any of these, whatever the extension (`nul.wav`) or trailing spaces.
+fn windows_device_name(c: &str) -> bool {
+    let stem = c.split('.').next().unwrap_or(c).trim_end_matches(' ').to_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+        s => {
+            let mut chars = s.chars();
+            let head: String = chars.by_ref().take(3).collect();
+            let tail: Vec<char> = chars.collect();
+            (head == "COM" || head == "LPT")
+                && tail.len() == 1
+                && (tail[0].is_ascii_digit() || matches!(tail[0], '¹' | '²' | '³'))
+        }
+    }
+}
+
+/// Comparison key for a project-relative path: '/' separators, ASCII
+/// lower-case (the session mixes case-insensitive and case-sensitive
+/// filesystems, and REAPER writes whatever case the user's file has).
+fn path_key(p: &str) -> String {
+    p.replace('\\', "/").to_ascii_lowercase()
 }
 
 // ---------- networking ----------
@@ -3247,13 +3488,70 @@ struct Download {
 /// Chunk offsets for a file of `size` bytes.
 fn file_pieces(file: usize, size: u64) -> Vec<Piece> {
     let mut v = Vec::new();
-    let mut off = 0;
+    let mut off: u64 = 0;
     while off < size {
         v.push(Piece { file, offset: off });
-        off += CHUNK_SIZE;
+        let Some(next) = off.checked_add(CHUNK_SIZE) else { break };
+        off = next;
     }
     v
 }
+
+/// Largest single file a transfer accepts (initial download or mid-session
+/// fetch); a manifest or answer claiming more is refused.
+const MAX_FILE_BYTES: u64 = 16 << 30;
+/// Largest whole project a join downloads.
+const MAX_PROJECT_BYTES: u64 = 64 << 30;
+/// Free space a download or fetch leaves on the disk.
+const DISK_RESERVE: u64 = 256 << 20;
+
+/// Bytes available to this user on the filesystem holding `dir`, `None` when
+/// it can't be told (then nothing is refused for lack of space).
+#[cfg(unix)]
+fn available_space(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: a zeroed statvfs is a valid out-parameter; `c` is NUL-terminated.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+#[cfg(windows)]
+fn available_space(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+    }
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut avail = 0u64;
+    // SAFETY: `wide` is NUL-terminated; the two null out-parameters are optional.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    (ok != 0).then_some(avail)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn available_space(_dir: &Path) -> Option<u64> {
+    None
+}
+
+/// Whether `needed` more bytes fit on the disk holding `dir`, keeping
+/// `DISK_RESERVE` free. Unknown free space counts as enough.
+fn space_for(dir: &Path, needed: u64) -> bool {
+    available_space(dir).is_none_or(|free| needed.saturating_add(DISK_RESERVE) <= free)
+}
+
+/// The status message a join fails with when the project won't fit on the
+/// disk, and when it exceeds the transfer limits; the extension maps both to
+/// stable codes.
+const DISK_SPACE_MESSAGE: &str = "not enough disk space for this project";
+const TOO_LARGE_MESSAGE: &str = "project too large to download";
 
 impl Download {
     fn request(&self, p: Piece) -> XferRequest {
@@ -3283,9 +3581,30 @@ struct Fetch {
     last_activity: Instant,
     attempts: u32,
     auth: String,
+    /// The session owner: the one peer whose `hash` a fetch trusts.
+    owner: Option<PeerId>,
+    /// Size the current candidate announced in its first piece; every later
+    /// piece must agree.
+    size: Option<u64>,
+    /// The owner's blake3 for the file, when it sent one: checked once whole.
+    expected_hash: String,
+    /// Running blake3 over what has been written (pieces arrive in order).
+    hasher: blake3::Hasher,
 }
 
 impl Fetch {
+    /// Drop what the current candidate sent and move on to the next one.
+    fn next_candidate(&mut self) {
+        self.idx += 1;
+        self.out = None;
+        self.written = 0;
+        self.attempts = 0;
+        self.size = None;
+        self.expected_hash.clear();
+        self.hasher = blake3::Hasher::new();
+        let _ = fs::remove_file(&self.tmp);
+    }
+
     fn request(&self) -> XferRequest {
         XferRequest::File {
             path: self.rel.clone(),
@@ -3369,7 +3688,7 @@ fn start_fetch(
     if dest.exists() {
         return;
     }
-    let candidates = shared.session_peers.lock().unwrap().clone();
+    let candidates = serving_peers(shared);
     if candidates.is_empty() {
         return; // the host re-requests on its tick once peers are around
     }
@@ -3389,93 +3708,159 @@ fn start_fetch(
         last_activity: Instant::now(),
         attempts: 0,
         auth: shared.auth_token.lock().unwrap().clone(),
+        owner: shared.owner_peer.lock().unwrap().parse().ok(),
+        size: None,
+        expected_hash: String::new(),
+        hasher: blake3::Hasher::new(),
     };
     if fetch_send(swarm, fetch_reqs, &mut fetch) {
         fetches.insert(fetch.rel.clone(), fetch);
     }
 }
 
-/// Feed a response (or failure: `response = None`) for a fetch request id.
+/// The peers a file may come from: the owner, plus the session members whose
+/// presence beacon proved the passphrase (`peers_info` holds only verified
+/// ones). A peer that merely subscribed to the public session topic is never
+/// asked: it could feed us any bytes it likes.
+fn serving_peers(shared: &Shared) -> Vec<PeerId> {
+    let owner = shared.owner_peer.lock().unwrap().clone();
+    let verified = shared.peers_info.lock().unwrap();
+    let mut out: Vec<PeerId> = shared
+        .session_peers
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| {
+            let id = p.to_string();
+            id == owner || verified.contains_key(&id)
+        })
+        .copied()
+        .collect();
+    // The owner first: it is the one peer whose hash a fetch can check.
+    if let Some(i) = out.iter().position(|p| p.to_string() == owner) {
+        out.swap(0, i);
+    }
+    out
+}
+
+/// Feed a response (with the transport-authenticated peer that answered) or
+/// a failure (`response = None`) for a fetch request id.
 fn handle_fetch_response(
     swarm: &mut Swarm<Behaviour>,
+    shared: &Shared,
     fetches: &mut FetchMap,
     fetch_reqs: &mut FetchReqs,
     rel: &str,
     request_id: request_response::OutboundRequestId,
-    response: Option<XferResponse>,
+    response: Option<(PeerId, XferResponse)>,
 ) {
     let Some(fetch) = fetches.get_mut(rel) else { return };
     if fetch.req != Some(request_id) {
         return; // a superseded retry answering late; only the live request counts
     }
+    let me = *swarm.local_peer_id();
+    let (peer, response) = match response {
+        Some((p, r)) => (Some(p), Some(r)),
+        None => (None, None),
+    };
+    let genuine = |r: &XferResponse| peer.is_some_and(|p| serve_proof_ok(r, &fetch.auth, &p, &me));
 
-    match response {
-        Some(XferResponse::FileChunk { size, compressed, data }) => {
-            fetch.attempts = 0;
-            let chunk = if compressed {
-                match zstd_decode_bounded(&data, CHUNK_SIZE as usize) {
-                    Ok(d) => d,
-                    Err(_) => return, // corrupt/oversized; in-order request stays in flight
+    // What to do with this answer: write a piece, or give up on this candidate.
+    let accepted = match response {
+        Some(ref r @ XferResponse::FileChunk { size, ref hash, .. }) if genuine(r) => {
+            let first = fetch.size.is_none();
+            if first {
+                // The first piece fixes the size; a lying peer can't make us
+                // reserve more than the cap or than the disk holds.
+                let fits = fetch.dest.parent().is_none_or(|d| space_for(d, size));
+                if size > MAX_FILE_BYTES || !fits {
+                    eprintln!("[reamesh] fetch {} refused: {size} bytes (limit or free space)", fetch.rel);
+                    None
+                } else {
+                    fetch.size = Some(size);
+                    if peer.is_some() && peer == fetch.owner {
+                        fetch.expected_hash = hash.clone();
+                    }
+                    Some(size)
                 }
+            } else if fetch.size == Some(size) {
+                Some(size)
             } else {
-                data
-            };
-            let expected = CHUNK_SIZE.min(size.saturating_sub(fetch.written)) as usize;
-            if chunk.len() != expected {
-                return; // stale retry; the in-order request stays in flight
-            }
-            let mut write = || -> std::io::Result<bool> {
-                if fetch.out.is_none() {
-                    if let Some(parent) = fetch.tmp.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fetch.out = Some(fs::File::create(&fetch.tmp)?);
-                    fetch.written = 0;
-                }
-                fetch.out.as_mut().unwrap().write_all(&chunk)?;
-                fetch.written += chunk.len() as u64;
-                if fetch.written >= size {
-                    fetch.out = None; // close before rename
-                    fs::rename(&fetch.tmp, &fetch.dest)?;
-                    return Ok(true);
-                }
-                Ok(false)
-            };
-            match write() {
-                Ok(true) => {
-                    eprintln!("[reamesh] fetched {} ({size} bytes)", fetch.rel);
-                    fetches.remove(rel);
-                }
-                Ok(false) => {
-                    let mut fetch = fetches.remove(rel).unwrap();
-                    fetch_send(swarm, fetch_reqs, &mut fetch);
-                    fetches.insert(rel.to_string(), fetch);
-                }
-                Err(e) => {
-                    eprintln!("[reamesh] fetch {} failed: {e}", fetch.rel);
-                    let f = fetches.remove(rel);
-                    if let Some(f) = f {
-                        let _ = fs::remove_file(&f.tmp);
-                    }
-                }
+                None // the file changed size under the fetch, or a lying peer
             }
         }
-        _ => {
-            // Any other response (peer cannot serve the file) or an outright
-            // request failure (None): start over with the next candidate; out
-            // of candidates, give up: the host re-requests while the file is
-            // missing.
-            fetch.idx += 1;
-            fetch.out = None;
+        _ => None,
+    };
+    let Some(size) = accepted else {
+        // Any other response (peer cannot serve the file, no valid proof,
+        // inconsistent size) or an outright request failure (None): start
+        // over with the next candidate; out of candidates, give up: the
+        // extension re-requests while the file is missing.
+        fetch.next_candidate();
+        if fetch.peer().is_some() {
+            let mut fetch = fetches.remove(rel).unwrap();
+            fetch_send(swarm, fetch_reqs, &mut fetch);
+            fetches.insert(rel.to_string(), fetch);
+        } else {
+            fetches.remove(rel);
+        }
+        return;
+    };
+    let Some(XferResponse::FileChunk { compressed, data, .. }) = response else { return };
+    fetch.attempts = 0;
+    let chunk = if compressed {
+        match zstd_decode_bounded(&data, CHUNK_SIZE as usize) {
+            Ok(d) => d,
+            Err(_) => return, // corrupt/oversized; in-order request stays in flight
+        }
+    } else {
+        data
+    };
+    let expected = CHUNK_SIZE.min(size.saturating_sub(fetch.written)) as usize;
+    if chunk.len() != expected {
+        return; // stale retry; the in-order request stays in flight
+    }
+    let mut write = || -> std::io::Result<bool> {
+        if fetch.out.is_none() {
+            if let Some(parent) = fetch.tmp.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fetch.out = Some(fs::File::create(&fetch.tmp)?);
             fetch.written = 0;
-            fetch.attempts = 0;
-            let _ = fs::remove_file(&fetch.tmp);
-            if fetch.peer().is_some() {
-                let mut fetch = fetches.remove(rel).unwrap();
-                fetch_send(swarm, fetch_reqs, &mut fetch);
-                fetches.insert(rel.to_string(), fetch);
-            } else {
-                fetches.remove(rel);
+            fetch.hasher = blake3::Hasher::new();
+        }
+        fetch.out.as_mut().unwrap().write_all(&chunk)?;
+        fetch.hasher.update(&chunk);
+        fetch.written += chunk.len() as u64;
+        if fetch.written >= size {
+            fetch.out = None; // close before rename
+            if !fetch.expected_hash.is_empty()
+                && fetch.hasher.finalize().to_hex().as_str() != fetch.expected_hash
+            {
+                return Err(std::io::Error::other("checksum mismatch"));
+            }
+            fs::rename(&fetch.tmp, &fetch.dest)?;
+            return Ok(true);
+        }
+        Ok(false)
+    };
+    match write() {
+        Ok(true) => {
+            eprintln!("[reamesh] fetched {} ({size} bytes)", fetch.rel);
+            // Ours now: other members may fetch it from this copy too.
+            shared.servable.lock().unwrap().insert(path_key(&fetch.rel));
+            fetches.remove(rel);
+        }
+        Ok(false) => {
+            let mut fetch = fetches.remove(rel).unwrap();
+            fetch_send(swarm, fetch_reqs, &mut fetch);
+            fetches.insert(rel.to_string(), fetch);
+        }
+        Err(e) => {
+            eprintln!("[reamesh] fetch {} failed: {e}", fetch.rel);
+            let f = fetches.remove(rel);
+            if let Some(f) = f {
+                let _ = fs::remove_file(&f.tmp);
             }
         }
     }
@@ -3525,12 +3910,47 @@ fn set_status(shared: &Shared, f: impl FnOnce(&mut StatusState)) {
     f(&mut shared.status.lock().unwrap());
 }
 
+/// What a serving check decided about a requested path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ServeScope {
+    No,
+    /// Found by this peer's own manifest walk of its project folder. The walk
+    /// follows the user's links (a linked sample folder), so this is served
+    /// wherever the link points.
+    Listed,
+    /// Named by a session member (a live item, a manifest from the host):
+    /// served only from inside the project folder, links that lead out of it
+    /// refused.
+    Contained,
+}
+
+/// Open `full` for serving: a regular file (never a device, pipe or folder),
+/// and for `contained`, one whose real location is inside `dir`.
+fn open_served(dir: &Path, full: &Path, contained: bool) -> std::io::Result<fs::File> {
+    if contained {
+        let root = fs::canonicalize(dir)?;
+        if !fs::canonicalize(full)?.starts_with(&root) {
+            return Err(std::io::Error::other("outside the project folder"));
+        }
+    }
+    // Checked before opening: opening a FIFO would block the event loop.
+    if !fs::metadata(full)?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let f = fs::File::open(full)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(f)
+}
+
 /// Handler for transfer requests. Every request carries the session access
 /// token, checked against `auth_token` (empty = open session) before anything
 /// is served. `Manifest` is owner-only; `File` is served by every peer that
 /// has a project copy (which powers both the windowed initial download and
-/// mid-session media fetch), limited to the paths `may_serve` admits.
-/// Project text chunks are returned zstd-compressed.
+/// mid-session media fetch), limited to the paths `may_serve` admits and
+/// never a file the manifest walk skips (dotfiles, backups, peak caches,
+/// transfer temps). Project text chunks are returned zstd-compressed.
 fn serve_xfer(
     hosting: Option<&Hosting>,
     serve_dir: Option<&Path>,
@@ -3539,7 +3959,7 @@ fn serve_xfer(
     requester: &PeerId,
     banned: bool,
     req: &XferRequest,
-    may_serve: &dyn Fn(&str) -> bool,
+    may_serve: &dyn Fn(&str) -> ServeScope,
 ) -> XferResponse {
     // A banned peer gets a distinct answer (a probe/join reports "banned",
     // not "wrong password"), and it gets it whether or not it still holds
@@ -3570,7 +3990,12 @@ fn serve_xfer(
                     message: format!("unsafe path: {path}"),
                 };
             };
-            if !may_serve(path) {
+            let scope = if path.split('/').any(skip_in_manifest) {
+                ServeScope::No
+            } else {
+                may_serve(path)
+            };
+            if scope == ServeScope::No {
                 return XferResponse::Error {
                     message: format!("not part of this session: {path}"),
                 };
@@ -3578,7 +4003,7 @@ fn serve_xfer(
             let full = dir.join(rel);
             let compress = is_compressible(path);
             let read = || -> std::io::Result<(u64, bool, Vec<u8>)> {
-                let mut f = fs::File::open(&full)?;
+                let mut f = open_served(dir, &full, scope == ServeScope::Contained)?;
                 let size = f.metadata()?.len();
                 f.seek(SeekFrom::Start(*offset))?;
                 let want = CHUNK_SIZE.min(size.saturating_sub(*offset)) as usize;
@@ -3595,7 +4020,22 @@ fn serve_xfer(
                 Ok((size, false, buf))
             };
             match read() {
-                Ok((size, compressed, data)) => XferResponse::FileChunk { size, compressed, data },
+                Ok((size, compressed, data)) => {
+                    // The owner vouches for the bytes with its manifest hash
+                    // while the file still has the size it was hashed at.
+                    let key = path_key(path);
+                    let hash = hosting
+                        .and_then(|h| h.files.iter().find(|f| f.size == size && path_key(&f.path) == key))
+                        .map(|f| f.hash.clone())
+                        .unwrap_or_default();
+                    XferResponse::FileChunk {
+                        size,
+                        compressed,
+                        data,
+                        hash,
+                        proof: xfer_proof(auth_token, PROOF_SERVE, me, requester),
+                    }
+                }
                 Err(e) => XferResponse::Error {
                     message: format!("read {path}: {e}"),
                 },
@@ -3661,6 +4101,7 @@ fn admit_proposal(shared: &Shared, payload: &[u8], proposer: &str) -> Option<Vec
     // source out of an item is refused here too, so no client build, however
     // broken, can ever strip media from the host's project.
     reject_media_blanking(&mut parsed, |id| doc_field(&ds.doc, ITEMS_ROOT, id, "chunk"), proposer);
+    reject_unsafe_media_paths(&mut parsed, proposer);
     let now = Instant::now();
     let mut admitted = JsonMap::new();
     for section in SECTIONS {
@@ -3941,11 +4382,8 @@ fn start_join(
     // everyone's roster until its download fails. The
     // subscribe happens when the manifest arrives.
     let staging = staging_dir.map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir);
-    let dir = staging.join(format!(
-        "{}-{}",
-        sanitize_dir_name(&info.session_name),
-        session_id.chars().take(8).collect::<String>()
-    ));
+    let dir = staging.join(staging_dir_name(&info.session_name, session_id, &owner));
+    shared.servable.lock().unwrap().clear();
     let sid = session_id.to_string();
     let name = info.session_name.clone();
     let dir_str = dir.to_string_lossy().into_owned();
@@ -4203,7 +4641,7 @@ async fn run_network(
                 Some(Command::ManifestReady(files)) => {
                     if let Some(h) = hosting.as_mut() {
                         eprintln!("[reamesh] manifest updated ({} files)", files.len());
-                        h.ever_listed.extend(files.iter().map(|f| f.path.clone()));
+                        h.ever_listed.extend(files.iter().map(|f| path_key(&f.path)));
                         h.files = files;
                     }
                 }
@@ -5084,16 +5522,20 @@ async fn run_network(
                             } else {
                                 shared.banned.lock().unwrap().contains(&peer.to_string())
                             };
-                            // The owner serves only what the session uses: files a
-                            // manifest listed, or media the live doc references
-                            // (added since the last manifest refresh). A client's
-                            // copy holds nothing but session files anyway.
-                            let may_serve = |p: &str| match hosting.as_ref() {
-                                Some(h) => {
-                                    h.ever_listed.contains(p)
-                                        || doc_references(&shared.doc.lock().unwrap().doc, p)
+                            // Only what the session uses is served: on the owner,
+                            // files a manifest listed; on a client, what its
+                            // manifest listed or it fetched since; on both, media
+                            // a live item names (added since, or recorded by
+                            // this guest and proposed).
+                            let may_serve = |p: &str| {
+                                let key = path_key(p);
+                                match hosting.as_ref() {
+                                    Some(h) if h.ever_listed.contains(&key) => ServeScope::Listed,
+                                    Some(h) if h.doc_admitted.contains(&key) => ServeScope::Contained,
+                                    None if shared.servable.lock().unwrap().contains(&key) => ServeScope::Contained,
+                                    _ if session_references(&shared, p) => ServeScope::Contained,
+                                    _ => ServeScope::No,
                                 }
-                                None => true,
                             };
                             let resp = serve_xfer(
                                 hosting.as_ref(),
@@ -5106,10 +5548,17 @@ async fn run_network(
                                 &may_serve,
                             );
                             // Remember an admitted path so its further pieces skip the doc scan.
-                            if let (Some(h), XferRequest::File { path, .. }, XferResponse::FileChunk { .. }) =
-                                (hosting.as_mut(), &request, &resp)
-                            {
-                                h.ever_listed.insert(path.clone());
+                            if let (XferRequest::File { path, .. }, XferResponse::FileChunk { .. }) = (&request, &resp) {
+                                let key = path_key(path);
+                                match hosting.as_mut() {
+                                    Some(h) if !h.ever_listed.contains(&key) => {
+                                        h.doc_admitted.insert(key);
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        shared.servable.lock().unwrap().insert(key);
+                                    }
+                                }
                             }
                             let _ = swarm.behaviour_mut().xfer.send_response(channel, resp);
                         }
@@ -5178,9 +5627,9 @@ async fn run_network(
                                 }
                                 handle_download_manifest(&mut swarm, &shared, &mut download, response);
                             } else if download.as_ref().is_some_and(|dl| dl.inflight.contains_key(&request_id)) {
-                                handle_download_piece(&mut swarm, &shared, &mut download, &verify_tx, request_id, Some(response));
+                                handle_download_piece(&mut swarm, &shared, &mut download, &verify_tx, request_id, Some((peer, response)));
                             } else if let Some(rel) = fetch_reqs.remove(&request_id) {
-                                handle_fetch_response(&mut swarm, &mut fetches, &mut fetch_reqs, &rel, request_id, Some(response));
+                                handle_fetch_response(&mut swarm, &shared, &mut fetches, &mut fetch_reqs, &rel, request_id, Some((peer, response)));
                             }
                         }
                     }
@@ -5201,7 +5650,7 @@ async fn run_network(
                     } else if download.as_ref().is_some_and(|dl| dl.inflight.contains_key(&request_id)) {
                         handle_download_piece(&mut swarm, &shared, &mut download, &verify_tx, request_id, None);
                     } else if let Some(rel) = fetch_reqs.remove(&request_id) {
-                        handle_fetch_response(&mut swarm, &mut fetches, &mut fetch_reqs, &rel, request_id, None);
+                        handle_fetch_response(&mut swarm, &shared, &mut fetches, &mut fetch_reqs, &rel, request_id, None);
                     }
                 }
                 _ => {}
@@ -5265,20 +5714,50 @@ fn file_matches(path: &Path, meta: &FileMeta) -> bool {
 /// Turn a manifest into the per-file download plan: skip files already present
 /// byte-for-byte (resume), copy in identical files found elsewhere under the
 /// staging root (dedup), and queue chunk requests for the rest.
+///
+/// The manifest is the host's word, so it is vetted before anything touches
+/// the disk: an entry with an unsafe path (see `safe_relative_path`) or a
+/// repeated one is skipped, a file over `MAX_FILE_BYTES` or a project over
+/// `MAX_PROJECT_BYTES` fails the join (`TOO_LARGE_MESSAGE`), and so does a
+/// project whose missing files won't fit on the disk (`DISK_SPACE_MESSAGE`).
 fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()> {
-    let reuse = build_reuse_index(dl.dir.parent().unwrap_or(&dl.dir));
-    for (idx, meta) in files.into_iter().enumerate() {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut plan: Vec<(FileMeta, PathBuf, bool)> = Vec::new();
+    let mut total: u64 = 0;
+    let mut needed: u64 = 0;
+    for meta in files {
         let Some(rel) = safe_relative_path(&meta.path) else {
-            return Err(std::io::Error::other(format!(
-                "unsafe path in manifest: {}",
-                meta.path
-            )));
+            eprintln!("[reamesh] skipping unsafe path in manifest: {:?}", meta.path);
+            continue;
         };
+        if !seen.insert(path_key(&meta.path)) {
+            eprintln!("[reamesh] skipping repeated path in manifest: {:?}", meta.path);
+            continue;
+        }
+        total = total
+            .checked_add(meta.size)
+            .filter(|&t| meta.size <= MAX_FILE_BYTES && t <= MAX_PROJECT_BYTES)
+            .ok_or_else(|| std::io::Error::other(TOO_LARGE_MESSAGE))?;
         let dest = dl.dir.join(&rel);
+        // Already on disk (a prior attempt)?
+        let present = file_matches(&dest, &meta);
+        if !present {
+            needed += meta.size; // bounded by `total`
+        }
+        plan.push((meta, dest, present));
+    }
+    if !space_for(&dl.dir, needed) {
+        return Err(std::io::Error::other(DISK_SPACE_MESSAGE));
+    }
+
+    let reuse = build_reuse_index(dl.dir.parent().unwrap_or(&dl.dir));
+    for (meta, dest, present) in plan {
+        let idx = dl.files.len();
         dl.total += meta.size;
 
-        // Already on disk (a prior attempt, or another session's copy)?
-        let reused = file_matches(&dest, &meta)
+        // Or an identical copy elsewhere under the staging root (another
+        // session's download of the same project)?
+        let reused = present
             || (!meta.hash.is_empty()
                 && reuse
                     .get(&meta.size)
@@ -5333,9 +5812,261 @@ fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()
                 dl.queue.push_back(p);
             }
         }
-        dl.files.push(FileDl { meta, tmp, dest, file: Some(f), remaining, tries: 0, owner_only: false, complete: false, media });
+        // Without the host's hash nothing could catch another peer's wrong
+        // bytes: such a file comes from the owner alone.
+        let owner_only = meta.hash.is_empty();
+        dl.files.push(FileDl { meta, tmp, dest, file: Some(f), remaining, tries: 0, owner_only, complete: false, media });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod transfer_safety_tests {
+    use super::*;
+
+    #[test]
+    fn media_paths_outside_the_project_are_unsafe() {
+        for ok in ["", "Audio/kick.wav", "Audio\\kick.wav", "kick.wav", "Sub/inner.rpp", "~kick.wav", "a b/c d.wav"] {
+            assert!(!media_path_unsafe(ok), "{ok:?} should be fine");
+        }
+        for bad in [
+            "/Users/x/Music/secret.wav",
+            "\\\\host\\share\\x.wav",
+            "//host/share/x.wav",
+            "C:\\Users\\x\\a.wav",
+            "C:a.wav",
+            "Audio/../../secret.wav",
+            "../secret.wav",
+            "./kick.wav",
+            "Audio//kick.wav",
+            "Audio/",
+            "~/Music/x.wav",
+            "kick.wav:stream",
+            "file:///etc/passwd",
+            "say \"hi\".wav",
+            "a\u{0}b.wav",
+            "a\nb.wav",
+        ] {
+            assert!(media_path_unsafe(bad), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn unsafe_file_lines_are_found_at_any_depth_and_quoting() {
+        let item = |file_line: &str| {
+            format!("<ITEM\n  POSITION 0\n  <SOURCE SECTION\n    LENGTH 1\n    <SOURCE WAVE\n      {file_line}\n    >\n  >\n>\n")
+        };
+        assert!(!chunk_has_unsafe_file_path(&item("FILE \"Audio/kick.wav\"")));
+        assert!(!chunk_has_unsafe_file_path(&item("FILE \"Audio/kick.wav\" 1")));
+        assert!(chunk_has_unsafe_file_path(&item("FILE \"/etc/hosts\"")));
+        assert!(chunk_has_unsafe_file_path(&item("FILE /etc/hosts")), "unquoted");
+        assert!(chunk_has_unsafe_file_path(&item("file \"/etc/hosts\"")), "any case");
+        assert!(chunk_has_unsafe_file_path(&item("\tFILE '/etc/hosts'")));
+        assert!(chunk_has_unsafe_file_path(&item("FILE `say \"x\".wav`")), "a path with a double quote");
+        assert!(chunk_has_unsafe_file_path(&item("FILE \"Audio/kick.wav")), "unterminated quote");
+        assert!(chunk_has_unsafe_file_path(&item("FILE \"\\\\srv\\share\\a.wav\"")));
+        // Other keywords and payload lines are not FILE lines.
+        assert!(!chunk_has_unsafe_file_path("<ITEM\n  NAME \"FILE /etc/hosts\"\n  FILEX /etc/hosts\n>\n"));
+        assert!(!chunk_has_unsafe_file_path("<VST \"VST: x\" x.vst 0\n  RklMRSAvZXRj\n>\n"));
+    }
+
+    #[test]
+    fn unsafe_media_paths_drop_items_and_track_fields() {
+        let mut cs = json!({
+            "items": {
+                "{OK}": { "present": true, "track": "{T}", "chunk": "<ITEM\n<SOURCE WAVE\nFILE \"Audio/a.wav\"\n>\n>\n" },
+                "{BAD}": { "present": true, "track": "{T}", "chunk": "<ITEM\n<SOURCE WAVE\nFILE \"/Users/x/a.wav\"\n>\n>\n" },
+            },
+            "tracks": {
+                "{T}": { "name": "FILE /not/a/chunk", "fxchain": "<FXCHAIN\nFILE \"C:\\\\x.wav\"\n>\n", "vol": 1.0 },
+                "{U}": { "env": "<VOLENV2\nFILE \"../x\"\n>\n" },
+            },
+            "project": { "project": { "notes": "FILE /etc/hosts" } },
+        });
+        reject_unsafe_media_paths(&mut cs, "test");
+        assert!(cs["items"].get("{OK}").is_some());
+        assert!(cs["items"].get("{BAD}").is_none(), "the whole item goes, not just its chunk");
+        assert!(cs["tracks"]["{T}"].get("fxchain").is_none());
+        assert_eq!(cs["tracks"]["{T}"]["name"], "FILE /not/a/chunk", "scalar fields are not chunks");
+        assert!(cs["tracks"].get("{U}").is_none(), "an emptied track entry is removed");
+        assert_eq!(cs["project"]["project"]["notes"], "FILE /etc/hosts");
+
+        let mut only_bad = json!({ "items": { "{BAD}": { "chunk": "FILE \"/x\"\n" } } });
+        reject_unsafe_media_paths(&mut only_bad, "test");
+        assert!(only_bad.get("items").is_none());
+    }
+
+    #[test]
+    fn transfer_paths_refuse_device_names_streams_and_aliases() {
+        assert_eq!(safe_relative_path("Audio/kick.wav"), Some(PathBuf::from("Audio").join("kick.wav")));
+        assert!(safe_relative_path("Aux 1.wav").is_some());
+        assert!(safe_relative_path("console.wav").is_some());
+        assert!(safe_relative_path("COM10.wav").is_some());
+        for bad in [
+            "", "/abs.wav", "../x.wav", "a/../x.wav", "a//b.wav", "./a.wav", "a/", "C:/x.wav",
+            "a\\b.wav", "kick.wav:Zone.Identifier", "kick.wav.", "kick.wav ", "Audio /k.wav",
+            "CON", "con.wav", "Audio/NUL", "nul.tar.gz", "AUX .wav", "com1.wav", "LPT9", "COM¹.wav",
+            "CONOUT$", "a\tb.wav",
+        ] {
+            assert!(safe_relative_path(bad).is_none(), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn staging_folders_are_bound_to_the_owner() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let name = staging_dir_name("My Song", "18c2f9a0-abcd", &a);
+        assert!(name.starts_with("My Song-"));
+        let tag = &name["My Song-".len()..];
+        assert!(tag.len() == 16 && tag.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        assert_eq!(name, staging_dir_name("My Song", "18c2f9a0-abcd", &a), "stable for a rejoin");
+        assert_ne!(name, staging_dir_name("My Song", "18c2f9a0-abcd", &b), "another host can't reuse it");
+        assert_ne!(name, staging_dir_name("My Song", "18c2f9a0-abce", &a));
+    }
+
+    fn test_download(dir: PathBuf) -> Download {
+        Download {
+            owner: PeerId::random(),
+            session_id: "sid".into(),
+            dir,
+            project_file: "Song.rpp".into(),
+            auth: String::new(),
+            got_manifest: true,
+            manifest_req: None,
+            files: Vec::new(),
+            queue: VecDeque::new(),
+            inflight: HashMap::new(),
+            window: DOWNLOAD_WINDOW_MIN,
+            peers: Vec::new(),
+            next_peer: 0,
+            total: 0,
+            done: 0,
+            last_activity: Instant::now(),
+            started: Instant::now(),
+            last_progress: Instant::now(),
+            verifying: 0,
+            media: Vec::new(),
+            media_released: false,
+            early_ready: false,
+        }
+    }
+
+    fn meta(path: &str, size: u64, hash: &str) -> FileMeta {
+        FileMeta { path: path.into(), size, hash: hash.into() }
+    }
+
+    #[test]
+    fn download_plan_vets_the_manifest() {
+        let root = std::env::temp_dir().join(format!("reamesh-plan-{}", std::process::id()));
+        let dir = root.join("Song-0123456789abcdef");
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut dl = test_download(dir.clone());
+        download_build(
+            &mut dl,
+            vec![
+                meta("Song.rpp", 10, "h1"),
+                meta("../escape.wav", 10, ""),
+                meta("/abs.wav", 10, ""),
+                meta("Audio/NUL.wav", 10, ""),
+                meta("audio/Kick.wav", 5, ""),
+                meta("Audio/kick.wav", 5, ""),
+            ],
+        )
+        .unwrap();
+        let planned: Vec<&str> = dl.files.iter().map(|f| f.meta.path.as_str()).collect();
+        assert_eq!(planned, ["Song.rpp", "audio/Kick.wav"], "unsafe and repeated entries are skipped");
+        assert!(!dl.files[0].owner_only, "a hashed file may come from any member");
+        assert!(dl.files[1].owner_only, "an unhashed one only from the owner");
+        assert!(!root.join("escape.wav").exists());
+        download_cleanup(&mut Some(dl));
+
+        let mut dl = test_download(dir.clone());
+        let err = download_build(&mut dl, vec![meta("Song.rpp", MAX_FILE_BYTES + 1, "")]).unwrap_err();
+        assert_eq!(err.to_string(), TOO_LARGE_MESSAGE);
+        let mut dl = test_download(dir.clone());
+        let err = download_build(&mut dl, vec![meta("a.wav", u64::MAX, ""), meta("b.wav", u64::MAX, "")]).unwrap_err();
+        assert_eq!(err.to_string(), TOO_LARGE_MESSAGE, "sizes can't wrap the total");
+        let many: Vec<FileMeta> = (0..5).map(|i| meta(&format!("f{i}.wav"), MAX_FILE_BYTES, "")).collect();
+        let mut dl = test_download(dir.clone());
+        assert_eq!(download_build(&mut dl, many).unwrap_err().to_string(), TOO_LARGE_MESSAGE);
+        assert!(dl.files.is_empty() && !dir.join(".reamesh-part-f0.wav").exists(), "nothing touched the disk");
+
+        // A plan that would need more than the disk has.
+        if let Some(free) = available_space(&dir)
+            && free < MAX_PROJECT_BYTES - DISK_RESERVE
+        {
+            let mut dl = test_download(dir.clone());
+            let files = vec![meta("big.wav", free.min(MAX_FILE_BYTES), ""), meta("big2.wav", free.min(MAX_FILE_BYTES), "")];
+            assert_eq!(download_build(&mut dl, files).unwrap_err().to_string(), DISK_SPACE_MESSAGE);
+        }
+        assert_eq!(file_pieces(0, 3 * CHUNK_SIZE + 1).len(), 4);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn serving_refuses_hidden_special_and_escaping_files() {
+        let root = std::env::temp_dir().join(format!("reamesh-serve-{}", std::process::id()));
+        let dir = root.join("proj");
+        fs::create_dir_all(dir.join("Audio")).unwrap();
+        fs::create_dir_all(root.join("outside")).unwrap();
+        fs::write(dir.join("Audio/a.wav"), b"audio").unwrap();
+        fs::write(dir.join(".hidden.wav"), b"x").unwrap();
+        fs::write(dir.join("Audio/a.wav.reapeaks"), b"x").unwrap();
+        fs::write(root.join("outside/secret.wav"), b"secret").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("outside/secret.wav"), dir.join("Audio/link.wav")).unwrap();
+            std::os::unix::fs::symlink(root.join("outside"), dir.join("Linked")).unwrap();
+        }
+
+        let (host, guest) = (PeerId::random(), PeerId::random());
+        let tok = auth_token("salt", "pw");
+        let hosting = Hosting {
+            session_id: "sid".into(),
+            session_name: "S".into(),
+            project_file: "p.rpp".into(),
+            files: vec![meta("Audio/a.wav", 5, "abc123")],
+            salt: "salt".into(),
+            auth: true,
+            meta: String::new(),
+            ever_listed: HashSet::new(),
+            doc_admitted: HashSet::new(),
+        };
+        let ask = |path: &str, scope: ServeScope| {
+            let req = prove_request(
+                XferRequest::File { path: path.into(), offset: 0, auth: String::new() },
+                &tok,
+                &guest,
+                &host,
+            );
+            serve_xfer(Some(&hosting), Some(&dir), &tok, &host, &guest, false, &req, &|_| scope)
+        };
+        match ask("Audio/a.wav", ServeScope::Contained) {
+            r @ XferResponse::FileChunk { .. } => {
+                assert!(serve_proof_ok(&r, &tok, &host, &guest));
+                assert!(!serve_proof_ok(&r, &tok, &guest, &host), "bound to the direction");
+                assert!(!serve_proof_ok(&r, &auth_token("salt", "guess"), &host, &guest));
+                let XferResponse::FileChunk { hash, data, .. } = r else { unreachable!() };
+                assert_eq!(hash, "abc123", "the owner vouches with its manifest hash");
+                assert_eq!(data, b"audio");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let refused = |r: XferResponse| matches!(r, XferResponse::Error { .. });
+        assert!(refused(ask("Audio/a.wav", ServeScope::No)));
+        assert!(refused(ask(".hidden.wav", ServeScope::Listed)));
+        assert!(refused(ask("Audio/a.wav.reapeaks", ServeScope::Listed)));
+        assert!(refused(ask("Audio", ServeScope::Listed)), "a folder is not a file");
+        #[cfg(unix)]
+        {
+            assert!(refused(ask("Audio/link.wav", ServeScope::Contained)), "a link out of the folder");
+            assert!(refused(ask("Linked/secret.wav", ServeScope::Contained)), "a linked folder");
+            // The host's own walk followed its link: that one is the user's choice.
+            assert!(!refused(ask("Linked/secret.wav", ServeScope::Listed)));
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 /// Fill the in-flight window: pull pending pieces and dispatch each to the
@@ -5526,7 +6257,7 @@ fn download_progress_check(shared: &Shared, dl: &mut Download) {
 fn download_tick(swarm: &mut Swarm<Behaviour>, shared: &Shared, download: &mut Option<Download>) {
     let Some(dl) = download.as_mut() else { return };
     let mut peers = vec![dl.owner];
-    for p in shared.session_peers.lock().unwrap().iter() {
+    for p in serving_peers(shared).iter() {
         if !peers.contains(p) {
             peers.push(*p);
         }
@@ -5601,6 +6332,8 @@ fn handle_download_manifest(
                 if let Err(e) = download_build(dl, files) {
                     return download_fail(download, shared, e.to_string());
                 }
+                // This copy may serve exactly these files to later joiners.
+                shared.servable.lock().unwrap().extend(dl.files.iter().map(|f| path_key(&f.meta.path)));
                 eprintln!(
                     "[reamesh] downloading into {} ({} of {} bytes already present)",
                     dl.dir.display(),
@@ -5645,10 +6378,14 @@ fn handle_download_piece(
     download: &mut Option<Download>,
     verify_tx: &VerifyTx,
     request_id: request_response::OutboundRequestId,
-    response: Option<XferResponse>,
+    response: Option<(PeerId, XferResponse)>,
 ) {
+    let me = *swarm.local_peer_id();
     let Some(dl) = download.as_mut() else { return };
     let Some((piece, sent)) = dl.inflight.remove(&request_id) else { return };
+    // A piece without the server's proof of the passphrase is as good as no
+    // answer: requeued for another peer.
+    let response = response.and_then(|(peer, r)| serve_proof_ok(&r, &dl.auth, &peer, &me).then_some(r));
     dl.last_activity = Instant::now();
     // Adapt the window to the link: a piece that came back quickly means there
     // is headroom for more in flight; a failed one (timeout, peer gone) means
@@ -6474,9 +7211,10 @@ mod tests {
             auth: true,
             meta: String::new(),
             ever_listed: HashSet::new(),
+            doc_admitted: HashSet::new(),
         };
         let serve = |req: &XferRequest, from: &PeerId| {
-            serve_xfer(Some(&hosting), None, &tok, &host, from, false, req, &|_| true)
+            serve_xfer(Some(&hosting), None, &tok, &host, from, false, req, &|_| ServeScope::Listed)
         };
         // The bare token is refused now; so is a proof meant for another server.
         assert!(matches!(serve(&XferRequest::Manifest { auth: tok.clone() }, &guest), XferResponse::Error { .. }));
@@ -6570,6 +7308,11 @@ mod tests {
         assert!(doc_references(doc, "Audio/snare.wav"));
         assert!(!doc_references(doc, "Audio/deleted.wav"), "a deleted item references nothing");
         assert!(!doc_references(doc, "Private/secret.txt"));
+        // Exact project-relative paths only (case and separators aside): a
+        // same-named file elsewhere in the folder is not what the item uses.
+        assert!(doc_references(doc, "audio/SNARE.wav"));
+        assert!(!doc_references(doc, "Old/Audio/snare.wav"));
+        assert!(!doc_references(doc, "snare.wav"));
     }
 
     #[test]

@@ -590,6 +590,56 @@ int main() {
     assert(reaperVersionSupported("garbage"));
   }
 
+  {
+    // Media paths from a peer: only project-relative ones may reach REAPER.
+    for (const char* ok : {"", "Audio/kick.wav", "Audio\\kick.wav", "kick.wav", "~kick.wav",
+                           "Sub/inner.rpp", "a b/c d.wav"})
+      assert(!mediaPathUnsafe(ok));
+    for (const char* bad :
+         {"/Users/x/Music/secret.wav", "\\\\host\\share\\x.wav", "//host/share/x.wav",
+          "C:\\Users\\x\\a.wav", "C:a.wav", "Audio/../../secret.wav", "../secret.wav",
+          "./kick.wav", "Audio//kick.wav", "Audio/", "~/Music/x.wav", "kick.wav:stream",
+          "file:///etc/passwd", "say \"hi\".wav", "a\nb.wav", "a\tb.wav"})
+      assert(mediaPathUnsafe(bad));
+
+    auto item = [](const std::string& fileLine) {
+      return "<ITEM\n  POSITION 0\n  <SOURCE SECTION\n    LENGTH 1\n    <SOURCE WAVE\n      " +
+             fileLine + "\n    >\n  >\n>\n";
+    };
+    assert(!chunkHasUnsafeFilePath(item("FILE \"Audio/kick.wav\"")));
+    assert(!chunkHasUnsafeFilePath(item("FILE \"Audio/kick.wav\" 1")));
+    assert(!chunkHasUnsafeFilePath(item("FILE \"Audio/kick.wav\"\r")));
+    assert(chunkHasUnsafeFilePath(item("FILE \"/etc/hosts\"")));  // nested in a section
+    assert(chunkHasUnsafeFilePath(item("FILE /etc/hosts")));      // unquoted
+    assert(chunkHasUnsafeFilePath(item("file \"/etc/hosts\"")));  // any case
+    assert(chunkHasUnsafeFilePath(item("\tFILE '/etc/hosts'")));
+    assert(chunkHasUnsafeFilePath(item("FILE `say \"x\".wav`")));  // path with a double quote
+    assert(chunkHasUnsafeFilePath(item("FILE \"Audio/kick.wav")));  // unterminated quote
+    assert(chunkHasUnsafeFilePath(item("FILE \"\\\\srv\\share\\a.wav\"")));
+    assert(chunkHasUnsafeFilePath(item("FILE \"C:\\Users\\x\\a.wav\"")));
+    // Other keywords and payload lines are not FILE lines.
+    assert(!chunkHasUnsafeFilePath("<ITEM\n  NAME \"FILE /etc/hosts\"\n  FILEX /etc/hosts\n>\n"));
+    assert(!chunkHasUnsafeFilePath("<VST \"VST: x\" x.vst 0\n  RklMRSAvZXRj\n>\n"));
+    assert(!chunkHasUnsafeFilePath(kTrackChunk));
+    // What the extension itself puts on the wire passes.
+    const std::string abs = "<ITEM\n  <SOURCE WAVE\n    FILE \"/Users/ben/Song/Audio/kick.wav\"\n  >\n>\n";
+    assert(chunkHasUnsafeFilePath(abs));
+    assert(!chunkHasUnsafeFilePath(relativizeChunkFiles(abs, {"/Users/ben/Song"})));
+
+    // A changeset loses the offending item whole and the offending track field.
+    json cs = {
+        {"items",
+         {{"{OK}", {{"present", true}, {"chunk", item("FILE \"Audio/a.wav\"")}}},
+          {"{BAD}", {{"present", true}, {"chunk", item("FILE \"/Users/x/a.wav\"")}}}}},
+        {"tracks",
+         {{"{T}",
+           {{"name", "FILE /not/a/chunk"}, {"fxchain", "<FXCHAIN\nFILE \"../x.wav\"\n>\n"}}}}}};
+    dropUnsafeMediaPaths(cs);
+    assert(cs["items"].contains("{OK}") && !cs["items"].contains("{BAD}"));
+    assert(!cs["tracks"]["{T}"].contains("fxchain"));
+    assert(cs["tracks"]["{T}"]["name"] == "FILE /not/a/chunk");
+  }
+
   printf("chunk_test: all assertions passed\n");
   return 0;
 }

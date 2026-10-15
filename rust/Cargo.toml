@@ -37,3 +37,8 @@ aho-corasick = "1"
 # lies in one of our own subnets (`hint_addrs`). Same version libp2p's mDNS
 # already pulls in.
 if-addrs = "0.15"
+
+# Free disk space before a download or fetch (`available_space`; on Windows it
+# calls kernel32 directly). Already in the tree through libp2p.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

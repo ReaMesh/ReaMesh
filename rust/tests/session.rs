@@ -832,16 +832,33 @@ fn mid_session_media_fetch() {
     );
 
     // And the reverse direction: the client "records" a file, the owner
-    // fetches it from the client.
+    // fetches it from the client. Not before the client put it on the
+    // timeline, though: a guest's copy serves session files only.
     let vox: Vec<u8> = (0..123_456).map(|i| (i % 13) as u8).collect();
     fs::create_dir_all(client_dir.join("Audio")).unwrap();
     fs::write(client_dir.join("Audio/vox.wav"), &vox).unwrap();
+    let leaked = wait_until(Duration::from_secs(3), || {
+        owner.fetch_file("Audio/vox.wav");
+        project.join("Audio/vox.wav").exists()
+    });
+    assert!(!leaked, "a guest's file nothing references was served");
+    client.push_local(
+        r#"{"items":{"{VOX}":{"present":true,"track":"{T1}","chunk":"<ITEM\n  <SOURCE WAVE\n    FILE \"Audio/vox.wav\"\n  >\n>\n"}}}"#,
+    );
     let fetched_back = wait_until(Duration::from_secs(20), || {
         owner.fetch_file("Audio/vox.wav");
         project.join("Audio/vox.wav").exists()
     });
     assert!(fetched_back, "owner never fetched the client's file");
     assert_eq!(fs::read(project.join("Audio/vox.wav")).unwrap(), vox);
+
+    // An item naming a file outside the project never enters the session.
+    client.push_local(
+        r#"{"items":{"{LEAK}":{"present":true,"track":"{T1}","chunk":"<ITEM\n  <SOURCE WAVE\n    FILE \"/etc/hosts\"\n  >\n>\n"}}}"#,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let v: Value = serde_json::from_str(&owner.snapshot_json()).unwrap();
+    assert!(v["items"].get("{LEAK}").is_none(), "an out-of-project media path was admitted");
 
     // Path traversal is refused outright.
     assert!(!client.fetch_file("../escape.wav"));
