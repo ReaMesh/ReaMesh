@@ -1815,7 +1815,14 @@ static std::set<std::string> g_copyFailed;      // gave up (logged once)
 // stay out of the diff because their media is still on its way in.
 static std::map<std::string, std::string> g_itemsAwaitingCopy;
 
+// Defined below, with processPeakJobs.
+static void queuePeakBuild(const std::string& guid);
+
 // Repoint every take still reading `srcPath` to the in-project copy at `dest`.
+// Peaks are keyed by source path, so a repointed take starts without them:
+// each one goes to the same sliced peak builder fetched media uses. REAPER's
+// own "build any missing peaks" ran on the main thread right as the sound was
+// added, and the arrange didn't repaint when it finished.
 static bool repointTakes(const std::string& srcPath, const std::string& dest) {
   bool repointed = false;
   const int n = CountMediaItems(nullptr);
@@ -1833,6 +1840,7 @@ static bool repointTakes(const std::string& srcPath, const std::string& dest) {
     SetMediaItemTake_Source(take, ns);
     PCM_Source_Destroy(src);
     UpdateItemInProject(item);
+    queuePeakBuild(itemGuid(item));
     repointed = true;
   }
   return repointed;
@@ -1925,8 +1933,7 @@ static void internalizeExternalMedia() {
     }).detach();
   }
 
-  // Peaks are keyed by source path; a repointed take starts without them.
-  if (repointed) Main_OnCommand(40047, 0);  // Peaks: Build any missing peaks
+  if (repointed) UpdateArrange();
 }
 
 // Defined below, near the tint helpers (needs applyItem / lockedItemsByOthers).
