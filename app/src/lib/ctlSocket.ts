@@ -15,8 +15,9 @@ export async function openCtlSocket(port: number): Promise<WebSocket> {
     token = null;
   }
   const url = `ws://127.0.0.1:${port}`;
-  // Without a token (no server on that port yet, or a browser preview against
-  // a stand-in server) the real extension refuses the handshake, which reads
-  // as "nobody there" and is retried on the usual cadence.
+  // Without a token (an extension from before the token, or a browser
+  // preview against a stand-in server) connect plainly: an extension that
+  // wants a token then only sends its `hello`, marked `auth: false`, which is
+  // still enough to show a version mismatch (see connection.ts).
   return token ? new WebSocket(url, [`reamesh.${token}`]) : new WebSocket(url);
 }

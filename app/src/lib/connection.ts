@@ -11,6 +11,7 @@ import { normalizeState, type Instance } from "./types";
 import { getProfile } from "./profile";
 import { getOverlaySettings, subscribeOverlaySettings } from "./overlaySettings";
 import { openCtlSocket } from "./ctlSocket";
+import { PROTO } from "./version";
 
 const ALL_PORTS = [47415, 47416, 47417, 47418];
 const RETRY_MS = 2000;
@@ -99,6 +100,14 @@ function attach(port: number, ws: WebSocket) {
     }
     const inst = live.get(port) ?? { port };
     if (msg.type === "hello") {
+      // Greeted without the run token (`auth: false`): the extension only
+      // says which build it is. A build of another protocol stays, so the
+      // version-mismatch screen can name it; one of ours is useless without
+      // the token, so drop it and fetch the token again on the next scan.
+      if (msg.auth === false && msg.proto === PROTO) {
+        ws.close();
+        return;
+      }
       inst.pid = Number(msg.pid) || undefined;
       inst.version = typeof msg.version === "string" ? msg.version : undefined;
       inst.proto = typeof msg.proto === "number" ? msg.proto : undefined;

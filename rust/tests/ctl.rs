@@ -31,8 +31,12 @@ fn authed(port: u16) -> Request {
     request(port, Some(&format!("reamesh.{}", ctl_token(port))))
 }
 
+/// Both tests share the one process-wide server and its command queue.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn ctl_server_refuses_clients_without_the_token() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let port = reamesh::reamesh_ctl_start();
     assert_ne!(port, 0, "ctl server failed to bind");
     #[cfg(unix)]
@@ -47,8 +51,9 @@ fn ctl_server_refuses_clients_without_the_token() {
         .build()
         .unwrap();
     rt.block_on(async move {
+        // A wrong token is refused at the handshake.
         let wrong = "reamesh.".to_string() + &"0".repeat(64);
-        for proto in [None, Some("reamesh."), Some(wrong.as_str()), Some("chat")] {
+        for proto in [Some("reamesh."), Some(wrong.as_str())] {
             let res = tokio::time::timeout(
                 Duration::from_secs(5),
                 tokio_tungstenite::connect_async(request(port, proto)),
@@ -57,6 +62,42 @@ fn ctl_server_refuses_clients_without_the_token() {
             .expect("connect timed out");
             assert!(res.is_err(), "handshake offering {proto:?} was accepted");
         }
+
+        // No token at all: the greeting (so an app can tell a version
+        // mismatch), marked unauthenticated, and nothing else. Its commands
+        // never reach the extension, and published state never reaches it.
+        let (mut ws, _) = tokio_tungstenite::connect_async(request(port, None))
+            .await
+            .expect("token-less connect failed");
+        let hello = ws.next().await.unwrap().unwrap();
+        let v: Value = serde_json::from_str(hello.to_text().unwrap()).unwrap();
+        assert_eq!(v["type"], "hello");
+        assert_eq!(v["auth"], false);
+        assert_eq!(v["proto"].as_u64(), Some(reamesh::PROTO as u64));
+        ws.send(Message::Text(r#"{"cmd":"leave","probe":"unauthenticated"}"#.into()))
+            .await
+            .unwrap();
+        ws.send(Message::Text(
+            r##"{"cmd":"set_profile","name":"Intruder","color":"#000000"}"##.into(),
+        ))
+        .await
+        .unwrap();
+        let cs = std::ffi::CString::new(r#"{"type":"state","mode":"probe"}"#).unwrap();
+        reamesh::reamesh_ctl_publish(cs.as_ptr());
+        let got = tokio::time::timeout(Duration::from_millis(500), ws.next()).await;
+        assert!(got.is_err(), "unauthenticated client received {got:?}");
+        // Leave no state behind for the other test's replay check.
+        let empty = std::ffi::CString::new("").unwrap();
+        reamesh::reamesh_ctl_publish(empty.as_ptr());
+        let mut seen = Vec::new();
+        while let Some(s) = ffi_poll() {
+            seen.push(s);
+        }
+        assert!(
+            !seen.iter().any(|s| s.contains("unauthenticated")),
+            "unauthenticated command was queued: {seen:?}"
+        );
+
         // The right token gets in, and the server echoes the subprotocol.
         let (_ws, resp) = tokio_tungstenite::connect_async(authed(port))
             .await
@@ -73,6 +114,7 @@ fn ctl_server_refuses_clients_without_the_token() {
 
 #[test]
 fn ctl_server_round_trip() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let port = reamesh::reamesh_ctl_start();
     assert_ne!(port, 0, "ctl server failed to bind");
     // Idempotent: second start returns the same port.

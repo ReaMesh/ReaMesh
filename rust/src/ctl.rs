@@ -21,10 +21,15 @@
 //! (owner-only permissions; the temp dir is per-user on macOS and Windows),
 //! and a client offers it as the WebSocket subprotocol `reamesh.<token>`,
 //! which the server echoes back. The ReaMesh app reads the file through its
-//! backend (`ctl_token`). A handshake without the right token is refused
-//! whatever its Origin, so neither a web page nor another user's process can
-//! drive the extension; a process running as the same user can read the file,
-//! which is the boundary the OS gives us anyway.
+//! backend (`ctl_token`). Nothing is accepted from a connection without the
+//! right token, whatever its Origin, so neither a web page nor another user's
+//! process can drive the extension or read its state; a process running as
+//! the same user can read the file, which is the boundary the OS gives us
+//! anyway. A wrong token is refused at the handshake. A connection that
+//! offers no token at all (an app from before the token, or one that found no
+//! token file) only gets the `hello` greeting, marked `"auth": false`, so the
+//! app can still tell a version mismatch apart from a missing extension; its
+//! commands are dropped and it never sees a state frame.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
@@ -366,8 +371,10 @@ async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<CtlShared>) 
         tokio::spawn(async move {
             let _slot = slot;
             let token = shared.token.lock().unwrap().clone();
-            // Refuse cross-origin handshakes (CSWSH) and anyone without this
-            // run's token before upgrading.
+            let authed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let authed_in = authed.clone();
+            // Refuse cross-origin handshakes (CSWSH) and a wrong token before
+            // upgrading; note whether the right one came along.
             let check = move |req: &Request, mut resp: Response| -> Result<Response, ErrorResponse> {
                 let refuse = |why: &str| {
                     let mut err = ErrorResponse::new(Some(why.to_string()));
@@ -383,11 +390,18 @@ async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<CtlShared>) 
                     .headers()
                     .get("sec-websocket-protocol")
                     .and_then(|v| v.to_str().ok());
+                let offers_token = offered.is_some_and(|h| {
+                    h.split(',').any(|p| p.trim().starts_with(TOKEN_PROTOCOL_PREFIX))
+                });
+                if !offers_token {
+                    // Greeting only (see the module docs).
+                    return Ok(resp);
+                }
                 let Some(proto) = token
                     .as_deref()
                     .and_then(|t| offered_token_protocol(offered, t))
                 else {
-                    eprintln!("[reamesh] ctl: rejected connection without a valid token");
+                    eprintln!("[reamesh] ctl: rejected connection with a wrong token");
                     return Err(refuse("unauthorized"));
                 };
                 // Browsers fail a handshake whose offered subprotocol isn't
@@ -396,6 +410,7 @@ async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<CtlShared>) 
                     return Err(refuse("unauthorized"));
                 };
                 resp.headers_mut().insert("sec-websocket-protocol", value);
+                authed_in.store(true, Ordering::Relaxed);
                 Ok(resp)
             };
             let config = WebSocketConfig::default()
@@ -410,19 +425,33 @@ async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<CtlShared>) 
                 return;
             };
             let (mut ws_tx, mut ws_rx) = ws.split();
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(OUTBOUND_CAP);
+            let authed = authed.load(Ordering::Relaxed);
             // Greet (with this build's version + PROTO, which the app checks
             // against its own before driving anything), then replay the last
             // known state so the app paints now.
-            let _ = tx.try_send(
-                json!({
-                    "type": "hello",
-                    "pid": std::process::id(),
-                    "version": crate::VERSION,
-                    "proto": crate::PROTO,
-                })
-                .to_string(),
-            );
+            let hello = json!({
+                "type": "hello",
+                "pid": std::process::id(),
+                "version": crate::VERSION,
+                "proto": crate::PROTO,
+                "auth": authed,
+            })
+            .to_string();
+            if !authed {
+                // Greeting only: everything it sends is ignored until it
+                // goes away.
+                if ws_tx.send(Message::Text(hello.into())).await.is_err() {
+                    return;
+                }
+                while let Some(Ok(msg)) = ws_rx.next().await {
+                    if matches!(msg, Message::Close(_)) {
+                        break;
+                    }
+                }
+                return;
+            }
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(OUTBOUND_CAP);
+            let _ = tx.try_send(hello);
             {
                 let last = shared.last_state.lock().unwrap().clone();
                 if !last.is_empty() {
