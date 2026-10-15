@@ -2,6 +2,7 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 
 // Native chrome for the presence overlay. The webview owns the HUD's content
@@ -40,6 +41,14 @@ static const NSTimeInterval kDragPause = 0.25; // suspend follow during a drag
 - (BOOL)canBecomeKeyWindow { return YES; }
 - (BOOL)canBecomeMainWindow { return NO; }
 @end
+
+// -[NSWindow _setPreventsActivation:] is private; guarded so a macOS without
+// it just falls back to the style bit.
+static void setPreventsActivation(NSWindow *w, BOOL on) {
+    SEL sel = NSSelectorFromString(@"_setPreventsActivation:");
+    if (![w respondsToSelector:sel]) return;
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(w, sel, on);
+}
 
 @interface ReaMeshOverlayController : NSObject <NSWindowDelegate>
 @property (strong) NSPanel *panel;
@@ -357,6 +366,12 @@ static ReaMeshOverlayController *gOverlay = nil;
     object_setClass(window, [ReaMeshOverlayPanel class]);
     NSPanel *panel = (NSPanel *)window;
     panel.styleMask |= NSWindowStyleMaskNonactivatingPanel;
+    // The style bit alone isn't enough on a window that was created without
+    // it: AppKit derives the window server's "prevents activation" flag only
+    // at init, so the swapped-in panel still activated ReaMesh on every click
+    // (the main window jumped in front of REAPER and the roster never got the
+    // click). Set the flag the init path would have set.
+    setPreventsActivation(panel, YES);
     panel.collectionBehavior |= (NSWindowCollectionBehaviorCanJoinAllSpaces |
                                  NSWindowCollectionBehaviorFullScreenAuxiliary |
                                  NSWindowCollectionBehaviorStationary);
@@ -445,6 +460,7 @@ static ReaMeshOverlayController *gOverlay = nil;
         // non-activating style bit is only valid on an NSPanel, so clear it
         // while the class is still our panel subclass, then restore tao's
         // original class so close/dealloc dispatch hits tao's implementations.
+        setPreventsActivation(panel, NO);
         panel.styleMask &= ~NSWindowStyleMaskNonactivatingPanel;
         if (self.originalClass) {
             object_setClass(panel, self.originalClass);
