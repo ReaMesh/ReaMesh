@@ -64,7 +64,9 @@ function DialogContent({
           // Sized for the 420px companion window: the stock `sm:` breakpoints
           // never fire here, so the layout is stated outright instead. No
           // shadow: the dimmed backdrop already sets the dialog apart.
-          "fixed top-[50%] left-[50%] z-50 grid w-[calc(100%-2rem)] max-w-[372px] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-2xl border bg-popover p-5 duration-200 outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",
+          // grid-cols-1 (= minmax(0, 1fr)) keeps one long nowrap row, like a
+          // plugin name, from widening the column past the dialog's edge.
+          "fixed top-[50%] left-[50%] z-50 grid grid-cols-1 w-[calc(100%-2rem)] max-w-[372px] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-2xl border bg-popover p-5 duration-200 outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",
           className
         )}
         // Open with focus on the dialog itself, not on its first button: a
