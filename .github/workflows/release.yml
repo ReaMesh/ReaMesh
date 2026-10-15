@@ -41,7 +41,8 @@ jobs:
       - name: Rust toolchain
         id: rust
         shell: bash
-        run: echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v6
         with:
           path: |
@@ -109,7 +110,8 @@ jobs:
       # lipo and the bundler rebuild every run.
       - name: Rust toolchain
         id: rust
-        run: echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v6
         with:
           path: |
@@ -223,7 +225,8 @@ jobs:
       # Same cache scheme as the other jobs (see windows).
       - name: Rust toolchain
         id: rust
-        run: echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v6
         with:
           path: |
