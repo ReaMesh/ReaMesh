@@ -20,8 +20,18 @@ export interface UpdateState {
   can_restart: boolean;
 }
 
+/** Beta gets every release, Stable only the ones marked stable. */
+export type UpdateChannel = "beta" | "stable";
+
+export interface ChannelInfo {
+  channel: UpdateChannel;
+  /** False until the first stable release exists: Stable shows, greyed out. */
+  stable_available: boolean;
+}
+
 let state: UpdateState = { phase: "idle", version: "", progress: 0, can_restart: false };
 let auto: boolean | undefined;
+let channel: ChannelInfo = { channel: "beta", stable_available: false };
 const listeners = new Set<() => void>();
 const emit = () => listeners.forEach((l) => l());
 let started = false;
@@ -43,6 +53,17 @@ function start() {
       emit();
     })
     .catch(() => {});
+  invoke<ChannelInfo>("get_update_channel")
+    .then((c) => {
+      if (!c) return;
+      channel = c;
+      emit();
+    })
+    .catch(() => {});
+  listen<UpdateChannel>("update-channel-changed", (e) => {
+    channel = { ...channel, channel: e.payload };
+    emit();
+  }).catch(() => {});
   listen<UpdateState>("update-state", (e) => {
     state = e.payload;
     emit();
@@ -70,6 +91,26 @@ export function useUpdate(): UpdateState {
 /** Whether checks run on their own. `undefined` until the backend answers. */
 export function useUpdateAuto(): boolean | undefined {
   return useSyncExternalStore(subscribe, () => auto);
+}
+
+export function getUpdateChannel(): ChannelInfo {
+  return channel;
+}
+
+export function useUpdateChannel(): ChannelInfo {
+  return useSyncExternalStore(subscribe, () => channel);
+}
+
+/** How the app names a channel, the same in every language. */
+export function channelLabel(c: UpdateChannel): string {
+  return c === "stable" ? "Stable" : "Beta";
+}
+
+export async function setUpdateChannel(next: UpdateChannel) {
+  if (next === "stable" && !channel.stable_available) return;
+  channel = { ...channel, channel: next };
+  emit();
+  await invoke("set_update_channel", { channel: next }).catch(() => {});
 }
 
 export function checkForUpdate() {

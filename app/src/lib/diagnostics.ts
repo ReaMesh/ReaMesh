@@ -4,7 +4,7 @@ import { getLangPref } from "./i18n";
 import { getReaperStatus } from "./install";
 import { localizeLogEntry } from "./log";
 import { getOverlaySettings } from "./overlaySettings";
-import { getUpdate } from "./updater";
+import { getUpdate, getUpdateChannel } from "./updater";
 import { PROTO } from "./version";
 
 /** Everything a bug report needs, as plain text: no project data, no names.
@@ -19,7 +19,7 @@ export async function buildDiagnostics(): Promise<string> {
     `Language: ${getLangPref()}`,
     `REAPER folder found: ${status?.reaperFound ?? "?"} · looks like REAPER: ${status?.isReaperDir ?? "?"}`,
     `Extension installed: ${status?.installed ?? "?"} · up to date: ${status?.upToDate ?? "?"}`,
-    `Update: ${getUpdate().phase} ${getUpdate().version} · overlay: ${JSON.stringify(getOverlaySettings())}`,
+    `Update: ${getUpdate().phase} ${getUpdate().version} (${getUpdateChannel().channel}) · overlay: ${JSON.stringify(getOverlaySettings())}`,
     `Instances: ${instances.length}`,
     ...instances.map(
       (i) =>

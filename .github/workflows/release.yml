@@ -2,8 +2,10 @@
 # inside it, and is also published on its own, signed, so a downloaded update
 # can install it before the app restarts) plus the macOS installer DMG, and
 # publishes them, with the updater manifests, as a draft release of this
-# repository. Publishing the draft makes it the latest release, which is where
-# installed apps look for updates (plugins.updater.endpoints in tauri.conf.json).
+# repository. The draft is a pre-release, i.e. a Beta: publishing it is what
+# hands it to installed apps (channel.yml copies its latest.json into the
+# Beta channel's manifest). Untick "Set as a pre-release" before publishing
+# to ship it as Stable instead.
 #
 # Trigger: push a tag `v<version>` matching the version in every manifest
 # (bun scripts/set-version.ts), or run it by hand on such a tag.
@@ -211,6 +213,7 @@ jobs:
           bun app/scripts/release-manifest.ts dist "$VERSION" \
             "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION"
       # A draft: nothing reaches installed apps until it is published by hand.
+      # A pre-release by default: every release goes to Beta for now.
       - name: Draft the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -220,6 +223,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --draft \
+            --prerelease \
             --title "ReaMesh $VERSION" \
             --notes-file "$RUNNER_TEMP/notes.md" \
             --generate-notes

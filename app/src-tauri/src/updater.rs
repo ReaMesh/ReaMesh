@@ -1,5 +1,5 @@
-// In-app updates. Checks the signed release manifest (plugins.updater in
-// tauri.conf.json), downloads a newer build in the background and holds it in
+// In-app updates. Checks the signed release manifest of the chosen channel
+// (Beta or Stable, see "the update channel" below), downloads a newer build in the background and holds it in
 // memory; nothing is installed until the user clicks restart. The state lives
 // here rather than in the webview so the native macOS settings window and the
 // webview show the same thing.
@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
@@ -151,6 +151,95 @@ pub fn store_auto(app: &AppHandle, enabled: bool) {
     crate::refresh_native_settings(app);
 }
 
+// ---------- the update channel ----------
+//
+// Beta gets every release, Stable only the ones published as stable. Each
+// channel has its own manifest, kept current by .github/workflows/channel.yml
+// in the fixed `updater` release when a release is published (a pre-release
+// goes to beta.json; a stable release to stable.json, and to beta.json too
+// unless a newer beta is already there). The manifests point at the versioned
+// release's artifacts, so `extension.json` is still found next to the app.
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Channel {
+    Beta,
+    Stable,
+}
+
+/// Off until the first stable release exists: the switch shows Stable greyed
+/// out, and a stored "stable" reads as Beta. Flip with that release.
+pub const STABLE_AVAILABLE: bool = false;
+
+const CHANNEL_BASE: &str = "https://github.com/ReaMesh/ReaMesh/releases/download/updater/";
+
+impl Channel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Channel::Beta => "beta",
+            Channel::Stable => "stable",
+        }
+    }
+
+    /// How the app names it, the same in every language.
+    pub fn label(self) -> &'static str {
+        match self {
+            Channel::Beta => "Beta",
+            Channel::Stable => "Stable",
+        }
+    }
+
+    fn manifest(self) -> String {
+        format!("{CHANNEL_BASE}{}.json", self.as_str())
+    }
+}
+
+fn channel_file(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|d| d.join("update_channel"))
+}
+
+/// Beta unless Stable was chosen (and exists).
+pub fn load_channel(app: &AppHandle) -> Channel {
+    let stored = channel_file(app)
+        .and_then(|p| fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    if STABLE_AVAILABLE && stored.trim() == "stable" {
+        Channel::Stable
+    } else {
+        Channel::Beta
+    }
+}
+
+pub fn store_channel(app: &AppHandle, channel: Channel) {
+    if channel == Channel::Stable && !STABLE_AVAILABLE {
+        return;
+    }
+    if channel == load_channel(app) {
+        return;
+    }
+    let Some(p) = channel_file(app) else { return };
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(p, channel.as_str());
+    // A download from the other channel no longer applies: forget it and
+    // look again on the new one. (One still downloading is dropped when it
+    // finishes, see check_and_download.)
+    {
+        let mut inner = INNER.lock().unwrap();
+        if matches!(inner.state.phase, Phase::Ready | Phase::Current | Phase::Failed) {
+            inner.pending = None;
+            inner.proto = None;
+            inner.state.phase = Phase::Idle;
+            inner.state.version.clear();
+            inner.state.progress = 0.0;
+        }
+    }
+    let _ = app.emit("update-channel-changed", channel);
+    publish(app, true);
+    spawn_check(app);
+}
+
 // ---------- checking and downloading ----------
 
 /// Check now (and download whatever is newer). A no-op while a check or a
@@ -180,8 +269,13 @@ pub fn spawn_check(app: &AppHandle) {
 }
 
 async fn check_and_download(app: &AppHandle) -> Result<(), String> {
+    let channel = load_channel(app);
+    let manifest = tauri::Url::parse(&channel.manifest()).map_err(|e| e.to_string())?;
     let update = app
-        .updater()
+        .updater_builder()
+        .endpoints(vec![manifest])
+        .map_err(|e| e.to_string())?
+        .build()
         .map_err(|e| e.to_string())?
         .check()
         .await
@@ -226,6 +320,17 @@ async fn check_and_download(app: &AppHandle) -> Result<(), String> {
         )
         .await
         .map_err(|e| e.to_string())?;
+    if load_channel(app) != channel {
+        // Switched channels while this downloaded: start over on the new one.
+        set(app, |i| {
+            i.state.phase = Phase::Idle;
+            i.state.version.clear();
+            i.state.progress = 0.0;
+            i.proto = None;
+        });
+        spawn_check(app);
+        return Ok(());
+    }
     let version = update.version.clone();
     let release = update.download_url.clone();
     set(app, |i| {
@@ -351,4 +456,20 @@ pub fn get_update_auto(app: AppHandle) -> bool {
 #[tauri::command]
 pub fn set_update_auto(app: AppHandle, enabled: bool) {
     store_auto(&app, enabled);
+}
+
+#[derive(Serialize)]
+pub struct ChannelInfo {
+    channel: Channel,
+    stable_available: bool,
+}
+
+#[tauri::command]
+pub fn get_update_channel(app: AppHandle) -> ChannelInfo {
+    ChannelInfo { channel: load_channel(&app), stable_available: STABLE_AVAILABLE }
+}
+
+#[tauri::command]
+pub fn set_update_channel(app: AppHandle, channel: Channel) {
+    store_channel(&app, channel);
 }

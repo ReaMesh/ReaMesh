@@ -25,6 +25,9 @@ import {
   checkForUpdate,
   restartToUpdate,
   setUpdateAuto,
+  setUpdateChannel,
+  channelLabel,
+  useUpdateChannel,
   useAppVersion,
   useUpdate,
   useUpdateAuto,
@@ -124,6 +127,7 @@ export function Settings({
   const overlay = useOverlaySettings();
   const update = useUpdate();
   const updateAuto = useUpdateAuto() ?? true;
+  const channel = useUpdateChannel();
   const version = useAppVersion();
   const instance = useActiveInstance();
   useLang(); // re-render when the language changes
@@ -322,7 +326,7 @@ export function Settings({
           <SectionLabel>{t("updates")}</SectionLabel>
           <Group>
             <Row
-              label={version ? `ReaMesh ${version}` : "ReaMesh"}
+              label={`${version ? `ReaMesh ${version}` : "ReaMesh"} ${channelLabel(channel.channel)}`}
               sub={
                 updateSub && (
                   <span className={cn(update.phase === "failed" && "text-amber-500")}>
@@ -356,6 +360,40 @@ export function Settings({
                 onChange={setUpdateAuto}
                 label={t("autoCheckUpdates")}
               />
+            </Row>
+            <Divider inset={false} />
+            {/* Beta gets every release, Stable only the tested ones. Stable
+                stays visible but greyed out until its first release. */}
+            <Row label={t("updateChannel")}>
+              <div
+                role="radiogroup"
+                aria-label={t("updateChannel")}
+                className="flex shrink-0 gap-1 rounded-lg bg-muted p-0.5"
+              >
+                {(["beta", "stable"] as const).map((c) => {
+                  const off = c === "stable" && !channel.stable_available;
+                  return (
+                    <button
+                      key={c}
+                      type="button"
+                      role="radio"
+                      aria-checked={channel.channel === c}
+                      disabled={off}
+                      onClick={() => setUpdateChannel(c)}
+                      className={cn(
+                        "h-6 rounded-md px-2.5 text-[12px] font-medium transition-colors",
+                        channel.channel === c
+                          ? "bg-foreground/[0.14] text-foreground"
+                          : "text-muted-foreground hover:text-foreground",
+                        off && "pointer-events-none opacity-40",
+                        focusRing,
+                      )}
+                    >
+                      {channelLabel(c)}
+                    </button>
+                  );
+                })}
+              </div>
             </Row>
           </Group>
         </section>

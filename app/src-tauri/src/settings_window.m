@@ -266,8 +266,10 @@ static ReaMeshSettingsController *gController = nil;
     [self.container addSubview:btn];
 
     const char *ver = self.cb.get_version(self.cb.ctx);
+    const int32_t channel = self.cb.get_update_channel(self.cb.ctx);
     NSTextField *name =
-        [self labelWithString:[NSString stringWithFormat:@"ReaMesh %s", ver ? ver : ""]
+        [self labelWithString:[NSString stringWithFormat:@"ReaMesh %s %@", ver ? ver : "",
+                                  channel == kReaMeshChannelStable ? @"Stable" : @"Beta"]
                         frame:NSMakeRect(kMargin, y + 1, w - btnW - 12, 18)];
     name.font = [NSFont systemFontOfSize:13];
     [self.container addSubview:name];
@@ -316,6 +318,28 @@ static ReaMeshSettingsController *gController = nil;
         self.cb.get_update_auto(self.cb.ctx) ? NSControlStateValueOn : NSControlStateValueOff;
     autoBox.frame = NSMakeRect(kMargin, y, w, 22);
     [self.container addSubview:autoBox];
+    y += 40;
+
+    // Beta gets every release, Stable only the ones marked stable. Until the
+    // first stable release exists, Stable is shown but can't be picked.
+    [self.container addSubview:[self headerWithString:L(@"Channel", @"Kanal") y:y]];
+    y += 26;
+    NSSegmentedControl *seg =
+        [NSSegmentedControl segmentedControlWithLabels:@[ @"Beta", @"Stable" ]
+                                          trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                target:self
+                                                action:@selector(channelChanged:)];
+    seg.frame = NSMakeRect(kMargin, y, 180, 24);
+    seg.selectedSegment = channel == kReaMeshChannelStable ? 1 : 0;
+    const BOOL stableOK = self.cb.stable_available(self.cb.ctx) != 0;
+    [seg setEnabled:stableOK forSegment:1];
+    [self.container addSubview:seg];
+}
+
+- (void)channelChanged:(NSSegmentedControl *)sender {
+    self.cb.set_update_channel(self.cb.ctx,
+                               sender.selectedSegment == 1 ? kReaMeshChannelStable
+                                                           : kReaMeshChannelBeta);
 }
 
 - (void)checkUpdate:(id)sender {

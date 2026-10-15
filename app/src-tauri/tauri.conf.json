@@ -33,7 +33,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE5QTA5RTlBMTJEQjhDN0EKUldSNmpOc1NtcDZncVhaM3RoUzF1TUNDZ2JlSmw5dWVjR3R2U1lSbEEyd0pYOG5tN0pwOUNDQlkK",
       "endpoints": [
-        "https://github.com/ReaMesh/ReaMesh/releases/latest/download/latest.json"
+        "https://github.com/ReaMesh/ReaMesh/releases/download/updater/beta.json"
       ],
       "windows": {
         "installMode": "quiet"

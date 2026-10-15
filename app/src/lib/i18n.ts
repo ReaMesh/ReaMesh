@@ -68,6 +68,7 @@ const en = {
   hostCopyTitle: "Before you host",
   hostCloudWarning: "The project is in a cloud folder. Pause syncing while you host.",
   hostAnyway: "Host anyway",
+  updateChannel: "Channel",
   hostCopyAndHost: "Copy and host",
 
   // Post-download plugin verification
@@ -456,6 +457,7 @@ const de: Record<MsgKey, string> = {
   hostCopyTitle: "Bevor du hostest",
   hostCloudWarning: "Das Projekt liegt in einem Cloud-Ordner. Pausiere den Sync, solange du hostest.",
   hostAnyway: "Trotzdem hosten",
+  updateChannel: "Kanal",
   hostCopyAndHost: "Kopieren und hosten",
 
   verifyTitle: "Plugin-Liste unvollständig",

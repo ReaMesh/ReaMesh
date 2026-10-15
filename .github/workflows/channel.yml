@@ -1,0 +1,56 @@
+# Update channels. Installed apps don't read a release directly: each follows
+# a channel (Settings → Updates) and reads that channel's manifest from the
+# fixed `updater` release (src-tauri/src/updater.rs). When a release is
+# published, its latest.json is copied there:
+#   pre-release → beta.json
+#   release     → stable.json, and beta.json too (Beta gets every release)
+# A manifest is only replaced by a version at least as new, so publishing an
+# older release late never moves a channel back.
+name: channel
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-channels
+  cancel-in-progress: false
+
+jobs:
+  channel:
+    if: github.event.release.tag_name != 'updater'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      TAG: ${{ github.event.release.tag_name }}
+      PRERELEASE: ${{ github.event.release.prerelease }}
+    steps:
+      - name: Fetch the release's manifest
+        run: gh release download "$TAG" --repo "$REPO" --pattern latest.json --dir new
+      - name: Make sure the channel release exists
+        run: |
+          gh release view updater --repo "$REPO" > /dev/null 2>&1 ||
+            gh release create updater --repo "$REPO" \
+              --target "${{ github.event.repository.default_branch }}" \
+              --prerelease --latest=false \
+              --title "Update channels" \
+              --notes "The manifests installed ReaMesh apps check for updates (beta.json, stable.json). Updated automatically when a release is published; not a release itself."
+      - name: Update the channel manifests
+        run: |
+          NEW="$(jq -r .version new/latest.json)"
+          publish() {
+            CUR="$(gh release download updater --repo "$REPO" --pattern "$1.json" --output - 2> /dev/null | jq -r .version 2> /dev/null || true)"
+            if [ -n "$CUR" ] && [ "$CUR" != null ] &&
+              [ "$(printf '%s\n%s\n' "$CUR" "$NEW" | sort -V | tail -n1)" != "$NEW" ]; then
+              echo "$1 stays on $CUR (newer than $NEW)"
+              return
+            fi
+            cp new/latest.json "$1.json"
+            gh release upload updater "$1.json" --repo "$REPO" --clobber
+            echo "$1 → $NEW"
+          }
+          publish beta
+          if [ "$PRERELEASE" != "true" ]; then publish stable; fi

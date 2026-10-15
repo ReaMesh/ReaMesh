@@ -1613,6 +1613,8 @@ pub fn run() {
             updater::update_restart,
             updater::get_update_auto,
             updater::set_update_auto,
+            updater::get_update_channel,
+            updater::set_update_channel,
             show_main_window,
             notify_join,
             clear_join_badge,
@@ -1786,6 +1788,9 @@ mod native_settings {
         reset_identity: extern "C" fn(*mut c_void) -> i32,
         copy_diagnostics: extern "C" fn(*mut c_void),
         get_version: extern "C" fn(*mut c_void) -> *const c_char,
+        get_update_channel: extern "C" fn(*mut c_void) -> i32,
+        set_update_channel: extern "C" fn(*mut c_void, i32),
+        stable_available: extern "C" fn(*mut c_void) -> i32,
     }
 
     extern "C" {
@@ -1935,6 +1940,20 @@ mod native_settings {
         updater::store_auto(handle(ctx), enabled != 0);
     }
 
+    // Channels as kReaMeshChannel* (0 = Beta, 1 = Stable).
+    extern "C" fn get_update_channel(ctx: *mut c_void) -> i32 {
+        (updater::load_channel(handle(ctx)) == updater::Channel::Stable) as i32
+    }
+
+    extern "C" fn set_update_channel(ctx: *mut c_void, channel: i32) {
+        let channel = if channel == 1 { updater::Channel::Stable } else { updater::Channel::Beta };
+        updater::store_channel(handle(ctx), channel);
+    }
+
+    extern "C" fn stable_available(_ctx: *mut c_void) -> i32 {
+        updater::STABLE_AVAILABLE as i32
+    }
+
     // The acknowledgements are a screen of the main window (the list is long
     // and lives in the webview bundle): bring it forward and switch to it.
     pub(super) extern "C" fn show_credits(ctx: *mut c_void) {
@@ -1997,6 +2016,9 @@ mod native_settings {
             reset_identity,
             copy_diagnostics,
             get_version,
+            get_update_channel,
+            set_update_channel,
+            stable_available,
         };
         unsafe { reamesh_settings_open(cb) };
     }
@@ -2048,7 +2070,13 @@ mod native_about {
     /// Main thread only.
     pub fn open(app: &AppHandle) {
         let ptr = *APP_PTR.get_or_init(|| Box::into_raw(Box::new(app.clone())) as usize);
-        let version = CString::new(app.package_info().version.to_string()).unwrap_or_default();
+        // "0.1.0 Beta": the channel this install follows rides with the number.
+        let version = CString::new(format!(
+            "{} {}",
+            app.package_info().version,
+            crate::updater::load_channel(app).label()
+        ))
+        .unwrap_or_default();
         let commit = CString::new(env!("REAMESH_COMMIT")).unwrap_or_default();
         let info = AboutInfo {
             ctx: ptr as *mut c_void,

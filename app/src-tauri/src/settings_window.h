@@ -34,6 +34,12 @@ enum {
     kReaMeshUpdateFailed = 5,
 };
 
+// Update channels shared with Rust (updater::Channel).
+enum {
+    kReaMeshChannelBeta = 0,
+    kReaMeshChannelStable = 1,
+};
+
 // Language preference values shared with Rust (the stored *preference*, not
 // the resolved language: "system" resolves through the device locale).
 enum {
@@ -75,6 +81,9 @@ typedef struct {
     int32_t (*reset_identity)(void *ctx);     // 1 = reset, 0 = none stored, -1 = failed
     void (*copy_diagnostics)(void *ctx);      // the webview assembles + copies them
     const char *(*get_version)(void *ctx);    // static, owned by Rust
+    int32_t (*get_update_channel)(void *ctx); // kReaMeshChannel*
+    void (*set_update_channel)(void *ctx, int32_t channel);
+    int32_t (*stable_available)(void *ctx);   // 1 = Stable can be chosen
 } SettingsCallbacks;
 
 // Opens (or re-focuses) the native settings window. Must be called on the
