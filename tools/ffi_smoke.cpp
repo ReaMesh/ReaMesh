@@ -14,6 +14,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -77,21 +78,32 @@ int main() {
   std::string sid = jsonStr(take(reamesh_status(owner)), "session_id");
 
   printf("waiting for the client to discover session %s...\n", sid.c_str());
-  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
   bool found = false;
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (!getenv("REAMESH_SMOKE_TICKET") && std::chrono::steady_clock::now() < deadline) {
     if (take(reamesh_sessions(client)).find(sid) != std::string::npos) { found = true; break; }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
-  if (!found) {
-    fprintf(stderr, "FAIL: session never discovered (is multicast blocked?)\n");
-    return 1;
-  }
 
   printf("joining + downloading...\n");
-  if (!reamesh_join_session(client, sid.c_str(), "")) {
-    fprintf(stderr, "FAIL: join_session refused\n");
-    return 1;
+  if (found) {
+    if (!reamesh_join_session(client, sid.c_str(), "")) {
+      fprintf(stderr, "FAIL: join_session refused\n");
+      return 1;
+    }
+  } else {
+    // No multicast (CI runners block it): dial the host from its invite link.
+    std::string ticket;
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (ticket.empty() && std::chrono::steady_clock::now() < deadline) {
+      ticket = take(reamesh_session_ticket(owner));
+      if (ticket.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    printf("not discovered, joining by invite link\n");
+    if (ticket.empty() || !reamesh_join_ticket(client, ticket.c_str(), "")) {
+      fprintf(stderr, "FAIL: session never discovered and the invite-link join failed\n");
+      return 1;
+    }
   }
   std::string projectPath;
   deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -185,6 +197,6 @@ int main() {
   reamesh_shutdown(client);
   reamesh_shutdown(owner);
   fs::remove_all(base);
-  printf("OK: discovery, file transfer, track + item round trips, media fetch, no echo\n");
+  printf("OK: %s, file transfer, track + item round trips, media fetch, no echo\n", found ? "discovery" : "invite-link join");
   return 0;
 }
