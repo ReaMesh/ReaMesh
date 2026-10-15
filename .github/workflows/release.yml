@@ -13,7 +13,11 @@
 # Secrets:
 #   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 #       the updater key (bun tauri signer generate); its public half is
-#       plugins.updater.pubkey
+#       plugins.updater.pubkey. Only the bundling and signing steps see it:
+#       the app is compiled first without it (`tauri build --no-bundle`), so
+#       no dependency's build script or install hook runs with the key in
+#       its environment, then `tauri bundle` packages the finished binary
+#       and signs the updater artifacts.
 #   APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
 #   APPLE_SIGNING_IDENTITY ("Developer ID Application: …"),
 #   APPLE_API_ISSUER, APPLE_API_KEY, APPLE_API_KEY_P8 (contents of the .p8)
@@ -32,28 +36,19 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-      # Cargo's downloads and build output. A run on main saves them; a release
-      # run on a tag can only read main's, so the keys match between build.yml
-      # and release.yml. Bundles stay out: a stale installer must never land in
-      # the upload below.
-      - name: Rust toolchain
-        id: rust
-        shell: bash
-        run: |
-          echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      # Cargo's downloads only (crates are checksummed against Cargo.lock), the
+      # same entry build.yml saves on main. Build output is never restored
+      # into a release: it is compiled from scratch.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            rust/target/
-            app/src-tauri/target/
-            !app/src-tauri/target/release/bundle/
-          key: cargo-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-${{ hashFiles('rust/Cargo.lock', 'app/src-tauri/Cargo.lock') }}
-          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-
+          key: cargo-registry-${{ github.job }}-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'app/src-tauri/Cargo.lock') }}
+          restore-keys: cargo-registry-${{ github.job }}-${{ runner.os }}-
       - name: Build Rust staticlib
         run: cargo build --release
         working-directory: rust
@@ -70,8 +65,11 @@ jobs:
           bun run build
           bun run test
         working-directory: app
-      - name: Build signed installer + updater artifacts
-        run: bun run tauri build --config src-tauri/tauri.release.conf.json
+      - name: Build the app
+        run: bun run tauri build --no-bundle --config src-tauri/tauri.release.conf.json
+        working-directory: app
+      - name: Bundle the installer + signed updater artifacts
+        run: bun run tauri bundle --config src-tauri/tauri.release.conf.json
         working-directory: app
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -88,7 +86,7 @@ jobs:
           cp ../extension/build/Release/reaper_reamesh.dll src-tauri/target/release/bundle/nsis/
           bun run tauri signer sign --app-version "$(bun -p 'require("./package.json").version')" \
             src-tauri/target/release/bundle/nsis/reaper_reamesh.dll
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows
           path: |
@@ -104,25 +102,35 @@ jobs:
       # from tauri.conf.json and is not notarized.
       DEVELOPER_ID: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-      # Same cache scheme as windows; the universal folder only holds what
-      # lipo and the bundler rebuild every run.
-      - name: Rust toolchain
-        id: rust
-        run: |
-          echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      # Same cache scheme as windows: downloads only.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            rust/target/
-            app/src-tauri/target/
-            !app/src-tauri/target/universal-apple-darwin/
-          key: cargo-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-${{ hashFiles('rust/Cargo.lock', 'app/src-tauri/Cargo.lock') }}
-          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-
+          key: cargo-registry-${{ github.job }}-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'app/src-tauri/Cargo.lock') }}
+          restore-keys: cargo-registry-${{ github.job }}-${{ runner.os }}-
+      - name: Rust tests
+        run: cargo test --release -- --test-threads=1
+        working-directory: rust
+      # Universal (Apple silicon + Intel), macOS 11+.
+      - name: Build extension dylib
+        run: ./build.sh --no-app
+      - name: App checks
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+          bun run test
+        working-directory: app
+      # Compiled before any signing material is on the machine.
+      - name: Build the app
+        run: |
+          bun run tauri build --target universal-apple-darwin --no-bundle \
+            --config src-tauri/tauri.release.conf.json
+        working-directory: app
       - name: Import signing certificate
         if: env.DEVELOPER_ID == 'true'
         env:
@@ -135,28 +143,18 @@ jobs:
           security set-keychain-settings -lut 3600 "$KEYCHAIN"
           security unlock-keychain -p ci "$KEYCHAIN"
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
           security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-      - name: Rust tests
-        run: cargo test --release -- --test-threads=1
-        working-directory: rust
-      # Universal (Apple silicon + Intel), macOS 11+.
-      - name: Build + sign extension dylib
+      # Notarization rejects an unsigned Mach-O anywhere in the bundle, so the
+      # dylib the bundle picks up is signed first.
+      - name: Sign extension dylib
+        if: env.DEVELOPER_ID == 'true'
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          ./build.sh --no-app
-          # Notarization rejects an unsigned Mach-O anywhere in the bundle.
-          if [ "$DEVELOPER_ID" = true ]; then
-            codesign --force --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY" extension/build/reaper_reamesh.dylib
-          fi
-      - name: App checks
-        run: |
-          bun install --frozen-lockfile
-          bun run build
-          bun run test
-        working-directory: app
-      - name: Build, sign + notarize the app and updater artifacts
+          codesign --force --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY" extension/build/reaper_reamesh.dylib
+      - name: Bundle, sign + notarize the app and updater artifacts
         working-directory: app
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -168,15 +166,15 @@ jobs:
         run: |
           if [ "$DEVELOPER_ID" = true ]; then
             export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
-            echo "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH"
-            bun run tauri build --target universal-apple-darwin \
+            (umask 077; echo "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH")
+            bun run tauri bundle --target universal-apple-darwin \
               --config src-tauri/tauri.release.conf.json \
               --config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$APPLE_SIGNING_IDENTITY\"}}}"
           else
             # Tauri reads these even when empty; unset, it signs ad-hoc and
             # skips notarization.
             unset APPLE_SIGNING_IDENTITY APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_P8
-            bun run tauri build --target universal-apple-darwin \
+            bun run tauri bundle --target universal-apple-darwin \
               --config src-tauri/tauri.release.conf.json
           fi
       # Taken out of the finished bundle, so it is the copy the app installs.
@@ -193,6 +191,14 @@ jobs:
           # make-dmg.sh clears everything but the .app out of this folder.
           mkdir -p ../release-macos
           cp "$B"/*.app.tar.gz "$B"/*.app.tar.gz.sig "$B"/reaper_reamesh.dylib "$B"/reaper_reamesh.dylib.sig ../release-macos/
+      # The signing material is no longer needed; nothing after this signs.
+      - name: Remove signing material
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/AuthKey.p8"
+          if [ -f "$RUNNER_TEMP/build.keychain" ] || [ -f "$RUNNER_TEMP/build.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/build.keychain" || true
+          fi
       # The download for new installs. The image stays unsigned either way: a
       # signed but not notarized image would add a second "Open Anyway" prompt.
       - name: Installer DMG
@@ -210,7 +216,7 @@ jobs:
             hdiutil create -volname "ReaMesh Installer" -srcfolder "$S" -fs HFS+ -format ULFO -ov "$DMG"
           fi
           cp "$DMG" ../release-macos/
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos
           path: release-macos/*
@@ -221,21 +227,16 @@ jobs:
   macos-intel:
     runs-on: macos-15-intel
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Same cache scheme as the other jobs (see windows).
-      - name: Rust toolchain
-        id: rust
-        run: |
-          echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            rust/target/
-          key: cargo-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-
+          key: cargo-registry-${{ github.job }}-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: cargo-registry-${{ github.job }}-${{ runner.os }}-
       - name: Build universal extension
         run: ./build.sh --no-app
       - name: Intel check
@@ -247,9 +248,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true

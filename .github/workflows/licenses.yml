@@ -1,31 +1,39 @@
-# Dependency-licence gate. ReaMesh is GPL-3.0; keeping strong-copyleft
-# dependencies out of the shipped program keeps its own licensing in the
-# maintainer's hands, so every push and PR checks the Rust crates
-# (cargo-deny, allow-list in deny.toml) and the bun packages
-# (tools/check-npm-licenses.ts). Cheap: no compilation, lockfiles only.
+# Dependency gate. ReaMesh is GPL-3.0; keeping strong-copyleft dependencies
+# out of the shipped program keeps its own licensing in the maintainer's
+# hands, so every push and PR checks the Rust crates (cargo-deny, allow-list
+# in deny.toml) and the bun packages (tools/check-npm-licenses.ts). The same
+# run checks both against the published security advisories (RustSec via
+# cargo-deny, the npm advisory database via `bun audit`) and that every crate
+# comes from crates.io. Cheap: no compilation, lockfiles only.
 name: licenses
 on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   licenses:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - name: Rust crates (core)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
-          command: check licenses
+          command: check licenses advisories sources
           manifest-path: rust/Cargo.toml
           arguments: --config deny.toml
       - name: Rust crates (app backend)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
-          command: check licenses
+          command: check licenses advisories sources
           manifest-path: app/src-tauri/Cargo.toml
           arguments: --config deny.toml
       - name: npm packages (app)
-        run: bun install --frozen-lockfile && bun ../tools/check-npm-licenses.ts .
+        run: |
+          bun install --frozen-lockfile
+          bun ../tools/check-npm-licenses.ts .
+          bun audit --audit-level=high
         working-directory: app
