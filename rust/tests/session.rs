@@ -363,6 +363,44 @@ fn client_edit_proposes_and_propagates() {
     let _ = fs::remove_dir_all(staging);
 }
 
+/// The owner admits only known fields in the shape capture produces: a
+/// malformed chunk part, an unknown field and a new action marker are dropped
+/// from a proposal, the rest of it lands.
+#[test]
+fn owner_drops_malformed_proposal_fields() {
+    let project = temp_dir("proj-shape");
+    let staging = temp_dir("staging-shape");
+    make_project(&project);
+    let (owner, client) = establish("shape-test", &project, &staging);
+
+    owner.push_local(r#"{"tracks":{"{T21}":{"present":true,"index":0,"name":"Vox"}}}"#);
+    let mut client_state = serde_json::Map::new();
+    assert!(wait_until(Duration::from_secs(10), || {
+        drain_into(&client, &mut client_state);
+        client_state.contains_key("{T21}")
+    }));
+    std::thread::sleep(Duration::from_millis(3200));
+    client.push_local(
+        r#"{"tracks":{"{T21}":{"name":"Lead Vox","lock":"LOCK 1\n<FXCHAIN\n>\n","evil":"x"}},
+            "project":{"project":{"markers":"M\t1\t0\t0\t0\t!40044\n","title":"Song"}}}"#,
+    );
+    // The admitted part lands in the owner's doc...
+    assert!(wait_until(Duration::from_secs(10), || {
+        let snap: Value = serde_json::from_str(&owner.snapshot_json()).unwrap();
+        snap["tracks"]["{T21}"]["name"] == "Lead Vox" && snap["project"]["project"]["title"] == "Song"
+    }));
+    // ...the rest never does.
+    let snap: Value = serde_json::from_str(&owner.snapshot_json()).unwrap();
+    assert_eq!(snap["tracks"]["{T21}"]["lock"], Value::Null);
+    assert_eq!(snap["tracks"]["{T21}"]["evil"], Value::Null);
+    assert_eq!(snap["project"]["project"]["markers"], Value::Null);
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
 #[test]
 fn authenticated_client_proposal_propagates() {
     // Proposals are gated on the session token (only token-holders may write

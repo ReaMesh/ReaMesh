@@ -31,6 +31,7 @@
 //! Authority, proposals and reconciliation are per (section, id, field).
 
 mod ctl;
+mod limits;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_char};
@@ -125,6 +126,12 @@ const SESSION_STALE: Duration = Duration::from_secs(10);
 /// legitimate burst (a full-state sync is one message); a flood past this is
 /// dropped rather than allowed to exhaust memory.
 const MAX_PENDING_UPDATES: usize = 4096;
+/// Largest gossip message (gossipsub `max_transmit_size`). Tied to the
+/// per-field cap: a proposal or update must fit one maximum-size field
+/// (`limits::MAX_CHUNK_FIELD`) with room to spare, and the owner's full-state
+/// anti-entropy update of a big project travels as a single message too, so
+/// this can't shrink below what real projects need.
+const MAX_GOSSIP_MESSAGE: usize = 2 * limits::MAX_CHUNK_FIELD;
 /// A second byte cap on the same queue. The per-message `max_transmit_size` is
 /// 64 MB, so bounding only the *count* would still let ~256 GB accumulate;
 /// bounding total bytes keeps the worst case to a fixed, modest ceiling.
@@ -464,14 +471,38 @@ fn live_locks(locks: &mut HashMap<FieldKey, Lock>, now: Instant) -> Vec<(FieldKe
     out
 }
 
-/// Serialize a live-lock list to the `{"locks":[[section,id,field,holder]...]}`
-/// wire shape (TAG_LOCKS payload).
-fn lock_table_json(locks: &[(FieldKey, String)]) -> Vec<u8> {
+/// Serialize a live-lock list to the `{"locks":[[section,id,field,holder]...],
+/// "seq"}` wire shape (TAG_LOCKS payload); `seq` is the owner's control
+/// sequence (see `limits::ctl_fresh`).
+fn lock_table_json(locks: &[(FieldKey, String)], seq: u64) -> Vec<u8> {
     let arr: Vec<JsonValue> = locks
         .iter()
         .map(|((s, id, f), h)| json!([s, id, f, h]))
         .collect();
-    json!({ "locks": arr }).to_string().into_bytes()
+    json!({ "locks": arr, "seq": seq }).to_string().into_bytes()
+}
+
+/// The owner's next control-message sequence ('K', 'B', 'L').
+fn next_ctl_seq(shared: &Shared) -> u64 {
+    limits::next_anchored_seq(&shared.ctl_seq)
+}
+
+/// Whether an owner control message of `kind` carrying `v["seq"]` is newer
+/// than every one accepted on that stream before (see `limits::ctl_fresh`).
+fn ctl_msg_fresh(
+    me: &str,
+    topic: &gossipsub::IdentTopic,
+    owner: &str,
+    kind: &str,
+    v: &JsonValue,
+) -> bool {
+    let seq = v.get("seq").and_then(|x| x.as_u64()).unwrap_or(0);
+    let stream = limits::ctl_stream(me, &topic.hash().to_string(), owner, kind);
+    let fresh = limits::ctl_fresh(stream, seq);
+    if !fresh {
+        eprintln!("[reamesh] dropped a stale or replayed '{kind}' control message (seq {seq})");
+    }
+    fresh
 }
 
 /// Parse a TAG_LOCKS payload back into a `(section,id,field) -> holder` map.
@@ -568,8 +599,13 @@ struct Shared {
     /// Client: sequence of the last proposal sent (see next_proposal_seq).
     proposal_seq: AtomicU64,
     /// Owner: the last admitted sequence per proposer: anything not newer is
-    /// a replay.
+    /// a replay. Kept for the whole hosting run, across a guest's re-subscribe
+    /// (its sequence is wall-clock anchored, so a rejoining guest's new
+    /// proposals are newer anyway).
     proposal_seqs: Mutex<HashMap<String, u64>>,
+    /// Owner: sequence of the last control message ('K', 'B', 'L') sent; see
+    /// `limits::ctl_fresh` for how receivers use it.
+    ctl_seq: AtomicU64,
     /// The session meta blob for the current session: what this owner set via
     /// `set_session_meta`, or (on a client) what the owner's manifest claimed.
     /// The extension reads it back after the download to verify the received
@@ -1730,6 +1766,7 @@ impl Reamesh {
             probe_result: Mutex::new(None),
             proposal_seq: AtomicU64::new(0),
             proposal_seqs: Mutex::new(HashMap::new()),
+            ctl_seq: AtomicU64::new(0),
             session_meta: Mutex::new(String::new()),
             marker_inbox: Mutex::new(Vec::new()),
         });
@@ -3387,7 +3424,7 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
             // Item/FX-chain state chunks ride gossipsub; plugin state blobs
             // (samplers etc.) can be tens of MB.
             let gs_config = gossipsub::ConfigBuilder::default()
-                .max_transmit_size(64 * 1024 * 1024)
+                .max_transmit_size(MAX_GOSSIP_MESSAGE)
                 .build()
                 .map_err(std::io::Error::other)?;
             let gossipsub = gossipsub::Behaviour::new(
@@ -4111,6 +4148,14 @@ fn admit_proposal(shared: &Shared, payload: &[u8], proposer: &str) -> Option<Vec
     }
 
     let mut ds = shared.doc.lock().unwrap();
+    // Only known fields, in the shape and size capture produces, and no marker
+    // list that brings in a new action marker (see `limits::sanitize_proposal`).
+    let current_markers = doc_field(&ds.doc, PROJECT_ROOT, "project", "markers");
+    let dropped =
+        limits::sanitize_proposal(&mut parsed, current_markers.as_ref().and_then(|v| v.as_str()));
+    if dropped > 0 {
+        eprintln!("[reamesh] proposal from {proposer}: dropped {dropped} malformed or unknown field(s)");
+    }
     // Third line of the placeholder guard (after the extension's diff pinning
     // and the client's push_local check): a chunk that would blank a media
     // source out of an item is refused here too, so no client build, however
@@ -4193,12 +4238,13 @@ fn publish_session(
         .is_ok()
 }
 
-/// The 'B' ban-table message for `live` (peer id strings).
-fn ban_table_msg(live: &HashSet<String>) -> Vec<u8> {
+/// The 'B' ban-table message for `live` (peer id strings), stamped with the
+/// owner's control sequence `seq`.
+fn ban_table_msg(live: &HashSet<String>, seq: u64) -> Vec<u8> {
     let mut ids: Vec<&String> = live.iter().collect();
     ids.sort();
     let mut data = vec![TAG_BANS];
-    data.extend_from_slice(json!({ "bans": ids }).to_string().as_bytes());
+    data.extend_from_slice(json!({ "bans": ids, "seq": seq }).to_string().as_bytes());
     data
 }
 
@@ -4471,6 +4517,12 @@ async fn run_network(
     // established, like an mDNS discovery, so the lobby announce flows at once).
     let mut hint_dialed: HashMap<Multiaddr, Instant> = HashMap::new();
     let mut hint_conns: HashSet<libp2p::swarm::ConnectionId> = HashSet::new();
+    // Global hint-dial rate cap, and the peers hints made explicit (oldest
+    // first, at most HINT_PEERS_MAX). mDNS-discovered peers are tracked so a
+    // hint eviction never takes their explicit status away.
+    let mut hint_rate = limits::HintRate::default();
+    let mut hint_peers: VecDeque<PeerId> = VecDeque::new();
+    let mut mdns_peers: HashSet<PeerId> = HashSet::new();
 
     let lobby = gossipsub::IdentTopic::new(LOBBY_TOPIC);
     let mut hosting = cfg.hosting;
@@ -4697,7 +4749,9 @@ async fn run_network(
                     } else if let Some(t) = sess_topic.clone() {
                         let mut data = vec![TAG_KICK];
                         data.extend_from_slice(
-                            json!({ "peer": peer, "ban": ban }).to_string().as_bytes(),
+                            json!({ "peer": peer, "ban": ban, "seq": next_ctl_seq(&shared) })
+                                .to_string()
+                                .as_bytes(),
                         );
                         if !publish_session(&mut swarm, &shared, &t, &data) && retry_pubs.len() < 256 {
                             retry_pubs.push(data);
@@ -4721,6 +4775,10 @@ async fn run_network(
                     for addr in addrs {
                         if hint_dialed.contains_key(&addr) || hint_dialed.len() >= 4 * HINT_MAX_ADDRS {
                             continue;
+                        }
+                        if !hint_rate.allow(Instant::now()) {
+                            eprintln!("[reamesh] address hint dropped: dial rate cap reached");
+                            break;
                         }
                         hint_dialed.insert(addr.clone(), Instant::now());
                         let opts = DialOpts::unknown_peer_id().address(addr).allocate_new_port().build();
@@ -4899,7 +4957,7 @@ async fn run_network(
                         infos.retain(|id, _| !live.contains(id));
                         drop(infos);
                         if let Some(t) = sess_topic.clone() {
-                            let data = ban_table_msg(&live);
+                            let data = ban_table_msg(&live, next_ctl_seq(&shared));
                             if !publish_session(&mut swarm, &shared, &t, &data) && retry_pubs.len() < 256 {
                                 retry_pubs.push(data);
                             }
@@ -5002,7 +5060,7 @@ async fn run_network(
                     }
                     if changed || lock_resend > 0 {
                         let mut data = vec![TAG_LOCKS];
-                        data.extend_from_slice(&lock_table_json(&live));
+                        data.extend_from_slice(&lock_table_json(&live, next_ctl_seq(&shared)));
                         let _ = publish_session(&mut swarm, &shared, &t, &data);
                     }
                 }
@@ -5086,6 +5144,31 @@ async fn run_network(
                     eprintln!("[reamesh] connection established with {peer_id} via {endpoint:?}");
                     if hint_conns.remove(&connection_id) {
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                        if !hint_peers.contains(&peer_id) {
+                            hint_peers.push_back(peer_id);
+                        }
+                        // Bounded: past HINT_PEERS_MAX the oldest hint peer
+                        // that isn't connected (else the oldest that isn't a
+                        // session member or the host we are joining) loses
+                        // its explicit status, unless mDNS found it too.
+                        while hint_peers.len() > limits::HINT_PEERS_MAX {
+                            let session = shared.session_peers.lock().unwrap().clone();
+                            let owner = shared.owner_peer.lock().unwrap().clone();
+                            let keep = |p: &PeerId| {
+                                session.contains(p)
+                                    || p.to_string() == owner
+                                    || pending_join.as_ref().is_some_and(|pj| pj.info.peer == *p)
+                            };
+                            let pos = hint_peers
+                                .iter()
+                                .position(|p| !swarm.is_connected(p) && !keep(p))
+                                .or_else(|| hint_peers.iter().position(|p| !keep(p)));
+                            let Some(pos) = pos else { break };
+                            let old = hint_peers.remove(pos).unwrap();
+                            if !mdns_peers.contains(&old) {
+                                swarm.behaviour_mut().gossipsub.remove_explicit_peer(&old);
+                            }
+                        }
                     }
                     // A reachable ticket host: stop the fast-fail clock and let
                     // it have the full window to send its announce.
@@ -5127,6 +5210,7 @@ async fn run_network(
                 SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
                     for (peer_id, addr) in peers {
                         eprintln!("[reamesh] mDNS discovered {peer_id} at {addr}");
+                        mdns_peers.insert(peer_id);
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                         // mDNS advertises LAN-interface addresses only. When the
                         // peer is another instance on this same machine (the
@@ -5153,6 +5237,7 @@ async fn run_network(
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
                     for (peer_id, _) in peers {
+                        mdns_peers.remove(&peer_id);
                         swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                     }
                 }
@@ -5164,15 +5249,16 @@ async fn run_network(
                         // everything.
                         if hosting.is_some() {
                             need_full_sync = true;
-                            // A (re)joining peer starts its proposal sequence
-                            // afresh: its own clock anchors it, and a clock
-                            // that went backwards must not lock it out.
-                            shared.proposal_seqs.lock().unwrap().remove(&peer_id.to_string());
-                            // ...and the current ban table, so it refuses the
-                            // same peers everyone else does.
+                            // A (re)joining peer keeps its proposal floor
+                            // (`proposal_seqs`): proposals captured before it
+                            // left must not become admissible again. Its
+                            // sequence is wall-clock anchored, so its new
+                            // proposals are newer anyway.
+                            // It also gets the current ban table, so it
+                            // refuses the same peers everyone else does.
                             let live = shared.banned.lock().unwrap().clone();
                             if !live.is_empty() && retry_pubs.len() < 256 {
-                                retry_pubs.push(ban_table_msg(&live));
+                                retry_pubs.push(ban_table_msg(&live, next_ctl_seq(&shared)));
                             }
                         }
                     }
@@ -5184,11 +5270,16 @@ async fn run_network(
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
                     if message.topic == lobby.hash() {
+                        // Any LAN peer can publish here: an announce is a few
+                        // hundred bytes, so anything far larger isn't parsed
+                        // at all, and every kept string is bounded.
                         if cfg.role == Role::Client
+                            && message.data.len() <= limits::ANNOUNCE_MAX_BYTES
                             && let Ok(v) = serde_json::from_slice::<JsonValue>(&message.data)
                             && v.get("kind").and_then(|k| k.as_str()) == Some("announce")
                         {
                             let get = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                            let clipped = |k: &str, max: usize| limits::clip(&get(k), max);
                             // Bind the announcement to its authenticated signer:
                             // the claimed `owner` peer id must match the message
                             // source. Otherwise any LAN peer could announce a
@@ -5201,22 +5292,38 @@ async fn run_network(
                                 .is_some_and(|src| src.to_string() == owner);
                             let mut info = SessionInfo {
                                 session_id: get("session_id"),
-                                session_name: get("session_name"),
-                                project_file: get("project_file"),
+                                session_name: clipped("session_name", 128),
+                                project_file: clipped("project_file", 256),
                                 owner,
-                                owner_name: get("owner_name"),
-                                owner_color: get("owner_color"),
+                                owner_name: clipped("owner_name", 64),
+                                owner_color: clipped("owner_color", 16),
                                 auth: v.get("auth").and_then(|x| x.as_bool()).unwrap_or(false),
                                 salt: get("salt"),
                                 files: v.get("files").and_then(|x| x.as_u64()).unwrap_or(0),
                                 bytes: v.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0),
                                 last_seen: Instant::now(),
                                 contested: false,
-                                proto: v.get("proto").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-                                version: get("ver"),
+                                proto: v
+                                    .get("proto")
+                                    .and_then(|x| x.as_u64())
+                                    .unwrap_or(0)
+                                    .min(u32::MAX as u64) as u32,
+                                version: clipped("ver", 32),
                             };
-                            if signer_is_owner && valid_session_id(&info.session_id) {
+                            if signer_is_owner
+                                && valid_session_id(&info.session_id)
+                                && limits::valid_salt(&info.salt)
+                            {
                                 let mut sessions = shared.sessions.lock().unwrap();
+                                // Bounded: a stream of distinct (signed, but
+                                // freely minted) announcers can't grow the
+                                // table past MAX_SESSIONS; the stalest goes.
+                                limits::evict_for(
+                                    &mut sessions,
+                                    &info.session_id,
+                                    limits::MAX_SESSIONS,
+                                    |s| s.last_seen,
+                                );
                                 match sessions.get_mut(&info.session_id) {
                                     // Pin the first-seen owner. Binding the
                                     // announce to its signer (above) stops a
@@ -5294,7 +5401,11 @@ async fn run_network(
                         };
                         match (plain.first(), cfg.role) {
                             (Some(&TAG_PRESENCE), _) => {
-                                if let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..]) {
+                                // A beacon is at most a few KB (sel is capped);
+                                // a larger one isn't even parsed.
+                                if plain.len() <= limits::BEACON_MAX_BYTES
+                                    && let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..])
+                                {
                                     let get = |k: &str| {
                                         v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
                                     };
@@ -5314,17 +5425,28 @@ async fn run_network(
                                     let mut infos = shared.peers_info.lock().unwrap();
                                     let beacons =
                                         infos.get(&src.to_string()).map(|p| p.beacons).unwrap_or(0) + 1;
+                                    // Bounded roster: the stalest entry makes
+                                    // room for a new one past MAX_PEERS_INFO.
+                                    limits::evict_for(
+                                        &mut infos,
+                                        &src.to_string(),
+                                        limits::MAX_PEERS_INFO,
+                                        |p| p.last_seen,
+                                    );
                                     infos.insert(
                                         src.to_string(),
                                         PeerPresence {
-                                            name: get("name"),
-                                            color: get("color"),
-                                            focus: get("focus"),
+                                            // Same bounds as our own profile
+                                            // (set_profile); a GUID / peer id
+                                            // fits easily in 64.
+                                            name: limits::clip(&get("name"), 64),
+                                            color: limits::clip(&get("color"), 16),
+                                            focus: limits::clip(&get("focus"), 64),
                                             play: v.get("play").and_then(|x| x.as_f64()).unwrap_or(0.0),
                                             v0: v.get("v0").and_then(|x| x.as_f64()).unwrap_or(0.0),
                                             v1: v.get("v1").and_then(|x| x.as_f64()).unwrap_or(0.0),
                                             playing: v.get("playing").and_then(|x| x.as_bool()).unwrap_or(false),
-                                            follow: get("follow"),
+                                            follow: limits::clip(&get("follow"), 64),
                                             sel: sanitize_sel(v.get("sel")),
                                             fx: sanitize_fx(v.get("fx")),
                                             frozen: v.get("frozen").and_then(|x| x.as_bool()).unwrap_or(false),
@@ -5338,7 +5460,9 @@ async fn run_network(
                                 // A shared flag marker. Authenticated like a
                                 // presence beacon: only token holders may drop
                                 // markers into anyone's project.
-                                if let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..]) {
+                                if plain.len() <= limits::BEACON_MAX_BYTES
+                                    && let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..])
+                                {
                                     let get = |k: &str| {
                                         v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
                                     };
@@ -5430,15 +5554,24 @@ async fn run_network(
                                 }
                             }
                             (Some(&TAG_KICK), Role::Client) => {
-                                // Only the owner moderates.
-                                let from_owner =
-                                    src.to_string() == *shared.owner_peer.lock().unwrap();
-                                if from_owner
+                                // Only the owner moderates, and only its newest
+                                // notice about a given peer counts.
+                                let owner = shared.owner_peer.lock().unwrap().clone();
+                                let me = swarm.local_peer_id().to_string();
+                                if src.to_string() == owner
                                     && let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..])
+                                    && let Some(t) = sess_topic.clone()
+                                    && ctl_msg_fresh(
+                                        &me,
+                                        &t,
+                                        &owner,
+                                        &format!("K:{}", v.get("peer").and_then(|x| x.as_str()).unwrap_or("")),
+                                        &v,
+                                    )
                                 {
                                     let target = v.get("peer").and_then(|x| x.as_str()).unwrap_or("");
                                     let ban = v.get("ban").and_then(|x| x.as_bool()).unwrap_or(false);
-                                    if target == swarm.local_peer_id().to_string() {
+                                    if target == me {
                                         eprintln!(
                                             "[reamesh] the host {} us",
                                             if ban { "banned" } else { "removed" }
@@ -5468,10 +5601,12 @@ async fn run_network(
                                 }
                             }
                             (Some(&TAG_BANS), Role::Client) => {
-                                let from_owner =
-                                    src.to_string() == *shared.owner_peer.lock().unwrap();
-                                if from_owner
+                                let owner = shared.owner_peer.lock().unwrap().clone();
+                                let me = swarm.local_peer_id().to_string();
+                                if src.to_string() == owner
                                     && let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..])
+                                    && let Some(t) = sess_topic.clone()
+                                    && ctl_msg_fresh(&me, &t, &owner, "B", &v)
                                 {
                                     let live: HashSet<String> = v
                                         .get("bans")
@@ -5506,11 +5641,13 @@ async fn run_network(
                             (Some(&TAG_LOCKS), Role::Client) => {
                                 // The owner is the sole lock arbiter; ignore any
                                 // table from a non-owner topic member.
-                                let from_owner =
-                                    src.to_string() == *shared.owner_peer.lock().unwrap();
-                                if from_owner
+                                let owner = shared.owner_peer.lock().unwrap().clone();
+                                let me = swarm.local_peer_id().to_string();
+                                if src.to_string() == owner
                                     && let Ok(v) =
                                         serde_json::from_slice::<JsonValue>(&plain[1..])
+                                    && let Some(t) = sess_topic.clone()
+                                    && ctl_msg_fresh(&me, &t, &owner, "L", &v)
                                 {
                                     *shared.peer_locks.lock().unwrap() = parse_lock_table(&v);
                                     // Stamp the arrival: reconciliation only
