@@ -13,6 +13,25 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
+      # Cargo's downloads and build output. A run on main saves them; a release
+      # run on a tag can only read main's, so the keys match between build.yml
+      # and release.yml. Bundles stay out: a stale installer must never land in
+      # the upload below.
+      - name: Rust toolchain
+        id: rust
+        shell: bash
+        run: echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust/target/
+            app/src-tauri/target/
+            !app/src-tauri/target/release/bundle/
+          key: cargo-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-${{ hashFiles('rust/Cargo.lock', 'app/src-tauri/Cargo.lock') }}
+          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-
       - name: Build Rust staticlib
         run: cargo build --release
         working-directory: rust
@@ -49,6 +68,22 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
+      # Same cache scheme as windows; the universal folder only holds what
+      # lipo and the bundler rebuild every run.
+      - name: Rust toolchain
+        id: rust
+        run: echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust/target/
+            app/src-tauri/target/
+            !app/src-tauri/target/universal-apple-darwin/
+          key: cargo-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-${{ hashFiles('rust/Cargo.lock', 'app/src-tauri/Cargo.lock') }}
+          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-
       - name: Rust tests
         run: cargo test --release -- --test-threads=1
         working-directory: rust
@@ -66,9 +101,10 @@ jobs:
           bun run test
         working-directory: app
       # Compile check only; the release workflow builds the signed bundle.
+      # Universal like the release, so this run warms the release's cache.
       # Pass --no-bundle directly; an extra -- would forward it to Cargo.
       - name: Build app (unbundled)
-        run: bun run tauri build --no-bundle
+        run: bun run tauri build --target universal-apple-darwin --no-bundle
         working-directory: app
 
   # Runs the Intel half of the universal build natively: architectures and
@@ -78,6 +114,19 @@ jobs:
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v7
+      # Same cache scheme as the other jobs (see windows).
+      - name: Rust toolchain
+        id: rust
+        run: echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust/target/
+          key: cargo-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-
       - name: Build universal extension
         run: ./build.sh --no-app
       - name: Intel check
