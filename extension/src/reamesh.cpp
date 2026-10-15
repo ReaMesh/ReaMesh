@@ -1272,8 +1272,9 @@ static bool isKeywordIntsLine(std::string_view t, std::string_view keyword) {
 //     outside the part's own lines/blocks);
 //   - plus the part's own shape: one `LOCK <ints>` line; `GROUP_FLAGS[_HIGH]
 //     <ints>` lines; receives that start with their AUXRECV line; envelope
-//     blocks (and send envelopes) without nested blocks; exactly one FX chain
-//     block.
+//     blocks (and send envelopes) whose only nested block is extension data
+//     (<EXT, one level deep: no item, source or plugin can hide in there);
+//     exactly one FX chain block.
 // Empty is always valid (it removes the part).
 static bool validTrackPart(int kind, const std::string& text) {
   if (kind < 0 || kind >= kPartCount) return false;
@@ -1292,9 +1293,11 @@ static bool validTrackPart(int kind, const std::string& text) {
     if (pos == 0) firstLine = t;
     pos = eol + 1;
     if (!t.empty() && t.front() == '<') {
+      // The one nested block an envelope carries: <EXT (extension key/value
+      // data, P_EXT), directly inside it.
       if (depth == 1)
         ++blocksAtTop;
-      else
+      else if (depth != 2 || blockTag(t) != "EXT")
         nested = true;
       ++depth;
     } else if (t == ">") {

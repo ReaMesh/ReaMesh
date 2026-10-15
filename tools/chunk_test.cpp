@@ -673,7 +673,10 @@ int main() {
     assert(!validTrackPart(kEnv, "  <VOLENV2\n    PT 0 1 0\n"));            // unclosed
     assert(!validTrackPart(kEnv, "  <VOLENV2\n  >\n  >\n  <FXCHAIN\n  >\n"));  // extra close
     assert(!validTrackPart(kLock, "  LOCK 1\n>\n<FXCHAIN\n>\n"));
-    // Nested blocks don't belong in envelopes (an item, a source, a plugin).
+    // Nested blocks don't belong in envelopes (an item, a source, a plugin),
+    // extension data (<EXT, one level deep) aside.
+    assert(validTrackPart(kEnv, "  <VOLENV2\n    <EXT\n      key value\n    >\n    PT 0 1 0\n  >\n"));
+    assert(!validTrackPart(kEnv, "  <VOLENV2\n    <EXT\n      <ITEM\n      >\n    >\n  >\n"));
     assert(!validTrackPart(kEnv, "  <VOLENV2\n    <ITEM\n    >\n  >\n"));
     assert(!validTrackPart(kEnv, "  <VOLENV2\n    <SOURCE WAVE\n    >\n  >\n"));
     assert(!validTrackPart(kRecv, "  AUXRECV 0 0\n  <AUXVOLENV\n    <VST \"x\" y\n    >\n  >\n"));
