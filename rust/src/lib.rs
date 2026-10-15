@@ -155,10 +155,10 @@ const PRESENCE_INTERVAL: Duration = Duration::from_secs(1);
 /// rest of the session keeps the 1s cadence. Ten ~300-byte messages a second
 /// on a mesh of a few peers is negligible even over a VPN.
 const PRESENCE_FAST_INTERVAL: Duration = Duration::from_millis(100);
-/// Shared (non-synced) marker: `'M'` + JSON `{"name","pos","by","color","mac"}`,
-/// published once when a user shares a flag marker from the roster bar. Every
-/// receiver drops a *local* marker into its project: deliberately outside the
-/// synced marker list, so each person can keep or delete it independently.
+/// Ping (wire name: shared marker): `'M'` + JSON `{"name","pos","by","color","mac"}`,
+/// published once when a user pings a timeline spot from the roster bar. Every
+/// receiver shows it as a short notice and writes nothing into its project
+/// (builds before pings dropped a local, non-synced "⚑" marker instead).
 /// Authenticated exactly like a presence beacon (token-keyed MAC over the
 /// sender's peer id), so open-topic bystanders can't inject markers.
 const TAG_MARKER: u8 = b'M';
@@ -2120,10 +2120,11 @@ impl Reamesh {
         self.shared.session_meta.lock().unwrap().clone()
     }
 
-    /// Share a flag marker with every session peer: `{"name","pos"}`. The
+    /// Ping a timeline spot to every session peer: `{"name","pos"}` (a
+    /// "shared marker" on the wire; receivers show it as a notice). The
     /// sharer's profile name/color are stamped on by the network task. The
-    /// caller inserts its own local marker itself (gossipsub does not loop a
-    /// publish back to its sender).
+    /// caller shows its own copy itself (gossipsub does not loop a publish
+    /// back to its sender).
     pub fn share_marker(&self, marker_json: &str) -> bool {
         let Ok(v) = serde_json::from_str::<JsonValue>(marker_json) else {
             return false;
@@ -2186,7 +2187,7 @@ impl Reamesh {
             .is_ok()
     }
 
-    /// Shared markers received from peers since the last call, as a JSON array
+    /// Pings (shared markers) received from peers since the last call, as a JSON array
     /// of `{"name","pos","by","color"}` ("[]" when none).
     pub fn drain_markers(&self) -> String {
         let drained: Vec<JsonValue> =

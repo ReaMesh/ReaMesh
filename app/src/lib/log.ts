@@ -44,7 +44,7 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   peer_markers_changed: "peerMarkersChanged",
   peer_title_changed: "peerTitleChanged",
   peer_notes_changed: "peerNotesChanged",
-  marker_shared: "logMarkerShared",
+  ping_sent: "logPingSent",
   follow_ended: "followEnded",
   nofx_open: "nofxOpen",
   verify_hold: "verifyHold",
@@ -80,12 +80,12 @@ export function localizeLogEntry(entry: LogEntry | string): string {
       const name = entry.params?.name;
       return name ? t("peerTrackRemoved", { name }) : t("peerTrackRemovedUnnamed");
     }
-    case "marker_received": {
+    case "ping_received": {
       const name = entry.params?.name ?? "";
       const by = entry.params?.by;
       return by
-        ? t("logMarkerReceived", { by, name })
-        : t("logMarkerReceivedUnnamed", { name });
+        ? t("logPingReceived", { by, name })
+        : t("logPingReceivedUnnamed", { name });
     }
     case "plugin_added": {
       const plugin = entry.params?.plugin ?? "";

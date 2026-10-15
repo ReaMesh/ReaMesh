@@ -109,6 +109,8 @@
 #define REAPERAPI_WANT_GetCursorPosition
 #define REAPERAPI_WANT_GetSet_ArrangeView2
 #define REAPERAPI_WANT_SetEditCurPos
+#define REAPERAPI_WANT_format_timestr_pos
+#define REAPERAPI_WANT_Undo_OnStateChange
 // The minimum-version gate at plugin load, and the host-version mismatch hint.
 #define REAPERAPI_WANT_GetAppVersion
 // Peak building for media that lands mid-session (processPeakJobs).
@@ -1303,9 +1305,10 @@ static bool chunkHasEmptySource(const std::string& chunk) {
 
 // ---------- shared (non-synced) flag markers ----------
 //
-// A marker whose name starts with this prefix is a *shared flag* dropped by a
-// session peer from the roster bar. Deliberately outside the synced marker
-// list: captureMarkers skips them (they never ride the wire) and applyMarkers
+// A marker whose name starts with this prefix is a *shared flag*: what the
+// roster bar's shared markers used to drop into every project (now pings, see
+// sharePing; an older peer still inserts one when pinged). Deliberately
+// outside the synced marker list: captureMarkers skips them (they never ride the wire) and applyMarkers
 // leaves them standing (a remote marker rebuild deletes only synced ones), so
 // every person can keep or delete their copy independently. (Renaming a
 // normal marker to start with "⚑ " opts it out of sync: by design.)
@@ -3338,7 +3341,7 @@ static void revertLockedItemEdits(Snapshot& snap) {
   g_applyingRemote = false;
 }
 
-// ---------- shared markers, follow mode, session meta, verified open ----------
+// ---------- pings, follow mode, session meta, verified open ----------
 
 // Parse "#rrggbb" to a native REAPER color int (with the custom-color flag),
 // 0 when the string isn't a color. Local display only: never on the wire.
@@ -3350,17 +3353,6 @@ static int colorFromHex(const std::string& hex) {
   return 0x1000000 | ColorToNative((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
 }
 
-// Drop a shared flag marker into this project: "⚑ <name> by <sharer>", tinted
-// with the sharer's identity color. Local and non-synced by construction (see
-// kSharedMarkerPrefix). No undo point, like a remote apply, Ctrl+Z must never
-// swallow it; deleting it by hand is the intended way to dismiss it.
-static void insertSharedMarker(const std::string& name, double pos, const std::string& by,
-                               const std::string& colorHex) {
-  std::string full = std::string(kSharedMarkerPrefix) + name;
-  if (!by.empty()) full += " by " + by;
-  AddProjectMarker2(nullptr, false, pos, 0, full.c_str(), -1, colorFromHex(colorHex));
-}
-
 // This user's own roster entry (peers[] is self-first), for name/color.
 static json selfPeerEntry() {
   json peers = handleJson(reamesh_peers, json::array());
@@ -3370,9 +3362,69 @@ static json selfPeerEntry() {
   return json::object();
 }
 
-// Share the marker named by the user at the current edit cursor: broadcast to
-// every peer and insert our own local copy (gossip never loops back).
-static void shareMarker(const std::string& rawName) {
+// ---------- pings ----------
+//
+// A ping points everyone at one spot on the timeline ("look here") without
+// touching anyone's project: the HUD shows it for a few seconds (who, what,
+// where) with a click to jump there and one to keep it as a normal, synced
+// marker (`add_marker`). On the wire it is still the 'M' shared-marker message,
+// so an older peer receiving one inserts its local "⚑" marker as before.
+struct Ping {
+  uint64_t id = 0;
+  long long at = 0;  // unix ms; the HUD times the notice from it
+  std::string name, by, color, label;
+  double pos = 0.0;
+  bool self = false;
+};
+static std::vector<Ping> g_pings;
+static uint64_t g_pingSeq = 0;
+// The HUD shows a ping for ~8s; the extension keeps it a little longer so a
+// HUD that (re)connects in the meantime still sees it, and only a few at once.
+constexpr long long kPingKeepMs = 15000;
+constexpr size_t kPingMax = 5;
+
+static long long unixMsNow() {
+  using namespace std::chrono;
+  return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+
+static void addPing(const std::string& name, double pos, const std::string& by,
+                    const std::string& color, bool self) {
+  Ping p;
+  p.id = ++g_pingSeq;
+  p.at = unixMsNow();
+  p.name = name;
+  p.by = by;
+  p.color = color;
+  p.pos = pos;
+  p.self = self;
+  // In this user's own ruler format (bars/beats, time, ...), as REAPER shows it.
+  char buf[64] = "";
+  format_timestr_pos(pos, buf, sizeof(buf), -1);
+  p.label = buf;
+  g_pings.push_back(std::move(p));
+  if (g_pings.size() > kPingMax) g_pings.erase(g_pings.begin());
+}
+
+// Recent pings for the ctl state; drops expired ones, and all of them outside
+// a session.
+static json pingsJson() {
+  if (g_mode != Mode::Hosting && g_mode != Mode::ClientActive) g_pings.clear();
+  const long long now = unixMsNow();
+  g_pings.erase(std::remove_if(g_pings.begin(), g_pings.end(),
+                               [now](const Ping& p) { return now - p.at > kPingKeepMs; }),
+                g_pings.end());
+  json out = json::array();
+  for (const auto& p : g_pings)
+    out.push_back({{"id", p.id}, {"at", p.at}, {"name", p.name}, {"by", p.by},
+                   {"color", p.color}, {"pos", p.pos}, {"label", p.label},
+                   {"self", p.self}});
+  return out;
+}
+
+// Ping the current edit cursor to every peer. Our own HUD shows it too, as the
+// confirmation that it went out (gossip never loops back).
+static void sharePing(const std::string& rawName) {
   if ((g_mode != Mode::Hosting && g_mode != Mode::ClientActive) || !g_handle) return;
   std::string name = sanitizeMarkerName(rawName.c_str());
   if (name.size() > 200) name.resize(200);
@@ -3381,13 +3433,12 @@ static void shareMarker(const std::string& rawName) {
   const json m = {{"name", name}, {"pos", pos}};
   if (!reamesh_share_marker(g_handle, m.dump().c_str())) return;
   const json self = selfPeerEntry();
-  insertSharedMarker(name, pos, jsonStr(self, "name"), jsonStr(self, "color"));
-  UpdateArrange();
-  logEvent("marker_shared", {{"name", name}}, "shared marker \"" + name + "\"");
+  addPing(name, pos, jsonStr(self, "name"), jsonStr(self, "color"), true);
+  logEvent("ping_sent", {{"name", name}}, "pinged \"" + name + "\"");
 }
 
-// Insert shared markers received from peers since the last tick.
-static void drainSharedMarkers() {
+// Pings received from peers since the last tick.
+static void drainPings() {
   if (!g_handle || (g_mode != Mode::Hosting && g_mode != Mode::ClientActive)) return;
   char* raw = reamesh_drain_markers(g_handle);
   std::string payload = raw ? raw : "[]";
@@ -3397,14 +3448,36 @@ static void drainSharedMarkers() {
   if (!arr.is_array() || arr.empty()) return;
   for (const auto& m : arr) {
     if (!m.is_object()) continue;
-    const std::string name = jsonStr(m, "name");
+    const std::string name = sanitizeMarkerName(jsonStr(m, "name").c_str());
     const std::string by = jsonStr(m, "by");
     if (name.empty()) continue;
-    insertSharedMarker(name, jsonNum(m, "pos", 0.0), by, jsonStr(m, "color"));
-    logEvent("marker_received", {{"name", name}, {"by", by}},
-             by.empty() ? "marker \"" + name + "\" was shared"
-                        : by + " shared marker \"" + name + "\"");
+    addPing(name, jsonNum(m, "pos", 0.0), by, jsonStr(m, "color"), false);
+    logEvent("ping_received", {{"name", name}, {"by", by}},
+             by.empty() ? "ping \"" + name + "\"" : by + " pinged \"" + name + "\"");
   }
+}
+
+// A ping's "jump there": move the edit cursor and scroll the arrange view to
+// it (a rolling transport follows, like click-to-follow).
+static void jumpTo(double pos) {
+  if (g_mode != Mode::Hosting && g_mode != Mode::ClientActive) return;
+  if (!std::isfinite(pos) || pos < 0) return;
+  SetEditCurPos(pos, true, true);
+  UpdateArrange();
+}
+
+// A ping's "keep as marker": a normal project marker in the pinger's color,
+// so it syncs to everyone like any other marker. An ordinary local edit, with
+// an undo point of its own.
+static void addMarkerAt(const std::string& rawName, double pos, const std::string& colorHex) {
+  if (g_mode != Mode::Hosting && g_mode != Mode::ClientActive) return;
+  if (!std::isfinite(pos) || pos < 0) return;
+  std::string name = sanitizeMarkerName(rawName.c_str());
+  // The "⚑ " prefix would opt it out of sync, the opposite of the point.
+  while (isSharedMarkerName(name.c_str())) name.erase(0, sizeof(kSharedMarkerPrefix) - 1);
+  if (name.size() > 200) name.resize(200);
+  AddProjectMarker2(nullptr, false, pos, 0, name.c_str(), -1, colorFromHex(colorHex));
+  Undo_OnStateChange("ReaMesh: add marker");
   UpdateArrange();
 }
 
@@ -4130,7 +4203,11 @@ static void ctlDispatch(const json& cmd) {
     if (!g_pendingOpenPath.empty() && g_mode == Mode::Downloading)
       openDownloadedProject(g_pendingOpenPath);
   } else if (c == "share_marker") {
-    shareMarker(jsonStr(cmd, "name"));
+    sharePing(jsonStr(cmd, "name"));
+  } else if (c == "jump_to") {
+    jumpTo(jsonNum(cmd, "pos", -1.0));
+  } else if (c == "add_marker") {
+    addMarkerAt(jsonStr(cmd, "name"), jsonNum(cmd, "pos", -1.0), jsonStr(cmd, "color"));
   } else if (c == "kick" || c == "ban") {
     moderatePeer(jsonStr(cmd, "peer_id"), c == "ban");
   } else if (c == "unban") {
@@ -4312,6 +4389,8 @@ static void ctlPublishState() {
   state["error"] = g_lastError;
   state["log"] = g_log;
   state["overridden"] = reverts;
+  // Recent pings, for the HUD notice (see sharePing).
+  state["pings"] = pingsJson();
   state["reconnecting"] = static_cast<bool>(g_reconnect);
   // Passphrase pre-check result ({session_id, ok|null} or null), passed through
   // so the Lobby can show "wrong password" inline without a session transition.
@@ -4778,7 +4857,7 @@ static void timerTick() {
       }
       pushLocalPresence();
       followTick();
-      drainSharedMarkers();
+      drainPings();
       if (g_mode == Mode::Hosting) refreshSessionMeta(false);
       // Capture before apply, so an edit made by the user in this tick
       // interval is diffed against the old baseline before remote

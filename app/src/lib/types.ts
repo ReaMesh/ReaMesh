@@ -165,6 +165,10 @@ export interface ExtState {
    *  list outlives a stop-hosting / re-host cycle). Absent from an older
    *  extension. */
   bans?: BanEntry[];
+  /** Recent pings ("look here" at a timeline spot), newest last, kept for a
+   *  few seconds. The HUD shows each once; `self` = this user sent it. Absent
+   *  from an older extension. */
+  pings?: PingEntry[];
   /** Version of the REAPER this extension runs in ("7.42"). Absent from an
    *  older extension. */
   reaper?: string;
@@ -172,6 +176,20 @@ export interface ExtState {
    *  runs as a stub that publishes only this frame; the app shows an "update
    *  REAPER" screen and sends it nothing. */
   unsupported?: { version: string; min: string } | null;
+}
+
+/** One ping, as the extension reports it. `id` counts up per REAPER run and
+ *  `at` is unix ms; `label` is `pos` in this user's ruler format. */
+export interface PingEntry {
+  id: number;
+  at: number;
+  name: string;
+  /** Sender's display name and identity color ("" when unknown). */
+  by: string;
+  color: string;
+  pos: number;
+  label: string;
+  self: boolean;
 }
 
 /** One running REAPER instance (= one control server port). */
@@ -203,6 +221,7 @@ export function normalizeState(msg: Record<string, unknown>): ExtState {
     sessions: arr(msg.sessions),
     log: arr(msg.log),
     bans: arr(msg.bans),
+    pings: arr(msg.pings),
   };
 }
 

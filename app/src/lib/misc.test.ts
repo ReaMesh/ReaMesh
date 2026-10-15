@@ -113,12 +113,12 @@ describe("localizeLogEntry", () => {
       localizeLogEntry({ code: "plugins_added", params: { count: 7, track: "Bus" }, text: "f" }),
     ).toContain("7");
   });
-  it("renders shared markers with and without a sharer", () => {
+  it("renders pings with and without a sharer", () => {
     expect(
-      localizeLogEntry({ code: "marker_received", params: { name: "Chorus", by: "Ana" }, text: "f" }),
+      localizeLogEntry({ code: "ping_received", params: { name: "Chorus", by: "Ana" }, text: "f" }),
     ).toContain("Ana");
     expect(
-      localizeLogEntry({ code: "marker_received", params: { name: "Chorus" }, text: "f" }),
+      localizeLogEntry({ code: "ping_received", params: { name: "Chorus" }, text: "f" }),
     ).toContain("Chorus");
   });
   it("falls back to the wire text for unknown codes", () => {

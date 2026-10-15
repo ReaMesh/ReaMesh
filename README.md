@@ -87,8 +87,8 @@ does sync. Master-track state, hardware outputs, pooled automation items, marker
 ruler lanes and project extension state aren't synced.
 
 An optional floating roster shows who's connected. You can follow someone's
-playback, selected track, view, item selection and open effect window, or share
-a marker at your cursor. Hosts can remove guests or block their device for 30
+playback, selected track, view, item selection and open effect window, or ping
+a spot on the timeline that everyone can jump to. Hosts can remove guests or block their device for 30
 minutes.
 
 ## Working together

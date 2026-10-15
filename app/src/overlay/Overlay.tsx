@@ -8,7 +8,7 @@
 
 import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
-import { ChevronUp, Eye, Flag } from "lucide-react";
+import { BookmarkPlus, Check, ChevronUp, Eye, Flag } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { currentMonitor, getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { Hint, HintProvider } from "@/components/Hint";
@@ -17,7 +17,7 @@ import { PeerAvatar } from "@/components/PeerAvatar";
 import { TrackNumber } from "@/components/TrackNumber";
 import { t, useLang } from "@/lib/i18n";
 import { localizeLogEntry } from "@/lib/log";
-import { displayName, type ExtState, type Peer } from "@/lib/types";
+import { displayName, type ExtState, type Peer, type PingEntry } from "@/lib/types";
 import { useOverlaySettings } from "@/lib/overlaySettings";
 import { cn, noContextMenu } from "@/lib/utils";
 import { useOverlayState } from "./useOverlayState";
@@ -136,6 +136,67 @@ function PeerRow({
 }
 
 const STACK_MAX = 4;
+
+/// How long a ping stays on screen (hovering holds it), and how many at once.
+const PING_SHOW_MS = 8000;
+const PING_MAX = 3;
+/// After the pointer leaves a held ping, it stays at least this much longer.
+const PING_LINGER_MS = 2000;
+
+type ShownPing = PingEntry & { key: string; until: number; kept?: boolean };
+
+/** One ping: who sent it, what, and where. The row jumps there; the button
+ *  keeps it as a normal (synced) marker. */
+function PingRow({
+  ping,
+  sender,
+  canKeep,
+  onJump,
+  onKeep,
+}: {
+  ping: ShownPing;
+  sender: Peer;
+  canKeep: boolean;
+  onJump: () => void;
+  onKeep: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-1 px-1.5 py-1">
+      <Hint label={t("pingJump", { name: displayName(sender) })}>
+        <button
+          type="button"
+          onClick={onJump}
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-1 py-0.5 text-left transition-colors outline-none hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        >
+          <PeerAvatar peer={sender} size="xs" />
+          <span className="min-w-0 flex-1 truncate text-[12px] font-medium">{ping.name}</span>
+          {ping.label && (
+            <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+              {ping.label}
+            </span>
+          )}
+        </button>
+      </Hint>
+      {canKeep && (
+        <Hint label={ping.kept ? t("pingKept") : t("pingKeep")}>
+          <button
+            type="button"
+            onClick={onKeep}
+            disabled={ping.kept}
+            aria-label={ping.kept ? t("pingKept") : t("pingKeep")}
+            className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:text-found disabled:hover:bg-transparent"
+          >
+            {ping.kept ? (
+              <Check className="size-3.5" aria-hidden="true" />
+            ) : (
+              <BookmarkPlus className="size-3.5" aria-hidden="true" />
+            )}
+          </button>
+        </Hint>
+      )}
+    </div>
+  );
+}
 
 /** Background media-transfer progress while the project is open: a word, the
  *  percentage, and a bar. The row goes once all files are here and editing
@@ -294,7 +355,63 @@ export function Overlay({ port }: { port: number | null }) {
     return () => clearTimeout(id);
   }, [lockNotice]);
 
-  // ---- roster bar: shared markers + follow mode ----
+  // ---- pings: "look here" from someone, shown for a few seconds ----
+  // Each ping shows once (keyed by its time + id, so a REAPER restart's fresh
+  // ids can't collide with old ones) and goes after PING_SHOW_MS unless the
+  // pointer rests on it. Nothing of it is ever written into the project.
+  const [shownPings, setShownPings] = useState<ShownPing[]>([]);
+  const seenPings = useRef(new Set<string>());
+  const pingHover = useRef(false);
+  const pings = state?.pings;
+  useEffect(() => {
+    if (!pings?.length) return;
+    const now = Date.now();
+    const fresh: ShownPing[] = [];
+    for (const p of pings) {
+      const key = `${p.at}:${p.id}`;
+      if (seenPings.current.has(key)) continue;
+      seenPings.current.add(key);
+      // A HUD that connects late shows only what is still current.
+      if (now - p.at < PING_SHOW_MS)
+        fresh.push({ ...p, key, until: Math.max(now, p.at) + PING_SHOW_MS });
+    }
+    if (fresh.length) setShownPings((prev) => [...prev, ...fresh].slice(-PING_MAX));
+  }, [pings]);
+  useEffect(() => {
+    if (!shownPings.length) return;
+    const id = setInterval(() => {
+      if (pingHover.current) return;
+      const now = Date.now();
+      setShownPings((prev) => {
+        const next = prev.filter((p) => p.until > now);
+        return next.length === prev.length ? prev : next;
+      });
+    }, 250);
+    return () => clearInterval(id);
+  }, [shownPings.length]);
+  const releasePings = () => {
+    pingHover.current = false;
+    const min = Date.now() + PING_LINGER_MS;
+    setShownPings((prev) => prev.map((p) => (p.until < min ? { ...p, until: min } : p)));
+  };
+  const pingSender = (p: ShownPing): Peer =>
+    (p.self && peers.find((x) => x.is_self)) || {
+      id: p.key,
+      name: p.by,
+      color: /^#[0-9a-fA-F]{6}$/.test(p.color) ? p.color : "#8a8a8a",
+      is_self: false,
+      is_owner: false,
+    };
+  const jumpToPing = (p: ShownPing) => send({ cmd: "jump_to", pos: p.pos });
+  const keepPing = (p: ShownPing) => {
+    send({ cmd: "add_marker", name: p.name, pos: p.pos, color: p.color });
+    setShownPings((prev) => prev.map((x) => (x.key === p.key ? { ...x, kept: true } : x)));
+  };
+  // A view-only join (no effects, or media still arriving) can't add markers.
+  const canKeep = !!state && !state.nofx && !loading;
+  const latestPing = shownPings[shownPings.length - 1];
+
+  // ---- roster bar: pings + follow mode ----
   const self = peers.find((p) => p.is_self);
   const followingId = self?.follow || "";
   const followTarget = followingId ? peers.find((p) => p.id === followingId) : undefined;
@@ -307,7 +424,7 @@ export function Overlay({ port }: { port: number | null }) {
     if (followingId) setPickMode(false);
   }, [followingId]);
 
-  // Temporarily let the HUD take focus while the marker field is open, then
+  // Temporarily let the HUD take focus while the ping field is open, then
   // return focus to REAPER. Focus the field only after the native call finishes.
   const markerInput = useRef<HTMLInputElement>(null);
   const markerWasOpen = useRef(false);
@@ -337,7 +454,7 @@ export function Overlay({ port }: { port: number | null }) {
     setMarkerName("");
   };
 
-  // Close the marker field on blur so later HUD clicks cannot steal focus.
+  // Close the ping field on blur so later HUD clicks cannot steal focus.
   useEffect(() => {
     if (!markerOpen) return;
     const onBlur = () => closeMarker();
@@ -356,6 +473,7 @@ export function Overlay({ port }: { port: number | null }) {
   };
   const stopFollowing = () => send({ cmd: "follow", peer_id: "" });
   // The two tools share one fold below the bar, so only one is ever open.
+  // ("marker" is the ping tool; the ctl command keeps its older name.)
   const openMarker = () => {
     setPickMode(false);
     setMarkerOpen((v) => !v);
@@ -431,6 +549,31 @@ export function Overlay({ port }: { port: number | null }) {
             )}
           </AnimatePresence>
         </div>
+        {/* Collapsed: a ping doesn't unfold the HUD; a flag in the sender's
+            colour says one is waiting, and a click opens it. */}
+        <AnimatePresence initial={false}>
+          {collapsed && latestPing && (
+            <motion.div
+              key="ping-flag"
+              initial={{ opacity: 0, scale: 0.6 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.6 }}
+              transition={{ type: "spring", stiffness: 420, damping: 30 }}
+            >
+              <Hint label={t("pingFrom", { name: displayName(pingSender(latestPing)) })}>
+                <button
+                  type="button"
+                  onClick={() => setCollapsed(false)}
+                  aria-label={t("pingFrom", { name: displayName(pingSender(latestPing)) })}
+                  className="grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-ring"
+                  style={{ color: pingSender(latestPing).color }}
+                >
+                  <Flag className="size-3.5" aria-hidden="true" />
+                </button>
+              </Hint>
+            </motion.div>
+          )}
+        </AnimatePresence>
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}
@@ -457,6 +600,44 @@ export function Overlay({ port }: { port: number | null }) {
             transition={{ type: "spring", stiffness: 400, damping: 38 }}
             style={{ overflow: "hidden" }}
           >
+            <AnimatePresence initial={false}>
+              {shownPings.length > 0 && (
+                <motion.div
+                  key="pings"
+                  role="status"
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: "auto", opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  transition={{ type: "spring", stiffness: 400, damping: 38 }}
+                  className="overflow-hidden"
+                  onMouseEnter={() => (pingHover.current = true)}
+                  onMouseLeave={releasePings}
+                >
+                  <div className="border-t border-white/10 py-0.5">
+                    <AnimatePresence initial={false}>
+                      {shownPings.map((p) => (
+                        <motion.div
+                          key={p.key}
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: "auto", opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          transition={{ type: "spring", stiffness: 400, damping: 38 }}
+                          className="overflow-hidden"
+                        >
+                          <PingRow
+                            ping={p}
+                            sender={pingSender(p)}
+                            canKeep={canKeep}
+                            onJump={() => jumpToPing(p)}
+                            onKeep={() => keepPing(p)}
+                          />
+                        </motion.div>
+                      ))}
+                    </AnimatePresence>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
             <AnimatePresence initial={false}>
               {lockNotice && (
                 <motion.div
@@ -515,7 +696,7 @@ export function Overlay({ port }: { port: number | null }) {
               </div>
             )}
 
-            {/* Markers and follow mode share this expandable area. */}
+            {/* Pings and follow mode share this expandable area. */}
             <div className="border-t border-white/10 px-1.5 py-1">
               {followTarget ? (
                 // Following someone: say whom, and end it with one click.
