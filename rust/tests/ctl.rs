@@ -5,6 +5,71 @@ use libp2p::futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Request;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+/// Read the run token the server wrote for `port`, like the app's backend.
+fn ctl_token(port: u16) -> String {
+    let path = std::env::temp_dir().join(format!("reamesh-ctl-{port}.token"));
+    std::fs::read_to_string(path).expect("control token file missing")
+}
+
+/// A handshake request offering `protocol` as the WebSocket subprotocol.
+fn request(port: u16, protocol: Option<&str>) -> Request {
+    let mut req = format!("ws://127.0.0.1:{port}")
+        .into_client_request()
+        .unwrap();
+    if let Some(p) = protocol {
+        req.headers_mut()
+            .insert("sec-websocket-protocol", HeaderValue::from_str(p).unwrap());
+    }
+    req
+}
+
+fn authed(port: u16) -> Request {
+    request(port, Some(&format!("reamesh.{}", ctl_token(port))))
+}
+
+#[test]
+fn ctl_server_refuses_clients_without_the_token() {
+    let port = reamesh::reamesh_ctl_start();
+    assert_ne!(port, 0, "ctl server failed to bind");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("reamesh-ctl-{port}.token"));
+        let mode = std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "token file readable by others");
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let wrong = "reamesh.".to_string() + &"0".repeat(64);
+        for proto in [None, Some("reamesh."), Some(wrong.as_str()), Some("chat")] {
+            let res = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio_tungstenite::connect_async(request(port, proto)),
+            )
+            .await
+            .expect("connect timed out");
+            assert!(res.is_err(), "handshake offering {proto:?} was accepted");
+        }
+        // The right token gets in, and the server echoes the subprotocol.
+        let (_ws, resp) = tokio_tungstenite::connect_async(authed(port))
+            .await
+            .expect("authenticated connect failed");
+        let echoed = resp
+            .headers()
+            .get("sec-websocket-protocol")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(echoed, format!("reamesh.{}", ctl_token(port)));
+    });
+}
 
 #[test]
 fn ctl_server_round_trip() {
@@ -20,7 +85,7 @@ fn ctl_server_round_trip() {
     rt.block_on(async move {
         let (mut ws, _) = tokio::time::timeout(
             Duration::from_secs(5),
-            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}")),
+            tokio_tungstenite::connect_async(authed(port)),
         )
         .await
         .expect("connect timed out")
@@ -74,7 +139,7 @@ fn ctl_server_round_trip() {
 
         // A late joiner gets the last state replayed right after the hello.
         let (mut ws2, _) =
-            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+            tokio_tungstenite::connect_async(authed(port))
                 .await
                 .unwrap();
         let _hello = ws2.next().await.unwrap().unwrap();

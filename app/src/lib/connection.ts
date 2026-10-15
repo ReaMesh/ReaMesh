@@ -10,6 +10,7 @@ import { useSyncExternalStore } from "react";
 import { normalizeState, type Instance } from "./types";
 import { getProfile } from "./profile";
 import { getOverlaySettings, subscribeOverlaySettings } from "./overlaySettings";
+import { openCtlSocket } from "./ctlSocket";
 
 const ALL_PORTS = [47415, 47416, 47417, 47418];
 const RETRY_MS = 2000;
@@ -30,6 +31,8 @@ interface StoreState {
 }
 
 const sockets = new Map<number, WebSocket>();
+/** Ports whose connection attempt is waiting for its token. */
+const opening = new Set<number>();
 const live = new Map<number, Instance>();
 let activePort: number | null = null;
 let snapshot: StoreState = { instances: [], activePort: null };
@@ -59,16 +62,24 @@ function ensureActive() {
 }
 
 function connect(port: number) {
-  if (sockets.has(port)) return;
+  if (sockets.has(port) || opening.has(port)) return;
   const fail = failures.get(port);
   if (fail && fail.count >= BACKOFF_AFTER && Date.now() < fail.nextAt) return;
-  let ws: WebSocket;
-  try {
-    ws = new WebSocket(`ws://127.0.0.1:${port}`);
-  } catch {
-    noteFailure(port);
-    return;
-  }
+  // Fetching the port's token is async; `opening` keeps the next scan from
+  // starting a second attempt meanwhile.
+  opening.add(port);
+  openCtlSocket(port)
+    .then((ws) => {
+      opening.delete(port);
+      attach(port, ws);
+    })
+    .catch(() => {
+      opening.delete(port);
+      noteFailure(port);
+    });
+}
+
+function attach(port: number, ws: WebSocket) {
   sockets.set(port, ws);
 
   ws.onopen = () => {

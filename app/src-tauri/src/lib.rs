@@ -1087,6 +1087,24 @@ fn port_trouble() -> bool {
     false
 }
 
+// ---------- control-server token ----------
+
+/// The run token of the extension's control server on `port`, which every
+/// connection must present (as the WebSocket subprotocol `reamesh.<token>`).
+/// The server writes it to the per-user temp dir with owner-only permissions
+/// when it binds (`token_path` in rust/src/ctl.rs); None when there is no
+/// server on that port, or a malformed file.
+#[tauri::command]
+fn ctl_token(port: u16) -> Option<String> {
+    if !(47415..=47418).contains(&port) {
+        return None;
+    }
+    let path = std::env::temp_dir().join(format!("reamesh-ctl-{port}.token"));
+    let token = fs::read_to_string(path).ok()?;
+    let token = token.trim();
+    (token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())).then(|| token.to_string())
+}
+
 // ---------- network identity reset ----------
 
 /// Delete the persisted per-install network identity
@@ -1524,11 +1542,24 @@ fn show_main_window(app: AppHandle) {
     }
 }
 
-/// Tell the extension to leave/stop the session over its control server. A
-/// no-Origin local WebSocket client is accepted by ctl.rs (it already runs as
-/// the user). Best-effort, fire-and-forget.
+/// Tell the extension to leave/stop the session over its control server,
+/// presenting the run token like the webview does. Best-effort,
+/// fire-and-forget.
 fn send_leave(port: u16) {
     use tungstenite::Message;
+    use tungstenite::client::IntoClientRequest;
+    let Some(token) = ctl_token(port) else {
+        return;
+    };
+    let Ok(mut request) = format!("ws://127.0.0.1:{port}").into_client_request() else {
+        return;
+    };
+    let Ok(protocol) = format!("reamesh.{token}").parse() else {
+        return;
+    };
+    request
+        .headers_mut()
+        .insert("sec-websocket-protocol", protocol);
     // A bare `connect` has no timeout, and exit is already prevented by the
     // time we get here: a hung connect would leave an app that cannot be
     // quit at all. Loopback either answers immediately or is not there.
@@ -1540,9 +1571,7 @@ fn send_leave(port: u16) {
     };
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(1500)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(1500)));
-    if let Ok((mut socket, _)) =
-        tungstenite::client(format!("ws://127.0.0.1:{port}"), stream)
-    {
+    if let Ok((mut socket, _)) = tungstenite::client(request, stream) {
         let _ = socket.send(Message::Text("{\"cmd\":\"leave\"}".to_string().into()));
         let _ = socket.flush();
     }
@@ -1779,6 +1808,7 @@ pub fn run() {
             vpn_active,
             open_firewall_settings,
             port_trouble,
+            ctl_token,
             reset_network_identity,
             joined_projects,
             trash_joined_project,

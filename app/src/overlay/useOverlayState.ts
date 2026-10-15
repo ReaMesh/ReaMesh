@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { normalizeState, type ExtState } from "@/lib/types";
+import { openCtlSocket } from "@/lib/ctlSocket";
 
 const RETRY_MS = 1500;
 
@@ -25,11 +26,16 @@ export function useOverlayState(port: number | null): {
       retry = window.setTimeout(open, RETRY_MS);
     };
 
-    const open = () => {
+    const open = async () => {
       try {
-        ws = new WebSocket(`ws://127.0.0.1:${port}`);
+        ws = await openCtlSocket(port);
       } catch {
-        schedule();
+        if (!closed) schedule();
+        return;
+      }
+      // Unmounted (or the port changed) while the token was being fetched.
+      if (closed) {
+        ws.close();
         return;
       }
       wsRef.current = ws;

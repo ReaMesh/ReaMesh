@@ -15,9 +15,19 @@
 //! Multiple REAPER instances on one machine (the documented dev setup) each
 //! bind the first free port in `CTL_PORTS`; the app scans the whole range and
 //! offers an instance picker when more than one answers.
+//!
+//! Every connection must present this run's secret: once a port is bound the
+//! server writes a fresh random token to `<temp dir>/reamesh-ctl-<port>.token`
+//! (owner-only permissions; the temp dir is per-user on macOS and Windows),
+//! and a client offers it as the WebSocket subprotocol `reamesh.<token>`,
+//! which the server echoes back. The ReaMesh app reads the file through its
+//! backend (`ctl_token`). A handshake without the right token is refused
+//! whatever its Origin, so neither a web page nor another user's process can
+//! drive the extension; a process running as the same user can read the file,
+//! which is the boundary the OS gives us anyway.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
 
@@ -25,7 +35,8 @@ use libp2p::futures::{SinkExt, StreamExt};
 use serde_json::{Value as JsonValue, json};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use tokio_tungstenite::tungstenite::http::StatusCode;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 /// Ports tried in order; one per running REAPER instance.
 pub const CTL_PORTS: [u16; 4] = [47415, 47416, 47417, 47418];
@@ -36,6 +47,21 @@ const INBOUND_CAP: usize = 64;
 /// port (a REAPER instance quit, a squatting program closed) is picked up
 /// automatically: the extension never has to be reloaded to recover.
 const BIND_RETRY: Duration = Duration::from_secs(5);
+/// Largest frame/message accepted from an app. Commands are small JSON
+/// objects; nothing legitimate comes near this.
+const MAX_INBOUND_BYTES: usize = 64 * 1024;
+/// Outbound frames buffered per connected app. A client that stops reading
+/// (or reads slower than the state changes) is dropped once this fills
+/// instead of growing memory without bound.
+const OUTBOUND_CAP: usize = 256;
+/// Concurrent connections (open sockets, handshaking or upgraded). The app
+/// keeps one per window; the rest is headroom for a restart's overlap.
+const MAX_CLIENTS: usize = 16;
+/// A handshake that hasn't completed by then is dropped, so a socket that
+/// never speaks can't hold a connection slot.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Subprotocol prefix a client puts in front of the run's token.
+const TOKEN_PROTOCOL_PREFIX: &str = "reamesh.";
 
 /// Marker for a loaded extension that could not bind any control port
 /// (47415-47418). Refresh on each failed attempt and remove after binding.
@@ -59,10 +85,70 @@ fn clear_noport_marker() {
     let _ = std::fs::remove_file(noport_marker_path());
 }
 
+/// Where the token of the server on `port` lives. The ReaMesh app's backend
+/// reads the same path (`ctl_token` in app/src-tauri/src/lib.rs).
+pub fn token_path(port: u16) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("reamesh-ctl-{port}.token"))
+}
+
+/// A fresh 256-bit token as hex, or None when the OS RNG is unavailable (the
+/// server then refuses every connection rather than use a guessable secret).
+fn new_token() -> Option<String> {
+    let mut buf = [0u8; 32];
+    getrandom::fill(&mut buf).ok()?;
+    Some(crate::hex_encode(&buf))
+}
+
+/// Write the token file readable by this user only. Written to a fresh
+/// sibling (create_new, so a planted file or symlink is never followed) and
+/// renamed over the final name, so a reader never sees a partial token and a
+/// previous run's file is replaced atomically.
+fn write_token_file(port: u16, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = token_path(port);
+    let tmp = path.with_extension(format!("token.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    owner_only(&mut opts);
+    let mut f = opts.open(&tmp)?;
+    f.write_all(token.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, &path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Owner-only permissions where the platform has mode bits. On Windows the
+/// file inherits the per-user temp folder's ACL (the user, SYSTEM and
+/// administrators), which is the equivalent.
+#[cfg(unix)]
+fn owner_only(opts: &mut std::fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.mode(0o600);
+}
+#[cfg(not(unix))]
+fn owner_only(_opts: &mut std::fs::OpenOptions) {}
+
+/// The `reamesh.<token>` entry of a `Sec-WebSocket-Protocol` header (a comma
+/// separated list) when it carries `expected`, compared in constant time.
+fn offered_token_protocol<'a>(header: Option<&'a str>, expected: &str) -> Option<&'a str> {
+    header?.split(',').map(str::trim).find(|p| {
+        p.strip_prefix(TOKEN_PROTOCOL_PREFIX)
+            .is_some_and(|t| crate::ct_eq(t.as_bytes(), expected.as_bytes()))
+    })
+}
+
 /// Allowed WebSocket origins for the ReaMesh app and development server.
-/// Browser JavaScript cannot forge Origin; checking it prevents websites from
-/// sending commands to the local control server. Local non-browser clients
-/// may omit Origin because they already run as the user.
+/// Browser JavaScript cannot forge Origin; checking it keeps websites from
+/// reaching the control server at all. The run token is what authenticates
+/// (see the module docs): it is required from every client, with or without
+/// an Origin, so this list is a second fence rather than the gate. That is
+/// why the dev-server origins can stay: a page on localhost:1420/1421 that
+/// isn't the ReaMesh app has no way to read the token file. Local non-browser
+/// clients (the app backend's quit-time `leave`, tests) send no Origin and
+/// pass here, then need the token like everyone else.
 ///
 /// Include http://tauri.localhost for Windows, where Tauri uses HTTP unless
 /// useHttpsScheme is enabled.
@@ -84,7 +170,7 @@ fn origin_allowed(origin: Option<&str>) -> bool {
 
 struct CtlShared {
     inbound: Mutex<VecDeque<String>>,
-    clients: Mutex<Vec<tokio::sync::mpsc::UnboundedSender<String>>>,
+    clients: Mutex<Vec<ClientTx>>,
     /// Last state published by the extension; replayed to newly-connected
     /// apps so they render immediately instead of waiting for the next tick.
     last_state: Mutex<String>,
@@ -94,12 +180,31 @@ struct CtlShared {
     /// tell the app "REAPER isn't responding": see the monitor task.
     last_beat: Mutex<Option<Instant>>,
     port: AtomicU16,
+    /// This run's control secret; None until a port is bound (or when the OS
+    /// RNG failed, which leaves the server refusing everyone).
+    token: Mutex<Option<String>>,
+    /// Open sockets, for `MAX_CLIENTS`.
+    open: AtomicUsize,
+}
+
+type ClientTx = tokio::sync::mpsc::Sender<String>;
+
+/// Queue `msg` for every client; a client whose buffer is full or whose
+/// connection ended is dropped (its socket task then sees the channel close).
+fn broadcast(clients: &Mutex<Vec<ClientTx>>, msg: &str) {
+    clients
+        .lock()
+        .unwrap()
+        .retain(|tx| tx.try_send(msg.to_string()).is_ok());
 }
 
 static CTL: OnceLock<Arc<CtlShared>> = OnceLock::new();
 
 /// Start the server (idempotent). Returns the bound port, 0 on failure.
 pub fn start() -> u16 {
+    // Two concurrent first calls must not start two servers.
+    static STARTING: Mutex<()> = Mutex::new(());
+    let _guard = STARTING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(ctl) = CTL.get() {
         return ctl.port.load(Ordering::Relaxed);
     }
@@ -109,6 +214,8 @@ pub fn start() -> u16 {
         last_state: Mutex::new(String::new()),
         last_beat: Mutex::new(None),
         port: AtomicU16::new(0),
+        token: Mutex::new(None),
+        open: AtomicUsize::new(0),
     });
     let (port_tx, port_rx) = std_mpsc::channel();
     {
@@ -157,6 +264,17 @@ pub fn start() -> u16 {
                         tokio::time::sleep(BIND_RETRY).await;
                     };
                     clear_noport_marker();
+                    match new_token() {
+                        Some(token) => match write_token_file(port, &token) {
+                            Ok(()) => *shared.token.lock().unwrap() = Some(token),
+                            Err(e) => eprintln!(
+                                "[reamesh] ctl: could not write the control token: {e}"
+                            ),
+                        },
+                        None => {
+                            eprintln!("[reamesh] ctl: no OS randomness for the control token")
+                        }
+                    }
                     shared.port.store(port, Ordering::Relaxed);
                     if !reported {
                         let _ = port_tx.send(port);
@@ -183,11 +301,7 @@ pub fn start() -> u16 {
                                     busy = stale;
                                     let msg =
                                         json!({"type": "busy", "busy": busy}).to_string();
-                                    shared
-                                        .clients
-                                        .lock()
-                                        .unwrap()
-                                        .retain(|tx| tx.send(msg.clone()).is_ok());
+                                    broadcast(&shared.clients, &msg);
                                 }
                             }
                         });
@@ -225,10 +339,15 @@ pub fn heartbeat() {
 pub fn publish(state: &str) {
     let Some(ctl) = CTL.get() else { return };
     *ctl.last_state.lock().unwrap() = state.to_string();
-    ctl.clients
-        .lock()
-        .unwrap()
-        .retain(|tx| tx.send(state.to_string()).is_ok());
+    broadcast(&ctl.clients, state);
+}
+
+/// Releases a `MAX_CLIENTS` slot when a connection task ends, however it ends.
+struct Slot(Arc<CtlShared>);
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<CtlShared>) {
@@ -237,32 +356,65 @@ async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<CtlShared>) 
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         };
+        if shared.open.fetch_add(1, Ordering::Relaxed) >= MAX_CLIENTS {
+            shared.open.fetch_sub(1, Ordering::Relaxed);
+            drop(stream);
+            continue;
+        }
+        let slot = Slot(shared.clone());
         let shared = shared.clone();
         tokio::spawn(async move {
-            // Reject cross-origin handshakes (CSWSH) before upgrading.
-            let check = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-                let origin = req
-                    .headers()
-                    .get("origin")
-                    .and_then(|v| v.to_str().ok());
-                if origin_allowed(origin) {
-                    Ok(resp)
-                } else {
-                    eprintln!("[reamesh] ctl: rejected connection from origin {origin:?}");
-                    let mut err = ErrorResponse::new(Some("origin not allowed".to_string()));
+            let _slot = slot;
+            let token = shared.token.lock().unwrap().clone();
+            // Refuse cross-origin handshakes (CSWSH) and anyone without this
+            // run's token before upgrading.
+            let check = move |req: &Request, mut resp: Response| -> Result<Response, ErrorResponse> {
+                let refuse = |why: &str| {
+                    let mut err = ErrorResponse::new(Some(why.to_string()));
                     *err.status_mut() = StatusCode::FORBIDDEN;
-                    Err(err)
+                    err
+                };
+                let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
+                if !origin_allowed(origin) {
+                    eprintln!("[reamesh] ctl: rejected connection from origin {origin:?}");
+                    return Err(refuse("origin not allowed"));
                 }
+                let offered = req
+                    .headers()
+                    .get("sec-websocket-protocol")
+                    .and_then(|v| v.to_str().ok());
+                let Some(proto) = token
+                    .as_deref()
+                    .and_then(|t| offered_token_protocol(offered, t))
+                else {
+                    eprintln!("[reamesh] ctl: rejected connection without a valid token");
+                    return Err(refuse("unauthorized"));
+                };
+                // Browsers fail a handshake whose offered subprotocol isn't
+                // echoed back.
+                let Ok(value) = HeaderValue::from_str(proto) else {
+                    return Err(refuse("unauthorized"));
+                };
+                resp.headers_mut().insert("sec-websocket-protocol", value);
+                Ok(resp)
             };
-            let Ok(ws) = tokio_tungstenite::accept_hdr_async(stream, check).await else {
+            let config = WebSocketConfig::default()
+                .max_message_size(Some(MAX_INBOUND_BYTES))
+                .max_frame_size(Some(MAX_INBOUND_BYTES));
+            let Ok(Ok(ws)) = tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                tokio_tungstenite::accept_hdr_async_with_config(stream, check, Some(config)),
+            )
+            .await
+            else {
                 return;
             };
             let (mut ws_tx, mut ws_rx) = ws.split();
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(OUTBOUND_CAP);
             // Greet (with this build's version + PROTO, which the app checks
             // against its own before driving anything), then replay the last
             // known state so the app paints now.
-            let _ = tx.send(
+            let _ = tx.try_send(
                 json!({
                     "type": "hello",
                     "pid": std::process::id(),
@@ -274,7 +426,7 @@ async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<CtlShared>) 
             {
                 let last = shared.last_state.lock().unwrap().clone();
                 if !last.is_empty() {
-                    let _ = tx.send(last);
+                    let _ = tx.try_send(last);
                 }
             }
             shared.clients.lock().unwrap().push(tx);
@@ -286,6 +438,7 @@ async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<CtlShared>) 
                                 break;
                             }
                         }
+                        // Dropped from the client list (its buffer filled up).
                         None => break,
                     },
                     inbound = ws_rx.next() => match inbound {
@@ -318,7 +471,22 @@ fn handle_inbound(shared: &CtlShared, msg: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::origin_allowed;
+    use super::{offered_token_protocol, origin_allowed};
+
+    #[test]
+    fn token_protocol_must_match_exactly() {
+        let t = "ab12";
+        assert_eq!(offered_token_protocol(Some("reamesh.ab12"), t), Some("reamesh.ab12"));
+        assert_eq!(
+            offered_token_protocol(Some("chat, reamesh.ab12"), t),
+            Some("reamesh.ab12")
+        );
+        assert_eq!(offered_token_protocol(None, t), None);
+        assert_eq!(offered_token_protocol(Some("reamesh.ab13"), t), None);
+        assert_eq!(offered_token_protocol(Some("reamesh.ab1"), t), None);
+        assert_eq!(offered_token_protocol(Some("reamesh."), t), None);
+        assert_eq!(offered_token_protocol(Some("ab12"), t), None);
+    }
 
     #[test]
     fn allows_app_and_devserver_origins() {
