@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { PROTO, protoSkew } from "./version";
+import { PROTO, compareVersions, protoSkew, versionSkew } from "./version";
 
 // App, extension and core release together under one version and one PROTO.
 // These keep the copies from drifting apart.
@@ -28,5 +28,23 @@ describe("version", () => {
     expect(JSON.parse(read("app/src-tauri/tauri.conf.json")).version).toBe(v);
     expect(cargoVersion("app/src-tauri/Cargo.toml")).toBe(v);
     expect(cargoVersion("rust/Cargo.toml")).toBe(v);
+  });
+});
+
+describe("versionSkew", () => {
+  it("refuses any other build, not just another protocol", () => {
+    expect(versionSkew("0.1.0", "0.1.0")).toBe("same");
+    expect(versionSkew("0.1.0", "0.1.1")).toBe("older");
+    expect(versionSkew("0.2.0", "0.1.9")).toBe("newer");
+    expect(versionSkew("0.10.0", "0.9.0")).toBe("newer");
+  });
+  it("treats an unknown side as matching", () => {
+    expect(versionSkew(undefined, "0.1.0")).toBe("same");
+    expect(versionSkew("0.1.0", "")).toBe("same");
+  });
+  it("orders pre-releases before their release", () => {
+    expect(compareVersions("0.2.0-beta.1", "0.2.0")).toBe(-1);
+    expect(compareVersions("0.2.0-beta.2", "0.2.0-beta.10")).toBe(-1);
+    expect(compareVersions("0.2.0-beta.1", "0.1.9")).toBe(1);
   });
 });

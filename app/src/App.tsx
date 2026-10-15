@@ -32,7 +32,7 @@ import { displayName, type ExtState, type LogEntry, type Mode } from "@/lib/type
 import { cn, focusRing } from "@/lib/utils";
 import { listenForRestart, revealWindow, takeResume, trackScreen } from "@/lib/resume";
 import { useAppVersion } from "@/lib/updater";
-import { protoSkew } from "@/lib/version";
+import { protoSkew, versionSkew } from "@/lib/version";
 
 // How long a fresh launch waits for REAPER to answer before showing the
 // waiting screen (see `holdBlank`).
@@ -499,17 +499,18 @@ export default function App() {
       un.then((f) => f());
     };
   }, []);
-  // Also when REAPER still runs an older build of the same protocol (e.g. this
-  // is the restart after an app update, whose install happened at launch).
-  // Not when it runs the newer copy pre-installed from a downloaded update.
-  const loadedOld =
-    !!instance?.version &&
-    !!appVersion &&
-    instance.version !== appVersion &&
-    instance.version !== reaper?.preinstalled;
-  const skew = instance?.state ? protoSkew(instance.proto) : "same";
+  // App and extension must be the same build. Another protocol is refused
+  // outright; another version of the same protocol too (e.g. the restart after
+  // an app update, whose install happened at launch while REAPER kept the old
+  // copy loaded), except that a session already running keeps going until it
+  // ends, with a banner that can't be dismissed. A newer extension (the copy
+  // pre-installed from a downloaded update) asks for the app update instead.
+  const verSkew = instance?.state ? versionSkew(instance.version, appVersion) : "same";
+  const protoSkewed = instance?.state ? protoSkew(instance.proto) : "same";
+  const skew = protoSkewed !== "same" ? protoSkewed : inSession ? "same" : verSkew;
+  const loadedOld = skew === "same" && verSkew === "older";
   const needsRestart =
-    (stale || loadedOld) && hasState && !restartDismissed && skew === "same";
+    hasState && skew === "same" && (loadedOld || (stale && !restartDismissed));
 
   // A fresh state frame proves the main thread responded, even before the
   // watchdog clears `busy` on its next tick.
@@ -594,17 +595,21 @@ export default function App() {
               role="status"
               className="mx-4 mt-2 flex items-center gap-2.5 rounded-xl bg-card px-3 py-2.5"
             >
-              <span className="flex-1 text-[12px] text-foreground/80">{t("extUpdatedRestart")}</span>
-              <button
-                type="button"
-                onClick={() => setRestartDismissed(true)}
-                className={cn(
-                  "shrink-0 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:text-foreground",
-                  focusRing,
-                )}
-              >
-                {t("firewallGotIt")}
-              </button>
+              <span className="flex-1 text-[12px] text-foreground/80">
+                {loadedOld ? t("extUpdatedRestartSession") : t("extUpdatedRestart")}
+              </span>
+              {!loadedOld && (
+                <button
+                  type="button"
+                  onClick={() => setRestartDismissed(true)}
+                  className={cn(
+                    "shrink-0 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:text-foreground",
+                    focusRing,
+                  )}
+                >
+                  {t("firewallGotIt")}
+                </button>
+              )}
             </div>
           </motion.div>
         )}

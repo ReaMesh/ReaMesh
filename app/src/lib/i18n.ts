@@ -168,6 +168,7 @@ const en = {
   updateAvailable: "Update available",
   extInstalledToast: "Extension installed. Restart REAPER to load it.",
   extUpdatedRestart: "Extension updated. Restart REAPER to load it.",
+  extUpdatedRestartSession: "ReaMesh was updated. Restart REAPER after this session.",
   extRemovedToast: "Extension removed. Restart REAPER to unload it.",
   language: "Language",
   languageSystem: "System",
@@ -375,6 +376,8 @@ const en = {
   logVersionMismatch: "The host runs a different ReaMesh version.",
   extOldTitle: "Restart REAPER",
   extOldBody: "ReaMesh was updated. Restart REAPER so it loads the matching extension.",
+  extOldInstallBody:
+    "REAPER runs an older ReaMesh extension. Install the matching one, then restart REAPER.",
   appOldTitle: "Update ReaMesh",
   appOldBody: "REAPER runs a newer ReaMesh extension than this app.",
   updates: "Updates",
@@ -550,6 +553,7 @@ const de: Record<MsgKey, string> = {
   updateAvailable: "Update verfügbar",
   extInstalledToast: "Erweiterung installiert. Starte REAPER neu, um sie zu laden.",
   extUpdatedRestart: "Erweiterung aktualisiert. Starte REAPER neu, um sie zu laden.",
+  extUpdatedRestartSession: "ReaMesh wurde aktualisiert. Starte REAPER nach dieser Session neu.",
   extRemovedToast: "Erweiterung entfernt. Starte REAPER neu, damit die Änderung wirksam wird.",
   language: "Sprache",
   languageSystem: "System",
@@ -748,6 +752,8 @@ const de: Record<MsgKey, string> = {
   logVersionMismatch: "Der Host nutzt eine andere ReaMesh-Version.",
   extOldTitle: "REAPER neu starten",
   extOldBody: "ReaMesh wurde aktualisiert. Starte REAPER neu, damit es die passende Erweiterung lädt.",
+  extOldInstallBody:
+    "In REAPER läuft eine ältere ReaMesh-Erweiterung. Installiere die passende und starte REAPER dann neu.",
   appOldTitle: "ReaMesh aktualisieren",
   appOldBody: "In REAPER läuft eine neuere ReaMesh-Erweiterung als diese App.",
   updates: "Updates",
