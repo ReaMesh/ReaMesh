@@ -39,6 +39,7 @@
 #define REAPERAPI_WANT_GetMediaTrackInfo_Value
 #define REAPERAPI_WANT_SetMediaTrackInfo_Value
 #define REAPERAPI_WANT_GetSetMediaTrackInfo_String
+#define REAPERAPI_WANT_GetSetMediaTrackInfo
 #define REAPERAPI_WANT_InsertTrackAtIndex
 #define REAPERAPI_WANT_DeleteTrack
 #define REAPERAPI_WANT_PreventUIRefresh
@@ -128,6 +129,7 @@
 #include "json.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -332,6 +334,25 @@ static int g_lastChangeCount = -1;
 // trade sync latency for a smooth REAPER UI instead of a choppy one.
 static std::chrono::milliseconds g_captureCost{0};
 static bool g_applyingRemote = false;  // echo-suppression / reentrancy guard
+// PreventUIRefresh nesting this extension holds right now. Every freeze goes
+// through freezeUI/thawUI so the timer's error recovery can hand REAPER's UI
+// back balanced if a tick unwinds halfway through an apply.
+static int g_uiFrozen = 0;
+static void freezeUI() {
+  PreventUIRefresh(1);
+  ++g_uiFrozen;
+}
+static void thawUI() {
+  if (g_uiFrozen <= 0) return;
+  --g_uiFrozen;
+  PreventUIRefresh(-1);
+}
+// JSON text for the FFI and the control server. Peer-authored and
+// REAPER-sourced strings can hold invalid UTF-8, which the default dump()
+// throws on; replace such bytes instead (valid text dumps unchanged).
+static std::string dumpJson(const json& j) {
+  return j.dump(-1, ' ', false, json::error_handler_t::replace);
+}
 // True only while Main_openProject runs on a finished download; published to
 // the app so its download stepper can show the "opening in REAPER" phase.
 static bool g_openingProject = false;
@@ -826,11 +847,12 @@ static std::string replaceTrackBlocks(const std::string& chunk, const TrackBlock
 // doesn't re-emit every receive as an edit. `mapEndpoint` converts the
 // leading token; returning "" drops the whole unit (the AUXRECV line plus the
 // AUX*ENV send-envelope blocks that follow it), used when the source track
-// doesn't exist on this side.
+// doesn't exist on this side. Anything before the first AUXRECV line belongs
+// to no unit and is dropped too.
 static std::string transformRecvUnits(
     const std::string& recv, const std::function<std::string(const std::string&)>& mapEndpoint) {
   std::string out;
-  bool dropping = false;
+  bool dropping = true;
   int depth = 0;
   size_t pos = 0;
   while (pos < recv.size()) {
@@ -1205,6 +1227,311 @@ static std::string stripFxBlocks(const std::string& text, bool takeFxOnly) {
   return out;
 }
 
+// ---------- incoming-field validation (pure text helpers) ----------
+//
+// Everything a remote changeset carries is peer-authored text that ends up in
+// REAPER: chunk parts are spliced into live track chunks, item chunks become
+// items, strings land in REAPER's own fields. Capture only ever produces a
+// narrow shape for each of them, so the apply side accepts exactly that shape
+// and drops anything else (a part that carries a second block past its own
+// would otherwise be spliced verbatim). The Rust owner repeats the cheap
+// structural part of these checks before admitting a proposal.
+// Unit-tested by tools/chunk_test.cpp.
+
+// A decimal integer token ("0", "-1", "4294967295").
+static bool isIntToken(std::string_view s) {
+  if (!s.empty() && s.front() == '-') s.remove_prefix(1);
+  if (s.empty() || s.size() > 20) return false;
+  for (char c : s)
+    if (c < '0' || c > '9') return false;
+  return true;
+}
+
+// `KEYWORD int int ...` (at least one integer), whitespace-separated.
+static bool isKeywordIntsLine(std::string_view t, std::string_view keyword) {
+  std::vector<std::string_view> tok;
+  size_t p = 0;
+  while (p < t.size()) {
+    while (p < t.size() && (t[p] == ' ' || t[p] == '\t')) ++p;
+    size_t e = p;
+    while (e < t.size() && t[e] != ' ' && t[e] != '\t') ++e;
+    if (e > p) tok.push_back(t.substr(p, e - p));
+    p = e;
+  }
+  if (tok.size() < 2 || tok[0] != keyword) return false;
+  for (size_t i = 1; i < tok.size(); ++i)
+    if (!isIntToken(tok[i])) return false;
+  return true;
+}
+
+// Whether `text` is a well-formed value for the track part `kind`, exactly as
+// extractTrackBlocks produces it from a track chunk:
+//   - LF-only lines, '\n'-terminated, blocks balanced and closed;
+//   - wrapped in a track chunk, the extraction yields `text` back for `kind`
+//     byte-for-byte and nothing for any other part (so nothing rides along
+//     outside the part's own lines/blocks);
+//   - plus the part's own shape: one `LOCK <ints>` line; `GROUP_FLAGS[_HIGH]
+//     <ints>` lines; receives that start with their AUXRECV line; envelope
+//     blocks (and send envelopes) without nested blocks; exactly one FX chain
+//     block.
+// Empty is always valid (it removes the part).
+static bool validTrackPart(int kind, const std::string& text) {
+  if (kind < 0 || kind >= kPartCount) return false;
+  if (text.empty()) return true;
+  if (text.back() != '\n' || text.find('\r') != std::string::npos ||
+      text.find('\0') != std::string::npos)
+    return false;
+  int depth = 1;  // inside the (virtual) <TRACK
+  int blocksAtTop = 0, linesAtTop = 0;
+  bool nested = false;
+  std::string_view firstLine;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    const size_t eol = text.find('\n', pos);
+    std::string_view t = ltrim(std::string_view(text.data() + pos, eol - pos));
+    if (pos == 0) firstLine = t;
+    pos = eol + 1;
+    if (!t.empty() && t.front() == '<') {
+      if (depth == 1)
+        ++blocksAtTop;
+      else
+        nested = true;
+      ++depth;
+    } else if (t == ">") {
+      if (--depth < 1) return false;  // would close the track itself
+    } else if (depth == 1) {
+      ++linesAtTop;
+    }
+  }
+  if (depth != 1) return false;  // an unclosed block would swallow the chunk's rest
+
+  const TrackBlocks b = extractTrackBlocks("<TRACK\n" + text + ">\n");
+  const std::string* parts[kPartCount] = {&b.lock,  &b.group,   &b.recv,
+                                          &b.recfx, &b.fxchain, &b.env};
+  for (int k = 0; k < kPartCount; ++k)
+    if (k == kind ? *parts[k] != text : !parts[k]->empty()) return false;
+
+  switch (kind) {
+    case kLock:
+      return blocksAtTop == 0 && linesAtTop == 1 && isKeywordIntsLine(firstLine, "LOCK");
+    case kGroup: {
+      // GROUP_FLAGS, GROUP_FLAGS_HIGH (and any later GROUP_FLAGS_* sibling):
+      // integer bitmasks only.
+      if (blocksAtTop != 0 || linesAtTop > 8) return false;
+      size_t p = 0;
+      while (p < text.size()) {
+        const size_t eol = text.find('\n', p);
+        std::string_view t = ltrim(std::string_view(text.data() + p, eol - p));
+        const std::string_view kw = t.substr(0, t.find_first_of(" \t"));
+        if (kw.rfind("GROUP_FLAGS", 0) != 0) return false;
+        for (char c : kw)
+          if (!((c >= 'A' && c <= 'Z') || c == '_')) return false;
+        if (!isKeywordIntsLine(t, kw)) return false;
+        p = eol + 1;
+      }
+      return true;
+    }
+    case kRecv:
+      return !nested && firstLine.rfind("AUXRECV ", 0) == 0;
+    case kEnv:
+      return !nested;
+    case kFxChain:
+    case kRecFx:
+      return blocksAtTop == 1 && linesAtTop == 0;
+  }
+  return false;
+}
+
+// Whether `chunk` is one balanced <ITEM block and nothing else (a trailing
+// newline aside). Says nothing about the item's media: that is the FILE-path
+// checks' business.
+static bool validItemChunk(const std::string& chunk) {
+  if (chunk.find('\0') != std::string::npos) return false;
+  int depth = 0;
+  bool first = true, closed = false;
+  size_t pos = 0;
+  while (pos < chunk.size()) {
+    size_t eol = chunk.find('\n', pos);
+    if (eol == std::string::npos) eol = chunk.size();
+    std::string_view line(chunk.data() + pos, eol - pos);
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    std::string_view t = ltrim(line);
+    pos = eol + 1;
+    if (closed) {
+      if (!t.empty()) return false;  // something after the item's closing ">"
+      continue;
+    }
+    if (first) {
+      if (t.empty() || t.front() != '<' || blockTag(t) != "ITEM") return false;
+      first = false;
+      depth = 1;
+      continue;
+    }
+    if (!t.empty() && t.front() == '<') {
+      ++depth;
+    } else if (t == ">") {
+      if (--depth == 0) closed = true;
+    }
+  }
+  return closed;
+}
+
+// A take source whose "media" is code: a video processor (`<SOURCE
+// VIDEOEFFECT`, EEL that REAPER runs) or a subproject (`<SOURCE RPP_PROJECT`,
+// which loads that project's own FX). Neither belongs in a no-FX join.
+static bool isCodeSourceLine(std::string_view t) {
+  if (blockTag(t) != "SOURCE") return false;
+  std::string_view rest = ltrim(t.substr(7));
+  const std::string_view type = rest.substr(0, rest.find_first_of(" \t"));
+  return type == "VIDEOEFFECT" || type == "RPP_PROJECT";
+}
+
+static bool hasCodeSource(const std::string& text) {
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t eol = text.find('\n', pos);
+    if (eol == std::string::npos) eol = text.size();
+    if (isCodeSourceLine(ltrim(std::string_view(text.data() + pos, eol - pos)))) return true;
+    pos = eol + 1;
+  }
+  return false;
+}
+
+// Replace every outermost <SOURCE block that contains a code source (see
+// isCodeSourceLine; a SECTION source wrapping one counts) with an empty
+// source, keeping the item itself: the no-FX copy of the project file.
+// Output is LF-normalized.
+static std::string blankCodeSources(const std::string& text) {
+  std::string out;
+  out.reserve(text.size());
+  std::string buf, indent;
+  int depth = 0, bufDepth = -1;  // depth at which the buffered source opened
+  bool bufCode = false;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t eol = text.find('\n', pos);
+    if (eol == std::string::npos) eol = text.size();
+    std::string_view line(text.data() + pos, eol - pos);
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    std::string_view t = ltrim(line);
+    pos = eol + 1;
+    const bool opens = !t.empty() && t.front() == '<';
+    if (bufDepth < 0 && opens && blockTag(t) == "SOURCE") {
+      bufDepth = depth;
+      bufCode = false;
+      indent.assign(line.substr(0, line.size() - t.size()));
+      buf.clear();
+    }
+    if (bufDepth >= 0) {
+      buf.append(line);
+      buf.push_back('\n');
+      if (opens && isCodeSourceLine(t)) bufCode = true;
+    } else {
+      out.append(line);
+      out.push_back('\n');
+    }
+    if (opens) {
+      ++depth;
+    } else if (t == ">") {
+      --depth;
+      if (bufDepth >= 0 && depth == bufDepth) {
+        out += bufCode ? indent + "<SOURCE EMPTY\n" + indent + ">\n" : buf;
+        bufDepth = -1;
+        buf.clear();
+      }
+    }
+  }
+  out += buf;  // unterminated source at EOF (malformed): as it was
+  return out;
+}
+
+// At most `maxBytes` of `s`, cut back to a UTF-8 character boundary.
+static std::string clampUtf8(std::string s, size_t maxBytes) {
+  if (s.size() <= maxBytes) return s;
+  size_t n = maxBytes;
+  while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) --n;
+  s.resize(n);
+  return s;
+}
+
+// A single-line text field (track/lane/group/marker name, title, author) as it
+// may enter REAPER: tab, CR and LF become spaces (they would break the
+// line-based formats some of these travel in), other C0 control characters
+// and DEL go, and the result is at most `maxBytes`. Idempotent, and applied on
+// capture as well, so capture -> apply -> recapture stays byte-stable.
+static std::string cleanLine(std::string_view s, size_t maxBytes) {
+  std::string out;
+  out.reserve((std::min)(s.size(), maxBytes + 4));
+  for (char c : s) {
+    const unsigned char u = static_cast<unsigned char>(c);
+    if (c == '\t' || c == '\n' || c == '\r')
+      out.push_back(' ');
+    else if (u >= 0x20 && u != 0x7F)
+      out.push_back(c);
+  }
+  return clampUtf8(std::move(out), maxBytes);
+}
+
+// Length caps for remote strings. REAPER's string getters fill caller buffers
+// without a size, so what a peer can set must stay well inside what this
+// file reads back with.
+static constexpr size_t kMaxNameBytes = 1024;        // track / lane / group / marker names
+static constexpr size_t kMaxProjectInfoBytes = 1024;  // title, author
+static constexpr size_t kProjectStringBuf = 64 * 1024;
+static constexpr size_t kMaxNotesBytes = (1 << 16) - 1;  // captureProjectNotes' buffer
+static constexpr int kMaxLanes = 256;
+static constexpr int kMaxTrackChannels = 128;
+static constexpr int kMaxMarkerLines = 10000;
+static constexpr int kMaxTempoLines = 10000;
+
+// ---------- marker actions ----------
+//
+// REAPER runs a marker named `!<command id>` as an action when playback passes
+// it (with marker actions enabled). A synced marker name is peer-authored, so
+// it must never turn into an action on somebody else's machine. The rule:
+//   - The owner's Rust core refuses a proposal whose marker list brings in an
+//     action-like name that isn't in the session's list already: a guest can
+//     keep or move the host's action markers, never create or rename one.
+//   - A client applies every action-like name from the owner guarded: with a
+//     zero-width space in front, so REAPER doesn't see a leading '!'. Capture
+//     strips exactly that guard again, so the wire value, the baseline and a
+//     re-proposed list all keep the owner's own text: no ping-pong, and the
+//     host's markers keep their names when a guest edits some other marker.
+//   - The owner applies an action-like name verbatim only when a marker with
+//     exactly that name is live (unguarded) in its project already: its own
+//     action marker coming back through a guest's edit. Anything else is
+//     guarded there too.
+// Regions follow the same rule. A user's own local action markers stay theirs.
+static constexpr const char kMarkerGuard[] = "\xE2\x80\x8B";  // U+200B ZERO WIDTH SPACE
+static constexpr size_t kMarkerGuardLen = sizeof(kMarkerGuard) - 1;
+
+static bool isActionMarkerName(std::string_view name) {
+  while (!name.empty() && name.front() == ' ') name.remove_prefix(1);
+  return !name.empty() && name.front() == '!';
+}
+
+static std::string guardMarkerName(const std::string& name) {
+  return isActionMarkerName(name) ? std::string(kMarkerGuard) + name : name;
+}
+
+static std::string unguardMarkerName(const std::string& name) {
+  if (name.compare(0, kMarkerGuardLen, kMarkerGuard) == 0 &&
+      isActionMarkerName(std::string_view(name).substr(kMarkerGuardLen)))
+    return name.substr(kMarkerGuardLen);
+  return name;
+}
+
+// The name a marker from the wire gets in this project. `liveActions` is the
+// owner's set of action-like names live in its project right now (null on a
+// client, which guards every action-like name).
+static std::string markerNameForApply(const std::string& wireName,
+                                      const std::set<std::string>* liveActions) {
+  std::string name = cleanLine(wireName, kMaxNameBytes);
+  if (isActionMarkerName(name) && !(liveActions && liveActions->count(name)))
+    return guardMarkerName(name);
+  return name;
+}
+
 // ---------- progressive join: placeholder rewrite (pure text helper) ----------
 //
 // Rewrite every take source in an RPP-syntax text whose media is not present
@@ -1386,6 +1713,14 @@ static std::string trackGuid(MediaTrack* tr) {
   return buf;
 }
 
+// A track string attribute (P_NAME, P_LANENAME:n), read through the pointer
+// API: REAPER's buffer-filling getter takes no buffer size, and a name set by a
+// peer (or loaded from their project file) is as long as they made it.
+static std::string trackStringAttr(MediaTrack* tr, const char* parm) {
+  const char* p = static_cast<const char*>(GetSetMediaTrackInfo(tr, parm, nullptr));
+  return p ? std::string(p) : std::string();
+}
+
 static MediaTrack* findTrackByGuid(const std::string& guid) {
   const int n = CountTracks(nullptr);
   for (int i = 0; i < n; ++i) {
@@ -1400,10 +1735,7 @@ static MediaTrack* findTrackByGuid(const std::string& guid) {
 // not just that something changed.
 static std::string trackNameByGuid(const std::string& guid) {
   MediaTrack* tr = findTrackByGuid(guid);
-  if (!tr) return "";
-  char buf[512] = "";
-  if (GetSetMediaTrackInfo_String(tr, "P_NAME", buf, false) && buf[0]) return buf;
-  return "";
+  return tr ? trackStringAttr(tr, "P_NAME") : "";
 }
 
 // Display name of a peer (the editing-lock holder), resolved from the roster by
@@ -1459,29 +1791,75 @@ static std::string captureTempo() {
   return out;
 }
 
+// Number parsing for peer-authored text fields: a whole token, finite (doubles)
+// and clamped (ints) before it reaches REAPER, never through an unchecked
+// sscanf/atoi (whose overflow is undefined) or a raw double-to-int cast.
+static bool parseFiniteDouble(const std::string& tok, double& out) {
+  if (tok.empty()) return false;
+  char* end = nullptr;
+  const double v = strtod(tok.c_str(), &end);
+  if (end != tok.c_str() + tok.size() || !std::isfinite(v)) return false;
+  out = v;
+  return true;
+}
+
+static bool parseClampedInt(const std::string& tok, long lo, long hi, int& out) {
+  if (tok.empty()) return false;
+  char* end = nullptr;
+  errno = 0;
+  long v = strtol(tok.c_str(), &end, 10);
+  if (end != tok.c_str() + tok.size()) return false;
+  if (errno == ERANGE) v = tok.front() == '-' ? lo : hi;
+  out = static_cast<int>(std::clamp(v, lo, hi));
+  return true;
+}
+
+// A double from JSON as an int in [lo, hi] (non-finite -> `dflt`).
+static int clampToInt(double v, int lo, int hi, int dflt) {
+  if (!std::isfinite(v)) return dflt;
+  return static_cast<int>(std::clamp(v, static_cast<double>(lo), static_cast<double>(hi)));
+}
+
+static std::vector<std::string> splitTokens(const std::string& line, char sep) {
+  std::vector<std::string> out;
+  size_t p = 0;
+  while (p <= line.size()) {
+    size_t e = line.find(sep, p);
+    if (e == std::string::npos) e = line.size();
+    if (sep != ' ' || e > p) out.emplace_back(line.substr(p, e - p));
+    p = e + 1;
+  }
+  return out;
+}
+
 static void applyTempo(const std::string& s) {
   for (int i = CountTempoTimeSigMarkers(nullptr) - 1; i >= 0; --i)
     DeleteTempoTimeSigMarker(nullptr, i);
   size_t pos = 0;
-  while (pos < s.size()) {
+  int lines = 0;
+  while (pos < s.size() && lines < kMaxTempoLines) {
     size_t eol = s.find('\n', pos);
     if (eol == std::string::npos) eol = s.size();
-    std::string line = s.substr(pos, eol - pos);
+    const std::vector<std::string> f = splitTokens(s.substr(pos, eol - pos), ' ');
     pos = eol + 1;
     double timepos = 0, bpm = 0;
     int num = 0, den = 0, linear = 0;
-    if (sscanf(line.c_str(), "%lf %lf %d %d %d", &timepos, &bpm, &num, &den, &linear) == 5)
-      SetTempoTimeSigMarker(nullptr, -1, timepos, -1, -1, bpm, num, den, linear != 0);
+    if (f.size() != 5 || !parseFiniteDouble(f[0], timepos) || !parseFiniteDouble(f[1], bpm) ||
+        !parseClampedInt(f[2], -1, 1024, num) || !parseClampedInt(f[3], -1, 1024, den) ||
+        !parseClampedInt(f[4], 0, 1, linear))
+      continue;
+    if (bpm <= 0 || bpm > 1e4 || std::fabs(timepos) > 1e9) continue;
+    ++lines;
+    SetTempoTimeSigMarker(nullptr, -1, timepos, -1, -1, bpm, num, den, linear != 0);
   }
 }
 
 // One line per marker/region: "M|R \t index \t pos \t rgnend \t color \t name".
-// Name is last so it may contain spaces; tabs/newlines are stripped on capture.
+// Name is last so it may contain spaces; tabs/newlines become spaces and other
+// control characters go (cleanLine). A guarded action name (see the marker
+// actions note) is captured without its guard.
 static std::string sanitizeMarkerName(const char* name) {
-  std::string out = name ? name : "";
-  for (char& c : out)
-    if (c == '\t' || c == '\n' || c == '\r') c = ' ';
-  return out;
+  return cleanLine(unguardMarkerName(name ? name : ""), kMaxNameBytes);
 }
 
 static std::string captureMarkers() {
@@ -1511,11 +1889,14 @@ static std::string captureMarkers() {
   return out;
 }
 
-static void applyMarkers(const std::string& s) {
+// `owner`: this peer hosts the session (see the marker actions note for what
+// that changes about action-like names).
+static void applyMarkers(const std::string& s, bool owner) {
   // Rebuild only the *synced* markers: shared flag markers stay standing:
   // each person keeps or deletes their own copy (capture filters them out, so
   // the wire list never contains one to re-add either).
   std::vector<int> doomed;
+  std::set<std::string> liveActions;  // owner: action names live here right now
   {
     int idx = 0, next;
     bool isrgn = false;
@@ -1524,7 +1905,10 @@ static void applyMarkers(const std::string& s) {
     int num = 0, color = 0;
     while ((next = EnumProjectMarkers3(nullptr, idx, &isrgn, &pos, &rgnend, &name, &num,
                                        &color)) != 0) {
-      if (!isSharedMarkerName(name)) doomed.push_back(idx);
+      if (!isSharedMarkerName(name)) {
+        doomed.push_back(idx);
+        if (owner && name && isActionMarkerName(name)) liveActions.insert(name);
+      }
       idx = next;
     }
   }
@@ -1532,7 +1916,8 @@ static void applyMarkers(const std::string& s) {
     DeleteProjectMarkerByIndex(nullptr, *it);
 
   size_t pos = 0;
-  while (pos < s.size()) {
+  int added = 0;
+  while (pos < s.size() && added < kMaxMarkerLines) {
     size_t eol = s.find('\n', pos);
     if (eol == std::string::npos) eol = s.size();
     std::string line = s.substr(pos, eol - pos);
@@ -1548,13 +1933,15 @@ static void applyMarkers(const std::string& s) {
       p = tab + 1;
     }
     if (f.size() != 5) continue;
-    std::string name = line.substr(p);
-    bool isrgn = f[0] == "R";
-    int num = atoi(f[1].c_str());
-    double mpos = strtod(f[2].c_str(), nullptr);
-    double rgnend = strtod(f[3].c_str(), nullptr);
-    int color = atoi(f[4].c_str());
+    const bool isrgn = f[0] == "R";
+    int num = 0, color = 0;
+    double mpos = 0, rgnend = 0;
+    if (!parseClampedInt(f[1], -1, 1 << 30, num) || !parseFiniteDouble(f[2], mpos) ||
+        !parseFiniteDouble(f[3], rgnend) || !parseClampedInt(f[4], 0, 0x1FFFFFF, color))
+      continue;
+    const std::string name = markerNameForApply(line.substr(p), owner ? &liveActions : nullptr);
     AddProjectMarker2(nullptr, isrgn, mpos, rgnend, name.c_str(), num, colorFromWire(color));
+    ++added;
   }
 }
 
@@ -1600,21 +1987,29 @@ static void applyProjectTimebase(const std::string& s) {
   if (int* tempo = projConfigInt("tempoenvtimelock")) *tempo = te;
 }
 
+// Title, author, group names: single-line, at most kMaxProjectInfoBytes (the
+// same cleanLine the apply side uses, so the round trip stays byte-stable).
+// GetSetProjectInfo_String's getter takes no buffer size; what a peer can set
+// is capped far below this buffer.
 static std::string captureProjectString(const char* desc) {
-  char buf[4096] = "";
-  GetSetProjectInfo_String(nullptr, desc, buf, false);
-  return buf;
+  static std::vector<char> buf(kProjectStringBuf);
+  buf[0] = '\0';
+  GetSetProjectInfo_String(nullptr, desc, buf.data(), false);
+  buf.back() = '\0';
+  return cleanLine(buf.data(), kMaxProjectInfoBytes);
 }
 
 static void applyProjectString(const char* desc, const std::string& value) {
-  std::vector<char> buf(value.begin(), value.end());
+  const std::string clean = cleanLine(value, kMaxProjectInfoBytes);
+  std::vector<char> buf(clean.begin(), clean.end());
   buf.push_back('\0');
   GetSetProjectInfo_String(nullptr, desc, buf.data(), true);
 }
 
 static std::string captureProjectNotes() {
-  std::vector<char> buf(1 << 16, '\0');
+  std::vector<char> buf(kMaxNotesBytes + 1, '\0');
   GetSetProjectNotes(nullptr, false, buf.data(), (int)buf.size());
+  buf.back() = '\0';
   // LF-only on the wire, for the same reason as normalizeChunk: notes come
   // back CRLF on Windows and LF on macOS, and the raw difference alone would
   // read as an edit every tick between peers on different platforms.
@@ -1624,7 +2019,9 @@ static std::string captureProjectNotes() {
 }
 
 static void applyProjectNotes(const std::string& notes) {
-  std::vector<char> buf(notes.begin(), notes.end());
+  // Never longer than captureProjectNotes reads back.
+  const std::string clamped = clampUtf8(notes, kMaxNotesBytes);
+  std::vector<char> buf(clamped.begin(), clamped.end());
   buf.push_back('\0');
   GetSetProjectNotes(nullptr, true, buf.data(), 0);
 }
@@ -1718,9 +2115,7 @@ static Snapshot snapshotProject() {
     MediaTrack* tr = GetTrack(nullptr, i);
     TrackState ts;
     ts.index = i;
-    char name[512] = "";
-    GetSetMediaTrackInfo_String(tr, "P_NAME", name, false);
-    ts.name = name;
+    ts.name = cleanLine(trackStringAttr(tr, "P_NAME"), kMaxNameBytes);
     ts.vol = GetMediaTrackInfo_Value(tr, "D_VOL");
     ts.pan = GetMediaTrackInfo_Value(tr, "D_PAN");
     ts.fxen = GetMediaTrackInfo_Value(tr, "I_FXEN") != 0.0;
@@ -1745,12 +2140,11 @@ static Snapshot snapshotProject() {
     ts.numlanes = (int)GetMediaTrackInfo_Value(tr, "I_NUMFIXEDLANES");
     ts.lanesettings = (int)GetMediaTrackInfo_Value(tr, "C_LANESETTINGS");
     if (ts.freemode == 2 && ts.numlanes > 0) {
-      for (int lane = 0; lane < ts.numlanes; ++lane) {
-        char key[32], lname[512] = "";
+      for (int lane = 0; lane < (std::min)(ts.numlanes, kMaxLanes); ++lane) {
+        char key[32];
         snprintf(key, sizeof(key), "P_LANENAME:%d", lane);
-        GetSetMediaTrackInfo_String(tr, key, lname, false);
         if (lane) ts.lanenames += '\n';
-        ts.lanenames += lname;
+        ts.lanenames += cleanLine(trackStringAttr(tr, key), kMaxNameBytes);
         snprintf(key, sizeof(key), "C_LANEPLAYS:%d", lane);
         if (lane) ts.laneplays += ' ';
         ts.laneplays += std::to_string((int)GetMediaTrackInfo_Value(tr, key));
@@ -1911,7 +2305,7 @@ static std::string diffSnapshots(const Snapshot& prev, const Snapshot& now) {
   if (!items.empty()) changeset["items"] = items;
   if (!project.empty()) changeset["project"] = project;
   if (changeset.empty()) return "";
-  return changeset.dump();
+  return dumpJson(changeset);
 }
 
 // Media imported from outside the project folder cannot be served to peers
@@ -2145,7 +2539,7 @@ static std::string guardMediaBlanking(const std::string& changeset, const Snapsh
   activityEvent("placeholder_blocked", json::object(),
                 "kept an item that is still waiting for its media out of the sync");
   if (items.empty()) cs.erase("items");
-  return cs.empty() ? std::string() : cs.dump();
+  return cs.empty() ? std::string() : dumpJson(cs);
 }
 
 static void captureLocalChanges(bool force) {
@@ -2284,50 +2678,65 @@ static void captureLocalChanges(bool force) {
 
 static void applyTrackFields(MediaTrack* tr, const json& fields) {
   if (fields.contains("name") && fields["name"].is_string()) {
-    std::string name = fields["name"].get<std::string>();
+    const std::string name = cleanLine(fields["name"].get<std::string>(), kMaxNameBytes);
     std::vector<char> buf(name.begin(), name.end());
     buf.push_back('\0');
     GetSetMediaTrackInfo_String(tr, "P_NAME", buf.data(), true);
   }
-  auto setNum = [&](const char* key, const char* parm) {
+  // Every number from the wire is finite and inside the attribute's range
+  // before REAPER sees it (it casts to int/char internally): a value capture
+  // can produce passes unchanged, anything else is clamped or skipped.
+  auto setNum = [&](const char* key, const char* parm, double lo, double hi) {
     auto it = fields.find(key);
-    if (it != fields.end() && it->is_number())
-      SetMediaTrackInfo_Value(tr, parm, it->get<double>());
+    if (it == fields.end() || !it->is_number()) return;
+    const double v = it->get<double>();
+    if (std::isfinite(v)) SetMediaTrackInfo_Value(tr, parm, std::clamp(v, lo, hi));
+  };
+  auto setInt = [&](const char* key, const char* parm, int lo, int hi) {
+    auto it = fields.find(key);
+    if (it == fields.end() || !it->is_number()) return;
+    const double v = it->get<double>();
+    if (std::isfinite(v)) SetMediaTrackInfo_Value(tr, parm, clampToInt(std::round(v), lo, hi, 0));
   };
   auto setBool = [&](const char* key, const char* parm) {
     auto it = fields.find(key);
     if (it != fields.end() && it->is_boolean())
       SetMediaTrackInfo_Value(tr, parm, it->get<bool>() ? 1.0 : 0.0);
   };
-  setNum("vol", "D_VOL");
-  setNum("pan", "D_PAN");
+  setNum("vol", "D_VOL", 0.0, 1e6);
+  setNum("pan", "D_PAN", -1.0, 1.0);
   // "mute" is intentionally not applied (nor captured): per-user monitoring,
   // like solo. An older peer may still send it; ignoring it here keeps the
   // local mix the user's own.
   setBool("fxen", "I_FXEN");
-  setNum("width", "D_WIDTH");
-  setNum("panmode", "I_PANMODE");
-  setNum("dualpanl", "D_DUALPANL");
-  setNum("dualpanr", "D_DUALPANR");
-  setNum("panlaw", "D_PANLAW");
-  setNum("panlawflags", "I_PANLAW_FLAGS");
+  setNum("width", "D_WIDTH", -1.0, 1.0);
+  setInt("panmode", "I_PANMODE", -1, 16);
+  setNum("dualpanl", "D_DUALPANL", -1.0, 1.0);
+  setNum("dualpanr", "D_DUALPANR", -1.0, 1.0);
+  setNum("panlaw", "D_PANLAW", -1.0, 1e3);
+  setInt("panlawflags", "I_PANLAW_FLAGS", -1, 255);
   setBool("phase", "B_PHASE");
   setBool("solodefeat", "B_SOLO_DEFEAT");
-  setNum("nchan", "I_NCHAN");
-  if (fields.contains("color") && fields["color"].is_number())
-    SetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR", colorFromWire(fields["color"].get<int>()));
-  setNum("folderdepth", "I_FOLDERDEPTH");
+  if (auto it = fields.find("nchan"); it != fields.end() && it->is_number()) {
+    int n = clampToInt(it->get<double>(), 2, kMaxTrackChannels, 2);
+    n += n & 1;  // track channel counts are even
+    SetMediaTrackInfo_Value(tr, "I_NCHAN", (std::min)(n, kMaxTrackChannels));
+  }
+  if (auto it = fields.find("color"); it != fields.end() && it->is_number())
+    SetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR",
+                            colorFromWire(clampToInt(it->get<double>(), 0, 0x1FFFFFF, 0)));
+  setInt("folderdepth", "I_FOLDERDEPTH", -128, 1);
   setBool("mainsend", "B_MAINSEND");
-  setNum("mainsendoffs", "C_MAINSEND_OFFS");
-  setNum("mainsendnch", "C_MAINSEND_NCH");
-  setNum("timebase", "C_BEATATTACHMODE");
+  setInt("mainsendoffs", "C_MAINSEND_OFFS", 0, 127);
+  setInt("mainsendnch", "C_MAINSEND_NCH", 0, 127);
+  setInt("timebase", "C_BEATATTACHMODE", -128, 127);
   // Flag before value: it decides whether the offset is seconds or samples.
-  setNum("playoffsflag", "I_PLAY_OFFSET_FLAG");
-  setNum("playoffs", "D_PLAY_OFFSET");
+  setInt("playoffsflag", "I_PLAY_OFFSET_FLAG", 0, 255);
+  setNum("playoffs", "D_PLAY_OFFSET", -1e9, 1e9);
   // Lane layout before the per-lane fields below, so the lanes exist.
-  setNum("freemode", "I_FREEMODE");
-  setNum("numlanes", "I_NUMFIXEDLANES");
-  setNum("lanesettings", "C_LANESETTINGS");
+  setInt("freemode", "I_FREEMODE", 0, 2);
+  setInt("numlanes", "I_NUMFIXEDLANES", 0, kMaxLanes);
+  setInt("lanesettings", "C_LANESETTINGS", 0, 255);
   if (fields.contains("lanenames") && fields["lanenames"].is_string()) {
     // Mirror capture exactly: it fills this only on a fixed-lane track, one
     // entry per lane, so a lone lane whose name was just cleared legitimately
@@ -2341,10 +2750,10 @@ static void applyTrackFields(MediaTrack* tr, const json& fields) {
     if (freemode == 2 && lanes > 0) {
       const std::string names = fields["lanenames"].get<std::string>();
       size_t pos = 0;
-      for (int lane = 0; lane < lanes && pos <= names.size(); ++lane) {
+      for (int lane = 0; lane < (std::min)(lanes, kMaxLanes) && pos <= names.size(); ++lane) {
         size_t eol = names.find('\n', pos);
         if (eol == std::string::npos) eol = names.size();
-        std::string n = names.substr(pos, eol - pos);
+        const std::string n = cleanLine(std::string_view(names).substr(pos, eol - pos), kMaxNameBytes);
         char key[32];
         snprintf(key, sizeof(key), "P_LANENAME:%d", lane);
         std::vector<char> buf(n.begin(), n.end());
@@ -2356,15 +2765,14 @@ static void applyTrackFields(MediaTrack* tr, const json& fields) {
   }
   if (fields.contains("laneplays") && fields["laneplays"].is_string()) {
     const std::string plays = fields["laneplays"].get<std::string>();
+    const int lanes = (std::min)((int)GetMediaTrackInfo_Value(tr, "I_NUMFIXEDLANES"), kMaxLanes);
     int lane = 0;
-    size_t pos = 0;
-    while (pos < plays.size()) {
-      size_t sp = plays.find(' ', pos);
-      if (sp == std::string::npos) sp = plays.size();
+    for (const std::string& tok : splitTokens(plays, ' ')) {
+      if (lane >= lanes) break;
+      int v = 0;
       char key[32];
       snprintf(key, sizeof(key), "C_LANEPLAYS:%d", lane++);
-      SetMediaTrackInfo_Value(tr, key, atof(plays.substr(pos, sp - pos).c_str()));
-      pos = sp + 1;
+      if (parseClampedInt(tok, 0, 127, v)) SetMediaTrackInfo_Value(tr, key, v);
     }
   }
 
@@ -2376,18 +2784,22 @@ static void applyTrackFields(MediaTrack* tr, const json& fields) {
   // tracks by GUID.
   TrackBlocksPatch patch;
   std::string fx, recfx, env, group, lock;
-  auto strField = [&](const char* key, std::string& store, const std::string*& slot) {
+  // Only a part in exactly the shape capture produces is spliced (see
+  // validTrackPart); sanitizeIncoming already dropped and counted the rest,
+  // this keeps every other apply path to the same rule.
+  auto strField = [&](const char* key, int kind, std::string& store, const std::string*& slot) {
     auto it = fields.find(key);
-    if (it != fields.end() && it->is_string()) {
+    if (it != fields.end() && it->is_string() &&
+        validTrackPart(kind, it->get_ref<const std::string&>())) {
       store = it->get<std::string>();
       slot = &store;
     }
   };
-  strField("fxchain", fx, patch.fxchain);
-  strField("recfx", recfx, patch.recfx);
-  strField("env", env, patch.env);
-  strField("group", group, patch.group);
-  strField("lock", lock, patch.lock);
+  strField("fxchain", kFxChain, fx, patch.fxchain);
+  strField("recfx", kRecFx, recfx, patch.recfx);
+  strField("env", kEnv, env, patch.env);
+  strField("group", kGroup, group, patch.group);
+  strField("lock", kLock, lock, patch.lock);
   if (patch.fxchain || patch.recfx || patch.env || patch.group || patch.lock) {
     std::string cur = objectStateChunk(tr);
     if (!cur.empty()) {
@@ -2670,6 +3082,9 @@ static void notePluginAdds(const std::string& trackName,
 // retry that resolved nothing new costs no re-baseline.
 static bool applyRecvField(const std::string& guid, const std::string& wire,
                            bool* wrote = nullptr) {
+  // A malformed value is never spliced, and nothing would ever make it
+  // well-formed: report it as done so it isn't parked for retries either.
+  if (!validTrackPart(kRecv, wire)) return true;
   MediaTrack* tr = findTrackByGuid(guid);
   if (!tr) return false;
   bool complete = true;
@@ -2706,23 +3121,109 @@ static bool applyRecvField(const std::string& guid, const std::string& wire,
   return complete;
 }
 
-// No-FX mode: drop fx-chain fields from track applies and take-FX blocks from
-// item chunks, so a view-only client never instantiates third-party code.
-static json filterChangesetNoFx(json cs) {
-  if (cs.contains("tracks") && cs["tracks"].is_object()) {
-    for (auto& [guid, fields] : cs["tracks"].items()) {
+// What sanitizeIncoming dropped from the changesets of one apply (for the log).
+struct SanitizeReport {
+  int invalid = 0;  // fields/items not in the shape capture produces
+  int noFx = 0;     // no-FX join: fields/items that would load code anyway
+};
+
+// Bring a peer-authored changeset into the shape capture produces before any
+// of it reaches REAPER (see the incoming-field validation notes): chunk parts
+// and item chunks that aren't well-formed are dropped (a bad item chunk drops
+// the whole item: applied without its chunk it would turn up as an empty item
+// under a fresh GUID), single-line strings are cleaned and clamped. Numbers
+// are clamped where they are applied, tempo/marker lists where they are
+// parsed.
+//
+// No-FX mode (a view-only client never instantiates third-party code): FX
+// chain fields go, take-FX blocks are stripped from item chunks, and any other
+// track part or item that would still load a plugin, a video processor or a
+// subproject is dropped.
+static json sanitizeIncoming(json cs, bool noFx, SanitizeReport& rep) {
+  if (!cs.is_object()) {
+    ++rep.invalid;
+    return json::object();
+  }
+  static const std::pair<const char*, int> kParts[] = {
+      {"fxchain", kFxChain}, {"recfx", kRecFx}, {"env", kEnv},
+      {"recv", kRecv},       {"group", kGroup}, {"lock", kLock}};
+  if (auto t = cs.find("tracks"); t != cs.end() && t->is_object()) {
+    for (auto& [guid, fields] : t->items()) {
       (void)guid;
-      if (fields.is_object()) {
-        fields.erase("fxchain");
-        fields.erase("recfx");
+      if (!fields.is_object()) continue;  // applyChangeset skips those
+      for (const auto& [key, kind] : kParts) {
+        auto f = fields.find(key);
+        if (f == fields.end()) continue;
+        if (!f->is_string() || !validTrackPart(kind, f->get_ref<const std::string&>())) {
+          fields.erase(f);
+          ++rep.invalid;
+        }
       }
+      if (noFx) {
+        fields.erase("fxchain");  // routine in this mode: not counted
+        fields.erase("recfx");
+        for (const char* key : {"env", "recv", "group", "lock"}) {
+          auto f = fields.find(key);
+          if (f != fields.end() && !collectPlugins(f->get_ref<const std::string&>()).empty()) {
+            fields.erase(f);
+            ++rep.noFx;
+          }
+        }
+      }
+      if (auto f = fields.find("name"); f != fields.end() && f->is_string())
+        *f = cleanLine(f->get_ref<const std::string&>(), kMaxNameBytes);
+      if (auto f = fields.find("lanenames"); f != fields.end() && f->is_string()) {
+        const std::vector<std::string> names = splitTokens(f->get_ref<const std::string&>(), '\n');
+        std::string out;
+        for (size_t i = 0; i < names.size() && i < (size_t)kMaxLanes; ++i) {
+          if (i) out += '\n';
+          out += cleanLine(names[i], kMaxNameBytes);
+        }
+        *f = out;
+      }
+      if (auto f = fields.find("laneplays"); f != fields.end() && f->is_string())
+        *f = clampUtf8(f->get<std::string>(), (size_t)kMaxLanes * 4);
     }
   }
-  if (cs.contains("items") && cs["items"].is_object()) {
-    for (auto& [guid, fields] : cs["items"].items()) {
-      (void)guid;
-      if (fields.is_object() && fields.contains("chunk") && fields["chunk"].is_string())
-        fields["chunk"] = stripFxBlocks(fields["chunk"].get<std::string>(), /*takeFxOnly=*/true);
+  if (auto it = cs.find("items"); it != cs.end() && it->is_object()) {
+    std::vector<std::string> doomed;
+    for (auto& [guid, fields] : it->items()) {
+      if (!fields.is_object()) continue;
+      auto f = fields.find("chunk");
+      if (f == fields.end()) continue;
+      if (!f->is_string() || !validItemChunk(f->get_ref<const std::string&>())) {
+        doomed.push_back(guid);
+        ++rep.invalid;
+        continue;
+      }
+      if (noFx) {
+        *f = stripFxBlocks(f->get_ref<const std::string&>(), /*takeFxOnly=*/true);
+        const std::string& chunk = f->get_ref<const std::string&>();
+        if (!collectPlugins(chunk).empty() || hasCodeSource(chunk)) {
+          doomed.push_back(guid);
+          ++rep.noFx;
+        }
+      }
+    }
+    for (const std::string& guid : doomed) it->erase(guid);
+  }
+  if (auto p = cs.find("project"); p != cs.end() && p->is_object()) {
+    if (auto f = p->find("project"); f != p->end() && f->is_object()) {
+      json& pf = *f;
+      for (const char* key : {"title", "author"})
+        if (auto s = pf.find(key); s != pf.end() && s->is_string())
+          *s = cleanLine(s->get_ref<const std::string&>(), kMaxProjectInfoBytes);
+      if (auto s = pf.find("notes"); s != pf.end() && s->is_string())
+        *s = clampUtf8(s->get<std::string>(), kMaxNotesBytes);
+      if (auto s = pf.find("groupnames"); s != pf.end() && s->is_string()) {
+        const std::vector<std::string> names = splitTokens(s->get_ref<const std::string&>(), '\n');
+        std::string out;
+        for (size_t i = 0; i < names.size() && i < 64; ++i) {
+          if (i) out += '\n';
+          out += cleanLine(names[i], kMaxProjectInfoBytes);
+        }
+        *s = out;
+      }
     }
   }
   return cs;
@@ -2767,6 +3268,18 @@ static void dropUnsafeMediaPaths(json& cs) {
              "ignored an incoming edit that points to a file outside the project");
 }
 
+// A log line at most once per `every` per code: a misbehaving peer can resend
+// the same bad field every tick.
+static void throttledLog(const char* code, json params, const std::string& text,
+                         std::chrono::seconds every) {
+  static std::map<std::string, std::chrono::steady_clock::time_point> last;
+  const auto now = std::chrono::steady_clock::now();
+  auto it = last.find(code);
+  if (it != last.end() && now - it->second < every) return;
+  last[code] = now;
+  logEvent(code, std::move(params), text);
+}
+
 static void applyChangeset(const json& changeset) {
   // One lazily-loaded lock table + roster for the whole changeset (see
   // LockHolders); resolving a holder per entity was an FFI call and a full
@@ -2800,8 +3313,8 @@ static void applyChangeset(const json& changeset) {
       MediaTrack* tr = findTrackByGuid(guid);
       bool created = false;
       if (!tr) {
-        int idx = (int)jsonNum(fields, "index", (double)CountTracks(nullptr));
-        idx = std::clamp(idx, 0, CountTracks(nullptr));
+        const int count = CountTracks(nullptr);
+        const int idx = clampToInt(jsonNum(fields, "index", (double)count), 0, count, count);
         InsertTrackAtIndex(idx, false);
         tr = GetTrack(nullptr, idx);
         if (!tr) continue;
@@ -2840,8 +3353,10 @@ static void applyChangeset(const json& changeset) {
       }
       if (fields.contains("recv") && fields["recv"].is_string())
         pendingRecv.emplace_back(guid, fields["recv"].get<std::string>());
-      if (fields.contains("index") && fields["index"].is_number())
-        desiredIndex[guid] = fields["index"].get<double>();
+      // Finite only: a NaN would break the reorder's sort ordering.
+      if (fields.contains("index") && fields["index"].is_number() &&
+          std::isfinite(fields["index"].get<double>()))
+        desiredIndex[guid] = std::clamp(fields["index"].get<double>(), -1e9, 1e9);
     }
     if (!desiredIndex.empty()) applyReorder(desiredIndex);
 
@@ -2910,7 +3425,7 @@ static void applyChangeset(const json& changeset) {
         activityEvent("peer_tempo_changed", json::object(), "the tempo map changed");
       }
       if (f.contains("markers") && f["markers"].is_string()) {
-        applyMarkers(f["markers"].get<std::string>());
+        applyMarkers(f["markers"].get<std::string>(), g_mode == Mode::Hosting);
         activityEvent("peer_markers_changed", json::object(), "markers/regions changed");
       }
       if (f.contains("notes") && f["notes"].is_string()) {
@@ -2967,19 +3482,30 @@ static void applyRemoteChanges() {
   // edits that landed after it along for the ride: that revert is captured
   // as a normal local change next tick and synced back out; there is no
   // re-application loop because we re-baseline below.)
-  PreventUIRefresh(1);
+  freezeUI();
+  SanitizeReport rep;
   for (auto& cs : changesets) {
     // A changeset is peer-authored JSON: a shape the apply code doesn't expect
     // drops that changeset, never unwinds through REAPER's timer.
     try {
       dropUnsafeMediaPaths(cs);
-      applyChangeset(g_noFx ? filterChangesetNoFx(cs) : cs);
+      applyChangeset(sanitizeIncoming(cs, g_noFx, rep));
     } catch (const std::exception& e) {
       logEvent("bad_changeset", {{"error", e.what()}},
                std::string("dropped a malformed incoming edit: ") + e.what());
     }
   }
-  PreventUIRefresh(-1);
+  thawUI();
+  if (rep.invalid)
+    throttledLog("bad_field", {{"count", rep.invalid}},
+                 "ignored " + std::to_string(rep.invalid) +
+                     " incoming change(s) that were not in the expected format",
+                 std::chrono::seconds(10));
+  if (rep.noFx)
+    throttledLog("nofx_skipped", {{"count", rep.noFx}},
+                 "skipped " + std::to_string(rep.noFx) +
+                     " incoming change(s) that would load effects or other code",
+                 std::chrono::seconds(10));
   TrackList_AdjustWindows(false);
   UpdateArrange();
 
@@ -3031,14 +3557,14 @@ static void revertWhileLoading(const json& changeset, const Snapshot& base) {
   }
   if (revert.empty()) return;
   g_applyingRemote = true;
-  PreventUIRefresh(1);
+  freezeUI();
   try {
     applyChangeset(revert);
   } catch (const std::exception& e) {
     logEvent("bad_changeset", {{"error", e.what()}},
              std::string("couldn't undo an edit made while loading: ") + e.what());
   }
-  PreventUIRefresh(-1);
+  thawUI();
   TrackList_AdjustWindows(false);
   UpdateArrange();
   g_applyingRemote = false;
@@ -3075,7 +3601,7 @@ static void processDeferredItems() {
   if (ready.empty()) return;
   flushLocalEdits();
   g_applyingRemote = true;
-  PreventUIRefresh(1);
+  freezeUI();
   for (const DeferredItem& d : ready) {
     try {
       applyItem(d.guid, d.fields, /*freshMedia=*/true);
@@ -3084,7 +3610,7 @@ static void processDeferredItems() {
                std::string("dropped a malformed incoming edit: ") + e.what());
     }
   }
-  PreventUIRefresh(-1);
+  thawUI();
   UpdateArrange();
   g_snapshot = snapshotProject();
   g_lastChangeCount = GetProjectStateChangeCount(nullptr);
@@ -3116,7 +3642,7 @@ static void processDeferredRecv() {
   g_lastRecvRetry = now;
   bool changed = false;
   g_applyingRemote = true;
-  PreventUIRefresh(1);
+  freezeUI();
   for (auto it = g_deferredRecv.begin(); it != g_deferredRecv.end();) {
     const bool complete = applyRecvField(it->first, it->second.wire, &changed);
     if (complete || now - it->second.since > std::chrono::seconds(90))
@@ -3124,7 +3650,7 @@ static void processDeferredRecv() {
     else
       ++it;
   }
-  PreventUIRefresh(-1);
+  thawUI();
   // Only a retry that actually spliced something needs the re-baseline; the
   // common case is a parked entry still waiting, which writes nothing.
   if (changed) {
@@ -3556,12 +4082,11 @@ static json pingsJson() {
 // confirmation that it went out (gossip never loops back).
 static void sharePing(const std::string& rawName) {
   if ((g_mode != Mode::Hosting && g_mode != Mode::ClientActive) || !g_handle) return;
-  std::string name = sanitizeMarkerName(rawName.c_str());
-  if (name.size() > 200) name.resize(200);
+  const std::string name = clampUtf8(sanitizeMarkerName(rawName.c_str()), 200);
   if (name.empty()) return;
   const double pos = GetCursorPosition();
   const json m = {{"name", name}, {"pos", pos}};
-  if (!reamesh_share_marker(g_handle, m.dump().c_str())) return;
+  if (!reamesh_share_marker(g_handle, dumpJson(m).c_str())) return;
   const json self = selfPeerEntry();
   addPing(name, pos, jsonStr(self, "name"), jsonStr(self, "color"), true);
   logEvent("ping_sent", {{"name", name}}, "pinged \"" + name + "\"");
@@ -3605,7 +4130,9 @@ static void addMarkerAt(const std::string& rawName, double pos, const std::strin
   std::string name = sanitizeMarkerName(rawName.c_str());
   // The "⚑ " prefix would opt it out of sync, the opposite of the point.
   while (isSharedMarkerName(name.c_str())) name.erase(0, sizeof(kSharedMarkerPrefix) - 1);
-  if (name.size() > 200) name.resize(200);
+  // The name came from someone else's ping: never an action marker here (see
+  // the marker actions note).
+  name = guardMarkerName(clampUtf8(name, 200));
   AddProjectMarker2(nullptr, false, pos, 0, name.c_str(), -1, colorFromHex(colorHex));
   Undo_OnStateChange("ReaMesh: add marker");
   UpdateArrange();
@@ -3714,13 +4241,13 @@ static void followMirrorSelection(const json& target) {
   if (sel)
     for (const auto& g : *sel)
       if (g.is_string()) want.insert(g.get<std::string>());
-  PreventUIRefresh(1);
+  freezeUI();
   const int n = CountMediaItems(nullptr);
   for (int i = 0; i < n; ++i) {
     MediaItem* item = GetMediaItem(nullptr, i);
     SetMediaItemSelected(item, want.count(itemGuid(item)) > 0);
   }
-  PreventUIRefresh(-1);
+  thawUI();
   UpdateArrange();
 }
 
@@ -3730,8 +4257,13 @@ static FollowFx parseFollowFx(const json& fx) {
   f.track = jsonStr(fx, "track");
   if (f.track.empty()) return f;
   f.item = jsonStr(fx, "item");
-  f.take = fx.contains("take") && fx["take"].is_number_integer() ? fx["take"].get<int>() : 0;
-  f.fx = fx.contains("fx") && fx["fx"].is_number_integer() ? fx["fx"].get<int>() : 0;
+  // Clamped, not cast: peer-supplied (input FX indices sit at 0x1000000+).
+  f.take = fx.contains("take") && fx["take"].is_number_integer()
+               ? clampToInt(fx["take"].get<double>(), 0, 1 << 20, 0)
+               : 0;
+  f.fx = fx.contains("fx") && fx["fx"].is_number_integer()
+             ? clampToInt(fx["fx"].get<double>(), 0, 1 << 26, 0)
+             : 0;
   f.flt = fx.contains("float") && fx["float"].is_boolean() && fx["float"].get<bool>();
   f.valid = f.take >= 0 && f.fx >= 0;
   return f;
@@ -3771,7 +4303,7 @@ static bool followFxShow(const FollowFx& f, bool show) {
 // join has no effects to show, so it only ever mirrors the selection.
 static void followMirrorFx(const json& target) {
   const json fx = target.contains("fx") && target["fx"].is_object() ? target["fx"] : json();
-  const std::string key = fx.is_null() ? std::string() : fx.dump();
+  const std::string key = fx.is_null() ? std::string() : dumpJson(fx);
   if (key == g_followLastFx) return;
   g_followLastFx = key;
   if (g_noFx) return;
@@ -3826,7 +4358,7 @@ static void refreshSessionMeta(bool force) {
                      {"tracks", CountTracks(nullptr)},
                      {"plugins", plugins},
                      {"reaper", g_reaperVersion}};
-  reamesh_set_session_meta(g_handle, meta.dump().c_str());
+  reamesh_set_session_meta(g_handle, dumpJson(meta).c_str());
 }
 
 // Compare the received .rpp against what the host's manifest claimed it loads.
@@ -4380,7 +4912,7 @@ static void ctlDispatch(const json& cmd) {
       json hint = {{"ips", cmd.contains("ips") && cmd["ips"].is_array() ? cmd["ips"] : json::array()},
                    {"tcp", port("tcp")},
                    {"quic", port("quic")}};
-      reamesh_dial_hint(g_handle, hint.dump().c_str());
+      reamesh_dial_hint(g_handle, dumpJson(hint).c_str());
     }
   } else if (c == "leave") {
     onLeave();
@@ -4461,11 +4993,9 @@ static void ctlPublishState() {
             continue;
           }
           if (!tr) continue;
-          char buf[512] = "";
-          GetSetMediaTrackInfo_String(tr, "P_NAME", buf, false);
           editing[holder] = {
               {"kind", "track"},
-              {"name", std::string(buf)},
+              {"name", trackStringAttr(tr, "P_NAME")},
               {"n", static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"))}};
         }
         for (auto& p : peers) {
@@ -4620,7 +5150,7 @@ static void ctlPublishState() {
   state["peers"] = std::move(peers);
 
   static std::string lastPublished;
-  std::string out = state.dump();
+  std::string out = dumpJson(state);
   if (out != lastPublished) {
     lastPublished = out;
     reamesh_ctl_publish(out.c_str());
@@ -4723,7 +5253,7 @@ static void pushLocalPresence() {
   // Deliberately UNCONDITIONAL (no change-gate): every call also proves the
   // main thread is alive, which is what keeps this peer's beacon from
   // reporting "frozen" while the user simply sits still.
-  reamesh_set_presence(p.dump().c_str());
+  reamesh_set_presence(dumpJson(p).c_str());
 }
 
 // Open the finished download in REAPER (Downloading -> ClientActive). In
@@ -4746,7 +5276,7 @@ static void openDownloadedProject(std::string path) {
   bool rewritten = false;
   if (g_noFx || progressive) text = readFileText(path);
   if (g_noFx && !text.empty()) {
-    text = stripFxBlocks(text, /*takeFxOnly=*/false);
+    text = blankCodeSources(stripFxBlocks(text, /*takeFxOnly=*/false));
     rewritten = true;
   }
   if (progressive && !text.empty()) {
@@ -4974,10 +5504,10 @@ static void unsupportedTick() {
                       {"bans", json::array()},
                       {"reaper", g_reaperVersion},
                       {"unsupported", {{"version", g_reaperVersion}, {"min", kMinReaperVersion}}}};
-  reamesh_ctl_publish(state.dump().c_str());
+  reamesh_ctl_publish(dumpJson(state).c_str());
 }
 
-static void timerTick() {
+static void timerTickBody() {
   if (g_unsupported) {
     unsupportedTick();
     return;
@@ -5054,6 +5584,41 @@ static void timerTick() {
   }
 }
 
+// An exception must never unwind into REAPER (it would take the whole process
+// down). Whatever threw: hand back every UI freeze this extension still holds,
+// drop the apply guard, and, if the tick died in the middle of writing remote
+// state into the project, re-baseline so that half-applied state isn't
+// captured as the user's own edit.
+static void recoverFromTickError(const char* what) {
+  const bool wasApplying = g_applyingRemote;
+  while (g_uiFrozen > 0) thawUI();
+  g_openingProject = false;
+  if (wasApplying && (g_mode == Mode::Hosting || g_mode == Mode::ClientActive)) {
+    try {
+      g_snapshot = snapshotProject();
+      g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+    } catch (...) {
+    }
+  }
+  g_applyingRemote = false;
+  try {
+    throttledLog("tick_error", {{"error", what}},
+                 std::string("recovered from an internal error: ") + what,
+                 std::chrono::seconds(10));
+  } catch (...) {
+  }
+}
+
+static void timerTick() {
+  try {
+    timerTickBody();
+  } catch (const std::exception& e) {
+    recoverFromTickError(e.what());
+  } catch (...) {
+    recoverFromTickError("unknown error");
+  }
+}
+
 // ---------- actions / entry point ----------
 
 static bool dispatchCommand(int command) {
@@ -5064,9 +5629,18 @@ static bool dispatchCommand(int command) {
   // tick's reconcileItemTints re-applies whatever is still locked. Covers the
   // saves and the actions that end in a "save changes?" prompt; auto-save and
   // the like are covered by the tint ledger (see the note in the header).
-  if (isSaveCommand(command)) restoreAllItemTints();
-  if (command == g_cmdHost) { onHost(""); return true; }
-  if (command == g_cmdLeave) { onLeave(); return true; }
+  // Same rule as the timer: nothing may unwind into REAPER's action dispatch.
+  try {
+    if (isSaveCommand(command)) restoreAllItemTints();
+    if (command == g_cmdHost) { onHost(""); return true; }
+    if (command == g_cmdLeave) { onLeave(); return true; }
+  } catch (const std::exception& e) {
+    recoverFromTickError(e.what());
+    return command == g_cmdHost || command == g_cmdLeave;
+  } catch (...) {
+    recoverFromTickError("unknown error");
+    return command == g_cmdHost || command == g_cmdLeave;
+  }
   return false;
 }
 

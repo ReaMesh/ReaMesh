@@ -286,6 +286,11 @@ const en = {
   logPlaceholdersUnresolved: "{count} items never got their media and stay empty here.",
   logPlaceholdersUnresolvedOne: "1 item never got its media and stays empty here.",
   logPlaceholderBlocked: "An item still waiting for its media wasn't synced.",
+  logBadField: "Ignored {count} incoming changes that weren't in the expected format.",
+  logBadFieldOne: "Ignored 1 incoming change that wasn't in the expected format.",
+  logNofxSkipped: "Skipped {count} incoming changes that would load effects or other code.",
+  logNofxSkippedOne: "Skipped 1 incoming change that would load effects or other code.",
+  logTickError: "Something went wrong while syncing. ReaMesh recovered and keeps going.",
   loadingMedia: "Loading media",
 
   // Download
@@ -696,6 +701,11 @@ const de: Record<MsgKey, string> = {
   logPlaceholdersUnresolved: "{count} Items haben ihre Medien nie erhalten und bleiben hier leer.",
   logPlaceholdersUnresolvedOne: "1 Item hat seine Medien nie erhalten und bleibt hier leer.",
   logPlaceholderBlocked: "Ein Item, das noch auf seine Medien wartet, wurde nicht synchronisiert.",
+  logBadField: "{count} empfangene Änderungen hatten nicht das erwartete Format und wurden ignoriert.",
+  logBadFieldOne: "1 empfangene Änderung hatte nicht das erwartete Format und wurde ignoriert.",
+  logNofxSkipped: "{count} empfangene Änderungen hätten Effekte oder anderen Code geladen und wurden übersprungen.",
+  logNofxSkippedOne: "1 empfangene Änderung hätte Effekte oder anderen Code geladen und wurde übersprungen.",
+  logTickError: "Beim Synchronisieren ist ein Fehler aufgetreten. ReaMesh hat sich davon erholt und läuft weiter.",
   loadingMedia: "Medien werden geladen",
 
   downloadStalled: "Der Download kommt nicht voran. Der Host ist möglicherweise offline.",

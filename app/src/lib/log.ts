@@ -59,6 +59,9 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   media_ready: "logMediaReady",
   placeholders_unresolved: "logPlaceholdersUnresolved",
   placeholder_blocked: "logPlaceholderBlocked",
+  bad_field: "logBadField",
+  nofx_skipped: "logNofxSkipped",
+  tick_error: "logTickError",
   kicked: "kickedByHost",
   banned: "bannedByHost",
 };

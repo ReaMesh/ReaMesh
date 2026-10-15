@@ -640,6 +640,211 @@ int main() {
     assert(cs["tracks"]["{T}"]["name"] == "FILE /not/a/chunk");
   }
 
+  // Incoming track parts: everything capture produces is accepted as is, and
+  // nothing that would splice more than the part itself gets through.
+  {
+    const TrackBlocks parts = extractTrackBlocks(norm);
+    assert(validTrackPart(kFxChain, parts.fxchain));
+    assert(validTrackPart(kRecFx, parts.recfx));
+    assert(validTrackPart(kEnv, parts.env));
+    assert(validTrackPart(kRecv, parts.recv));
+    assert(validTrackPart(kGroup, parts.group));
+    assert(validTrackPart(kLock, parts.lock));
+    // The wire form of receives (GUID instead of the source index) too.
+    const std::string wireRecv = transformRecvUnits(
+        parts.recv, [](const std::string& tok) { return "{GUID-" + tok + "}"; });
+    assert(wireRecv.find("AUXRECV {GUID-0} ") != std::string::npos);
+    assert(validTrackPart(kRecv, wireRecv));
+    // Empty always means "remove the part".
+    for (int k = 0; k < kPartCount; ++k) assert(validTrackPart(k, ""));
+    // A part is only valid as its own kind.
+    assert(!validTrackPart(kEnv, parts.fxchain));
+    assert(!validTrackPart(kLock, parts.group));
+    assert(!validTrackPart(kRecv, parts.env));
+
+    // Something riding along after the part's own line/block.
+    assert(!validTrackPart(kLock, "  LOCK 1\n  <FXCHAIN\n    <JS foo\n    >\n  >\n"));
+    assert(!validTrackPart(kGroup, "  GROUP_FLAGS 1 0\n  <FXCHAIN\n  >\n"));
+    assert(!validTrackPart(kEnv, parts.env + "  <ITEM\n    POSITION 1\n  >\n"));
+    assert(!validTrackPart(kFxChain, parts.fxchain + parts.fxchain));  // two chains
+    assert(!validTrackPart(kFxChain, parts.fxchain + "  NAME \"x\"\n"));
+    assert(!validTrackPart(kRecv, "  NAME \"x\"\n" + parts.recv));  // before the first AUXRECV
+    // Block structure that would close the track or swallow the rest of it.
+    assert(!validTrackPart(kEnv, "  <VOLENV2\n    PT 0 1 0\n"));            // unclosed
+    assert(!validTrackPart(kEnv, "  <VOLENV2\n  >\n  >\n  <FXCHAIN\n  >\n"));  // extra close
+    assert(!validTrackPart(kLock, "  LOCK 1\n>\n<FXCHAIN\n>\n"));
+    // Nested blocks don't belong in envelopes (an item, a source, a plugin).
+    assert(!validTrackPart(kEnv, "  <VOLENV2\n    <ITEM\n    >\n  >\n"));
+    assert(!validTrackPart(kEnv, "  <VOLENV2\n    <SOURCE WAVE\n    >\n  >\n"));
+    assert(!validTrackPart(kRecv, "  AUXRECV 0 0\n  <AUXVOLENV\n    <VST \"x\" y\n    >\n  >\n"));
+    // Line shapes: integers only, nothing else on the LOCK / GROUP lines.
+    assert(validTrackPart(kLock, "LOCK 1\n"));
+    assert(!validTrackPart(kLock, "LOCK 1\nLOCK 0\n"));
+    assert(!validTrackPart(kLock, "LOCK x\n"));
+    assert(!validTrackPart(kLock, "LOCK\n"));
+    assert(!validTrackPart(kGroup, "GROUP_FLAGS 1 \"<VST\"\n"));
+    assert(!validTrackPart(kGroup, "GROUP_FLAGSx1 1\n"));
+    // Text hygiene: LF-only and '\n'-terminated, like capture.
+    assert(!validTrackPart(kLock, "LOCK 1"));
+    assert(!validTrackPart(kLock, "LOCK 1\r\n"));
+    assert(!validTrackPart(kLock, std::string("LOCK 1\0\n", 8)));
+  }
+
+  // Receives: lines before the first AUXRECV belong to no unit and are dropped.
+  {
+    const std::string recv = "  NAME \"x\"\n  AUXRECV 1 0 1\n  <AUXVOLENV\n    PT 0 1 0\n  >\n";
+    const std::string out = transformRecvUnits(recv, [](const std::string& t) { return t; });
+    assert(out == "  AUXRECV 1 0 1\n  <AUXVOLENV\n    PT 0 1 0\n  >\n");
+  }
+
+  // Item chunks: one balanced <ITEM block, nothing outside it.
+  {
+    assert(validItemChunk("<ITEM\n  POSITION 1\n  <SOURCE WAVE\n    FILE \"a.wav\"\n  >\n>\n"));
+    assert(validItemChunk("<ITEM\nPOSITION 2.0\n>"));  // no trailing newline
+    assert(!validItemChunk(""));
+    assert(!validItemChunk("<TRACK\n>\n"));
+    assert(!validItemChunk("  POSITION 1\n<ITEM\n>\n"));
+    assert(!validItemChunk("<ITEM\n  POSITION 1\n"));               // unclosed
+    assert(!validItemChunk("<ITEM\n>\n<ITEM\n>\n"));                // two items
+    assert(!validItemChunk("<ITEM\n>\n<FXCHAIN\n>\n"));
+  }
+
+  // Code-carrying take sources (no-FX joins).
+  {
+    const std::string sub =
+        "<ITEM\n"
+        "  POSITION 1\n"
+        "  <SOURCE SECTION\n"
+        "    LENGTH 2\n"
+        "    <SOURCE RPP_PROJECT\n"
+        "      FILE \"sub.rpp\"\n"
+        "    >\n"
+        "  >\n"
+        "  <SOURCE VIDEOEFFECT\n"
+        "    <CODE\n"
+        "      | gfx_blit(0);\n"
+        "    >\n"
+        "  >\n"
+        "  <SOURCE WAVE\n"
+        "    FILE \"a.wav\"\n"
+        "  >\n"
+        ">\n";
+    assert(hasCodeSource(sub));
+    assert(!hasCodeSource("<ITEM\n  <SOURCE WAVE\n    FILE \"a.wav\"\n  >\n>\n"));
+    const std::string blanked = blankCodeSources(sub);
+    assert(!hasCodeSource(blanked));
+    assert(blanked.find("RPP_PROJECT") == std::string::npos);
+    assert(blanked.find("gfx_blit") == std::string::npos);
+    assert(blanked.find("POSITION 1") != std::string::npos);    // the item stays
+    assert(blanked.find("FILE \"a.wav\"") != std::string::npos);  // plain media stays
+    assert(blanked.find("  <SOURCE EMPTY\n  >\n") != std::string::npos);
+    assert(validItemChunk(blanked));
+    assert(blankCodeSources(blanked) == blanked);
+  }
+
+  // Single-line strings: control characters out, UTF-8-safe length clamp.
+  {
+    assert(cleanLine("Bass\tDI\r\n", 64) == "Bass DI  ");
+    assert(cleanLine(std::string("a\x01" "b\x7f" "c"), 64) == "abc");
+    assert(cleanLine("Grüße", 3) == "Gr");  // never splits the ü
+    assert(clampUtf8("Grüße", 4) == "Grü");
+    assert(clampUtf8("abc", 10) == "abc");
+    const std::string c = cleanLine("x\ty", 64);
+    assert(cleanLine(c, 64) == c);  // idempotent
+  }
+
+  // Number parsing for peer text: whole tokens, finite, clamped.
+  {
+    int i = 0;
+    double d = 0;
+    assert(parseClampedInt("12", 0, 100, i) && i == 12);
+    assert(parseClampedInt("99999999999999999999", 0, 100, i) && i == 100);
+    assert(parseClampedInt("-99999999999999999999", -1, 100, i) && i == -1);
+    assert(!parseClampedInt("12x", 0, 100, i));
+    assert(!parseClampedInt("", 0, 100, i));
+    assert(parseFiniteDouble("1.5", d) && d == 1.5);
+    assert(!parseFiniteDouble("nan", d));
+    assert(!parseFiniteDouble("inf", d));
+    assert(!parseFiniteDouble("1e999", d));
+    assert(clampToInt(1e300, 0, 10, 5) == 10);
+    assert(clampToInt(std::nan(""), 0, 10, 5) == 5);
+    assert(splitTokens("1  2 3", ' ') == (std::vector<std::string>{"1", "2", "3"}));
+    assert(splitTokens("a\n\nb", '\n') == (std::vector<std::string>{"a", "", "b"}));
+  }
+
+  // Marker actions: a remote action-like name is guarded on apply, capture
+  // gives back the exact wire text (no ping-pong), and only the owner keeps a
+  // name that is live in its own project already.
+  {
+    assert(isActionMarkerName("!40044"));
+    assert(isActionMarkerName("  !40044"));
+    assert(!isActionMarkerName("Chorus !"));
+    const std::string guarded = markerNameForApply("!40044", nullptr);
+    assert(guarded != "!40044");
+    assert(!isActionMarkerName(guarded));
+    assert(unguardMarkerName(guarded) == "!40044");
+    assert(sanitizeMarkerName(guarded.c_str()) == "!40044");
+    assert(markerNameForApply("Verse", nullptr) == "Verse");
+    assert(unguardMarkerName("Verse") == "Verse");
+    const std::set<std::string> live = {"!1013"};
+    assert(markerNameForApply("!1013", &live) == "!1013");  // the host's own
+    assert(markerNameForApply("!40044", &live) != "!40044");  // anything new is guarded
+    // A guard that doesn't sit in front of an action name is ordinary text.
+    const std::string plain = std::string(kMarkerGuard) + "Intro";
+    assert(unguardMarkerName(plain) == plain);
+  }
+
+  // The apply-side sanitizer: bad parts and items go, good ones pass unchanged.
+  {
+    const TrackBlocks parts = extractTrackBlocks(norm);
+    json cs = {
+        {"tracks",
+         {{"{T1}",
+           {{"name", "Lead\tVox"},
+            {"env", parts.env},
+            {"lock", "  LOCK 1\n  <FXCHAIN\n  >\n"},
+            {"group", 5},
+            {"fxchain", parts.fxchain}}}}},
+        {"items",
+         {{"{I1}", {{"chunk", "<ITEM\n  POSITION 1\n>\n"}}},
+          {"{I2}", {{"chunk", "<ITEM\n>\n<FXCHAIN\n>\n"}}},
+          {"{I3}", {{"present", false}}}}},
+        {"project", {{"project", {{"title", "a\nb"}, {"groupnames", "x\ty\n\nz"}}}}}};
+    SanitizeReport rep;
+    json out = sanitizeIncoming(cs, /*noFx=*/false, rep);
+    assert(rep.invalid == 3 && rep.noFx == 0);
+    const json& t = out["tracks"]["{T1}"];
+    assert(t["name"] == "Lead Vox");
+    assert(t["env"] == parts.env);
+    assert(t["fxchain"] == parts.fxchain);
+    assert(!t.contains("lock") && !t.contains("group"));
+    assert(out["items"].contains("{I1}") && !out["items"].contains("{I2}"));
+    assert(out["items"].contains("{I3}"));
+    assert(out["project"]["project"]["title"] == "a b");
+    assert(out["project"]["project"]["groupnames"] == "x y\n\nz");
+
+    // No-FX: chains go (routinely), and anything still loading code is dropped.
+    json nofx = {
+        {"tracks",
+         {{"{T1}",
+           {{"fxchain", parts.fxchain},
+            {"recfx", parts.recfx},
+            {"env", parts.env},
+            {"recv", "AUXRECV 0 0\n<AUXVOLENV\nPT 0 1 0\n>\n"}}}}},
+        {"items",
+         {{"{I1}", {{"chunk", "<ITEM\n  <TAKEFX\n    <VST \"x\" y\n    >\n  >\n>\n"}}},
+          {"{I2}", {{"chunk", "<ITEM\n  <SOURCE RPP_PROJECT\n    FILE \"s.rpp\"\n  >\n>\n"}}}}}};
+    SanitizeReport rep2;
+    json o2 = sanitizeIncoming(nofx, /*noFx=*/true, rep2);
+    assert(rep2.invalid == 0 && rep2.noFx == 1);
+    assert(!o2["tracks"]["{T1}"].contains("fxchain"));
+    assert(!o2["tracks"]["{T1}"].contains("recfx"));
+    assert(o2["tracks"]["{T1}"].contains("env"));
+    assert(o2["tracks"]["{T1}"].contains("recv"));
+    assert(o2["items"]["{I1}"]["chunk"] == "<ITEM\n>\n");  // take FX stripped
+    assert(!o2["items"].contains("{I2}"));                  // subproject dropped
+  }
+
   printf("chunk_test: all assertions passed\n");
   return 0;
 }
