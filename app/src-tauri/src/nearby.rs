@@ -11,8 +11,9 @@
 //!
 //! The preference (`nearby` file: "1" on, "0" off, absent = never decided)
 //! gates everything: the CoreBluetooth managers, and with them the system's
-//! permission prompt, only exist once the user turned it on. macOS only for
-//! now (src/ble.m); elsewhere it reports `supported: false`.
+//! permission prompt, only exist once the user turned it on. macOS runs on
+//! CoreBluetooth (src/ble.m), Windows on the WinRT Bluetooth APIs
+//! (src/ble_win.rs); elsewhere it reports `supported: false`.
 
 use serde::Serialize;
 use std::fs;
@@ -58,8 +59,10 @@ pub fn store_pref(app: &AppHandle, on: bool) {
     crate::refresh_native_settings(app);
 }
 
+/// macOS always (the permission is asked for on first use); Windows once an
+/// adapter with the LE central and peripheral roles was found.
 pub fn supported() -> bool {
-    cfg!(target_os = "macos")
+    ble::supported()
 }
 
 /// Bluetooth permission as the webview and settings window show it.
@@ -108,10 +111,19 @@ static APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
 
 /// A payload read from a nearby host: validated, then handed to the main
 /// window, which owns the connection to the extension.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 fn on_found(raw: &str) {
     let (Some(app), Some(clean)) = (APP.get(), clean_payload(raw)) else { return };
     let _ = app.emit_to("main", "nearby:found", clean);
+}
+
+/// Support or permission changed behind the webview's back (Windows finds
+/// its adapter after startup): it reads the state again.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn changed() {
+    if let Some(app) = APP.get() {
+        let _ = app.emit("nearby-changed", ());
+    }
 }
 
 pub fn init(app: &AppHandle) {
@@ -178,6 +190,10 @@ mod ble {
         unsafe { reamesh_ble_init(found) }
     }
 
+    pub fn supported() -> bool {
+        true
+    }
+
     pub fn authorization() -> i32 {
         unsafe { reamesh_ble_authorization() }
     }
@@ -192,9 +208,16 @@ mod ble {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+#[path = "ble_win.rs"]
+mod ble;
+
+#[cfg(not(any(target_os = "macos", windows)))]
 mod ble {
     pub fn init() {}
+    pub fn supported() -> bool {
+        false
+    }
     pub fn authorization() -> i32 {
         -1
     }

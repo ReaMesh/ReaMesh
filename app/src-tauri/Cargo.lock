@@ -68,6 +68,7 @@ dependencies = [
  "trash",
  "tungstenite",
  "windows",
+ "windows-future",
 ]
 
 [[package]]

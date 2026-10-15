@@ -57,11 +57,20 @@ trash = { version = "5", default-features = false, features = ["coinit_apartment
 # a non-activating topmost window that follows REAPER's and hides when REAPER
 # is not in front. macOS does the same job in Objective-C (src/overlay_panel.m),
 # compiled by build.rs. Version pinned to the one tao already pulls in, so this
-# does not build a second copy of the crate.
+# does not build a second copy of the crate. The Devices/Storage features are
+# nearby sessions over Bluetooth (src/ble_win.rs, WinRT); windows-future holds
+# the WinRT async types the windows crate no longer re-exports.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_Threading",
+  "Devices_Bluetooth",
+  "Devices_Bluetooth_Advertisement",
+  "Devices_Bluetooth_GenericAttributeProfile",
+  "Devices_Radios",
+  "Foundation",
+  "Storage_Streams",
 ] }
+windows-future = "0.3"
 
