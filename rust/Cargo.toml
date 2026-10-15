@@ -17,19 +17,19 @@ serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
-tokio-tungstenite = "0.27"
+tokio-tungstenite = "0.30"
 yrs = "0.26"
 blake3 = "1.5"
 zstd = "0.14"
 # Memory-hard KDF for the session passphrase token: the per-session salt is
 # announced publicly, so a plain fast hash would be brute-forceable offline.
-argon2 = "0.5"
+argon2 = "0.6"
 # CSPRNG for the per-session auth salt.
-getrandom = "0.2"
+getrandom = "0.4"
 # AEAD sealing of session-topic gossip for passphrase-protected sessions, so a
 # LAN peer without the passphrase can't observe live edits (or lift the session
 # token out of a plaintext proposal envelope).
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 # Matching every project file name against the project text at once, to
 # share only the files a session actually uses (`referenced_files`).
 aho-corasick = "1"

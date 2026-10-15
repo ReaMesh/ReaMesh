@@ -1067,12 +1067,12 @@ fn seal_session_msg(key: &chacha20poly1305::Key, tagged: &[u8], sender: &str) ->
     use chacha20poly1305::aead::{Aead, Payload};
     use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
     let mut nonce = [0u8; SEAL_NONCE_LEN];
-    if let Err(e) = getrandom::getrandom(&mut nonce) {
+    if let Err(e) = getrandom::fill(&mut nonce) {
         eprintln!("[reamesh] seal: getrandom failed ({e}); message not sent");
         return None;
     }
     let ct = XChaCha20Poly1305::new(key)
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: tagged, aad: sender.as_bytes() })
+        .encrypt(&XNonce::from(nonce), Payload { msg: tagged, aad: sender.as_bytes() })
         .ok()?;
     let mut out = Vec::with_capacity(1 + SEAL_NONCE_LEN + ct.len());
     out.push(TAG_SEALED);
@@ -1090,9 +1090,10 @@ fn open_session_msg(key: &chacha20poly1305::Key, data: &[u8], sender: &str) -> O
     if data.first() != Some(&TAG_SEALED) || data.len() < 1 + SEAL_NONCE_LEN + 16 {
         return None;
     }
+    let nonce = XNonce::try_from(&data[1..1 + SEAL_NONCE_LEN]).ok()?;
     XChaCha20Poly1305::new(key)
         .decrypt(
-            XNonce::from_slice(&data[1..1 + SEAL_NONCE_LEN]),
+            &nonce,
             Payload { msg: &data[1 + SEAL_NONCE_LEN..], aad: sender.as_bytes() },
         )
         .ok()
@@ -1116,7 +1117,7 @@ fn valid_session_id(id: &str) -> bool {
 
 fn random_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
-    if let Err(e) = getrandom::getrandom(&mut buf) {
+    if let Err(e) = getrandom::fill(&mut buf) {
         // getrandom only fails if the OS RNG is unavailable; fall back to a
         // time/address probe rather than panicking. (Salt secrecy is not the
         // security property (the passphrase is) but uniqueness still matters.)
@@ -6382,6 +6383,24 @@ mod tests {
         assert_ne!(sealed, sealed2);
         // Open sessions have no key at all: gossip stays plaintext.
         assert!(gossip_key("").is_none());
+    }
+
+    #[test]
+    fn auth_and_sealing_bytes_are_wire_stable() {
+        // Known answers from argon2 0.5.3 + chacha20poly1305 0.10.1. Peers on
+        // different builds must derive the same token and open each other's
+        // sealed gossip, so a dependency bump that changes either output is a
+        // wire change and needs a PROTO bump.
+        let token = auth_token("salt-abc", "hunter2");
+        assert_eq!(token, "3b7578c63371470c2a87e10ddcbfc8afe1154d61649ff26ec47b97665c3bbdbb");
+        let hex = "5824242424242424242424242424242424242424242424242461e21698d50c45\
+                   1221db05239abb2ae4ea0183f5410b671ef07f64db";
+        let sealed: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let key = gossip_key(&token).unwrap();
+        assert_eq!(open_session_msg(&key, &sealed, "12D3KooPeerOne").unwrap(), b"Ahello-world");
     }
 
     #[test]
