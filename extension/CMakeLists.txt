@@ -14,7 +14,17 @@ project(reaper_reamesh CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_library(reaper_reamesh SHARED src/reamesh.cpp)
+if(APPLE)
+  enable_language(OBJCXX)
+  set(CMAKE_OBJCXX_STANDARD 20)
+  set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+  set(REAMESH_CURSOR_SRC src/cursor_overlay_mac.mm)
+  set_source_files_properties(src/cursor_overlay_mac.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+else()
+  set(REAMESH_CURSOR_SRC src/cursor_overlay_stub.cpp)
+endif()
+
+add_library(reaper_reamesh SHARED src/reamesh.cpp ${REAMESH_CURSOR_SRC})
 set_target_properties(reaper_reamesh PROPERTIES
   PREFIX ""
   # Only export ReaperPluginEntry (marked with REAPER_PLUGIN_DLL_EXPORT);
@@ -53,7 +63,9 @@ target_link_libraries(reaper_reamesh PRIVATE "${REAMESH_RUST_LIB}")
 if(APPLE)
   target_link_libraries(reaper_reamesh PRIVATE
     "-framework CoreFoundation"
-    "-framework CoreGraphics"  # main-display height for the overlay y-flip
+    "-framework CoreGraphics"
+    "-framework Cocoa"         # peer cursor layer (cursor_overlay_mac.mm)
+    "-framework QuartzCore"
     "-framework Security"
     "-framework SystemConfiguration"
     resolv

@@ -120,6 +120,10 @@
 #define REAPERAPI_WANT_PCM_Source_BuildPeaks
 // The persisted-tint ledger (tintLedgerSave / tintLedgerLine).
 #define REAPERAPI_WANT_GetCurrentProjectInLoadSave
+// Peer cursors in the arrange (cursor_overlay.h).
+#define REAPERAPI_WANT_GetMainHwnd
+#define REAPERAPI_WANT_UpdateTimeline
+#define REAPERAPI_WANT_CSurf_OnScroll
 #define REAPERAPI_WANT_MarkProjectDirty
 
 #include "reaper_plugin.h"
@@ -127,6 +131,7 @@
 
 #include "reamesh_ffi.h"
 #include "json.hpp"
+#include "cursor_overlay.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -5510,6 +5515,151 @@ static void unsupportedTick() {
   reamesh_ctl_publish(dumpJson(state).c_str());
 }
 
+// ---------- peer cursors in the arrange (prototype) ----------
+//
+// Everyone's mouse over the arrange, drawn by cursor_overlay inside REAPER.
+// Positions go out semantically: project seconds, track GUID and the height
+// fraction inside that track, so a cursor lands on the same spot of the song
+// whatever each person's zoom and scroll.
+
+static bool g_cursorAttached = false;
+// GUID -> track, valid while the project state change count holds (adding,
+// removing or reordering tracks bumps it). nullptr caches "not here".
+static std::map<std::string, MediaTrack*> g_cursorTracks;
+static int g_cursorTracksStamp = -1;
+
+static bool cursorReady() {
+  return (g_mode == Mode::Hosting || g_mode == Mode::ClientActive) && !g_applyingRemote &&
+         !g_openingProject;
+}
+
+static bool cursorTimeAxis(double* t0, double* spp) {
+  double a = 0, b = 0, end = 0;
+  GetSet_ArrangeView2(nullptr, false, 0, 0, t0, &end);
+  GetSet_ArrangeView2(nullptr, false, 0, 1000, &a, &b);
+  *spp = (b - a) / 1000.0;
+  return *spp > 0.0;
+}
+
+static MediaTrack* cursorTrack(const std::string& guid) {
+  const int stamp = GetProjectStateChangeCount(nullptr);
+  if (stamp != g_cursorTracksStamp) {
+    g_cursorTracks.clear();
+    g_cursorTracksStamp = stamp;
+  }
+  auto it = g_cursorTracks.find(guid);
+  if (it != g_cursorTracks.end()) return it->second;
+  MediaTrack* hit = findTrackByGuid(guid);
+  g_cursorTracks[guid] = hit;
+  return hit;
+}
+
+static bool cursorTrackSpan(const char* guid, double* y, double* h) {
+  MediaTrack* tr = cursorTrack(guid);
+  if (!tr) return false;
+  const bool shown = GetMediaTrackInfo_Value(tr, "B_SHOWINTCP") != 0.0;
+  *y = GetMediaTrackInfo_Value(tr, "I_TCPY");
+  *h = shown ? GetMediaTrackInfo_Value(tr, "I_TCPH") : 0.0;
+  return true;
+}
+
+static bool cursorTrackAt(double y, std::string* guid, double* fy) {
+  const int n = CountTracks(nullptr);
+  for (int i = 0; i < n; ++i) {
+    MediaTrack* tr = GetTrack(nullptr, i);
+    if (GetMediaTrackInfo_Value(tr, "B_SHOWINTCP") == 0.0) continue;
+    const double ty = GetMediaTrackInfo_Value(tr, "I_TCPY");
+    const double th = GetMediaTrackInfo_Value(tr, "I_TCPH");
+    if (th > 0 && y >= ty && y < ty + th) {
+      *guid = trackGuid(tr);
+      *fy = (y - ty) / th;
+      return true;
+    }
+  }
+  return false;
+}
+
+static void cursorSetTimeAxis(double t0, double t1) {
+  double a = t0, b = t1;
+  GetSet_ArrangeView2(nullptr, true, 0, 0, &a, &b);
+  UpdateTimeline();
+}
+
+static bool cursorTrackGuidAt(int index, std::string* guid) {
+  MediaTrack* tr = GetTrack(nullptr, index);
+  if (!tr) return false;
+  *guid = trackGuid(tr);
+  return true;
+}
+
+static void cursorTestNudge(int kind, int index, int v) {
+  if (kind == 0) {
+    MediaTrack* tr = GetTrack(nullptr, index);
+    if (!tr) return;
+    SetMediaTrackInfo_Value(tr, "I_HEIGHTOVERRIDE", v);
+    TrackList_AdjustWindows(false);
+  } else {
+    CSurf_OnScroll(0, v);
+  }
+}
+
+static void cursorStop() {
+  if (!g_cursorAttached) return;
+  cursor_overlay::detach();
+  g_cursorAttached = false;
+}
+
+// Sends the local pointer at most every 50ms and only while it changes (plus a
+// keep-alive every 3s while it rests in the arrange, so peers don't fade it as
+// stale). A click goes out at once.
+static void cursorTick() {
+  if (!g_cursorAttached) {
+    static const cursor_overlay::Host host = {cursorReady, cursorTimeAxis, cursorTrackSpan,
+                                              cursorTrackAt, cursorSetTimeAxis, cursorTrackGuidAt,
+                                              cursorTestNudge};
+    g_cursorAttached = cursor_overlay::attach(GetMainHwnd(), host);
+    if (!g_cursorAttached) return;
+  }
+  char* raw = reamesh_drain_cursors(g_handle);
+  const std::string payload = raw ? raw : "[]";
+  reamesh_free_string(raw);
+  if (payload != "[]") {
+    const json arr = json::parse(payload, nullptr, false);
+    if (arr.is_array())
+      for (const auto& c : arr) {
+        if (!c.is_object()) continue;
+        cursor_overlay::Remote r;
+        r.id = jsonStr(c, "by");
+        r.name = jsonStr(c, "name");
+        r.color = jsonStr(c, "color");
+        r.t = jsonNum(c, "t", 0.0);
+        r.guid = jsonStr(c, "g");
+        r.fy = jsonNum(c, "fy", 0.0);
+        r.in = jsonBool(c, "in", false);
+        r.click = jsonBool(c, "click", false);
+        cursor_overlay::update(r);
+      }
+  }
+  cursor_overlay::tick();
+
+  static cursor_overlay::Local last;
+  static auto lastSent = std::chrono::steady_clock::time_point{};
+  cursor_overlay::Local l;
+  if (!cursor_overlay::sampleLocal(&l)) return;
+  const auto now = std::chrono::steady_clock::now();
+  const auto since = now - lastSent;
+  const bool changed = l.in != last.in ||
+                       (l.in && (std::fabs(l.px - last.px) >= 1 || std::fabs(l.py - last.py) >= 1 ||
+                                 l.guid != last.guid || l.t != last.t));
+  const bool send = l.click || (changed && since >= std::chrono::milliseconds(50)) ||
+                    (l.in && since >= std::chrono::seconds(3));
+  if (!send) return;
+  const json m = {{"t", l.t}, {"g", l.guid}, {"fy", l.fy}, {"in", l.in}, {"click", l.click}};
+  reamesh_send_cursor(g_handle, dumpJson(m).c_str());
+  last = l;
+  lastSent = now;
+}
+
 static void timerTickBody() {
   if (g_unsupported) {
     unsupportedTick();
@@ -5520,6 +5670,7 @@ static void timerTickBody() {
   // Idle (the app may connect before any session exists).
   ctlTick();
   healPersistedTints();
+  if (!g_handle || (g_mode != Mode::Hosting && g_mode != Mode::ClientActive)) cursorStop();
   if (!g_handle) return;
 
   switch (g_mode) {
@@ -5567,6 +5718,7 @@ static void timerTickBody() {
       pushLocalPresence();
       followTick();
       drainPings();
+      cursorTick();
       if (g_mode == Mode::Hosting) refreshSessionMeta(false);
       // Capture before apply, so an edit made by the user in this tick
       // interval is diffed against the old baseline before remote

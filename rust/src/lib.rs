@@ -73,7 +73,7 @@ const LOBBY_TOPIC: &str = "reamesh/v2/lobby";
 /// instead of tested. Mirrored in the app (`app/src/lib/version.ts`,
 /// `app/src-tauri/src/lib.rs`); app/src/lib/version.test.ts checks the copies
 /// agree.
-pub const PROTO: u32 = 3;
+pub const PROTO: u32 = 4;
 /// This build's version, the same number across the core, the extension and
 /// the ReaMesh app (they release together).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -169,6 +169,12 @@ const PRESENCE_FAST_INTERVAL: Duration = Duration::from_millis(100);
 /// Authenticated exactly like a presence beacon (token-keyed MAC over the
 /// sender's peer id), so open-topic bystanders can't inject markers.
 const TAG_MARKER: u8 = b'M';
+/// Live mouse cursor over the arrange: `'C'` + JSON
+/// `{"t","g","fy","in","click","seq","mac"}` (project seconds, track GUID,
+/// 0..1 within the track, false once the mouse left the arrange). Sent at
+/// most ~20 times a second and only while it changes; receivers keep the
+/// latest per peer for the in-REAPER cursor layer. MAC'd like a beacon.
+const TAG_CURSOR: u8 = b'C';
 /// If the extension's main-thread presence feed (`set_presence`, called every
 /// timer tick) has been silent this long while the network thread still runs,
 /// REAPER's main thread is stuck (modal dialog, plugin hang): the beacon
@@ -615,6 +621,9 @@ struct Shared {
     /// extension to drain on its main-thread tick and drop into the project as
     /// local, non-synced markers.
     marker_inbox: Mutex<Vec<JsonValue>>,
+    /// Cursor updates received from peers ('C' messages), oldest first,
+    /// drained by the extension's cursor layer.
+    cursor_inbox: Mutex<Vec<JsonValue>>,
     /// Peer ids currently banned from this session: on the owner a mirror of
     /// the process-global ban table (refreshed every tick; the tick's diff
     /// against it is what triggers the blacklist + 'B' broadcast), on a
@@ -1545,6 +1554,9 @@ enum Command {
     /// Share a flag marker with every session peer (one 'M' publish). The
     /// sharer's display name and color are stamped on from the live profile.
     ShareMarker { name: String, pos: f64 },
+    /// Publish this peer's arrange cursor (one 'C' publish, the JSON body
+    /// without the MAC, which the task stamps on).
+    Cursor(JsonValue),
     /// Owner-side moderation: tell `peer` to leave (one 'K' publish), and with
     /// `ban` also keep it out for BAN_DURATION (the table itself is updated
     /// synchronously by `Reamesh::moderate`; the task publishes the change).
@@ -1769,6 +1781,7 @@ impl Reamesh {
             ctl_seq: AtomicU64::new(0),
             session_meta: Mutex::new(String::new()),
             marker_inbox: Mutex::new(Vec::new()),
+            cursor_inbox: Mutex::new(Vec::new()),
         });
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (init_tx, init_rx) = std_mpsc::channel();
@@ -2343,6 +2356,30 @@ impl Reamesh {
         self.cmd_tx
             .send(Command::Moderate { peer: peer_id.to_string(), ban })
             .is_ok()
+    }
+
+    /// Publish the local arrange cursor: `{"t","g","fy","in","click"}`.
+    pub fn send_cursor(&self, cursor_json: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<JsonValue>(cursor_json) else {
+            return false;
+        };
+        let num = |k: &str| v.get(k).and_then(|x| x.as_f64()).filter(|x| x.is_finite());
+        let body = json!({
+            "t": num("t").unwrap_or(0.0),
+            "g": v.get("g").and_then(|x| x.as_str()).unwrap_or("").chars().take(64).collect::<String>(),
+            "fy": num("fy").unwrap_or(0.0).clamp(0.0, 1.0),
+            "in": v.get("in").and_then(|x| x.as_bool()).unwrap_or(false),
+            "click": v.get("click").and_then(|x| x.as_bool()).unwrap_or(false),
+        });
+        self.cmd_tx.send(Command::Cursor(body)).is_ok()
+    }
+
+    /// Cursor updates received since the last call, oldest first, as
+    /// `[{"by","name","color","t","g","fy","in","click"}]` ("[]" when none).
+    pub fn drain_cursors(&self) -> String {
+        let drained: Vec<JsonValue> =
+            std::mem::take(&mut *self.shared.cursor_inbox.lock().unwrap());
+        json!(drained).to_string()
     }
 
     /// Pings (shared markers) received from peers since the last call, as a JSON array
@@ -4467,6 +4504,7 @@ fn start_join(
     shared.session_meta.lock().unwrap().clear();
     shared.peers_info.lock().unwrap().clear();
     shared.marker_inbox.lock().unwrap().clear();
+    shared.cursor_inbox.lock().unwrap().clear();
     // Drop any proposals left in flight from a previous session
     // (e.g. before an auto-rejoin): their stale timestamps would
     // otherwise time out and surface as phantom snap-backs the
@@ -4741,6 +4779,19 @@ async fn run_network(
                             }
                         }
                         None => eprintln!("[reamesh] dropped shared marker: not in a session"),
+                    }
+                }
+                Some(Command::Cursor(mut body)) => {
+                    // Cursor traffic is ephemeral: never queued for retry,
+                    // a lost update is replaced by the next one.
+                    if let Some(t) = sess_topic.clone() {
+                        body["mac"] = json!(presence_mac(
+                            &shared.auth_token.lock().unwrap().clone(),
+                            &swarm.local_peer_id().to_string(),
+                        ));
+                        let mut data = vec![TAG_CURSOR];
+                        data.extend_from_slice(body.to_string().as_bytes());
+                        let _ = publish_session(&mut swarm, &shared, &t, &data);
                     }
                 }
                 Some(Command::Moderate { peer, ban }) => {
@@ -5454,6 +5505,45 @@ async fn run_network(
                                             beacons,
                                         },
                                     );
+                                }
+                            }
+                            (Some(&TAG_CURSOR), _) => {
+                                if plain.len() <= 1024
+                                    && let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..])
+                                {
+                                    let mac = v.get("mac").and_then(|x| x.as_str()).unwrap_or("");
+                                    let expected = presence_mac(
+                                        &shared.auth_token.lock().unwrap().clone(),
+                                        &src.to_string(),
+                                    );
+                                    if !ct_eq(mac.as_bytes(), expected.as_bytes()) {
+                                        continue;
+                                    }
+                                    let by = src.to_string();
+                                    let (name, color) = shared
+                                        .peers_info
+                                        .lock()
+                                        .unwrap()
+                                        .get(&by)
+                                        .map(|p| (p.name.clone(), p.color.clone()))
+                                        .unwrap_or_default();
+                                    let num = |k: &str| {
+                                        v.get(k).and_then(|x| x.as_f64()).filter(|x| x.is_finite()).unwrap_or(0.0)
+                                    };
+                                    let mut inbox = shared.cursor_inbox.lock().unwrap();
+                                    if inbox.len() >= 256 {
+                                        inbox.remove(0);
+                                    }
+                                    inbox.push(json!({
+                                        "by": by,
+                                        "name": name,
+                                        "color": if color.is_empty() { default_color(&by) } else { color },
+                                        "t": num("t"),
+                                        "g": v.get("g").and_then(|x| x.as_str()).unwrap_or("").chars().take(64).collect::<String>(),
+                                        "fy": num("fy").clamp(0.0, 1.0),
+                                        "in": v.get("in").and_then(|x| x.as_bool()).unwrap_or(false),
+                                        "click": v.get("click").and_then(|x| x.as_bool()).unwrap_or(false),
+                                    }));
                                 }
                             }
                             (Some(&TAG_MARKER), _) => {
@@ -7214,6 +7304,32 @@ pub extern "C" fn reamesh_drain_markers(handle: *mut Reamesh) -> *mut c_char {
     } else {
         let r = unsafe { &*handle };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.drain_markers()))
+            .unwrap_or_else(|_| "[]".to_string())
+    };
+    into_c_string(out)
+}
+
+/// Publish the local arrange cursor (`{"t","g","fy","in","click"}`) to every
+/// session peer. Returns whether it was queued.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_send_cursor(handle: *mut Reamesh, cursor_json: *const c_char) -> bool {
+    let (false, Some(c)) = (handle.is_null(), cstr_arg(cursor_json)) else {
+        return false;
+    };
+    let r = unsafe { &*handle };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.send_cursor(&c))).unwrap_or(false)
+}
+
+/// Cursor updates received from peers since the last call, oldest first, as
+/// a JSON array of `{"by","name","color","t","g","fy","in","click"}`. Free
+/// with `reamesh_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_drain_cursors(handle: *mut Reamesh) -> *mut c_char {
+    let out = if handle.is_null() {
+        "[]".to_string()
+    } else {
+        let r = unsafe { &*handle };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.drain_cursors()))
             .unwrap_or_else(|_| "[]".to_string())
     };
     into_c_string(out)

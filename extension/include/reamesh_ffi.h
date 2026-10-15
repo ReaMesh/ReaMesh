@@ -19,7 +19,7 @@
  * `app/src-tauri/src/lib.rs`); app/src/lib/version.test.ts checks the copies
  * agree.
  */
-#define PROTO 3
+#define PROTO 4
 
 typedef struct ReameshHandle ReameshHandle;
 
@@ -223,6 +223,19 @@ bool reamesh_share_marker(struct ReameshHandle *handle, const char *marker_json)
  * `reamesh_free_string`.
  */
 char *reamesh_drain_markers(struct ReameshHandle *handle);
+
+/**
+ * Publish the local arrange cursor (`{"t","g","fy","in","click"}`) to every
+ * session peer. Returns whether it was queued.
+ */
+bool reamesh_send_cursor(struct ReameshHandle *handle, const char *cursor_json);
+
+/**
+ * Cursor updates received from peers since the last call, oldest first, as
+ * a JSON array of `{"by","name","color","t","g","fy","in","click"}`. Free
+ * with `reamesh_free_string`.
+ */
+char *reamesh_drain_cursors(struct ReameshHandle *handle);
 
 /**
  * Owner-side moderation: make `peer_id` leave the session (`ban` false: a
