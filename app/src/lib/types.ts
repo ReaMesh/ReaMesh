@@ -111,6 +111,10 @@ export interface ExtState {
   session: string;
   /** Name (stem) of the project currently open in this REAPER instance. */
   project: string;
+  /** Full paths this REAPER is using: every open project tab, the session's
+   *  project, and the folder a join downloads into. Absent from older
+   *  extensions. */
+  in_use?: string[];
   /** Last session-ending event; null when there is none. */
   error: LogEntry | null;
   log: LogEntry[];

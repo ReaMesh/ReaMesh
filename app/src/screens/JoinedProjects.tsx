@@ -41,6 +41,12 @@ function sessionDirName(name: string): string {
   return cleaned.trim().replace(/^\.+/, "") || "session";
 }
 
+/** Comparable form of a path: one separator, no trailing one, and case-folded
+ *  (the default macOS and Windows file systems ignore case). */
+function normPath(p: string): string {
+  return p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
 export function JoinedProjects({ onBack }: { onBack: () => void }) {
   useLang();
   const [list, setList] = useState<JoinedProject[] | null>(null);
@@ -56,16 +62,26 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
   }, []);
   useEffect(load, [load]);
 
-  // A copy one of the running REAPERs has open (or is downloading into) stays.
-  const inUse = (p: JoinedProject) =>
-    instances.some(({ state }) => {
+  // A copy one of the running REAPERs has open (or is downloading into)
+  // stays: any path it reports that lies inside the copy's folder.
+  const inUse = (p: JoinedProject) => {
+    const dir = normPath(p.path);
+    return instances.some(({ state }) => {
       if (!state) return false;
+      if (state.in_use) {
+        return state.in_use.some((u) => {
+          const n = normPath(u);
+          return n === dir || n.startsWith(dir + "/");
+        });
+      }
+      // An older extension reports only names: match on those.
       if (state.project && p.projects.includes(state.project)) return true;
       return (
         (state.mode === "downloading" || state.mode === "client") &&
         sessionDirName(state.session) === p.name
       );
     });
+  };
 
   const trash = async () => {
     if (!target) return;

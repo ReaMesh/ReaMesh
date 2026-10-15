@@ -359,6 +359,9 @@ struct StatusState {
     /// keep moving meanwhile; it drops to false when the last file lands.
     background: bool,
     project_path: Option<String>,
+    /// The folder a join downloads into (set when it starts), so the app
+    /// can tell that copy is in use before the project is open.
+    dir: Option<String>,
     session_id: Option<String>,
     session_name: Option<String>,
     message: Option<String>,
@@ -379,6 +382,7 @@ impl StatusState {
             "current_file": self.current_file,
             "background": self.background,
             "project_path": self.project_path,
+            "dir": self.dir,
             "session_id": self.session_id,
             "session_name": self.session_name,
             "message": self.message,
@@ -1496,6 +1500,7 @@ impl Reamesh {
             current_file: String::new(),
             background: false,
             project_path: None,
+            dir: None,
             session_id: Some(session_id),
             session_name: Some(session_name.to_string()),
             message: None,
@@ -1557,6 +1562,7 @@ impl Reamesh {
             current_file: String::new(),
             background: false,
             project_path: None,
+            dir: None,
             session_id: None,
             session_name: None,
             message: None,
@@ -3784,9 +3790,11 @@ fn start_join(
     ));
     let sid = session_id.to_string();
     let name = info.session_name.clone();
+    let dir_str = dir.to_string_lossy().into_owned();
     set_status(shared, |s| {
         s.state = "connecting".into();
         s.progress = 0.0;
+        s.dir = Some(dir_str);
         s.session_id = Some(sid);
         s.session_name = Some(name);
         s.message = None;

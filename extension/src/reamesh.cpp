@@ -4384,6 +4384,24 @@ static void ctlPublishState() {
   state["type"] = "state";
   state["mode"] = modeName();
   state["project"] = fileStem(currentProjectPath());
+  // Full paths this REAPER is using, so the app's joined-projects list never
+  // offers to trash one of them: every open project tab, the session's
+  // project, and the folder a join is downloading into (before it is open).
+  {
+    json inUse = json::array();
+    for (int i = 0;; ++i) {
+      char buf[4096] = {0};
+      if (!EnumProjects(i, buf, sizeof(buf))) break;
+      if (buf[0]) inUse.push_back(std::string(buf));
+    }
+    if ((g_mode == Mode::Hosting || g_mode == Mode::ClientActive) && !g_sessionProjectPath.empty())
+      inUse.push_back(g_sessionProjectPath);
+    if (g_mode == Mode::Downloading || g_mode == Mode::ClientActive) {
+      const std::string dir = jsonStr(st, "dir");
+      if (!dir.empty()) inUse.push_back(dir);
+    }
+    state["in_use"] = std::move(inUse);
+  }
   // This REAPER's version, for the app's host-version mismatch warning.
   state["reaper"] = g_reaperVersion;
   state["error"] = g_lastError;
