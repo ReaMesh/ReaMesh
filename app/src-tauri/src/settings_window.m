@@ -12,7 +12,7 @@ static NSString *const kReaperDownloadURL = @"https://www.reaper.fm/download.php
 static NSString *const kDocsURL = @"https://reamesh.com/docs";
 
 static const CGFloat kWindowWidth = 480;
-static const CGFloat kWindowHeight = 416;
+static const CGFloat kWindowHeight = 448;
 static const CGFloat kMargin = 24;
 
 // The window is bilingual (English/German), driven by the same stored
@@ -358,6 +358,10 @@ static ReaMeshSettingsController *gController = nil;
     self.cb.show_credits(self.cb.ctx);
 }
 
+- (void)showJoined:(id)sender {
+    self.cb.show_joined(self.cb.ctx);
+}
+
 - (void)overlayToggled:(NSButton *)sender {
     int32_t mask = self.cb.get_overlay(self.cb.ctx);
     int32_t bit = (int32_t)sender.tag;
@@ -523,6 +527,24 @@ static ReaMeshSettingsController *gController = nil;
     help.lineBreakMode = NSLineBreakByWordWrapping;
     help.maximumNumberOfLines = 0;
     [self.container addSubview:help];
+    y += 48;
+
+    // Downloaded copies of joined sessions live in the REAPER folder too.
+    [self.container addSubview:[self headerWithString:L(@"Storage", @"Speicher") y:y]];
+    y += 28;
+
+    CGFloat showW = 120;
+    NSTextField *joinedLabel =
+        [self labelWithString:L(@"Joined projects", @"Beigetretene Projekte")
+                        frame:NSMakeRect(kMargin, y + 4, w - showW - 12, 18)];
+    joinedLabel.font = [NSFont systemFontOfSize:13];
+    [self.container addSubview:joinedLabel];
+    NSButton *joined = [NSButton buttonWithTitle:L(@"Show…", @"Anzeigen…")
+                                          target:self
+                                          action:@selector(showJoined:)];
+    joined.frame = NSMakeRect(kMargin + w - showW, y, showW, 28);
+    joined.bezelStyle = NSBezelStyleRounded;
+    [self.container addSubview:joined];
 }
 
 // Privacy (network identity) and help (docs, diagnostics, version): the

@@ -3,14 +3,14 @@ import { listen } from "@tauri-apps/api/event";
 
 // Bridges the restart after an update so it reads as a short reload: the
 // window fades out, the screen the server doesn't know about (Settings, the
-// acknowledgements) is remembered, and the new process starts hidden, puts
+// acknowledgements, the joined projects) is remembered, and the new process starts hidden, puts
 // that screen back and only shows its window once something is painted.
 
 const KEY = "reamesh.resume";
 /** Older than this, a leftover note is from some other exit: ignore it. */
 const MAX_AGE_MS = 60_000;
 
-export type ResumeScreen = "settings" | "credits" | null;
+export type ResumeScreen = "settings" | "credits" | "joined" | null;
 
 let current: () => ResumeScreen = () => null;
 

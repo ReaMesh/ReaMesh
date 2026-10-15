@@ -1107,6 +1107,157 @@ fn do_reset_identity(app: &AppHandle) -> Result<bool, String> {
     Ok(true)
 }
 
+// ---------- joined projects ----------
+//
+// Every join downloads the host's project into a folder of its own under
+// `<REAPER resource>/ReaMesh/<session name>-<session id>` (the extension's
+// staging root). The extension sweeps copies nothing has touched for three
+// days; this lists what is there so a big one can go to the Trash right away.
+
+/// Entries one listing walks at most, so a pathological folder can't hang it.
+const JOINED_WALK_BUDGET: u32 = 200_000;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JoinedProject {
+    /// Folder name inside the staging root: what `trash_joined_project` takes.
+    dir: String,
+    /// The session's name (the folder name minus its session-id suffix).
+    name: String,
+    path: String,
+    bytes: u64,
+    /// Newest modification anywhere inside, unix ms.
+    modified: u64,
+    /// Stems of the project files inside, as REAPER reports an open project.
+    projects: Vec<String>,
+}
+
+fn staging_root(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(resource_dir(&load_custom_path(app))?.join("ReaMesh"))
+}
+
+/// "Song-18c2f9a0" → "Song": the extension names each copy after the session
+/// plus the first 8 hex digits of its id.
+fn joined_name(dir: &str) -> String {
+    match dir.rsplit_once('-') {
+        Some((name, id))
+            if !name.is_empty() && id.len() == 8 && id.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            name.to_string()
+        }
+        _ => dir.to_string(),
+    }
+}
+
+fn unix_ms(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+fn scan_joined(path: &Path, dir: String) -> JoinedProject {
+    let mut bytes = 0u64;
+    let mut newest = fs::metadata(path).and_then(|m| m.modified()).ok();
+    let mut projects = Vec::new();
+    let mut budget = JOINED_WALK_BUDGET;
+    // (folder, depth): project files sit at the top or one level down.
+    let mut stack = vec![(path.to_path_buf(), 0u32)];
+    'walk: while let Some((d, depth)) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for entry in rd.flatten() {
+            if budget == 0 {
+                break 'walk;
+            }
+            budget -= 1;
+            // Not following links: a link out of the folder isn't its size.
+            let Ok(meta) = entry.path().symlink_metadata() else { continue };
+            if let Ok(t) = meta.modified() {
+                if newest.is_none_or(|n| t > n) {
+                    newest = Some(t);
+                }
+            }
+            if meta.is_dir() {
+                stack.push((entry.path(), depth + 1));
+                continue;
+            }
+            bytes += meta.len();
+            let p = entry.path();
+            if depth <= 1 && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("rpp")) {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    projects.push(stem.to_string());
+                }
+            }
+        }
+    }
+    JoinedProject {
+        name: joined_name(&dir),
+        path: path.to_string_lossy().into_owned(),
+        dir,
+        bytes,
+        modified: newest.map(unix_ms).unwrap_or(0),
+        projects,
+    }
+}
+
+/// The downloaded copies of joined sessions, most recently used first.
+#[tauri::command]
+async fn joined_projects(app: AppHandle) -> Result<Vec<JoinedProject>, String> {
+    let root = staging_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let Ok(rd) = fs::read_dir(&root) else { return Vec::new() };
+        let mut list: Vec<JoinedProject> = rd
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| {
+                let dir = e.file_name().to_str()?.to_string();
+                // Hidden folders are transfer temp state, not a project.
+                if dir.starts_with('.') {
+                    return None;
+                }
+                Some(scan_joined(&e.path(), dir))
+            })
+            .collect();
+        list.sort_by(|a, b| b.modified.cmp(&a.modified));
+        list
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Move one downloaded copy (a folder name from `joined_projects`) to the
+/// Trash / Recycle Bin, so a mistaken click can still be put back.
+#[tauri::command]
+async fn trash_joined_project(app: AppHandle, dir: String) -> Result<(), String> {
+    let root = staging_root(&app)?;
+    // A bare folder name, never a path: nothing outside the staging root.
+    if dir.is_empty()
+        || dir.starts_with('.')
+        || dir.contains(['/', '\\'])
+        || Path::new(&dir).components().count() != 1
+    {
+        return Err("invalid project folder".into());
+    }
+    let path = root.join(&dir);
+    let meta = path.symlink_metadata().map_err(|e| e.to_string())?;
+    if !meta.is_dir() {
+        return Err("invalid project folder".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let ctx = {
+            #[allow(unused_mut)]
+            let mut ctx = trash::TrashContext::default();
+            // Finder's method asks for permission to control Finder.
+            #[cfg(target_os = "macos")]
+            {
+                use trash::macos::{DeleteMethod, TrashContextExtMacos};
+                ctx.set_delete_method(DeleteMethod::NsFileManager);
+            }
+            ctx
+        };
+        ctx.delete(&path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 fn get_reaper_path(app: AppHandle) -> Option<String> {
     load_custom_path(&app)
@@ -1625,6 +1776,8 @@ pub fn run() {
             open_firewall_settings,
             port_trouble,
             reset_network_identity,
+            joined_projects,
+            trash_joined_project,
             copy_diagnostics_text,
             build_info
         ])
@@ -1791,6 +1944,7 @@ mod native_settings {
         get_update_channel: extern "C" fn(*mut c_void) -> i32,
         set_update_channel: extern "C" fn(*mut c_void, i32),
         stable_available: extern "C" fn(*mut c_void) -> i32,
+        show_joined: extern "C" fn(*mut c_void),
     }
 
     extern "C" {
@@ -1967,6 +2121,18 @@ mod native_settings {
         let _ = app.emit("menu:credits", ());
     }
 
+    // The joined-projects list is a main-window screen too (sizes, Trash).
+    extern "C" fn show_joined(ctx: *mut c_void) {
+        use tauri::Manager;
+        let app = handle(ctx);
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.unminimize();
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        let _ = app.emit("menu:joined", ());
+    }
+
     extern "C" fn reset_identity(ctx: *mut c_void) -> i32 {
         match do_reset_identity(handle(ctx)) {
             Ok(true) => 1,
@@ -2019,6 +2185,7 @@ mod native_settings {
             get_update_channel,
             set_update_channel,
             stable_available,
+            show_joined,
         };
         unsafe { reamesh_settings_open(cb) };
     }

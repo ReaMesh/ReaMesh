@@ -16,6 +16,7 @@ import { Outdated } from "@/screens/Outdated";
 import { Session } from "@/screens/Session";
 import { Settings } from "@/screens/Settings";
 import { Credits } from "@/screens/Credits";
+import { JoinedProjects } from "@/screens/JoinedProjects";
 import { ExtMismatch } from "@/screens/ExtMismatch";
 import { startScanning, send, useActiveInstance } from "@/lib/connection";
 import { offerInvite } from "@/lib/invite";
@@ -271,24 +272,28 @@ export default function App() {
   const state = instance?.state;
   const reaper = useReaperStatus();
   // Settings is a webview screen on Windows only (macOS has the native
-  // window), so the acknowledgements return to it only there.
+  // window), so the acknowledgements and joined projects return to it only there.
   const [settingsOpen, setSettingsOpen] = useState(
-    resumed?.screen === "settings" || (resumed?.screen === "credits" && isWindows),
+    resumed?.screen === "settings" ||
+      ((resumed?.screen === "credits" || resumed?.screen === "joined") && isWindows),
   );
   const [creditsOpen, setCreditsOpen] = useState(resumed?.screen === "credits");
+  const [joinedOpen, setJoinedOpen] = useState(resumed?.screen === "joined");
   useLang(); // re-render the whole tree when the language changes
   const appVersion = useAppVersion();
 
   // Remembered across the restart after an update.
-  const screenRef = useRef({ settingsOpen, creditsOpen });
-  screenRef.current = { settingsOpen, creditsOpen };
+  const screenRef = useRef({ settingsOpen, creditsOpen, joinedOpen });
+  screenRef.current = { settingsOpen, creditsOpen, joinedOpen };
   useEffect(() => {
     trackScreen(() =>
       screenRef.current.creditsOpen
         ? "credits"
-        : screenRef.current.settingsOpen
-          ? "settings"
-          : null,
+        : screenRef.current.joinedOpen
+          ? "joined"
+          : screenRef.current.settingsOpen
+            ? "settings"
+            : null,
     );
   }, []);
 
@@ -372,6 +377,7 @@ export default function App() {
   const waiting =
     !settingsOpen &&
     !creditsOpen &&
+    !joinedOpen &&
     reaper !== undefined &&
     !holdBlank &&
     !state &&
@@ -435,6 +441,7 @@ export default function App() {
         setSettingsOpen(true);
       }),
       listen("menu:credits", () => setCreditsOpen(true)),
+      listen("menu:joined", () => setJoinedOpen(true)),
       listen("menu:settings-changed", () => {
         loadReaperPath().then(refreshStatus);
       }),
@@ -531,6 +538,8 @@ export default function App() {
   let screen: { key: string; node: React.ReactNode };
   if (creditsOpen) {
     screen = { key: "credits", node: <Credits onBack={() => setCreditsOpen(false)} /> };
+  } else if (joinedOpen) {
+    screen = { key: "joined", node: <JoinedProjects onBack={() => setJoinedOpen(false)} /> };
   } else if (settingsOpen) {
     screen = {
       key: "settings",
@@ -538,6 +547,7 @@ export default function App() {
         <Settings
           onBack={() => setSettingsOpen(false)}
           onOpenCredits={() => setCreditsOpen(true)}
+          onOpenJoined={() => setJoinedOpen(true)}
         />
       ),
     };

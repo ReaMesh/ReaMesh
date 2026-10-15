@@ -38,6 +38,8 @@ import {
   useOverlaySettings,
 } from "@/lib/overlaySettings";
 import { isWindows } from "@/lib/platform";
+import { formatBytes } from "@/lib/format";
+import { listJoinedProjects } from "@/screens/JoinedProjects";
 import { PROTO } from "@/lib/version";
 import { cn, focusRing } from "@/lib/utils";
 
@@ -117,9 +119,11 @@ function Switch({
 export function Settings({
   onBack,
   onOpenCredits,
+  onOpenJoined,
 }: {
   onBack: () => void;
   onOpenCredits: () => void;
+  onOpenJoined: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const status = useReaperStatus();
@@ -134,6 +138,13 @@ export function Settings({
   const [build, setBuild] = useState<BuildInfo | null>(null);
   useEffect(() => {
     invoke<BuildInfo>("build_info").then(setBuild, () => {});
+  }, []);
+  const [joinedBytes, setJoinedBytes] = useState<number | null>(null);
+  useEffect(() => {
+    listJoinedProjects().then(
+      (l) => setJoinedBytes(l.reduce((n, p) => n + p.bytes, 0)),
+      () => {},
+    );
   }, []);
   const buildDate =
     build && build.buildTime > 0
@@ -475,6 +486,26 @@ export function Settings({
                 </Button>
               )}
             </Row>
+          </Group>
+        </section>
+
+        <section className="space-y-2">
+          <SectionLabel>{t("storage")}</SectionLabel>
+          <Group>
+            <button
+              type="button"
+              onClick={onOpenJoined}
+              className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
+            >
+              <Row label={t("joinedProjects")}>
+                {!!joinedBytes && (
+                  <span className="shrink-0 text-[12px] text-muted-foreground tabular-nums">
+                    {formatBytes(joinedBytes)}
+                  </span>
+                )}
+                <ChevronRight className="size-3.5 text-muted-foreground" aria-hidden="true" />
+              </Row>
+            </button>
           </Group>
         </section>
 

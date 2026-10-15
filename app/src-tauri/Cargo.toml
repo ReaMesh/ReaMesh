@@ -49,6 +49,9 @@ sys-locale = "0.3"
 # Network interfaces for the Lobby's "a VPN is active" line (vpn_active).
 # Same version libp2p's mDNS already pulls into the extension's core.
 if-addrs = "0.15"
+# Settings → Joined projects moves a downloaded session copy to the Trash /
+# Recycle Bin instead of deleting it outright.
+trash = { version = "5", default-features = false, features = ["coinit_apartmentthreaded"] }
 
 # The presence overlay's native behaviour on Windows (src/overlay_panel_win.rs):
 # a non-activating topmost window that follows REAPER's and hides when REAPER
