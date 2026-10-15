@@ -2326,17 +2326,19 @@ impl Reamesh {
         let mut infos = self.shared.peers_info.lock().unwrap();
         let now = Instant::now();
         infos.retain(|_, p| now.duration_since(p.last_seen) < PRESENCE_STALE);
-        // Deterministic roster order: session_peers comes from gossipsub's
-        // internal hash map each tick, so its order can differ from tick to
-        // tick, without the sort the composed app state "changes" every tick
-        // and roster rows shuffle.
-        let mut others: Vec<String> = self
-            .shared
-            .session_peers
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|p| p.to_string())
+        // Everyone with a fresh authenticated beacon, directly connected or
+        // not: where peers can't discover each other (multicast blocked, a
+        // guest network, a ticket join), two guests are each connected only
+        // to the host, and their beacons reach each other through the host's
+        // gossip relay. Requiring a direct connection hid them from each
+        // other. A direct member that leaves is dropped from `peers_info` by
+        // the tick right away; a relayed one ages out after PRESENCE_STALE.
+        // Sorted for a deterministic roster order, so the composed app state
+        // doesn't "change" every tick and rows don't shuffle.
+        let mut others: Vec<String> = infos
+            .keys()
+            .filter(|id| id.as_str() != self.local_peer_id)
+            .cloned()
             .collect();
         others.sort();
         others.dedup();
@@ -3795,8 +3797,10 @@ fn start_join(
     shared.peer_locks.lock().unwrap().clear();
     *shared.peer_locks_at.lock().unwrap() = None;
     shared.force_revert.lock().unwrap().clear();
-    // Per-session extras from any previous join on this handle.
+    // Per-session extras from any previous join on this handle. The roster
+    // lists every fresh beacon, so the previous session's people go too.
     shared.session_meta.lock().unwrap().clear();
+    shared.peers_info.lock().unwrap().clear();
     shared.marker_inbox.lock().unwrap().clear();
     // Drop any proposals left in flight from a previous session
     // (e.g. before an auto-rejoin): their stale timestamps would
@@ -4219,7 +4223,22 @@ async fn run_network(
                         .map(|(p, _)| *p)
                         .filter(|p| !blacklisted.contains(p))
                         .collect();
-                    *shared.session_peers.lock().unwrap() = peers;
+                    // A direct member that just left the topic (unsubscribed,
+                    // disconnected) leaves the roster now, not after its last
+                    // beacon goes stale. If it is still in the session behind
+                    // the host, its next relayed beacon brings it back.
+                    let prev = std::mem::replace(&mut *shared.session_peers.lock().unwrap(), peers.clone());
+                    let gone: Vec<String> = prev
+                        .iter()
+                        .filter(|p| !peers.contains(p))
+                        .map(|p| p.to_string())
+                        .collect();
+                    if !gone.is_empty() {
+                        let mut infos = shared.peers_info.lock().unwrap();
+                        for id in &gone {
+                            infos.remove(id);
+                        }
+                    }
                 }
                 // Owner: mirror the process-global ban table (a new ban, a
                 // revoke, an expiry) into the shared set, the gossipsub
