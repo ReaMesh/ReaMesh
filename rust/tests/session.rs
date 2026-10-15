@@ -863,8 +863,8 @@ fn progressive_join_reports_ready_before_media() {
     let project = temp_dir("proj-progressive");
     let staging = temp_dir("staging-progressive");
     make_project(&project);
-    // Well above PROGRESSIVE_MIN_BYTES (16 MiB), spread over three files that
-    // the .rpp uses in reverse order, so the timeline ordering is observable.
+    // Well above PROGRESSIVE_MIN_BYTES (16 MiB), spread over three files (one
+    // only a plugin uses), all of it held back behind the project file.
     const BIG: usize = 24 * 1024 * 1024;
     let stems: Vec<(String, Vec<u8>)> = (0..3u8)
         .map(|k| {
@@ -895,7 +895,7 @@ fn progressive_join_reports_ready_before_media() {
 
     // Poll tightly: the early `ready` must show up while media is still missing.
     let mut saw_early = false;
-    let mut first_media_seen: Option<String> = None;
+    let mut saw_media_missing = false;
     let mut client_dir: Option<PathBuf> = None;
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -914,10 +914,9 @@ fn progressive_join_reports_ready_before_media() {
                 // Ready came with the project file + small files, media pending.
                 assert!(dir.join("Song.rpp").exists());
                 assert!(dir.join("notes.txt").exists());
-                assert!(present.len() < stems.len(), "ready+background with all media present");
-                if first_media_seen.is_none() && present.len() == 1 {
-                    first_media_seen = Some(present[0].to_string());
-                }
+                // The last file can land a moment before `background` drops,
+                // so only some early report has to come with media missing.
+                saw_media_missing |= present.len() < stems.len();
             } else {
                 break; // finished
             }
@@ -926,15 +925,14 @@ fn progressive_join_reports_ready_before_media() {
         std::thread::sleep(Duration::from_millis(2));
     }
     assert!(saw_early, "never observed ready with background=true");
+    assert!(saw_media_missing, "ready+background only ever with all media present");
     let dir = client_dir.unwrap();
     for (name, bytes) in &stems {
         assert_eq!(&fs::read(dir.join(name)).unwrap(), bytes, "{name} corrupted");
     }
-    // Timeline order: the item at POSITION 10 (stem2) comes before the one at
-    // POSITION 30 (stem0); the unreferenced stem1 goes last.
-    if let Some(first) = first_media_seen {
-        assert_eq!(first, "Audio/stem2.wav", "media not delivered in timeline order");
-    }
+    // The media queue is sorted by timeline position (media_order_from_rpp has
+    // its own unit test). Which file lands first is not asserted here: pieces
+    // of several files are in flight at once, over more than one connection.
     // The final status is the ordinary completed one.
     let s: Value = serde_json::from_str(&client.status_json()).unwrap();
     assert_eq!(s["state"], "ready");
