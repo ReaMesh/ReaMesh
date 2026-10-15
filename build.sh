@@ -104,7 +104,7 @@ echo "Built: $EXT_OUT"
 [[ "$PLATFORM" == macos ]] && echo "       ($(lipo -archs "$EXT_OUT"), macOS $MAC_MIN+)"
 
 if [[ "$PLATFORM" == other ]]; then
-  echo "No companion app target on this platform."
+  echo "No app target on this platform."
   exit 0
 fi
 [[ $NO_APP == 1 ]] && exit 0

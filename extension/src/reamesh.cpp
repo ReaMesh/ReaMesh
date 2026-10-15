@@ -25,7 +25,7 @@
 // fetched from the session peers in the background; the item is applied as
 // soon as its files exist (deferred apply).
 //
-// Send status, errors, and activity to the companion app through the local
+// Send status, errors, and activity to the ReaMesh app through the local
 // control server instead of writing to the REAPER console. The app is the UI,
 // so the extension does not depend on ReaImGui or ReaPack.
 
@@ -493,7 +493,7 @@ static std::string g_joinPassphrase;
 // LAN), kept for auto-rejoin like the passphrase.
 static std::string g_joinTicket;
 
-// Two parameter-free convenience actions; the companion app is the real UI
+// Two parameter-free convenience actions; the ReaMesh app is the real UI
 // and drives everything (browse/join/leave) over the control server instead.
 static int g_cmdHost = 0, g_cmdLeave = 0;
 static custom_action_register_t g_caHost = {
@@ -501,7 +501,7 @@ static custom_action_register_t g_caHost = {
 static custom_action_register_t g_caLeave = {
     0, "REAMESH_LEAVE", "ReaMesh: Leave session / stop hosting", nullptr};
 
-// Activity log streamed to the companion app (never the REAPER console).
+// Activity log streamed to the ReaMesh app (never the REAPER console).
 // Entries are structured ({"code", "params", "text"}) so the app can render
 // them in the user's language; `text` is the English fallback for codes the
 // app doesn't know (or a raw message when `code` is empty).
@@ -4049,10 +4049,10 @@ static double jsonNum(const json& j, const char* key, double dflt) {
   return (it != j.end() && it->is_number()) ? it->get<double>() : dflt;
 }
 
-// ---------- companion app control server ----------
+// ---------- app control server ----------
 //
 // The Rust lib runs a localhost WebSocket server (reamesh_ctl_*) that the
-// ReaMesh companion app connects to. The app's commands are queued there and
+// ReaMesh app connects to. The app's commands are queued there and
 // drained here, on the main thread, where it is safe to drive the
 // browse/host/join/leave paths; in return we push one composed state JSON
 // (mode, session, people with names/colors, announced sessions, activity
@@ -4241,7 +4241,7 @@ static void ctlDispatch(const json& cmd) {
   } else if (c == "reveal_peer") {
     revealPeer(jsonStr(cmd, "peer_id"));
   } else if (c == "set_tint") {
-    // Companion app overlay setting: whether to paint the dark-grey lock tint.
+    // App overlay setting: whether to paint the dark-grey lock tint.
     const bool on = cmd.contains("on") && cmd["on"].is_boolean() ? cmd["on"].get<bool>() : true;
     if (on != g_tintEnabled) {
       g_tintEnabled = on;
@@ -4253,7 +4253,7 @@ static void ctlDispatch(const json& cmd) {
   }
 }
 
-// Compose the extension's state and publish it to the companion app when it
+// Compose the extension's state and publish it to the ReaMesh app when it
 // changed. Kept apart from the command drain (ctlTick) so a long main-thread
 // operation can publish an interim state on its own: openDownloadedProject
 // does, right before Main_openProject blocks, without dispatching queued
@@ -4807,7 +4807,7 @@ static void timerTick() {
     return;
   }
   if (g_applyingRemote) return;
-  // Companion-app commands and state mirroring run in every mode, including
+  // App commands and state mirroring run in every mode, including
   // Idle (the app may connect before any session exists).
   ctlTick();
   healPersistedTints();

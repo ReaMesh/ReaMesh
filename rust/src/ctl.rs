@@ -1,7 +1,7 @@
-//! Localhost control server for the ReaMesh companion app.
+//! Localhost control server for the ReaMesh app.
 //!
 //! A tiny WebSocket server bound to 127.0.0.1 that outlives any session: the
-//! companion app connects to it to remote-control the extension and mirror
+//! app connects to it to remote-control the extension and mirror
 //! its state. The C++ extension remains authoritative. Commands from the app
 //! are queued here and drained by the extension's timer tick through
 //! `reamesh_ctl_poll`, and the extension pushes its composed state JSON back
@@ -59,7 +59,7 @@ fn clear_noport_marker() {
     let _ = std::fs::remove_file(noport_marker_path());
 }
 
-/// Allowed WebSocket origins for the companion app and development server.
+/// Allowed WebSocket origins for the ReaMesh app and development server.
 /// Browser JavaScript cannot forge Origin; checking it prevents websites from
 /// sending commands to the local control server. Local non-browser clients
 /// may omit Origin because they already run as the user.

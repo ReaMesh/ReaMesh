@@ -7,7 +7,7 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 
 // Two entry points share this bundle. The floating presence HUD is opened as a
 // separate Tauri window pointed at `index.html?overlay=1&port=<n>`; every other
-// window is the main companion app. We branch with dynamic imports so the
+// window is the main app. We branch with dynamic imports so the
 // overlay window never pulls in App.tsx's module-level scanning side effects
 // (and vice versa).
 const params = new URLSearchParams(window.location.search);

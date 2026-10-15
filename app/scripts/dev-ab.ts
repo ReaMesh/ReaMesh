@@ -1,4 +1,4 @@
-// Launch two companion-app dev instances side by side (`bun run dev:ab`):
+// Launch two app dev instances side by side (`bun run dev:ab`):
 // A: plain `tauri dev` (Vite 1420, identifier com.reamesh.ReaMesh)
 // B: `tauri dev --config src-tauri/tauri.dev-b.conf.json` (Vite 1421,
 //    separate identifier and localStorage/config for a second profile)

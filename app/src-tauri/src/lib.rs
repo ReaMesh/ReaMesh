@@ -1,4 +1,4 @@
-// The companion app's Tauri backend stays thin: all session state lives in
+// The ReaMesh app's Tauri backend stays thin: all session state lives in
 // the REAPER extension, which the frontend talks to directly over the
 // localhost control WebSocket. The backend only does what the webview can't:
 // filesystem access for installing the bundled extension into REAPER's

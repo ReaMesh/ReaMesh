@@ -61,7 +61,7 @@ function DialogContent({
       <DialogPrimitive.Content
         data-slot="dialog-content"
         className={cn(
-          // Sized for the 420px companion window: the stock `sm:` breakpoints
+          // Sized for the 420px app window: the stock `sm:` breakpoints
           // never fire here, so the layout is stated outright instead. No
           // shadow: the dimmed backdrop already sets the dialog apart.
           // grid-cols-1 (= minmax(0, 1fr)) keeps one long nowrap row, like a

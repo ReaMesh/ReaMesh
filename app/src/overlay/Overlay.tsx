@@ -1,5 +1,5 @@
 // Frameless presence HUD for peer names, colors, and focused tracks. Session
-// controls remain in the main companion window.
+// controls remain in the main app window.
 //
 // Expanded shows the full roster. Collapsed shows the avatar stack.
 //

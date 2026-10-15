@@ -1,4 +1,4 @@
-//! Control-server round trip: this test plays the companion app, talking to
+//! Control-server round trip: this test plays the ReaMesh app, talking to
 //! the same WebSocket server REAPER's extension starts.
 
 use libp2p::futures::{SinkExt, StreamExt};

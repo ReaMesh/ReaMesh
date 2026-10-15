@@ -12,7 +12,7 @@
 /**
  * Compatibility number shared by everything a ReaMesh build talks to: the
  * session wire format (gossip, transfer, changeset JSON) and the control
- * server the companion app drives. Bump it on *any* change one side could
+ * server the ReaMesh app drives. Bump it on *any* change one side could
  * misread. Peers only join sessions announcing the same number, and the app
  * only drives an extension reporting it, so mismatched builds are refused
  * instead of tested. Mirrored in the app (`app/src/lib/version.ts`,
@@ -161,7 +161,7 @@ char *reamesh_locked_entities(struct ReameshHandle *handle);
 /**
  * Set the process-wide display profile (name + color hex) included in this
  * peer's presence beacons. Survives host/join/leave; usually set by the
- * companion app through the control server rather than called directly.
+ * app through the control server rather than called directly.
  */
 void reamesh_set_profile(const char *name, const char *color);
 
@@ -240,13 +240,13 @@ bool reamesh_unban(const char *peer_id);
 char *reamesh_bans(void);
 
 /**
- * Start the localhost control server the companion app connects to
+ * Start the localhost control server the ReaMesh app connects to
  * (idempotent). Returns the bound port, 0 if no port was available.
  */
 uint16_t reamesh_ctl_start(void);
 
 /**
- * Next command sent by a connected companion app, as a JSON string, or null
+ * Next command sent by a connected ReaMesh app, as a JSON string, or null
  * when none is queued. The extension drains this on its timer tick and
  * dispatches the commands itself (the server never acts on the session).
  * Free non-null results with `reamesh_free_string`.
@@ -254,7 +254,7 @@ uint16_t reamesh_ctl_start(void);
 char *reamesh_ctl_poll(void);
 
 /**
- * Broadcast the extension's composed state JSON to every connected companion
+ * Broadcast the extension's composed state JSON to every connected ReaMesh
  * app (and replay it to apps that connect later).
  */
 void reamesh_ctl_publish(const char *state_json);

@@ -66,7 +66,7 @@ const SECTIONS: [&str; 3] = [TRACKS_ROOT, ITEMS_ROOT, PROJECT_ROOT];
 const LOBBY_TOPIC: &str = "reamesh/v2/lobby";
 /// Compatibility number shared by everything a ReaMesh build talks to: the
 /// session wire format (gossip, transfer, changeset JSON) and the control
-/// server the companion app drives. Bump it on *any* change one side could
+/// server the ReaMesh app drives. Bump it on *any* change one side could
 /// misread. Peers only join sessions announcing the same number, and the app
 /// only drives an extension reporting it, so mismatched builds are refused
 /// instead of tested. Mirrored in the app (`app/src/lib/version.ts`,
@@ -74,7 +74,7 @@ const LOBBY_TOPIC: &str = "reamesh/v2/lobby";
 /// agree.
 pub const PROTO: u32 = 1;
 /// This build's version, the same number across the core, the extension and
-/// the companion app (they release together).
+/// the ReaMesh app (they release together).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const XFER_PROTOCOL: &str = "/reamesh/xfer/1";
 /// Max payload per file chunk over the transfer protocol. Each chunk is one
@@ -125,7 +125,7 @@ const SESSION_STALE: Duration = Duration::from_secs(10);
 /// legitimate burst (a full-state sync is one message); a flood past this is
 /// dropped rather than allowed to exhaust memory.
 const MAX_PENDING_UPDATES: usize = 4096;
-/// Companion byte cap on the same queue. The per-message `max_transmit_size` is
+/// A second byte cap on the same queue. The per-message `max_transmit_size` is
 /// 64 MB, so bounding only the *count* would still let ~256 GB accumulate;
 /// bounding total bytes keeps the worst case to a fixed, modest ceiling.
 const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
@@ -169,7 +169,7 @@ const TAG_MARKER: u8 = b'M';
 const MAIN_THREAD_STALE: Duration = Duration::from_secs(4);
 
 /// How often each connected peer is pinged for a round-trip time. The
-/// companion app turns a sustained high RTT into a "slow connection" notice;
+/// app turns a sustained high RTT into a "slow connection" notice;
 /// ping cost is one tiny stream per interval, so a short interval is cheap.
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 /// A ping that takes this long counts as a (very) slow link, not a dead one:
@@ -345,14 +345,14 @@ struct StatusState {
     state: String,
     progress: f64,
     /// Byte counters behind `progress` while downloading (0 otherwise): the
-    /// companion app shows "412 MB / 1.3 GB" and a transfer rate from these.
+    /// app shows "412 MB / 1.3 GB" and a transfer rate from these.
     done_bytes: u64,
     total_bytes: u64,
     /// File counters for the same download ("busy with file 3 of 41").
     files_done: u64,
     files_total: u64,
     /// Relative path of the file whose chunk arrived most recently ("" outside
-    /// a download): the companion app's download screen shows its name.
+    /// a download): the ReaMesh app's download screen shows its name.
     current_file: String,
     /// True while a progressive join is `ready` with media still downloading
     /// in the background (see PROGRESSIVE_MIN_BYTES). The byte/file counters
@@ -603,7 +603,7 @@ struct PeerPresence {
     beacons: u64,
 }
 
-/// Process-wide display profile (name, color hex), set by the companion app
+/// Process-wide display profile (name, color hex), set by the ReaMesh app
 /// through the control server (or `reamesh_set_profile`). Global rather than
 /// per-session: it describes the user, not the session, and must survive
 /// host/join/leave cycles.
@@ -645,7 +645,7 @@ fn banned_ids() -> HashSet<String> {
     live_bans().into_iter().map(|(id, _)| id).collect()
 }
 
-/// The live ban list for the companion app, as a JSON array of
+/// The live ban list for the ReaMesh app, as a JSON array of
 /// `{"id","name","color","expires_at"}` (`expires_at` = unix ms), soonest to lapse
 /// first. Independent of any session handle: the table is process-global.
 pub fn bans_json() -> String {
@@ -1156,13 +1156,13 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 // while that hosting run lives (id and ports change on re-host), like a
 // meeting link.
 
-/// Ticket wire format, a deep link the companion app registers as its own:
+/// Ticket wire format, a deep link the ReaMesh app registers as its own:
 ///
 /// `reamesh://join/<sid>?n=<name>&s=1&p=<peer>&a=<ip>,<ip>&t=<tcp>&q=<quic>`
 ///
 /// - `n` session name, percent-encoded (absent when empty)
 /// - `s` `1` when the session takes a passphrase (absent otherwise); read by
-///   the companion app to ask for one before joining, not by this side
+///   the ReaMesh app to ask for one before joining, not by this side
 /// - `p` the host's peer id (base58)
 /// - `a` the host's dialable IPs, comma-separated
 /// - `t` the host's TCP port, `q` its QUIC (UDP) port; at least one
@@ -1171,7 +1171,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// shares the same two ports: naming the IPs and the ports separately is what
 /// keeps the link short (the previous base64-JSON form spelled out every
 /// `/ip4/../tcp/..` multiaddr and ran to several hundred characters). It stays
-/// a plain readable URL, not binary, so the companion app can parse it in the
+/// a plain readable URL, not binary, so the ReaMesh app can parse it in the
 /// webview to show the session name and passphrase flag before anything
 /// touches the network.
 const TICKET_PREFIX: &str = "reamesh://join/";
@@ -1346,7 +1346,7 @@ fn parse_ticket(ticket: &str) -> Option<TicketInfo> {
             }
             "t" => tcp = v.parse().ok().filter(|p| *p != 0)?,
             "q" => quic = v.parse().ok().filter(|p| *p != 0)?,
-            // `s` (the auth flag) is the companion app's business; anything a
+            // `s` (the auth flag) is the ReaMesh app's business; anything a
             // later version adds is ignored rather than refused.
             _ => {}
         }
@@ -5992,7 +5992,7 @@ pub extern "C" fn reamesh_locked_entities(handle: *mut Reamesh) -> *mut c_char {
 
 /// Set the process-wide display profile (name + color hex) included in this
 /// peer's presence beacons. Survives host/join/leave; usually set by the
-/// companion app through the control server rather than called directly.
+/// app through the control server rather than called directly.
 #[unsafe(no_mangle)]
 pub extern "C" fn reamesh_set_profile(name: *const c_char, color: *const c_char) {
     set_profile(
@@ -6113,14 +6113,14 @@ pub extern "C" fn reamesh_bans() -> *mut c_char {
     into_c_string(std::panic::catch_unwind(bans_json).unwrap_or_else(|_| "[]".to_string()))
 }
 
-/// Start the localhost control server the companion app connects to
+/// Start the localhost control server the ReaMesh app connects to
 /// (idempotent). Returns the bound port, 0 if no port was available.
 #[unsafe(no_mangle)]
 pub extern "C" fn reamesh_ctl_start() -> u16 {
     std::panic::catch_unwind(ctl::start).unwrap_or(0)
 }
 
-/// Next command sent by a connected companion app, as a JSON string, or null
+/// Next command sent by a connected ReaMesh app, as a JSON string, or null
 /// when none is queued. The extension drains this on its timer tick and
 /// dispatches the commands itself (the server never acts on the session).
 /// Free non-null results with `reamesh_free_string`.
@@ -6132,7 +6132,7 @@ pub extern "C" fn reamesh_ctl_poll() -> *mut c_char {
     }
 }
 
-/// Broadcast the extension's composed state JSON to every connected companion
+/// Broadcast the extension's composed state JSON to every connected ReaMesh
 /// app (and replay it to apps that connect later).
 #[unsafe(no_mangle)]
 pub extern "C" fn reamesh_ctl_publish(state_json: *const c_char) {

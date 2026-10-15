@@ -36,7 +36,7 @@ jobs:
           bun run test
         working-directory: app
       # The app bundles the DLL built above, so this has to come after it.
-      - name: Build companion app + installer
+      - name: Build app + installer
         run: bun run tauri build
         working-directory: app
       - uses: actions/upload-artifact@v7
@@ -67,7 +67,7 @@ jobs:
         working-directory: app
       # Compile check only; the release workflow builds the signed bundle.
       # Pass --no-bundle directly; an extra -- would forward it to Cargo.
-      - name: Build companion app (unbundled)
+      - name: Build app (unbundled)
         run: bun run tauri build --no-bundle
         working-directory: app
 

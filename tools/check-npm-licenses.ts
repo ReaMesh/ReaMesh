@@ -1,4 +1,4 @@
-// Dependency-licence gate for the companion app's bun packages (app/).
+// Dependency-licence gate for the ReaMesh app's bun packages (app/).
 //
 //   bun tools/check-npm-licenses.ts app
 //
