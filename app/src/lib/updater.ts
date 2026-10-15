@@ -31,7 +31,7 @@ export interface ChannelInfo {
 
 let state: UpdateState = { phase: "idle", version: "", progress: 0, can_restart: false };
 let auto: boolean | undefined;
-let channel: ChannelInfo = { channel: "beta", stable_available: false };
+let channel: ChannelInfo = { channel: "stable", stable_available: true };
 const listeners = new Set<() => void>();
 const emit = () => listeners.forEach((l) => l());
 let started = false;

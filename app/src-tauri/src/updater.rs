@@ -167,9 +167,9 @@ pub enum Channel {
     Stable,
 }
 
-/// Off until the first stable release exists: the switch shows Stable greyed
-/// out, and a stored "stable" reads as Beta. Flip with that release.
-pub const STABLE_AVAILABLE: bool = false;
+/// On since 1.0.0, the first stable release. Off, the switch shows Stable
+/// greyed out and a stored "stable" reads as Beta.
+pub const STABLE_AVAILABLE: bool = true;
 
 const CHANNEL_BASE: &str = "https://github.com/ReaMesh/ReaMesh/releases/download/updater/";
 
@@ -198,12 +198,12 @@ fn channel_file(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_config_dir().ok().map(|d| d.join("update_channel"))
 }
 
-/// Beta unless Stable was chosen (and exists).
+/// Stable unless Beta was chosen (or Stable doesn't exist yet).
 pub fn load_channel(app: &AppHandle) -> Channel {
     let stored = channel_file(app)
         .and_then(|p| fs::read_to_string(p).ok())
         .unwrap_or_default();
-    if STABLE_AVAILABLE && stored.trim() == "stable" {
+    if STABLE_AVAILABLE && stored.trim() != "beta" {
         Channel::Stable
     } else {
         Channel::Beta
