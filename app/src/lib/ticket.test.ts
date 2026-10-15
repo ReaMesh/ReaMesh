@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeTicket, isInviteLink, normalizeTicket } from "./ticket";
+import { decodeTicket, isInviteLink, normalizeTicket, ticketAddrs } from "./ticket";
 
 const PEER = "12D3KooWQYhTNQdmr3ArTeUHRYzFg94BKyTkoWBDWez9kSCVe2Xo";
 
@@ -87,5 +87,21 @@ describe("decodeTicket", () => {
     expect(decodeTicket(makeTicket({ t: "70000" }))).toBeNull();
     expect(decodeTicket(makeTicket({ t: "0" }))).toBeNull();
     expect(decodeTicket(makeTicket({ q: "abc" }))).toBeNull();
+  });
+});
+
+describe("ticketAddrs", () => {
+  it("returns the host's dialable addresses for the Bluetooth advertisement", () => {
+    expect(ticketAddrs(makeTicket())).toEqual({
+      ips: ["192.168.1.7", "100.101.102.103"],
+      tcp: 54001,
+      quic: 54002,
+    });
+    expect(ticketAddrs(makeTicket({ q: null, a: "10.0.0.2,nope" }))).toEqual({
+      ips: ["10.0.0.2"],
+      tcp: 54001,
+      quic: 0,
+    });
+    expect(ticketAddrs(makeTicket({ a: null }))).toBeNull();
   });
 });

@@ -1,6 +1,14 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useAnimate, useReducedMotion } from "motion/react";
-import { ChevronDown, ClipboardPaste, LoaderCircle, LockKeyhole, Ticket, X } from "lucide-react";
+import {
+  Bluetooth,
+  ChevronDown,
+  ClipboardPaste,
+  LoaderCircle,
+  LockKeyhole,
+  Ticket,
+  X,
+} from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
 import {
@@ -27,6 +35,7 @@ import { recordHostJoin } from "@/lib/knownHosts";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
 import { getProfile, useProfile } from "@/lib/profile";
+import { nearbyBlocked, setNearby, useNearby } from "@/lib/nearby";
 import { decodeTicket, normalizeTicket } from "@/lib/ticket";
 import { initials, type ExtState, type SessionAd } from "@/lib/types";
 import { protoSkew } from "@/lib/version";
@@ -949,6 +958,45 @@ function VpnHint() {
   );
 }
 
+/** How long the Lobby stays empty before it offers Bluetooth. */
+const NEARBY_OFFER_DELAY_MS = 10_000;
+
+/** Bluetooth under an empty Lobby. Some networks (guest Wi-Fi) block the usual
+ *  search; once nothing has shown up for a while, and only until the user
+ *  decided either way, one quiet button turns the Bluetooth search on (which
+ *  is what asks macOS for the permission). Once on, a line says so. */
+function NearbyLine() {
+  const n = useNearby();
+  const [waited, setWaited] = useState(false);
+  useEffect(() => {
+    const id = setTimeout(() => setWaited(true), NEARBY_OFFER_DELAY_MS);
+    return () => clearTimeout(id);
+  }, []);
+  if (!n.supported) return null;
+  if (n.enabled === true) {
+    return (
+      <p className="mt-1.5 text-[11.5px] leading-normal text-muted-foreground/80">
+        {nearbyBlocked(n) ? t("nearbyBlocked") : t("nearbySearching")}
+      </p>
+    );
+  }
+  if (n.enabled === false || !waited || nearbyBlocked(n)) return null;
+  return (
+    <button
+      type="button"
+      onClick={() => setNearby(true)}
+      title={t("nearbyHostHint")}
+      className={cn(
+        "mx-auto mt-2 flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground",
+        focusRing,
+      )}
+    >
+      <Bluetooth className="size-3 shrink-0" aria-hidden="true" />
+      {t("nearbyOffer")}
+    </button>
+  );
+}
+
 /** The extension lost the host without a farewell and is watching the lobby
  *  to rejoin the same session on its own: one quiet row, nothing to do. */
 function ReconnectRow({ log }: { log: ExtState["log"] }) {
@@ -1004,6 +1052,7 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
             <div className="px-6 py-6 text-center">
               <p className="text-[13px] text-muted-foreground">{t("noSessionsYet")}</p>
               <VpnHint />
+              <NearbyLine />
             </div>
           )}
         </Group>

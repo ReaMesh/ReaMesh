@@ -34,6 +34,7 @@ import { cn, focusRing } from "@/lib/utils";
 import { listenForRestart, revealWindow, takeResume, trackScreen } from "@/lib/resume";
 import { useAppVersion } from "@/lib/updater";
 import { protoSkew, versionSkew } from "@/lib/version";
+import { useNearbySync } from "@/lib/nearby";
 
 // How long a fresh launch waits for REAPER to answer before showing the
 // waiting screen (see `holdBlank`).
@@ -480,6 +481,9 @@ export default function App() {
   useEffect(() => {
     if (mode === "idle" && port != null && !unsupported) send({ cmd: "browse" }, port);
   }, [mode, port, unsupported]);
+
+  // Bluetooth as a discovery fallback: scan in the Lobby, advertise while hosting.
+  useNearbySync(mode, state?.ticket, port);
 
   // Give the overlay the active instance's port and process. A port change must
   // rebuild the HUD even when both instances are already in sessions.

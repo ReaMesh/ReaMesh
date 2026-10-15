@@ -1,4 +1,5 @@
 #import "settings_window.h"
+#import "ble.h"
 #import <Cocoa/Cocoa.h>
 
 // Native macOS Settings window with General, Overlay, Updates and Advanced panes.
@@ -10,6 +11,8 @@ static NSString *const kTabUpdates = @"updates";
 static NSString *const kTabAdvanced = @"advanced";
 static NSString *const kReaperDownloadURL = @"https://www.reaper.fm/download.php";
 static NSString *const kDocsURL = @"https://reamesh.com/docs";
+static NSString *const kBluetoothPrivacyURL =
+    @"x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth";
 
 static const CGFloat kWindowWidth = 480;
 static const CGFloat kWindowHeight = 448;
@@ -569,6 +572,46 @@ static ReaMeshSettingsController *gController = nil;
     [self.container addSubview:reset];
     y += 50;
 
+    // Bluetooth as a discovery fallback: only the host's network addresses
+    // travel over it, the session itself still runs over the network.
+    [self.container addSubview:[self headerWithString:L(@"Nearby sessions", @"Sessions in der Nähe")
+                                                    y:y]];
+    y += 26;
+    const BOOL nearbyOn = self.cb.get_nearby(self.cb.ctx) != 0;
+    NSButton *nearby =
+        [NSButton checkboxWithTitle:L(@"Find and share sessions over Bluetooth",
+                                      @"Sessions per Bluetooth finden und anbieten")
+                             target:self
+                             action:@selector(nearbyToggled:)];
+    nearby.state = nearbyOn ? NSControlStateValueOn : NSControlStateValueOff;
+    nearby.frame = NSMakeRect(kMargin, y, w, 22);
+    [self.container addSubview:nearby];
+    y += 24;
+    const int32_t auth = self.cb.get_nearby_auth(self.cb.ctx);
+    const BOOL blocked = nearbyOn && (auth == kReaMeshBleDenied || auth == kReaMeshBleRestricted);
+    NSTextField *nearbyNote = [self
+        labelWithString:blocked
+                            ? L(@"Bluetooth is not allowed for ReaMesh in System Settings.",
+                                @"Bluetooth ist für ReaMesh in den Systemeinstellungen nicht erlaubt.")
+                            : L(@"For networks that block the usual search, such as guest Wi-Fi.",
+                                @"Für Netzwerke, die die normale Suche blockieren, z. B. Gäste-WLANs.")
+                  frame:NSMakeRect(kMargin + 20, y, w - 20, 16)];
+    nearbyNote.font = [NSFont systemFontOfSize:11];
+    nearbyNote.textColor = blocked ? [NSColor systemOrangeColor] : [NSColor secondaryLabelColor];
+    [self.container addSubview:nearbyNote];
+    y += 20;
+    if (blocked && auth == kReaMeshBleDenied) {
+        NSButton *open = [NSButton buttonWithTitle:L(@"Open System Settings…",
+                                                     @"Systemeinstellungen öffnen…")
+                                            target:self
+                                            action:@selector(openBluetoothPrivacy:)];
+        open.frame = NSMakeRect(kMargin + 16, y, 220, 28);
+        open.bezelStyle = NSBezelStyleRounded;
+        [self.container addSubview:open];
+        y += 32;
+    }
+    y += 18;
+
     [self.container addSubview:[self headerWithString:L(@"Help", @"Hilfe") y:y]];
     y += 28;
 
@@ -632,6 +675,21 @@ static ReaMeshSettingsController *gController = nil;
             [done beginSheetModalForWindow:self.window completionHandler:nil];
         });
     }];
+}
+
+- (void)nearbyToggled:(NSButton *)sender {
+    self.cb.set_nearby(self.cb.ctx, sender.state == NSControlStateValueOn ? 1 : 0);
+    [self showTab:self.selectedTab];
+}
+
+- (void)openBluetoothPrivacy:(id)sender {
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:kBluetoothPrivacyURL]];
+}
+
+// Coming back from the system's permission prompt or System Settings: the
+// Bluetooth note may be out of date.
+- (void)windowDidBecomeKey:(NSNotification *)notification {
+    if ([self.selectedTab isEqualToString:kTabAdvanced]) [self showTab:self.selectedTab];
 }
 
 - (void)openDocs:(id)sender {

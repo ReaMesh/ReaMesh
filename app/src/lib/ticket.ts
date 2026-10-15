@@ -57,7 +57,25 @@ function parsePort(v: string): number | null {
   return n >= 1 && n <= 65535 ? n : null;
 }
 
+/** Where an invite link says its host can be dialed. */
+export interface TicketAddrs {
+  ips: string[];
+  /** 0 when the link names no such port. */
+  tcp: number;
+  quic: number;
+}
+
 export function decodeTicket(raw: string): TicketInfo | null {
+  return parseTicket(raw)?.info ?? null;
+}
+
+/** The host's addresses from its own invite link: what it advertises to
+ *  nearby devices over Bluetooth (lib/nearby.ts). */
+export function ticketAddrs(raw: string): TicketAddrs | null {
+  return parseTicket(raw)?.addrs ?? null;
+}
+
+function parseTicket(raw: string): { info: TicketInfo; addrs: TicketAddrs } | null {
   const s = normalizeTicket(raw);
   if (s.length > TICKET_MAX_LEN || !isInviteLink(s)) return null;
   const rest = s.slice(TICKET_PREFIX.length);
@@ -69,7 +87,7 @@ export function decodeTicket(raw: string): TicketInfo | null {
   let name = "";
   let auth = false;
   let peer = "";
-  let ips = 0;
+  let ips: string[] = [];
   let tcp: number | null = null;
   let quic: number | null = null;
   for (const pair of query.split("&")) {
@@ -93,7 +111,7 @@ export function decodeTicket(raw: string): TicketInfo | null {
         peer = v;
         break;
       case "a":
-        ips = v.split(",").filter(isIp).slice(0, MAX_IPS).length;
+        ips = v.split(",").filter(isIp).slice(0, MAX_IPS);
         break;
       case "t":
         tcp = parsePort(v);
@@ -110,6 +128,6 @@ export function decodeTicket(raw: string): TicketInfo | null {
   // The extension pins the join to `p` (it must parse as a PeerId) and needs
   // at least one address plus one port to dial.
   if (!/^[1-9A-HJ-NP-Za-km-z]{40,}$/.test(peer)) return null;
-  if (ips === 0 || (tcp === null && quic === null)) return null;
-  return { sid, name, auth, peer };
+  if (ips.length === 0 || (tcp === null && quic === null)) return null;
+  return { info: { sid, name, auth, peer }, addrs: { ips, tcp: tcp ?? 0, quic: quic ?? 0 } };
 }

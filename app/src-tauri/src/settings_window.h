@@ -85,6 +85,9 @@ typedef struct {
     void (*set_update_channel)(void *ctx, int32_t channel);
     int32_t (*stable_available)(void *ctx);   // 1 = Stable can be chosen
     void (*show_joined)(void *ctx);           // joined projects, main window
+    int32_t (*get_nearby)(void *ctx);         // 1 = nearby sessions over Bluetooth on
+    void (*set_nearby)(void *ctx, int32_t on);
+    int32_t (*get_nearby_auth)(void *ctx);    // kReaMeshBle* (ble.h)
 } SettingsCallbacks;
 
 // Opens (or re-focuses) the native settings window. Must be called on the

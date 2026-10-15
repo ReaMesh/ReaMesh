@@ -1,0 +1,2 @@
+/* Bluetooth permission prompt (Info.plist NSBluetoothAlwaysUsageDescription). */
+"NSBluetoothAlwaysUsageDescription" = "ReaMesh nutzt Bluetooth, um Sessions in der Nähe zu finden, wenn das Netzwerk die normale Suche blockiert, und um deine auffindbar zu machen.";

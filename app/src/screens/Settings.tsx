@@ -6,6 +6,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { Divider, Group, SectionLabel } from "@/components/Group";
 import { PathField } from "@/components/PathField";
 import { ProfileEditor } from "@/components/ProfileEditor";
@@ -41,6 +42,7 @@ import { isWindows } from "@/lib/platform";
 import { formatBytes } from "@/lib/format";
 import { listJoinedProjects } from "@/screens/JoinedProjects";
 import { PROTO } from "@/lib/version";
+import { nearbyBlocked, setNearby, useNearby } from "@/lib/nearby";
 import { cn, focusRing } from "@/lib/utils";
 
 const SOURCE_URL = "https://github.com/ReaMesh/ReaMesh";
@@ -78,41 +80,6 @@ function Row({
   );
 }
 
-function Switch({
-  checked,
-  onChange,
-  label,
-  disabled,
-}: {
-  checked: boolean;
-  onChange: (v: boolean) => void;
-  label: string;
-  disabled?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={cn(
-        "relative h-[22px] w-[38px] shrink-0 rounded-full transition-colors disabled:pointer-events-none",
-        checked ? "bg-found" : "bg-white/15",
-        focusRing,
-      )}
-    >
-      <span
-        className={cn(
-          "absolute top-0.5 left-0.5 size-[18px] rounded-full bg-white transition-transform",
-          checked && "translate-x-4",
-        )}
-      />
-    </button>
-  );
-}
-
 // Full-screen app settings, reached from the Windows title-bar gear or Ctrl+,
 // (macOS has the native AppKit settings window instead, from Cmd+,). Grouped rows with one
 // control each; your name and colour on top (the Lobby edits them too).
@@ -127,6 +94,7 @@ export function Settings({
 }) {
   const [busy, setBusy] = useState(false);
   const status = useReaperStatus();
+  const nearby = useNearby();
   const hasCustom = !!getReaperPath();
   const overlay = useOverlaySettings();
   const update = useUpdate();
@@ -532,6 +500,28 @@ export function Settings({
             })}
           </Group>
         </section>
+
+        {nearby.supported && (
+          <section className="space-y-2">
+            <SectionLabel>{t("nearbySettings")}</SectionLabel>
+            <Group>
+              <Row
+                label={t("nearbySettingsLabel")}
+                sub={
+                  nearby.enabled === true && nearbyBlocked(nearby)
+                    ? t("nearbyBlocked")
+                    : t("nearbySettingsSub")
+                }
+              >
+                <Switch
+                  checked={nearby.enabled === true}
+                  onChange={setNearby}
+                  label={t("nearbySettingsLabel")}
+                />
+              </Row>
+            </Group>
+          </section>
+        )}
 
         <section className="space-y-2">
           <SectionLabel>{t("privacy")}</SectionLabel>

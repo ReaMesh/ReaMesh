@@ -4,5 +4,7 @@
   <dict>
     <key>CFBundleIconName</key>
     <string>ReaMesh</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>ReaMesh uses Bluetooth to find sessions nearby on networks that block the usual search, and to make yours findable.</string>
   </dict>
 </plist>

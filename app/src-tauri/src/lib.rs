@@ -13,6 +13,7 @@ use tauri::{AppHandle, Manager};
 
 #[cfg(target_os = "windows")]
 mod overlay_panel_win;
+mod nearby;
 mod updater;
 
 /// The compatibility number this build speaks, mirrored from the core's
@@ -1779,7 +1780,11 @@ pub fn run() {
             joined_projects,
             trash_joined_project,
             copy_diagnostics_text,
-            build_info
+            build_info,
+            nearby::nearby_state,
+            nearby::set_nearby,
+            nearby::nearby_scan,
+            nearby::nearby_advertise
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -1795,6 +1800,7 @@ pub fn run() {
                     eprintln!("[reamesh] deep link registration: {e}");
                 }
             }
+            nearby::init(app.handle());
             // Keep an installed extension matching this build (unless the
             // user removed it).
             maybe_auto_install(app.handle());
@@ -1945,6 +1951,9 @@ mod native_settings {
         set_update_channel: extern "C" fn(*mut c_void, i32),
         stable_available: extern "C" fn(*mut c_void) -> i32,
         show_joined: extern "C" fn(*mut c_void),
+        get_nearby: extern "C" fn(*mut c_void) -> i32,
+        set_nearby: extern "C" fn(*mut c_void, i32),
+        get_nearby_auth: extern "C" fn(*mut c_void) -> i32,
     }
 
     extern "C" {
@@ -2133,6 +2142,24 @@ mod native_settings {
         let _ = app.emit("menu:joined", ());
     }
 
+    extern "C" fn get_nearby(ctx: *mut c_void) -> i32 {
+        (super::nearby::load_pref(handle(ctx)) == Some(true)) as i32
+    }
+
+    extern "C" fn set_nearby(ctx: *mut c_void, on: i32) {
+        super::nearby::store_pref(handle(ctx), on != 0);
+    }
+
+    extern "C" fn get_nearby_auth(_ctx: *mut c_void) -> i32 {
+        match super::nearby::authorization() {
+            "undetermined" => 0,
+            "restricted" => 1,
+            "denied" => 2,
+            "allowed" => 3,
+            _ => -1,
+        }
+    }
+
     extern "C" fn reset_identity(ctx: *mut c_void) -> i32 {
         match do_reset_identity(handle(ctx)) {
             Ok(true) => 1,
@@ -2186,6 +2213,9 @@ mod native_settings {
             set_update_channel,
             stable_available,
             show_joined,
+            get_nearby,
+            set_nearby,
+            get_nearby_auth,
         };
         unsafe { reamesh_settings_open(cb) };
     }

@@ -57,7 +57,8 @@
     "macOS": {
       "minimumSystemVersion": "11.0",
       "files": {
-        "Resources/Assets.car": "../../proprietary/icons/Assets.car"
+        "Resources/Assets.car": "../../proprietary/icons/Assets.car",
+        "Resources/de.lproj/InfoPlist.strings": "de.lproj/InfoPlist.strings"
       },
       "signingIdentity": "-",
       "hardenedRuntime": true,

@@ -7,6 +7,7 @@ fn main() {
             .file("src/settings_window.m")
             .file("src/overlay_panel.m")
             .file("src/about_window.m")
+            .file("src/ble.m")
             .flag("-fobjc-arc")
             .compile("reamesh_native");
         println!("cargo:rustc-link-lib=framework=Cocoa");
@@ -14,12 +15,16 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
         // CADisplayLink, driving the overlay's follow tick.
         println!("cargo:rustc-link-lib=framework=QuartzCore");
+        // Nearby-session hints over Bluetooth LE (src/ble.m).
+        println!("cargo:rustc-link-lib=framework=CoreBluetooth");
         println!("cargo:rerun-if-changed=src/settings_window.m");
         println!("cargo:rerun-if-changed=src/settings_window.h");
         println!("cargo:rerun-if-changed=src/overlay_panel.m");
         println!("cargo:rerun-if-changed=src/overlay_panel.h");
         println!("cargo:rerun-if-changed=src/about_window.m");
         println!("cargo:rerun-if-changed=src/about_window.h");
+        println!("cargo:rerun-if-changed=src/ble.m");
+        println!("cargo:rerun-if-changed=src/ble.h");
     }
 
     build_info();
