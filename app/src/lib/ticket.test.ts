@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeTicket, isInviteLink, normalizeTicket, ticketAddrs } from "./ticket";
+import { decodeTicket, isDialableIp, isInviteLink, normalizeTicket, ticketAddrs } from "./ticket";
 
 const PEER = "12D3KooWQYhTNQdmr3ArTeUHRYzFg94BKyTkoWBDWez9kSCVe2Xo";
 
@@ -103,5 +103,54 @@ describe("ticketAddrs", () => {
       quic: 0,
     });
     expect(ticketAddrs(makeTicket({ a: null }))).toBeNull();
+  });
+});
+
+describe("isDialableIp", () => {
+  it("accepts ordinary host addresses", () => {
+    for (const ip of [
+      "192.168.1.7",
+      "10.0.0.2",
+      "100.101.102.103",
+      "fd7a:115c:a1e0::1",
+      "2001:db8::5",
+      "1:2:3:4:5:6:7:8",
+      "::ffff:192.168.1.7",
+    ]) {
+      expect(isDialableIp(ip), ip).toBe(true);
+    }
+  });
+
+  it("refuses local and non-host addresses", () => {
+    for (const ip of [
+      "127.0.0.1",
+      "127.8.9.10",
+      "0.0.0.0",
+      "169.254.1.1",
+      "224.0.0.251",
+      "239.1.2.3",
+      "255.255.255.255",
+      "::1",
+      "::",
+      "0:0:0:0:0:0:0:1",
+      "fe80::1",
+      "FE80::abcd",
+      "ff02::fb",
+      "::ffff:127.0.0.1",
+      "::ffff:169.254.1.1",
+      "1::2::3",
+      "12345::1",
+      "1:2:3:4:5:6:7",
+    ]) {
+      expect(isDialableIp(ip), ip).toBe(false);
+    }
+  });
+
+  it("drops them from a ticket, and refuses a ticket left with none", () => {
+    expect(ticketAddrs(makeTicket({ a: "127.0.0.1,192.168.1.7,ff02::1" }))?.ips).toEqual([
+      "192.168.1.7",
+    ]);
+    expect(decodeTicket(makeTicket({ a: "127.0.0.1" }))).toBeNull();
+    expect(decodeTicket(makeTicket({ a: "::1,169.254.3.4" }))).toBeNull();
   });
 });

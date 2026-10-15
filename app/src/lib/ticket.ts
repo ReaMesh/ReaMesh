@@ -50,6 +50,60 @@ function isIp(s: string): boolean {
   return IPV4.test(s) || (s.length <= 45 && IPV6.test(s));
 }
 
+/** The eight 16-bit groups of an IPv6 address (with an optional dotted IPv4
+ *  tail), or null when it doesn't parse. */
+function ipv6Groups(s: string): number[] | null {
+  let text = s;
+  const lastColon = text.lastIndexOf(":");
+  const v4 = text.slice(lastColon + 1);
+  if (v4.includes(".")) {
+    // A dotted IPv4 tail is the last two groups.
+    if (!IPV4.test(v4)) return null;
+    const o = v4.split(".").map(Number);
+    const hex = (n: number) => n.toString(16);
+    text = `${text.slice(0, lastColon + 1)}${hex((o[0] << 8) | o[1])}:${hex((o[2] << 8) | o[3])}`;
+  }
+  const halves = text.split("::");
+  if (halves.length > 2) return null;
+  const part = (h: string) => (h === "" ? [] : h.split(":"));
+  const head = part(halves[0]);
+  const tail = halves.length === 2 ? part(halves[1]) : [];
+  const all = [...head, ...tail];
+  if (all.some((g) => !/^[0-9a-fA-F]{1,4}$/.test(g))) return null;
+  // Without "::" there must be exactly eight groups; with it, fewer.
+  if (halves.length === 1 ? all.length !== 8 : all.length > 7) return null;
+  const fill = Array<string>(8 - all.length).fill("0");
+  return [...head, ...fill, ...tail].map((g) => parseInt(g, 16));
+}
+
+function ipv4Dialable(o: number[]): boolean {
+  const [a, b] = o;
+  if (a === 127) return false; // loopback
+  if (o.every((x) => x === 0)) return false; // unspecified
+  if (a === 169 && b === 254) return false; // link-local
+  if (a >= 224 && a <= 239) return false; // multicast
+  if (o.every((x) => x === 255)) return false; // broadcast
+  return true;
+}
+
+/** Whether a ticket address can name a host: loopback, unspecified,
+ *  link-local, multicast and broadcast never do. Mirrors the extension's
+ *  `dialable_ip`, which drops the same addresses from a ticket. */
+export function isDialableIp(s: string): boolean {
+  if (IPV4.test(s)) return ipv4Dialable(s.split(".").map(Number));
+  const g = ipv6Groups(s);
+  if (!g) return false;
+  // IPv4-mapped (::ffff:a.b.c.d) follows the IPv4 rules.
+  if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) {
+    return ipv4Dialable([g[6] >> 8, g[6] & 0xff, g[7] >> 8, g[7] & 0xff]);
+  }
+  if (g.every((x) => x === 0)) return false; // ::
+  if (g.slice(0, 7).every((x) => x === 0) && g[7] === 1) return false; // ::1
+  if ((g[0] & 0xffc0) === 0xfe80) return false; // link-local
+  if ((g[0] & 0xff00) === 0xff00) return false; // multicast
+  return true;
+}
+
 /** A port parameter: `null` when the value is not a usable port. */
 function parsePort(v: string): number | null {
   if (!/^\d{1,5}$/.test(v)) return null;
@@ -111,7 +165,7 @@ function parseTicket(raw: string): { info: TicketInfo; addrs: TicketAddrs } | nu
         peer = v;
         break;
       case "a":
-        ips = v.split(",").filter(isIp).slice(0, MAX_IPS);
+        ips = v.split(",").filter(isIp).filter(isDialableIp).slice(0, MAX_IPS);
         break;
       case "t":
         tcp = parsePort(v);

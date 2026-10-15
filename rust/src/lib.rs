@@ -1329,12 +1329,26 @@ struct TicketInfo {
 /// An address worth putting in a ticket: loopback and unspecified are
 /// meaningless off-machine (a same-host client re-derives loopback itself, see
 /// `dial_ticket`), and link-local (169.254/16, fe80::/10) can't be dialed
-/// without a scope the link doesn't carry.
+/// without a scope the link doesn't carry. Multicast and broadcast are never a
+/// host. `parse_ticket` applies the same rule to what a ticket names, so a
+/// link can't point the joiner at its own machine or a local-only service.
 fn dialable_ip(ip: &IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified() && !v4.is_link_local(),
+        IpAddr::V4(v4) => {
+            !v4.is_loopback()
+                && !v4.is_unspecified()
+                && !v4.is_link_local()
+                && !v4.is_multicast()
+                && !v4.is_broadcast()
+        }
         IpAddr::V6(v6) => {
-            !v6.is_loopback() && !v6.is_unspecified() && (v6.segments()[0] & 0xffc0) != 0xfe80
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return dialable_ip(&IpAddr::V4(v4));
+            }
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && (v6.segments()[0] & 0xffc0) != 0xfe80
         }
     }
 }
@@ -1426,6 +1440,7 @@ fn parse_ticket(ticket: &str) -> Option<TicketInfo> {
                 ips = v
                     .split(',')
                     .filter_map(|ip| ip.parse().ok())
+                    .filter(dialable_ip)
                     .take(TICKET_MAX_IPS)
                     .collect()
             }
@@ -7554,6 +7569,38 @@ mod tests {
         assert!(parse_ticket(&ticket.replace("&t=54001&q=54002", "")).is_none()); // no port
         assert!(parse_ticket(&ticket.replace("t=54001", "t=70000")).is_none());
         assert!(parse_ticket(&ticket.replace("t=54001", "t=0")).is_none());
+    }
+
+    #[test]
+    fn ticket_drops_local_and_non_host_addresses() {
+        let peer_str = "12D3KooWQYhTNQdmr3ArTeUHRYzFg94BKyTkoWBDWez9kSCVe2Xo";
+        let with = |a: &str| format!("reamesh://join/abc?p={peer_str}&a={a}&t=54001");
+        for bad in [
+            "127.0.0.1",
+            "127.8.9.10",
+            "0.0.0.0",
+            "169.254.1.1",
+            "224.0.0.251",
+            "239.1.2.3",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fe80::1",
+            "ff02::fb",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.1.1",
+        ] {
+            assert!(parse_ticket(&with(bad)).is_none(), "{bad} accepted");
+        }
+        // A bad address next to a good one is dropped, the good one kept.
+        let info = parse_ticket(&with("127.0.0.1,192.168.1.7,ff02::1,fd00::5")).unwrap();
+        assert_eq!(
+            info.addrs,
+            vec![
+                "/ip4/192.168.1.7/tcp/54001".parse::<Multiaddr>().unwrap(),
+                "/ip6/fd00::5/tcp/54001".parse::<Multiaddr>().unwrap(),
+            ]
+        );
     }
 
     #[test]

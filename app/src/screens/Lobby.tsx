@@ -614,20 +614,18 @@ function InviteCard({
   };
   const busy = checking || joining;
 
-  // A link the OS opened the app with: fill it in and, when the session takes
-  // no passphrase, go straight on to the host check (and so the trust dialog);
-  // a protected one waits here for the passphrase. Also runs on mount, for a
-  // link that arrived while another screen was up.
+  // A link the OS opened the app with: fill it in and wait. Nothing is dialed
+  // until the user presses Join (or enters the passphrase), so a link opened
+  // by a web page or another app can't make ReaMesh contact a host on its own.
+  // Also runs on mount, for a link that arrived while another screen was up.
   const inviteSeq = useInviteSeq();
   useEffect(() => {
     const link = takeInvite();
     if (!link) return;
-    const info = decodeTicket(link);
     setOpen(true);
     setRaw(link);
     setPass("");
     setError("");
-    if (info && !info.auth && !joining && !needName()) startCheck(normalizeTicket(link), "");
   }, [inviteSeq]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // The X in the head: fold back to the one-line link and forget the code, so
