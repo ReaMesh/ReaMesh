@@ -16,7 +16,7 @@
     "deep-link:default",
     {
       "identifier": "opener:allow-open-path",
-      "allow": [{ "path": "/Applications/*.app" }]
+      "allow": [{ "path": "/Applications/REAPER.app" }]
     }
   ]
 }

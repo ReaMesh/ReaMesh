@@ -105,10 +105,23 @@ fn store_custom_path(app: &AppHandle, path: Option<String>) -> Result<(), String
     let p = custom_path_file(app).ok_or("could not resolve config directory")?;
     match path {
         Some(v) if !v.is_empty() => {
+            // Only an existing folder, stored as its canonical absolute path
+            // (no relative or `..` forms that resolve elsewhere later).
+            let dir = fs::canonicalize(&v).map_err(|e| e.to_string())?;
+            if !dir.is_dir() {
+                return Err("not a folder".into());
+            }
             if let Some(parent) = p.parent() {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            fs::write(&p, v).map_err(|e| e.to_string())
+            // Windows canonicalizes to the verbatim `\\?\C:\…` form; keep the
+            // ordinary drive path the rest of the app (and the user) expects.
+            let dir = dir.to_string_lossy().into_owned();
+            let dir = match dir.strip_prefix(r"\\?\") {
+                Some(rest) if !rest.starts_with(r"UNC\") => rest.to_string(),
+                _ => dir,
+            };
+            fs::write(&p, dir.as_bytes()).map_err(|e| e.to_string())
         }
         _ => {
             let _ = fs::remove_file(&p);
