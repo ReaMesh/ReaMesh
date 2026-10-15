@@ -1,8 +1,9 @@
 # Release: builds the signed app for both platforms (the extension rides
 # inside it, and is also published on its own, signed, so a downloaded update
-# can install it before the app restarts) and publishes it, with the updater
-# manifests, as a release of this repository, which is where installed apps
-# look for updates (plugins.updater.endpoints in tauri.conf.json).
+# can install it before the app restarts) plus the macOS installer DMG, and
+# publishes them, with the updater manifests, as a draft release of this
+# repository. Publishing the draft makes it the latest release, which is where
+# installed apps look for updates (plugins.updater.endpoints in tauri.conf.json).
 #
 # Trigger: push a tag `v<version>` matching the version in every manifest
 # (bun scripts/set-version.ts), or run it by hand on such a tag.
@@ -150,14 +151,30 @@ jobs:
           cp "$B/ReaMesh.app/Contents/Resources/reaper_reamesh.dylib" "$B/"
           bun run tauri signer sign --app-version "$(bun -p 'require("./package.json").version')" \
             "$B/reaper_reamesh.dylib"
+          # make-dmg.sh clears everything but the .app out of this folder.
+          mkdir -p ../release-macos
+          cp "$B"/*.app.tar.gz "$B"/*.app.tar.gz.sig "$B"/reaper_reamesh.dylib "$B"/reaper_reamesh.dylib.sig ../release-macos/
+      # The download for new installs. The image stays unsigned either way: a
+      # signed but not notarized image would add a second "Open Anyway" prompt.
+      - name: Installer DMG
+        working-directory: app
+        run: |
+          VERSION="$(bun -p 'require("./package.json").version')"
+          DMG=src-tauri/target/universal-apple-darwin/release/bundle/dmg/ReaMesh_$VERSION.dmg
+          if ! APPLE_SIGNING_IDENTITY= bash scripts/make-dmg.sh; then
+            # Finder scripting can fail on a runner; ship a plain image then.
+            echo "::warning::styled DMG failed, packaging a plain one"
+            S="$(mktemp -d)"
+            cp -R src-tauri/target/universal-apple-darwin/release/bundle/macos/ReaMesh.app "$S/"
+            ln -s /Applications "$S/Applications"
+            mkdir -p "$(dirname "$DMG")"
+            hdiutil create -volname "ReaMesh Installer" -srcfolder "$S" -fs HFS+ -format ULFO -ov "$DMG"
+          fi
+          cp "$DMG" ../release-macos/
       - uses: actions/upload-artifact@v7
         with:
           name: macos
-          path: |
-            app/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
-            app/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
-            app/src-tauri/target/universal-apple-darwin/release/bundle/macos/reaper_reamesh.dylib
-            app/src-tauri/target/universal-apple-darwin/release/bundle/macos/reaper_reamesh.dylib.sig
+          path: release-macos/*
 
   # The macOS build is universal; this runs its Intel half natively on an
   # Intel Mac (binaries, x86_64 load, C++ tests, Rust tests) before anything
@@ -186,15 +203,23 @@ jobs:
       - name: Updater manifest
         run: |
           VERSION="$(jq -r .version app/package.json)"
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "::error::ref $GITHUB_REF_NAME does not match version v$VERSION"
+            exit 1
+          fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           bun app/scripts/release-manifest.ts dist "$VERSION" \
             "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION"
-      - name: Publish the release
+      # A draft: nothing reaches installed apps until it is published by hand.
+      - name: Draft the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          sed "s/{{VERSION}}/$VERSION/g" .github/release-notes.md > "$RUNNER_TEMP/notes.md"
           gh release create "v$VERSION" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
+            --draft \
             --title "ReaMesh $VERSION" \
-            --notes "ReaMesh $VERSION"
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --generate-notes
