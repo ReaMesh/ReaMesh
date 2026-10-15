@@ -1,0 +1,43 @@
+# Download count for the README badge. GitHub's own total sums every release
+# asset, and installed apps fetch some of them on their own (the channel
+# manifests on every update check, the extension next to a found update), so
+# that number mostly counts update checks. This counts what a person installs
+# or an app updates to: the DMG, the Windows setup (also what the Windows
+# updater fetches) and the macOS update archive, and publishes it as
+# downloads.json in the `updater` release, which the badge reads.
+name: downloads
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: download-count
+  cancel-in-progress: true
+
+jobs:
+  count:
+    if: github.event_name != 'release' || github.event.release.tag_name != 'updater'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Count and publish
+        run: |
+          gh release view updater --repo "$REPO" > /dev/null 2>&1 || {
+            echo "no updater release yet"
+            exit 0
+          }
+          COUNT="$(gh api --paginate "repos/$REPO/releases?per_page=100" \
+            --jq '.[] | select(.draft | not) | select(.tag_name != "updater")
+                  | .assets[] | select(.name | test("(\\.dmg|-setup\\.exe|\\.app\\.tar\\.gz)$"))
+                  | .download_count' | awk '{ s += $1 } END { print s + 0 }')"
+          jq -n --argjson n "$COUNT" '{downloads: $n}' > downloads.json
+          cat downloads.json
+          gh release upload updater downloads.json --repo "$REPO" --clobber
