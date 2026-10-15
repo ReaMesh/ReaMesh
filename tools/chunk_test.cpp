@@ -1,7 +1,7 @@
 // Unit test for the pure state-chunk parsing/splicing helpers in
 // extension/src/reamesh.cpp (normalizeChunk, extractTrackBlocks,
 // replaceTrackBlocks, transformRecvUnits, chunkFilePaths, isRelativePath,
-// pathInsideDir, relativizeChunkFiles).
+// pathInsideDir, relativizeChunkFiles, absolutizeChunkFiles).
 // No REAPER needed.
 //
 // Build & run:
@@ -532,6 +532,42 @@ int main() {
     auto relFiles = chunkFilePaths(rel);
     assert(relFiles.size() == 4 && relFiles[0] == "Audio/Kick_01.wav" &&
            isRelativePath(relFiles[0]) && !isRelativePath(relFiles[1]));
+  }
+
+  // Incoming media paths are resolved against our own project folder before
+  // REAPER sees them, including a folder whose name ends in a space.
+  {
+    const std::string wire =
+        "<ITEM\n"
+        "  <SOURCE WAVE\n"
+        "    FILE \"Whoosh.wav\" 1\n"
+        "  >\n"
+        "  <SOURCE WAVE\n"
+        "    FILE \"Audio/Kick.wav\"\n"
+        "  >\n"
+        "  <SOURCE WAVE\n"
+        "    FILE \"/Samples/Clap.wav\"\n"
+        "  >\n"
+        "  <SOURCE WAVE\n"
+        "    FILE \"../Elsewhere/Hat.wav\"\n"
+        "  >\n"
+        ">\n";
+    const std::string dir = "/Users/david/Reaper Projekte ";
+    const std::string abs = absolutizeChunkFiles(wire, dir);
+    assert(abs.find("FILE \"/Users/david/Reaper Projekte /Whoosh.wav\" 1\n") != std::string::npos);
+    assert(abs.find("FILE \"/Users/david/Reaper Projekte /Audio/Kick.wav\"") != std::string::npos);
+    assert(abs.find("FILE \"/Samples/Clap.wav\"") != std::string::npos);
+    assert(abs.find("FILE \"../Elsewhere/Hat.wav\"") != std::string::npos);
+    // Recapture maps it back to the wire text exactly: no ping-pong.
+    assert(relativizeChunkFiles(abs, {dir}) == wire);
+    // A trailing separator on the folder doesn't double up.
+    assert(absolutizeChunkFiles(wire, dir + "/") == abs);
+    // Windows spelling: backslashes throughout, and back to '/' on the wire.
+    const std::string win = absolutizeChunkFiles(wire, "C:\\Users\\Ben\\Song");
+    assert(win.find("FILE \"C:\\Users\\Ben\\Song\\Audio\\Kick.wav\"") != std::string::npos);
+    assert(relativizeChunkFiles(win, {"C:\\Users\\Ben\\Song"}) == wire);
+    // No saved project: untouched.
+    assert(absolutizeChunkFiles(wire, "") == wire);
   }
 
   // REAPER version gate: releases order as decimals, not as integer pairs.

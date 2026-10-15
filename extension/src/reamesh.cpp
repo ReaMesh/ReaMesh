@@ -970,6 +970,67 @@ static std::string relativizeChunkFiles(const std::string& chunk,
   return out;
 }
 
+// The inverse, applied to every incoming item chunk before REAPER sees it:
+// each project-relative double-quoted FILE path becomes `dir`/path, in the
+// separator `dir` is spelled with. Leaving the resolution to REAPER failed on
+// a real project: the host's folder was "Reaper Projekte " (trailing space),
+// a guest's newly added sound arrived as "Whoosh.wav", REAPER resolved it
+// somewhere else, the item stayed offline and the project saved a path to a
+// file that doesn't exist. The file the fetch put at projectDir()/path is
+// exactly what this names. Recapture maps the absolute path back to the same
+// relative text, so the round trip stays byte-stable. Paths that climb out
+// ("..") or are already absolute stay as they are; so does everything when
+// `dir` is empty (no saved project).
+static std::string absolutizeChunkFiles(const std::string& chunk, std::string dir) {
+  if (dir.empty() || isRelativePath(dir)) return chunk;
+  const bool backslash = dir.find('\\') != std::string::npos && dir.find('/') == std::string::npos;
+  const char sep = backslash ? '\\' : '/';
+  while (dir.size() > 1 && (dir.back() == '/' || dir.back() == '\\')) dir.pop_back();
+  std::string out;
+  out.reserve(chunk.size() + 256);
+  size_t pos = 0;
+  while (pos < chunk.size()) {
+    size_t eol = chunk.find('\n', pos);
+    const bool hasEol = eol != std::string::npos;
+    if (!hasEol) eol = chunk.size();
+    const std::string_view line(chunk.data() + pos, eol - pos);
+    const std::string_view t = ltrim(line);
+    std::string abs;
+    size_t q1 = std::string_view::npos, q2 = std::string_view::npos;
+    if (t.rfind("FILE \"", 0) == 0) {
+      q1 = line.find('"');
+      q2 = line.find('"', q1 + 1);
+      if (q2 != std::string_view::npos) {
+        std::string rel(line.substr(q1 + 1, q2 - q1 - 1));
+        std::replace(rel.begin(), rel.end(), '\\', '/');
+        // Same cleanliness rule as pathInsideDir: no empty, "." or ".." part.
+        bool clean = isRelativePath(rel);
+        for (size_t start = 0; clean && start <= rel.size();) {
+          size_t end = rel.find('/', start);
+          if (end == std::string::npos) end = rel.size();
+          const std::string_view part(rel.data() + start, end - start);
+          clean = !part.empty() && part != "." && part != "..";
+          start = end + 1;
+        }
+        if (clean) {
+          if (backslash) std::replace(rel.begin(), rel.end(), '/', '\\');
+          abs = dir + sep + rel;
+        }
+      }
+    }
+    if (abs.empty()) {
+      out.append(line);
+    } else {
+      out.append(line.substr(0, q1 + 1));
+      out.append(abs);
+      out.append(line.substr(q2));
+    }
+    if (hasEol) out.push_back('\n');
+    pos = eol + 1;
+  }
+  return out;
+}
+
 // ---------- plugin inventory / FX stripping (pure text helpers) ----------
 //
 // Both sides of the join-preview story parse RPP text with the same helper:
@@ -2423,7 +2484,8 @@ static void applyItem(const std::string& guid, const json& fields, bool freshMed
     // The chunk carries the originator's item GUID, so identity is stamped
     // onto newly created items as a side effect.
     const std::string& chunk = fields["chunk"].get_ref<const std::string&>();
-    setObjectStateChunk(item, chunk);
+    const std::vector<std::string>& dirs = mediaPathDirs();
+    setObjectStateChunk(item, absolutizeChunkFiles(chunk, dirs.empty() ? "" : dirs.front()));
     if (!itemChunkHasColor(chunk)) SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", 0.0);
     fileBacked = chunkHasFileSource(chunk);
     // A file-backed chunk landing on a progressive-join placeholder is its
