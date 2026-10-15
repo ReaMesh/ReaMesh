@@ -3,8 +3,24 @@
 # and mDNS. Type-check and test the frontend on both platforms.
 name: build
 on:
-  #disabled for now
-  #push:
+  # Pushes that only touch docs, artwork no build embeds, or other workflows
+  # don't build; workflow_dispatch still runs it on demand.
+  push:
+    paths-ignore:
+      - "**.md"
+      - LICENSE
+      - docs/**
+      - proprietary/screenshots/**
+      - proprietary/dmg/**
+      - .github/ISSUE_TEMPLATE/**
+      - .github/dependabot.yml
+      - .github/workflows/channel.yml
+      - .github/workflows/downloads.yml
+      - .github/workflows/licenses.yml
+      - .github/workflows/release.yml
+      - deny.toml
+      - skills-lock.json
+      - .gitignore
   workflow_dispatch:
 
 jobs:
