@@ -1876,6 +1876,13 @@ bool pointerOver(void* hwnd) {
   }
 }
 
+bool pointerOverApp() {
+  @autoreleasepool {
+    const NSInteger n = [NSWindow windowNumberAtPoint:[NSEvent mouseLocation] belowWindowWithWindowNumber:0];
+    return [NSApp windowWithWindowNumber:n] != nil;
+  }
+}
+
 std::string storyAway() {
   if (!g_story) return {};
   const double ph = storyPhase();

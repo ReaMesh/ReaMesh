@@ -133,6 +133,10 @@
 #define REAPERAPI_WANT_SnapToGrid
 #define REAPERAPI_WANT_GetToggleCommandState
 #define REAPERAPI_WANT_CountTrackMediaItems
+// Live values during gestures (liveTick / liveApply).
+#define REAPERAPI_WANT_GetLastTouchedFX
+#define REAPERAPI_WANT_TrackFX_GetParamNormalized
+#define REAPERAPI_WANT_TrackFX_SetParamNormalized
 #define REAPERAPI_WANT_UpdateTimeline
 #define REAPERAPI_WANT_CSurf_OnScroll
 #define REAPERAPI_WANT_MarkProjectDirty
@@ -2510,6 +2514,8 @@ static void internalizeExternalMedia() {
 
 // Defined below, near the tint helpers (needs applyItem / lockedItemsByOthers).
 static void revertLockedItemEdits(Snapshot& snap);
+static void pinLivePreviews(Snapshot& snap);
+static void liveArrived(const std::string& trackGuid, const json& fields);
 // Defined below, after applyChangeset.
 static void revertWhileLoading(const json& changeset, const Snapshot& base);
 
@@ -2656,6 +2662,7 @@ static void captureLocalChanges(bool force) {
   // state without proposing the edit. Keeping the authoritative baseline
   // also prevents the local lock tint from entering the diff.
   revertLockedItemEdits(snap);
+  pinLivePreviews(snap);
   pinPlaceholderItems(snap);
 
   std::string changeset = diffSnapshots(g_snapshot, snap);
@@ -2713,6 +2720,7 @@ static void captureLocalChanges(bool force) {
 // ---------- apply (remote side) ----------
 
 static void applyTrackFields(MediaTrack* tr, const json& fields) {
+  liveArrived(trackGuid(tr), fields);
   if (fields.contains("name") && fields["name"].is_string()) {
     const std::string name = cleanLine(fields["name"].get<std::string>(), kMaxNameBytes);
     std::vector<char> buf(name.begin(), name.end());
@@ -5806,6 +5814,8 @@ static json cursorAway() {
   MediaItem* item = nullptr;
   int fxTrackNo = 0, fxItemNo = -1, fxNo = 0;
   if (kind.empty()) {
+    // Only where REAPER is what the pointer is over, not another app on top.
+    if (!cursor_overlay::pointerOverApp()) return json();
     int x = 0, y = 0;
     GetMousePosition(&x, &y);
     char info[128] = {};
@@ -6061,6 +6071,228 @@ static void cursorTick() {
   cursor_overlay::tick();
 }
 
+// ---------- live values during gestures ----------
+//
+// REAPER commits a fader drag or a plug-in knob turn only when the button is
+// let go, so the edit reaches the others only then. Meanwhile the values
+// themselves go out as a preview (TAG_LIVE) at the timer rate: volume, pan
+// and width of every track that differs from what was last synced, and the
+// last-touched plug-in parameter while the button is held. Mute and solo stay
+// per-user, as everywhere else. Receivers show the preview but keep it out of
+// their own capture (pinLivePreviews), and drop it when the real edit arrives
+// or after a short silence.
+
+struct LiveTrackVals {
+  double vol = 1, pan = 0, width = 1;
+  bool operator==(const LiveTrackVals&) const = default;
+};
+// What we last streamed, per track.
+static std::map<std::string, LiveTrackVals> g_liveSent;
+struct LiveFxSent {
+  std::string key;  // guid:fx:param
+  double v = -1;
+};
+static LiveFxSent g_liveFxSent;
+// Previews applied here: per track, when they were last refreshed, and for
+// a plug-in parameter its value before the preview.
+struct LivePin {
+  std::chrono::steady_clock::time_point at;
+  bool scalars = false;
+  bool fx = false;
+  int fxIdx = 0, param = 0;
+  double fxOrig = 0;
+};
+static std::map<std::string, LivePin> g_livePins;
+static constexpr std::chrono::milliseconds kLiveExpire{1200};
+
+static bool liveNear(double a, double b) { return std::fabs(a - b) < 1e-9; }
+
+static void liveTick() {
+  if (!g_handle || (g_mode != Mode::Hosting && g_mode != Mode::ClientActive)) return;
+  static auto last = std::chrono::steady_clock::time_point{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::milliseconds(30)) return;
+  last = now;
+  const bool held = cursor_overlay::mouseHeld();
+  const bool playing = (GetPlayState() & 1) != 0;
+  json tracks = json::object();
+  std::set<std::string> seen;
+  for (int i = 0, n = CountTracks(nullptr); i < n; ++i) {
+    MediaTrack* tr = GetTrack(nullptr, i);
+    const std::string guid = trackGuid(tr);
+    auto base = g_snapshot.tracks.find(guid);
+    if (base == g_snapshot.tracks.end() || g_livePins.count(guid)) continue;
+    const LiveTrackVals v{GetMediaTrackInfo_Value(tr, "D_VOL"), GetMediaTrackInfo_Value(tr, "D_PAN"),
+                          GetMediaTrackInfo_Value(tr, "D_WIDTH")};
+    const bool differs = !liveNear(v.vol, base->second.vol) || !liveNear(v.pan, base->second.pan) ||
+                         !liveNear(v.width, base->second.width);
+    // While playing, only a gesture counts (automation moves values too).
+    if (differs && (held || !playing)) {
+      seen.insert(guid);
+      auto s = g_liveSent.find(guid);
+      if (s == g_liveSent.end() || !(s->second == v)) {
+        tracks[guid] = {{"vol", v.vol}, {"pan", v.pan}, {"width", v.width}};
+        g_liveSent[guid] = v;
+      }
+    }
+  }
+  // Gestures that ended (captured, or back where they were).
+  for (auto it = g_liveSent.begin(); it != g_liveSent.end();) {
+    if (seen.count(it->first)) {
+      ++it;
+      continue;
+    }
+    tracks[it->first] = {{"end", true}};
+    it = g_liveSent.erase(it);
+  }
+  json fx;
+  int trackNo = 0, fxNo = 0, param = 0;
+  if (held && GetLastTouchedFX(&trackNo, &fxNo, &param) && trackNo > 0 && (trackNo >> 16) == 0 &&
+      (fxNo >> 16) == 0) {
+    if (MediaTrack* tr = GetTrack(nullptr, trackNo - 1)) {
+      const std::string guid = trackGuid(tr);
+      const double v = TrackFX_GetParamNormalized(tr, fxNo, param);
+      const std::string key = guid + ":" + std::to_string(fxNo) + ":" + std::to_string(param);
+      if (!g_livePins.count(guid) && (key != g_liveFxSent.key || !liveNear(v, g_liveFxSent.v))) {
+        if (key == g_liveFxSent.key)  // a change while held: the knob is moving
+          fx = {{"g", guid}, {"fx", fxNo}, {"p", param}, {"v", v}};
+        g_liveFxSent = {key, v};
+      }
+    }
+  }
+  if (tracks.empty() && fx.is_null()) return;
+  json m = json::object();
+  if (!tracks.empty()) m["tracks"] = tracks;
+  if (!fx.is_null()) m["fx"] = fx;
+  reamesh_send_live(g_handle, dumpJson(m).c_str());
+}
+
+// Put a track's previewed values back to what was last synced.
+static void liveRestore(const std::string& guid, const LivePin& pin) {
+  MediaTrack* tr = findTrackByGuid(guid);
+  auto base = g_snapshot.tracks.find(guid);
+  if (!tr) return;
+  if (pin.scalars && base != g_snapshot.tracks.end()) {
+    SetMediaTrackInfo_Value(tr, "D_VOL", base->second.vol);
+    SetMediaTrackInfo_Value(tr, "D_PAN", base->second.pan);
+    SetMediaTrackInfo_Value(tr, "D_WIDTH", base->second.width);
+  }
+  if (pin.fx) TrackFX_SetParamNormalized(tr, pin.fxIdx, pin.param, pin.fxOrig);
+}
+
+static void liveApply() {
+  if (!g_handle || (g_mode != Mode::Hosting && g_mode != Mode::ClientActive)) return;
+  char* raw = reamesh_drain_live(g_handle);
+  const std::string payload = raw ? raw : "[]";
+  reamesh_free_string(raw);
+  const auto now = std::chrono::steady_clock::now();
+  bool touched = false;
+  g_applyingRemote = true;
+  if (payload != "[]") {
+    const json arr = json::parse(payload, nullptr, false);
+    // Fields someone holds: only the holder's preview of them is shown (anyone
+    // else's edit there is going to be undone anyway).
+    std::map<std::string, std::string> holders;  // "guid/field" -> holder
+    {
+      char* lr = reamesh_locked_entities(g_handle);
+      const json locks = json::parse(lr ? lr : "[]", nullptr, false);
+      reamesh_free_string(lr);
+      if (locks.is_array())
+        for (const auto& e : locks)
+          if (e.is_object() && jsonStr(e, "section") == "tracks")
+            holders[jsonStr(e, "id") + "/" + jsonStr(e, "field")] = jsonStr(e, "holder");
+    }
+    auto heldByOther = [&](const std::string& guid, const char* field, const std::string& by) {
+      auto h = holders.find(guid + "/" + field);
+      return h != holders.end() && h->second != by;
+    };
+    for (const auto& u : arr.is_array() ? arr : json::array()) {
+      if (!u.is_object()) continue;
+      const std::string by = jsonStr(u, "by");
+      if (u.contains("tracks") && u["tracks"].is_object())
+        for (const auto& [guid, vals] : u["tracks"].items()) {
+          // Our own gesture on this track wins locally.
+          if (g_liveSent.count(guid) || !vals.is_object()) continue;
+          MediaTrack* tr = findTrackByGuid(guid);
+          if (!tr) continue;
+          if (jsonBool(vals, "end", false)) {
+            if (auto p = g_livePins.find(guid); p != g_livePins.end() && p->second.scalars) {
+              // The real edit follows (or already came): drop the pin on
+              // the next capture rather than snapping back here.
+              p->second.at = now - kLiveExpire + std::chrono::milliseconds(600);
+            }
+            continue;
+          }
+          if (heldByOther(guid, "vol", by) || heldByOther(guid, "pan", by)) continue;
+          SetMediaTrackInfo_Value(tr, "D_VOL", jsonNum(vals, "vol", 1.0));
+          SetMediaTrackInfo_Value(tr, "D_PAN", jsonNum(vals, "pan", 0.0));
+          SetMediaTrackInfo_Value(tr, "D_WIDTH", jsonNum(vals, "width", 1.0));
+          LivePin& pin = g_livePins[guid];
+          pin.at = now;
+          pin.scalars = true;
+          touched = true;
+        }
+      if (u.contains("fx") && u["fx"].is_object()) {
+        const json& f = u["fx"];
+        const std::string guid = jsonStr(f, "g");
+        MediaTrack* tr = findTrackByGuid(guid);
+        const int fxIdx = static_cast<int>(jsonNum(f, "fx", -1)), param = static_cast<int>(jsonNum(f, "p", -1));
+        if (!tr || fxIdx < 0 || param < 0 || fxIdx >= TrackFX_GetCount(tr) || heldByOther(guid, "fxchain", by))
+          continue;
+        LivePin& pin = g_livePins[guid];
+        if (!pin.fx || pin.fxIdx != fxIdx || pin.param != param) {
+          if (pin.fx) TrackFX_SetParamNormalized(tr, pin.fxIdx, pin.param, pin.fxOrig);
+          pin.fx = true;
+          pin.fxIdx = fxIdx;
+          pin.param = param;
+          pin.fxOrig = TrackFX_GetParamNormalized(tr, fxIdx, param);
+        }
+        TrackFX_SetParamNormalized(tr, fxIdx, param, jsonNum(f, "v", 0.0));
+        pin.at = now;
+        touched = true;
+      }
+    }
+  }
+  // A preview that went quiet without its real edit (cancelled, or undone
+  // by the owner): back to what was last synced.
+  for (auto it = g_livePins.begin(); it != g_livePins.end();) {
+    if (now - it->second.at < kLiveExpire) {
+      ++it;
+      continue;
+    }
+    liveRestore(it->first, it->second);
+    touched = true;
+    it = g_livePins.erase(it);
+  }
+  g_applyingRemote = false;
+  if (touched) g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+}
+
+// The real edit arrived for a previewed track: it replaces the preview.
+static void liveArrived(const std::string& guid, const json& fields) {
+  auto p = g_livePins.find(guid);
+  if (p == g_livePins.end()) return;
+  if (fields.contains("vol") || fields.contains("pan") || fields.contains("width")) p->second.scalars = false;
+  if (fields.contains("fxchain")) p->second.fx = false;
+  if (!p->second.scalars && !p->second.fx) g_livePins.erase(p);
+}
+
+// Keep previewed values out of the capture diff: they are someone else's
+// gesture, not ours.
+static void pinLivePreviews(Snapshot& snap) {
+  for (const auto& [guid, pin] : g_livePins) {
+    auto cur = snap.tracks.find(guid);
+    auto base = g_snapshot.tracks.find(guid);
+    if (cur == snap.tracks.end() || base == g_snapshot.tracks.end()) continue;
+    if (pin.scalars) {
+      cur->second.vol = base->second.vol;
+      cur->second.pan = base->second.pan;
+      cur->second.width = base->second.width;
+    }
+    if (pin.fx) cur->second.fxchain = base->second.fxchain;
+  }
+}
+
 static void timerTickBody() {
   if (g_unsupported) {
     unsupportedTick();
@@ -6120,6 +6352,8 @@ static void timerTickBody() {
       followTick();
       drainPings();
       cursorTick();
+      liveTick();
+      liveApply();
       if (g_mode == Mode::Hosting) refreshSessionMeta(false);
       // Capture before apply, so an edit made by the user in this tick
       // interval is diffed against the old baseline before remote

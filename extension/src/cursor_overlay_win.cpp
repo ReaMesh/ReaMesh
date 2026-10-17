@@ -69,6 +69,15 @@ bool pointerOver(void* hwnd) {
   return under && GetAncestor(under, GA_ROOT) == GetAncestor(h, GA_ROOT);
 }
 
+bool pointerOverApp() {
+  POINT p{};
+  if (!GetCursorPos(&p)) return false;
+  HWND under = WindowFromPoint(p);
+  DWORD pid = 0;
+  if (under) GetWindowThreadProcessId(under, &pid);
+  return under && pid == GetCurrentProcessId();
+}
+
 bool sampleLocal(Local* out) {
   if (!g_tv) return false;
   *out = Local{};

@@ -153,6 +153,8 @@ bool mouseHeld();
 // Whether the pointer is over the window that holds `hwnd` (an HWND / NSView*),
 // with nothing covering it.
 bool pointerOver(void* hwnd);
+// Whether the topmost window under the pointer is one of REAPER's.
+bool pointerOverApp();
 // REAMESH_CURSOR_DEMO=story only: where the scripted pointer is meant to be
 // working while away ("fx", "midi", "mixer" or "").
 std::string storyAway();
