@@ -4,7 +4,7 @@
 // different number on the other end means a different build: the app refuses
 // to drive such an extension (REAPER still has the old one loaded) and the
 // Lobby refuses to join such a host, instead of anyone testing the mix.
-export const PROTO = 4;
+export const PROTO = 3;
 
 /** How a peer's or extension's `proto` relates to ours. A build from before
  *  `proto` existed reports none and counts as 0, i.e. older. */

@@ -20,7 +20,7 @@ mod updater;
 /// `PROTO` (rust/src/lib.rs; app/src/lib/version.test.ts checks the copies
 /// agree). An update is restarted into mid-session only when its manifest
 /// names the same number.
-pub(crate) const PROTO: u32 = 4;
+pub(crate) const PROTO: u32 = 3;
 
 #[cfg(target_os = "macos")]
 const PLUGIN_NAME: &str = "reaper_reamesh.dylib";
@@ -182,8 +182,10 @@ fn store_lang_pref(app: &AppHandle, pref: &str) {
 // on by default, so existing installs start with it on as well). Bit 8
 // (time-selection) is retired and masked off. Bit 16 is set when the HUD is
 // switched off altogether (inverted so existing installs keep it on); the
-// webview just stops opening the window.
-const OVERLAY_ALL: u8 = 0b1_0111;
+// webview just stops opening the window. Bits 32 and 64 are set when other
+// people's cursors are hidden in REAPER and when ours is not shared (inverted
+// the same way).
+const OVERLAY_ALL: u8 = 0b111_0111;
 const OVERLAY_REMEMBER_POS: u8 = 0b100;
 /// Fresh install: HUD shown, every toggle on.
 const OVERLAY_DEFAULT: u8 = 0b111;

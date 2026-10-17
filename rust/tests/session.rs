@@ -796,6 +796,8 @@ fn locked_entities_reports_other_peers_item_holds_not_own() {
                 e["section"] == "items"
                     && e["id"] == "{I1}"
                     && e["holder"] == serde_json::json!(client_id)
+                    && e["color"].as_str().is_some_and(|c| c.len() == 7 && c.starts_with('#'))
+                    && e["name"].is_string()
             })
         }),
         "owner never saw the client's item lock: {}",
@@ -1418,6 +1420,74 @@ fn presence_names_propagate() {
     drop(owner);
     let _ = fs::remove_dir_all(project);
     let _ = fs::remove_dir_all(staging);
+}
+
+/// Wait for the first cursor update `to` receives and return it.
+fn next_cursor(to: &Reamesh) -> Option<Value> {
+    let mut got = None;
+    wait_until(Duration::from_secs(10), || {
+        let v: Value = serde_json::from_str(&to.drain_cursors()).unwrap();
+        got = v.as_array().unwrap().first().cloned();
+        got.is_some()
+    });
+    got
+}
+
+fn cursor_round_trip(pass: &str) {
+    let project = temp_dir("proj-cursor");
+    let staging = temp_dir("staging-cursor");
+    make_project(&project);
+    reamesh::set_profile("Tester", "#a1b2c3");
+    let (owner, client) = establish_pass("cursor-test", &project, &staging, pass);
+    let owner_id = owner.local_peer_id().to_string();
+    let client_id = client.local_peer_id().to_string();
+
+    // Out of range values are clamped and an overlong GUID is cut by the sender.
+    let long_guid = format!("{{{}}}", "A".repeat(100));
+    let sent = serde_json::json!({ "t": 12.5, "g": long_guid, "fy": 1.7, "in": true, "click": true });
+    // Gossip needs a moment after the mesh forms; resend until one lands.
+    let mut c = None;
+    for _ in 0..10 {
+        assert!(owner.send_cursor(&sent.to_string()));
+        c = next_cursor(&client);
+        if c.is_some() {
+            break;
+        }
+    }
+    let c = c.expect("cursor never arrived");
+    assert_eq!(c["by"], serde_json::json!(owner_id));
+    assert_eq!(c["t"], 12.5);
+    assert_eq!(c["fy"], 1.0);
+    assert_eq!(c["in"], true);
+    assert_eq!(c["click"], true);
+    assert_eq!(c["g"].as_str().unwrap().chars().count(), 64);
+    assert!(c["color"].as_str().unwrap().starts_with('#'));
+    assert!(c.get("mac").is_none(), "the MAC is not handed to the extension");
+
+    // And the other way, leaving the arrange.
+    assert!(client.send_cursor(r#"{"t":1,"g":"{T1}","fy":0.5,"in":false}"#));
+    let o = next_cursor(&owner).expect("client cursor never arrived");
+    assert_eq!(o["by"], serde_json::json!(client_id));
+    assert_eq!(o["in"], false);
+    assert_eq!(o["click"], false);
+
+    // Garbage is refused before it reaches the wire.
+    assert!(!owner.send_cursor("not json"));
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
+fn cursor_updates_round_trip() {
+    cursor_round_trip("");
+}
+
+#[test]
+fn cursor_updates_round_trip_sealed() {
+    cursor_round_trip("hunter2");
 }
 
 #[test]

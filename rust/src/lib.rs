@@ -73,7 +73,7 @@ const LOBBY_TOPIC: &str = "reamesh/v2/lobby";
 /// instead of tested. Mirrored in the app (`app/src/lib/version.ts`,
 /// `app/src-tauri/src/lib.rs`); app/src/lib/version.test.ts checks the copies
 /// agree.
-pub const PROTO: u32 = 4;
+pub const PROTO: u32 = 3;
 /// This build's version, the same number across the core, the extension and
 /// the ReaMesh app (they release together).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -170,10 +170,12 @@ const PRESENCE_FAST_INTERVAL: Duration = Duration::from_millis(100);
 /// sender's peer id), so open-topic bystanders can't inject markers.
 const TAG_MARKER: u8 = b'M';
 /// Live mouse cursor over the arrange: `'C'` + JSON
-/// `{"t","g","fy","in","click","seq","mac"}` (project seconds, track GUID,
-/// 0..1 within the track, false once the mouse left the arrange). Sent at
-/// most ~20 times a second and only while it changes; receivers keep the
-/// latest per peer for the in-REAPER cursor layer. MAC'd like a beacon.
+/// `{"t","g","fy","in","click","mac"}` (project seconds, track GUID, 0..1
+/// within the track, false once the mouse left the arrange). Sent at most ~30
+/// times a second and only while it changes (plus a keep-alive every few
+/// seconds); receivers queue them for the in-REAPER cursor layer. MAC'd like a
+/// beacon. Additive: builds without it drop the unknown tag unread (the
+/// receive match's catch-all), so it needs no `PROTO` bump.
 const TAG_CURSOR: u8 = b'C';
 /// If the extension's main-thread presence feed (`set_presence`, called every
 /// timer tick) has been silent this long while the network thread still runs,
@@ -2587,21 +2589,42 @@ impl Reamesh {
     }
 
     /// The live editing locks currently held by a peer *other than us*, as a
-    /// JSON array of `{"section","id","field","holder"}`. Read from the live
-    /// lock table (`peer_locks`: what the owner broadcasts and a client last
-    /// received), so it only ever lists locks still inside `LOCK_HOLD`; the
-    /// owner's own held fields and a client's own held fields are filtered out
-    /// (holder == us). The extension uses this purely to tint media items
-    /// another peer is editing: it is a local view hint, never project state
-    /// and never anything that rides back out on the wire.
+    /// JSON array of `{"section","id","field","holder","name","color"}` (name:
+    /// the holder's roster name, empty until their first beacon). Read from
+    /// the live lock table (`peer_locks`: what the owner broadcasts and a
+    /// client last received), so it only ever lists locks still inside
+    /// `LOCK_HOLD`; the owner's own held fields and a client's own held fields
+    /// are filtered out (holder == us). The extension uses this purely to mark
+    /// media items another peer is editing: it is a local view hint, never
+    /// project state and never anything that rides back out on the wire.
     pub fn locked_entities_json(&self) -> String {
         let me = self.local_peer_id.as_str();
-        let locks = self.shared.peer_locks.lock().unwrap();
-        let arr: Vec<JsonValue> = locks
+        // Copied out first: the two tables are never held together.
+        let locks: Vec<_> = self
+            .shared
+            .peer_locks
+            .lock()
+            .unwrap()
             .iter()
             .filter(|(_, holder)| holder.as_str() != me)
+            .map(|(k, holder)| (k.clone(), holder.clone()))
+            .collect();
+        let peers = self.shared.peers_info.lock().unwrap();
+        let arr: Vec<JsonValue> = locks
+            .iter()
             .map(|((section, id, field), holder)| {
-                json!({ "section": section, "id": id, "field": field, "holder": holder })
+                let (name, color) = peers
+                    .get(holder)
+                    .map(|p| (p.name.clone(), p.color.clone()))
+                    .unwrap_or_default();
+                json!({
+                    "section": section,
+                    "id": id,
+                    "field": field,
+                    "holder": holder,
+                    "name": name,
+                    "color": if color.is_empty() { default_color(holder) } else { color },
+                })
             })
             .collect();
         json!(arr).to_string()
