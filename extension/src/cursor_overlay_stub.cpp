@@ -17,6 +17,5 @@ void revert(const Revert&) {}
 bool mouseHeld() { return false; }
 bool pointerOver(void*) { return false; }
 bool pointerOverApp() { return false; }
-std::string storyAway() { return {}; }
 
 }  // namespace cursor_overlay

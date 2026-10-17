@@ -13,29 +13,10 @@
 //    target to the new one. Those offsets run in the render server, so they
 //    keep moving at display rate even while REAPER's main thread is busy, and
 //    they ride on top of whatever the model position does.
-//
-// Prototype knobs (environment, read at attach):
-//   REAMESH_CURSOR_SYNC=commit|timer|paint  when the glue pass runs (default commit)
-//   REAMESH_CURSOR_DEMO=k          send a synthetic moving pointer (path phase k) instead of the mouse
-//   REAMESH_CURSOR_DEMO=story      send a scripted 40s tour of every cursor state (see storyPoint)
-//   REAMESH_CURSOR_IDLE=s          dim resting cursors after s seconds instead of 10
-//   REAMESH_CURSOR_REDUCE_MOTION=1 behave as with the system's "Reduce motion"
-//   REAMESH_CURSOR_DEMO_ITEM=<guid>  with DEMO: the synthetic pointer rides on that item
-//   REAMESH_CURSOR_FAKE=N          show N synthetic local peers (load test)
-//   REAMESH_CURSOR_BUSY=ms:every   block the main thread for ms every `every` ms
-//   REAMESH_CURSOR_KNOBS=<file>    re-read `busy=ms:every` from this file every second
-//   REAMESH_CURSOR_SCROLLTEST=scroll|zoom|height|vscroll  animate the arrange view at 60 Hz
-//   REAMESH_CURSOR_STATS=1         print timing stats to stderr every 5s
-//   REAMESH_CURSOR_TRACE=1         log each local sample and each arrival (latency)
-//   REAMESH_CURSOR_PARK=t:track:fy:#rrggbb  one synthetic peer parked at a spot
-//   REAMESH_CURSOR_SNAPSHOT=<file.png>  with STATS: render the layer tree there every 5s
+
 
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
-#import <objc/runtime.h>
-
-#include <mach/mach_time.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <cmath>
@@ -186,7 +167,6 @@ constexpr Style kStyle = {
 
 // ---------- state ----------
 
-enum class Sync { Commit, Timer, Paint };
 enum class Side { Left, Right, Top, Bottom };
 
 struct Peer {
@@ -229,6 +209,7 @@ struct Peer {
 
   bool cursorShown = false, tagShown = false, edgeShown = false, parked = false;
   bool idle = false, pressed = false;
+  bool fresh = false;  // heard from within staleAfter (tick notices the change)
   CGPoint cursorModel = CGPointZero, tagModel = CGPointZero, edgeModel = CGPointZero;
   Side edgeSide = Side::Left;
 };
@@ -265,11 +246,10 @@ CALayer* g_root = nil;
 CGFloat g_scale = 2;
 std::map<std::string, Peer> g_peers;
 bool g_showCursors = true;
-// System setting "Reduce motion" (or REAMESH_CURSOR_REDUCE_MOTION): no
-// springs, no scaling, cursors fade instead of travelling.
+// The system setting "Reduce motion": no springs, no scaling, cursors fade
+// instead of travelling.
 bool g_reduceMotion = false;
 double g_reduceMotionChecked = 0;
-double g_idleDimAfter = kStyle.idleDimAfter;  // REAMESH_CURSOR_IDLE overrides (demo)
 // Item marks live in their own layer below the cursors.
 CALayer* g_markRoot = nil;
 std::map<std::string, MarkState> g_marks;
@@ -294,30 +274,8 @@ CATextLayer* g_followText = nil;
 std::string g_followKey;
 CFRunLoopObserverRef g_observer = nullptr;
 id g_clickMonitor = nil;
-Class g_tvOrigClass = Nil;
 bool g_clickPending = false;
 NSPoint g_clickPoint = NSZeroPoint;
-
-Sync g_sync = Sync::Commit;
-int g_demo = 0;  // 0 off, else the synthetic path's phase
-bool g_story = false;  // REAMESH_CURSOR_DEMO=story: the scripted feature tour
-int g_fake = 0;
-double g_busyMs = 0, g_busyEvery = 0, g_lastBusy = 0;
-std::string g_scrollTest;
-NSTimer* g_scrollTimer = nil;
-double g_scrollT0 = 0, g_scrollT1 = 0, g_scrollStart = 0;
-double g_lastFake = 0;
-bool g_stats = false;
-bool g_trace = false;  // REAMESH_CURSOR_TRACE: log every sample/arrival (latency measurement)
-std::string g_park;
-
-// Stats: glue lag (geometry change seen → layers moved), pass cost.
-double g_changeAt = 0;
-std::vector<double> g_lags;
-unsigned g_ripples = 0, g_clicksOut = 0;
-unsigned g_observerPasses = 0, g_gluePasses = 0, g_paintPasses = 0, g_netUpdates = 0;
-double g_observerCost = 0, g_glueCost = 0;
-double g_lastStats = 0;
 
 double now() { return CACurrentMediaTime(); }
 
@@ -505,7 +463,6 @@ void popOut(CALayer* l) {
 }
 
 void ripple(Peer& p) {
-  ++g_ripples;
   CAShapeLayer* r = [CAShapeLayer layer];
   const double rr = kStyle.rippleRadius;
   CGPathRef circle = CGPathCreateWithEllipseInRect(CGRectMake(-rr, -rr, 2 * rr, 2 * rr), nullptr);
@@ -1032,17 +989,6 @@ bool layoutPeer(Peer& p, const Geo& g, double t) {
   return moved;
 }
 
-// Would any layer move if laid out now? (lag detection only)
-bool anyChange(const Geo& g, double t) {
-  for (auto& [id, p] : g_peers) {
-    const Place pl = placeOf(p, g, t);
-    if (pl.kind == Place::Cursor && p.cursorShown && !samePoint(pl.p, p.cursorModel)) return true;
-    if (pl.kind == Place::Edge && p.edgeShown && pl.side == p.edgeSide && !samePoint(pl.p, p.edgeModel))
-      return true;
-  }
-  return false;
-}
-
 void checkScale() {
   const CGFloat s = g_tv.window ? g_tv.window.backingScaleFactor : 2;
   if (s == g_scale) return;
@@ -1062,33 +1008,47 @@ void checkScale() {
 
 void layoutMarks(const Geo& g);
 
+// Whether nothing on screen can have moved since the last full pass: no
+// update waiting and the view (time axis, size, track rows) unchanged. The
+// observer runs on every run-loop pass, ~1000 times a second, and most of
+// them change nothing. REAPER's own numbers can trail a change by a pass, so
+// after one the full pass keeps running for a moment.
+double g_viewKey[5] = {};
+unsigned long long g_viewStamp = 0;
+double g_viewSettleUntil = 0;
+
+bool quiet(const Geo& g, double t) {
+  const unsigned long long stamp = g.ok && g_host.rowsStamp ? g_host.rowsStamp() : 0;
+  const double key[5] = {g.t0, g.spp, g.W, g.H, g.ok ? 1.0 : 0.0};
+  if (stamp != g_viewStamp || !std::equal(key, key + 5, g_viewKey)) {
+    g_viewStamp = stamp;
+    std::copy(key, key + 5, g_viewKey);
+    g_viewSettleUntil = t + 0.15;
+    return false;
+  }
+  if (t < g_viewSettleUntil || g_marksDirty || !g_pendingReverts.empty() || t < g_marksSettleUntil) return false;
+  for (const auto& [id, p] : g_peers)
+    if (p.pendingSpring || p.pendingClick) return false;
+  return true;
+}
+
 // The glue pass: every peer to its current pixel (`onlyPending`: just the
 // peers with a network update waiting).
-void glue(const char* why, bool onlyPending = false) {
+void glue(bool onlyPending = false) {
   if (!g_attached) return;
   if (!NSEqualRects(g_view.frame, g_tv.bounds)) g_view.frame = g_tv.bounds;
   if (g_peers.empty() && g_marks.empty() && g_pendingReverts.empty()) return;
-  const uint64_t a = mach_absolute_time();
   const double t = now();
   checkScale();
   const Geo g = readGeo();
+  if (!onlyPending && quiet(g, t)) return;
   if (!onlyPending && g.ok && !g_pendingReverts.empty()) {
     for (const auto& r : g_pendingReverts) runRevert(r, g);
     g_pendingReverts.clear();
   }
   if (!onlyPending) layoutMarks(g);
-  bool moved = false;
   for (auto& [id, p] : g_peers)
-    if (!onlyPending || p.pendingSpring || p.pendingClick) moved |= layoutPeer(p, g, t);
-  if (moved && g_changeAt > 0) {
-    g_lags.push_back((t - g_changeAt) * 1000.0);
-    g_changeAt = 0;
-  }
-  ++g_gluePasses;
-  mach_timebase_info_data_t tb;
-  mach_timebase_info(&tb);
-  g_glueCost += double(mach_absolute_time() - a) * tb.numer / tb.denom / 1000.0;
-  (void)why;
+    if (!onlyPending || p.pendingSpring || p.pendingClick) layoutPeer(p, g, t);
 }
 
 void onObserver() {
@@ -1103,7 +1063,6 @@ void onObserver() {
     }
   }
   if (g_peers.empty() && g_marks.empty() && g_pendingReverts.empty()) return;
-  ++g_observerPasses;
   // Updates stopped: the pointer came to rest, so take the prediction back.
   const double t = now();
   for (auto& [id, p] : g_peers)
@@ -1112,60 +1071,7 @@ void onObserver() {
       p.vt = p.vfy = 0;
       p.pendingSpring = true;
     }
-  if (g_sync == Sync::Commit) {
-    glue("commit");
-    return;
-  }
-  // Other modes: only note when the arrange moved under the cursors, so the
-  // stats can say how long it took the chosen pass to catch up.
-  if (g_changeAt > 0) return;
-  const uint64_t a = mach_absolute_time();
-  const Geo g = readGeo();
-  if (anyChange(g, now())) g_changeAt = now();
-  mach_timebase_info_data_t tb;
-  mach_timebase_info(&tb);
-  g_observerCost += double(mach_absolute_time() - a) * tb.numer / tb.denom / 1000.0;
-}
-
-void printStats() {
-  const double t = now();
-  if (!g_stats || t - g_lastStats < 5) return;
-  const double span = g_lastStats > 0 ? t - g_lastStats : 5;
-  g_lastStats = t;
-  std::vector<double> l = g_lags;
-  std::sort(l.begin(), l.end());
-  double mean = 0;
-  for (double v : l) mean += v;
-  if (!l.empty()) mean /= l.size();
-  const double p95 = l.empty() ? 0 : l[std::min(l.size() - 1, size_t(l.size() * 0.95))];
-  const double mx = l.empty() ? 0 : l.back();
-  const char* mode = g_sync == Sync::Commit ? "commit" : g_sync == Sync::Timer ? "timer" : "paint";
-  logf("mode=%s peers=%zu net=%.1f/s glue=%.1f/s (%.1fus avg) observer=%.1f/s (%.1fus avg) paint=%.1f/s "
-       "lag n=%zu mean=%.2fms p95=%.2fms max=%.2fms ripples=%u clicks_out=%u",
-       mode, g_peers.size(), g_netUpdates / span, g_gluePasses / span,
-       g_gluePasses ? g_glueCost / g_gluePasses : 0, g_observerPasses / span,
-       (g_observerPasses && g_sync != Sync::Commit) ? g_observerCost / g_observerPasses : 0,
-       g_paintPasses / span, l.size(), mean, p95, mx, g_ripples, g_clicksOut);
-  size_t shownMarks = 0;
-  for (const auto& [id, ms] : g_marks) shownMarks += ms.shown;
-  logf("marks=%zu shown=%zu hover=%d", g_marks.size(), shownMarks, (int)g_hoverShown);
-  if (const char* snap = getenv("REAMESH_CURSOR_SNAPSHOT")) {
-    const CGSize sz = g_view.bounds.size;
-    NSBitmapImageRep* rep = [[NSBitmapImageRep alloc]
-        initWithBitmapDataPlanes:nullptr pixelsWide:NSInteger(sz.width * g_scale) pixelsHigh:NSInteger(sz.height * g_scale)
-                   bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO
-                  colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
-    NSGraphicsContext* ctx = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
-    CGContextRef cg = ctx.CGContext;
-    CGContextScaleCTM(cg, g_scale, g_scale);
-    CGContextTranslateCTM(cg, 0, sz.height);
-    CGContextScaleCTM(cg, 1, -1);
-    [g_root renderInContext:cg];
-    [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:@(snap) atomically:YES];
-  }
-  g_lags.clear();
-  g_netUpdates = g_gluePasses = g_observerPasses = g_paintPasses = 0;
-  g_glueCost = g_observerCost = 0;
+  glue();
 }
 
 // ---------- item marks ----------
@@ -1288,199 +1194,12 @@ void layoutMarks(const Geo& g) {
   layoutHover();
 }
 
-// ---------- synthetic motion (demo sender, fake peers) ----------
-
-// A slow Lissajous path over the arrange, in arrange pixels.
-NSPoint synthPoint(double t, int k, const Geo& g) {
-  const double ph = k * 1.7;
-  return NSMakePoint(g.W * (0.5 + 0.36 * std::sin(2 * M_PI * 0.11 * t + ph)),
-                     g.H * (0.42 + 0.34 * std::sin(2 * M_PI * 0.17 * t + ph * 1.3)));
-}
-
-// REAMESH_CURSOR_DEMO=story: a scripted pointer showing every cursor state
-// in turn, on a 50s loop aligned to the wall clock (so a test script in the
-// same instance can open an FX window and drop the dragged item in step).
-// Returns false while the pointer is meant to be away from the arrange.
-double storyPhase() { return std::fmod([[NSDate date] timeIntervalSince1970], 50.0); }
-
-bool storyPoint(const Geo& g, NSPoint* vp, bool* down) {
-  const double ph = storyPhase();
-  static double lastPh = 0;
-  const bool clickNow = lastPh < 10.0 && ph >= 10.0;
-  lastPh = ph;
-  const double W = g.W, H = g.H;
-  auto lerp = [](double a, double b, double u) { return a + (b - a) * std::clamp(u, 0.0, 1.0); };
-  auto ease = [](double u) { u = std::clamp(u, 0.0, 1.0); return u * u * (3 - 2 * u); };
-  // The drag: grab the demo item (REAMESH_CURSOR_DEMO_ITEM) and carry it 4s
-  // later and one track down. The start is fixed when the drag begins.
-  static NSPoint grab = NSZeroPoint, drop = NSZeroPoint;
-  if (ph < 5) {
-    double t0 = 0, t1 = 0, y = 0, h = 0, ty = 0, th = 0;
-    std::string track;
-    if (const char* item = getenv("REAMESH_CURSOR_DEMO_ITEM");
-        item && g_host.itemSpan && g_host.itemSpan(item, &t0, &t1, &y, &h, &track) &&
-        g_host.trackSpan(track.c_str(), &ty, &th)) {
-      grab = NSMakePoint((t0 + (t1 - t0) * 0.4 - g.t0) / g.spp, y + h * 0.5);
-      drop = NSMakePoint(grab.x + 4.0 / g.spp, grab.y + th);
-    } else {
-      grab = NSMakePoint(0.3 * W, 0.3 * H);
-      drop = NSMakePoint(0.45 * W, 0.4 * H);
-    }
-  }
-  *down = false;
-  if (ph < 4) {  // gliding about
-    *vp = synthPoint(now(), 1, g);
-  } else if (ph < 6) {  // over to the item
-    const NSPoint a = synthPoint(now() - (ph - 4), 1, g);
-    const double u = ease((ph - 4) / 2);
-    *vp = NSMakePoint(lerp(a.x, grab.x, u), lerp(a.y, grab.y, u));
-  } else if (ph < 9) {  // dragging it: button held
-    const double u = ease((ph - 6.3) / 2.4);
-    *vp = NSMakePoint(lerp(grab.x, drop.x, u), lerp(grab.y, drop.y, u));
-    *down = true;
-  } else if (ph < 11) {  // let go; a click
-    *vp = drop;
-    if (clickNow) {
-      g_clickPending = true;
-      g_clickPoint = *vp;
-    }
-  } else if (ph < 13.5) {  // a long jump, then a little circling
-    const double a = (ph - 11) * 2.4;
-    *vp = NSMakePoint(0.82 * W + 30 * std::sin(a), 0.74 * H + 22 * std::cos(a));
-  } else if (ph < 18) {  // past the right edge, moving down the tracks
-    *vp = NSMakePoint(W * 1.25, lerp(0.15 * H, 0.85 * H, ease((ph - 13.5) / 4.5)));
-  } else if (ph < 20) {  // back in
-    const double u = ease((ph - 18) / 2);
-    *vp = NSMakePoint(lerp(W * 1.02, 0.6 * W, u), lerp(0.85 * H, 0.5 * H, u));
-  } else if (ph < 28) {  // resting
-    *vp = NSMakePoint(0.6 * W, 0.5 * H);
-  } else if (ph < 43) {  // away: FX window, MIDI editor, mixer
-    return false;
-  } else {
-    *vp = synthPoint(now(), 1, g);
-  }
-  return true;
-}
+// ---------- the local pointer ----------
 
 bool semanticAt(NSPoint vp, const Geo& g, double* tt, std::string* guid, double* fy) {
   if (!g.ok || !g_host.trackAt(vp.y, guid, fy)) return false;
   *tt = g.t0 + vp.x * g.spp;
   return true;
-}
-
-void fakeTick() {
-  if (g_fake <= 0) return;
-  const double t = now();
-  if (t - g_lastFake < 0.05) return;
-  g_lastFake = t;
-  static const char* names[] = {"Lena", "Sam", "Alex", "Ben", "Mia", "Noah", "Ida", "Tom"};
-  static const char* colors[] = {"#e5484d", "#30a46c", "#8e4ec6", "#f76b15",
-                                 "#0090ff", "#d6409f", "#12a594", "#ffc53d"};
-  const Geo g = readGeo();
-  for (int k = 0; k < g_fake; ++k) {
-    cursor_overlay::Remote r;
-    r.id = "fake-" + std::to_string(k);
-    r.name = names[k % 8];
-    r.color = colors[k % 8];
-    r.in = semanticAt(synthPoint(t, k + 1, g), g, &r.t, &r.guid, &r.fy);
-    r.click = std::fmod(t + k, 4.0) < 0.05;
-    cursor_overlay::update(r);
-  }
-}
-
-void parkTick() {
-  if (g_park.empty()) return;
-  static double lastPark = 0;
-  if (now() - lastPark < 1.0) return;
-  lastPark = now();
-  double t = 0, fy = 0;
-  int idx = 0;
-  char color[16] = "#00e5ff";
-  if (sscanf(g_park.c_str(), "%lf:%d:%lf:%15s", &t, &idx, &fy, color) < 3) return;
-  cursor_overlay::Remote r;
-  r.id = "park";
-  r.name = "Alex";
-  r.color = color;
-  r.t = t;
-  r.fy = fy;
-  r.in = g_host.trackGuidAt && g_host.trackGuidAt(idx, &r.guid);
-  cursor_overlay::update(r);
-}
-
-void busyTick() {
-  static double lastKnobs = 0;
-  if (const char* knobs = getenv("REAMESH_CURSOR_KNOBS"); knobs && now() - lastKnobs > 1) {
-    lastKnobs = now();
-    if (FILE* f = fopen(knobs, "r")) {
-      double ms = 0, every = 0;
-      if (fscanf(f, "busy=%lf:%lf", &ms, &every) == 2) g_busyMs = ms, g_busyEvery = every;
-      fclose(f);
-    }
-  }
-  if (g_busyMs <= 0) return;
-  const double t = now();
-  if ((t - g_lastBusy) * 1000 < g_busyEvery) return;
-  g_lastBusy = t;
-  usleep(useconds_t(g_busyMs * 1000));
-}
-
-void startScrollTest() {
-  if (g_scrollTest.empty() || !g_host.setTimeAxis) return;
-  g_scrollTimer = [NSTimer timerWithTimeInterval:1.0 / 60
-                                         repeats:YES
-                                           block:^(NSTimer*) {
-                                             if (!g_host.ready || !g_host.ready()) return;
-                                             double t0 = 0, spp = 0;
-                                             if (g_scrollT1 <= g_scrollT0) {
-                                               if (!g_host.timeAxis(&t0, &spp)) return;
-                                               g_scrollT0 = t0;
-                                               g_scrollT1 = t0 + spp * g_view.bounds.size.width;
-                                               g_scrollStart = now();
-                                             }
-                                             const double span = g_scrollT1 - g_scrollT0;
-                                             const double ph = std::sin(2 * M_PI * 0.25 * (now() - g_scrollStart));
-                                             if (g_scrollTest == "height") {
-                                               const int hgt = int(64 + 40 * ph);
-                                               g_host.testNudge(0, 0, hgt);
-                                               return;
-                                             }
-                                             if (g_scrollTest == "vscroll") {
-                                               static int step = 0;
-                                               ++step;
-                                               if (step % 4 == 0) g_host.testNudge(1, 0, (step / 120) % 2 ? -1 : 1);
-                                               return;
-                                             }
-                                             if (g_scrollTest == "zoom") {
-                                               const double c = g_scrollT0 + span / 2;
-                                               const double h = span / 2 * (1 + 0.35 * ph);
-                                               g_host.setTimeAxis(c - h, c + h);
-                                             } else {
-                                               const double d = 0.25 * span * ph;
-                                               g_host.setTimeAxis(g_scrollT0 + d, g_scrollT1 + d);
-                                             }
-                                           }];
-  [[NSRunLoop mainRunLoop] addTimer:g_scrollTimer forMode:NSRunLoopCommonModes];
-}
-
-// ---------- the paint hook (REAMESH_CURSOR_SYNC=paint) ----------
-
-void installPaintHook() {
-  g_tvOrigClass = object_getClass(g_tv);
-  NSString* name = [NSString stringWithFormat:@"ReaMeshCursorTV_%s", class_getName(g_tvOrigClass)];
-  Class sub = NSClassFromString(name);
-  if (!sub) {
-    sub = objc_allocateClassPair(g_tvOrigClass, name.UTF8String, 0);
-    Method m = class_getInstanceMethod(g_tvOrigClass, @selector(drawRect:));
-    IMP orig = method_getImplementation(m);
-    IMP imp = imp_implementationWithBlock(^(id self, NSRect r) {
-      ((void (*)(id, SEL, NSRect))orig)(self, @selector(drawRect:), r);
-      ++g_paintPasses;
-      glue("paint");
-    });
-    class_addMethod(sub, @selector(drawRect:), imp, method_getTypeEncoding(m));
-    objc_registerClassPair(sub);
-  }
-  object_setClass(g_tv, sub);
 }
 
 NSView* findTrackView(void* mainWindow) {
@@ -1525,21 +1244,6 @@ bool attach(void* mainWindow, const Host& host) {
     g_host = host;
     g_tv = tv;
     g_scale = tv.window ? tv.window.backingScaleFactor : 2;
-
-    const char* sync = getenv("REAMESH_CURSOR_SYNC");
-    g_sync = !sync ? Sync::Commit
-             : !strcmp(sync, "timer") ? Sync::Timer
-             : !strcmp(sync, "paint") ? Sync::Paint
-                                      : Sync::Commit;
-    g_demo = getenv("REAMESH_CURSOR_DEMO") ? std::max(1, atoi(getenv("REAMESH_CURSOR_DEMO"))) : 0;
-    g_story = getenv("REAMESH_CURSOR_DEMO") && !strcmp(getenv("REAMESH_CURSOR_DEMO"), "story");
-    if (const char* idle = getenv("REAMESH_CURSOR_IDLE")) g_idleDimAfter = std::max(0.5, atof(idle));
-    g_fake = getenv("REAMESH_CURSOR_FAKE") ? atoi(getenv("REAMESH_CURSOR_FAKE")) : 0;
-    if (const char* b = getenv("REAMESH_CURSOR_BUSY")) sscanf(b, "%lf:%lf", &g_busyMs, &g_busyEvery);
-    g_scrollTest = getenv("REAMESH_CURSOR_SCROLLTEST") ? getenv("REAMESH_CURSOR_SCROLLTEST") : "";
-    g_stats = getenv("REAMESH_CURSOR_STATS") != nullptr;
-    g_trace = getenv("REAMESH_CURSOR_TRACE") != nullptr;
-    g_park = getenv("REAMESH_CURSOR_PARK") ? getenv("REAMESH_CURSOR_PARK") : "";
 
     ReaMeshCursorView* v = [[ReaMeshCursorView alloc] initWithFrame:tv.bounds];
     CALayer* root = [CALayer layer];
@@ -1595,12 +1299,7 @@ bool attach(void* mainWindow, const Host& host) {
                                                              }
                                                              return e;
                                                            }];
-    if (g_sync == Sync::Paint) installPaintHook();
     g_attached = true;
-    startScrollTest();
-    logf("attached to %s %.0fx%.0f flipped=%d layer=%s scale=%.0f sync=%s demo=%d fake=%d",
-         class_getName(object_getClass(tv)), tv.bounds.size.width, tv.bounds.size.height, tv.isFlipped,
-         tv.layer ? class_getName([tv.layer class]) : "none", g_scale, sync ? sync : "commit", g_demo, g_fake);
   }
   return true;
 }
@@ -1608,8 +1307,6 @@ bool attach(void* mainWindow, const Host& host) {
 void detach() {
   if (!g_attached) return;
   @autoreleasepool {
-    if (g_scrollTimer) [g_scrollTimer invalidate];
-    g_scrollTimer = nil;
     if (g_observer) {
       CFRunLoopRemoveObserver(CFRunLoopGetMain(), g_observer, kCFRunLoopCommonModes);
       CFRelease(g_observer);
@@ -1617,8 +1314,6 @@ void detach() {
     }
     if (g_clickMonitor) [NSEvent removeMonitor:g_clickMonitor];
     g_clickMonitor = nil;
-    if (g_tvOrigClass && g_tv) object_setClass(g_tv, g_tvOrigClass);
-    g_tvOrigClass = Nil;
     for (auto& [id, p] : g_peers) p.dragItems.clear();
     g_peers.clear();
     g_pendingReverts.clear();
@@ -1762,7 +1457,7 @@ void setMarks(const std::vector<Mark>& marks) {
     // Called right after the tick applied other people's edits, which move
     // items without touching anything the observer's cheap check watches.
     if (!g_marks.empty()) g_marksDirty = true;
-    if (g_marksDirty) glue("marks");
+    if (g_marksDirty) glue();
   }
 }
 
@@ -1813,28 +1508,21 @@ void update(const Remote& r) {
     if (moved || r.click) p.lastMove = t;
     p.pendingSpring = p.pendingSpring || moved;
     p.pendingClick = p.pendingClick || r.click;
-    ++g_netUpdates;
-    if (g_trace)
-      fprintf(stderr, "[trace] rx %.3f %.9f\n", [[NSDate date] timeIntervalSince1970] * 1000, r.t);
   }
 }
 
 void tick() {
   if (!g_attached) return;
   @autoreleasepool {
-    busyTick();
-    fakeTick();
-    parkTick();
     const double t = now();
     if (t - g_reduceMotionChecked > 2) {
       g_reduceMotionChecked = t;
-      g_reduceMotion = getenv("REAMESH_CURSOR_REDUCE_MOTION") ||
-                       NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion;
+      g_reduceMotion = NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion;
     }
-    // Network updates land here, with a spring; in timer mode the view glue
-    // rides along. In commit mode the observer would also catch them before
-    // this pass commits.
-    glue("tick", g_sync != Sync::Timer);
+    // Network updates that arrived through the timer rather than the
+    // observer's pump land here (the observer would catch them before this
+    // pass commits anyway).
+    glue(true);
     for (auto it = g_peers.begin(); it != g_peers.end();) {
       Peer& p = it->second;
       if (t - std::max(p.lastMsg, p.fxAt) > kStyle.forgetAfter) {
@@ -1842,17 +1530,23 @@ void tick() {
         it = g_peers.erase(it);
         continue;
       }
+      // Gone quiet (or back): lay it out again, the glue pass skips peers
+      // without news.
+      const bool fresh = t - p.lastMsg <= kStyle.staleAfter;
+      if (fresh != p.fresh) {
+        p.fresh = fresh;
+        p.pendingSpring = true;
+      }
       updateTag(p, t);
       // A cursor resting a while dims to half; waiting beside an FX window is
       // not resting.
-      const bool idle = p.cursorShown && !p.parked && t - p.lastMove > g_idleDimAfter;
+      const bool idle = p.cursorShown && !p.parked && t - p.lastMove > kStyle.idleDimAfter;
       if (idle != p.idle) {
         fade(p.arrow, idle ? kStyle.idleOpacity : 1, idle ? kStyle.idleFade : kStyle.fadeIn);
         p.idle = idle;
       }
       ++it;
     }
-    printStats();
   }
 }
 
@@ -1883,15 +1577,6 @@ bool pointerOverApp() {
   }
 }
 
-std::string storyAway() {
-  if (!g_story) return {};
-  const double ph = storyPhase();
-  if (ph >= 28 && ph < 33) return "fx";
-  if (ph >= 33 && ph < 38) return "midi";
-  if (ph >= 38 && ph < 43) return "mixer";
-  return {};
-}
-
 bool sampleLocal(Local* out) {
   if (!g_attached) return false;
   @autoreleasepool {
@@ -1913,35 +1598,15 @@ bool sampleLocal(Local* out) {
       g_localPoint = vp;
       if (!g_marks.empty() || g_hoverShown) layoutHover();
     }
-    bool down = over && ([NSEvent pressedMouseButtons] & 1);
-    double it0 = 0, it1 = 0, iy = 0, ih = 0;
-    if (g_story) {
-      over = storyPoint(g, &vp, &down);
-    } else if (const char* item = getenv("REAMESH_CURSOR_DEMO_ITEM");
-        g_demo && item && g_host.itemSpan && g_host.itemSpan(item, &it0, &it1, &iy, &ih, nullptr)) {
-      // Rides on an item, as if dragging it.
-      const double w = 0.06 * std::sin(2 * M_PI * 0.7 * now());
-      vp = NSMakePoint((it0 + (it1 - it0) * (0.4 + w) - g.t0) / g.spp, iy + ih * 0.45);
-      over = true;
-    } else if (g_demo) {
-      vp = synthPoint(now(), g_demo * 3, g);
-      over = true;
-      if (std::fmod(now(), 3.0) < 0.04) {
-        g_clickPending = true;
-        g_clickPoint = vp;
-      }
-    }
+    const bool down = over && ([NSEvent pressedMouseButtons] & 1);
     if (!over) return true;
     if (g_clickPending) {
       vp = g_clickPoint;
       out->click = true;
       g_clickPending = false;
-      ++g_clicksOut;
     }
     out->in = semanticAt(vp, g, &out->t, &out->guid, &out->fy);
     out->down = out->in && down;
-    if (g_trace && out->in)
-      fprintf(stderr, "[trace] tx %.3f %.9f\n", [[NSDate date] timeIntervalSince1970] * 1000, out->t);
     out->px = vp.x;
     out->py = vp.y;
   }

@@ -3,10 +3,11 @@
 // Other people's mouse cursors, and an outline around the items someone else
 // is editing, are drawn as compositor layers on top of REAPER's track view,
 // inside REAPER's own process: Core Animation on macOS
-// (cursor_overlay_mac.mm). Windows has no drawing layer yet
-// (cursor_overlay_win.cpp only samples and sends the local pointer), so there
-// the extension keeps marking locked items with its colour tint. The layer is
-// display-only and click-through; it never takes input.
+// (cursor_overlay_mac.mm). Windows has no layer yet (cursor_overlay_win.cpp
+// declines attach() and only provides the pointer helpers), so there the
+// extension keeps marking locked items with its colour tint and cursors are
+// neither drawn nor sent. The layer is display-only and click-through; it
+// never takes input.
 //
 // Positions travel semantically ({project seconds, track GUID, 0..1 within the
 // track}), so every peer sees a cursor at the same musical spot whatever their
@@ -50,12 +51,6 @@ struct Host {
   // sends the local pointer. The layer calls it right before it draws, so a
   // cursor that arrived this pass is on screen in this frame.
   void (*pump)();
-  // Test scaffolding only: move the arrange to [t0, t1]; the GUID of the
-  // track at an index.
-  void (*setTimeAxis)(double t0, double t1);
-  bool (*trackGuidAt)(int index, std::string* guid);
-  // 0: set the height of track `index` to `v` px; 1: scroll vertically by `v` steps.
-  void (*testNudge)(int kind, int index, int v);
 };
 
 // Attach to the arrange of REAPER's main window (an NSView* / HWND). Returns
@@ -155,8 +150,5 @@ bool mouseHeld();
 bool pointerOver(void* hwnd);
 // Whether the topmost window under the pointer is one of REAPER's.
 bool pointerOverApp();
-// REAMESH_CURSOR_DEMO=story only: where the scripted pointer is meant to be
-// working while away ("fx", "midi", "mixer" or "").
-std::string storyAway();
 
 }  // namespace cursor_overlay

@@ -137,8 +137,6 @@
 #define REAPERAPI_WANT_GetLastTouchedFX
 #define REAPERAPI_WANT_TrackFX_GetParamNormalized
 #define REAPERAPI_WANT_TrackFX_SetParamNormalized
-#define REAPERAPI_WANT_UpdateTimeline
-#define REAPERAPI_WANT_CSurf_OnScroll
 #define REAPERAPI_WANT_MarkProjectDirty
 
 #include "reaper_plugin.h"
@@ -5764,30 +5762,6 @@ static bool cursorTrackAt(double y, std::string* guid, double* fy) {
   return false;
 }
 
-static void cursorSetTimeAxis(double t0, double t1) {
-  double a = t0, b = t1;
-  GetSet_ArrangeView2(nullptr, true, 0, 0, &a, &b);
-  UpdateTimeline();
-}
-
-static bool cursorTrackGuidAt(int index, std::string* guid) {
-  MediaTrack* tr = GetTrack(nullptr, index);
-  if (!tr) return false;
-  *guid = trackGuid(tr);
-  return true;
-}
-
-static void cursorTestNudge(int kind, int index, int v) {
-  if (kind == 0) {
-    MediaTrack* tr = GetTrack(nullptr, index);
-    if (!tr) return;
-    SetMediaTrackInfo_Value(tr, "I_HEIGHTOVERRIDE", v);
-    TrackList_AdjustWindows(false);
-  } else {
-    CSurf_OnScroll(0, v);
-  }
-}
-
 static void cursorStop() {
   if (!g_cursorAttached) return;
   cursor_overlay::detach();
@@ -5809,37 +5783,28 @@ static std::string shortFxName(std::string n) {
 // track panel (on that track's row), or an FX window (with the plug-in).
 // Null when the pointer is nowhere we can point at.
 static json cursorAway() {
-  std::string kind = cursor_overlay::storyAway();  // the scripted demo only
+  // Only where REAPER is what the pointer is over, not another app on top.
+  if (!cursor_overlay::pointerOverApp()) return json();
+  std::string kind;
   MediaTrack* tr = nullptr;
   MediaItem* item = nullptr;
   int fxTrackNo = 0, fxItemNo = -1, fxNo = 0;
-  if (kind.empty()) {
-    // Only where REAPER is what the pointer is over, not another app on top.
-    if (!cursor_overlay::pointerOverApp()) return json();
-    int x = 0, y = 0;
-    GetMousePosition(&x, &y);
-    char info[128] = {};
-    MediaTrack* hit = GetThingFromPoint(x, y, info, sizeof info);
-    const std::string_view what(info);
-    if (HWND me = MIDIEditor_GetActive(); me && cursor_overlay::pointerOver(me)) {
-      if (MediaItem_Take* take = MIDIEditor_GetTake(me)) item = GetMediaItemTake_Item(take);
-      if (item) kind = "midi";
-    } else if (hit && what.rfind("mcp", 0) == 0) {
-      kind = "mixer";
-      tr = hit;
-    } else if (hit && what.rfind("tcp", 0) == 0) {
-      kind = "tcp";
-      tr = hit;
-    } else if (what.rfind("fx", 0) == 0 && (GetFocusedFX2(&fxTrackNo, &fxItemNo, &fxNo) & 3)) {
-      kind = "fx";
-    }
-  } else if (kind == "midi") {
-    if (const char* demo = getenv("REAMESH_CURSOR_DEMO_ITEM")) item = cursorItem(demo);
-    if (!item) return json();
-  } else if (kind == "mixer") {
-    tr = GetTrack(nullptr, 2);
-  } else if (kind == "fx" && !(GetFocusedFX2(&fxTrackNo, &fxItemNo, &fxNo) & 3)) {
-    return json();
+  int x = 0, y = 0;
+  GetMousePosition(&x, &y);
+  char info[128] = {};
+  MediaTrack* hit = GetThingFromPoint(x, y, info, sizeof info);
+  const std::string_view what(info);
+  if (HWND me = MIDIEditor_GetActive(); me && cursor_overlay::pointerOver(me)) {
+    if (MediaItem_Take* take = MIDIEditor_GetTake(me)) item = GetMediaItemTake_Item(take);
+    if (item) kind = "midi";
+  } else if (hit && what.rfind("mcp", 0) == 0) {
+    kind = "mixer";
+    tr = hit;
+  } else if (hit && what.rfind("tcp", 0) == 0) {
+    kind = "tcp";
+    tr = hit;
+  } else if (what.rfind("fx", 0) == 0 && (GetFocusedFX2(&fxTrackNo, &fxItemNo, &fxNo) & 3)) {
+    kind = "fx";
   }
   if (kind.empty()) return json();
   json a = {{"k", kind}};
@@ -6061,8 +6026,7 @@ static void cursorTick() {
   if (!g_cursorAttached) {
     static const cursor_overlay::Host host = {
         cursorReady,     cursorTimeAxis, cursorTrackSpan,   cursorTrackAt,     cursorItemSpan,
-        cursorTrackShift, cursorRowsStamp, cursorPump, cursorSetTimeAxis, cursorTrackGuidAt,
-        cursorTestNudge};
+        cursorTrackShift, cursorRowsStamp, cursorPump};
     g_cursorAttached = cursor_overlay::attach(GetMainHwnd(), host);
     if (!g_cursorAttached) return;
   }

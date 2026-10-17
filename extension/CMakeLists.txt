@@ -21,7 +21,7 @@ if(APPLE)
   set(REAMESH_CURSOR_SRC src/cursor_overlay_mac.mm)
   set_source_files_properties(src/cursor_overlay_mac.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 elseif(WIN32)
-  # No drawing layer yet: samples and sends the local pointer only.
+  # No arrange layer yet: pointer helpers only (see the file).
   set(REAMESH_CURSOR_SRC src/cursor_overlay_win.cpp)
 else()
   set(REAMESH_CURSOR_SRC src/cursor_overlay_stub.cpp)
@@ -76,6 +76,6 @@ if(APPLE)
 elseif(WIN32)
   target_link_libraries(reaper_reamesh PRIVATE
     ws2_32 bcrypt ntdll userenv iphlpapi crypt32 secur32 ncrypt runtimeobject propsys
-    user32  # pointer sampling (cursor_overlay_win.cpp)
+    user32  # pointer helpers (cursor_overlay_win.cpp)
   )
 endif()
