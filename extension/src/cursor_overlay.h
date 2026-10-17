@@ -38,8 +38,9 @@ struct Host {
   // arrange. false when the item is not in this project or not visible.
   bool (*itemSpan)(const char* guid, double* t0, double* t1, double* y, double* h);
   // Changes whenever item rows may have moved without the time axis moving:
-  // project edits, vertical scroll, track heights. Item marks are laid out
-  // again only when this or the time axis changed.
+  // local project edits, vertical scroll, track heights. Between two
+  // setMarks calls, marks are laid out again only when this or the time axis
+  // changed.
   unsigned long long (*rowsStamp)();
   // Exchange cursors with the session: feeds arrived updates to update() and
   // sends the local pointer. The layer calls it right before it draws, so a
@@ -76,7 +77,8 @@ struct Remote {
 };
 void update(const Remote& r);
 
-// Items to mark, replacing the previous set (called every extension tick).
+// Items to mark, replacing the previous set. Called every extension tick,
+// after remote edits were applied: lays the marks out again each time.
 struct Mark {
   std::string item;         // item GUID
   std::string name, color;  // who is editing it; color "#rrggbb"

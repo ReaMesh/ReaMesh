@@ -17,6 +17,7 @@
 // Prototype knobs (environment, read at attach):
 //   REAMESH_CURSOR_SYNC=commit|timer|paint  when the glue pass runs (default commit)
 //   REAMESH_CURSOR_DEMO=k          send a synthetic moving pointer (path phase k) instead of the mouse
+//   REAMESH_CURSOR_DEMO_ITEM=<guid>  with DEMO: the synthetic pointer rides on that item
 //   REAMESH_CURSOR_FAKE=N          show N synthetic local peers (load test)
 //   REAMESH_CURSOR_BUSY=ms:every   block the main thread for ms every `every` ms
 //   REAMESH_CURSOR_KNOBS=<file>    re-read `busy=ms:every` from this file every second
@@ -73,10 +74,11 @@ struct Style {
   double rippleRadius, rippleLine, rippleScaleFrom, rippleScaleTo, rippleOpacity, rippleDuration;
   // Edge indicator for peers outside the visible arrange.
   double edgeInset, edgeHeight, edgeFont, edgePadX, edgeOpacity;
-  // Item someone else is editing: an outline in their colour over a faint
-  // wash of it, with a light keyline inside so it reads on an item of the
-  // same colour. Their name shows while the local pointer is over the item.
-  double markLine, markRadius, markFill, markKeyline, markKeylineOpacity, markFadeIn, markFadeOut;
+  // Item someone else is editing: dimmed ("not yours right now") with a thin
+  // outline in their colour; their name shows while the local pointer is over
+  // it. A mark stays up a little after the lock lapses, so the pauses
+  // between someone's edits don't make it flicker.
+  double markLine, markRadius, markDim, markLinger, markFadeIn, markFadeOut;
   double markTagFont, markTagHeight, markTagPadX, markTagGap;
   // Placeholder whose media is still downloading: a dark veil, no outline.
   double loadingVeil;
@@ -118,9 +120,8 @@ constexpr Style kStyle = {
     .edgeOpacity = 0.92,
     .markLine = 1.5,
     .markRadius = 3,
-    .markFill = 0.12,
-    .markKeyline = 1,
-    .markKeylineOpacity = 0.7,
+    .markDim = 0.3,
+    .markLinger = 0.6,
     .markFadeIn = 0.15,
     .markFadeOut = 0.3,
     .markTagFont = 10,
@@ -160,7 +161,7 @@ struct Peer {
 struct MarkState {
   cursor_overlay::Mark m;
   CALayer* box = nil;
-  CALayer* keyline = nil;  // inside the outline
+  double lastWanted = 0;  // when setMarks last asked for it
   bool shown = false;
   CGRect rect = CGRectZero;  // in the view, unclipped; valid while shown
 };
@@ -189,6 +190,10 @@ bool g_showCursors = true;
 CALayer* g_markRoot = nil;
 std::map<std::string, MarkState> g_marks;
 bool g_marksDirty = false;
+// REAPER reports an item's rows as of its last draw, which can trail a zoom
+// or scroll by a pass: after any change, marks are laid out on every pass
+// until this time.
+double g_marksSettleUntil = 0;
 double g_markKey[5] = {};
 unsigned long long g_markStamp = 0;
 // The name of whoever edits the item under the local pointer.
@@ -731,18 +736,13 @@ void styleMark(MarkState& ms) {
   [CATransaction setDisableActions:YES];
   CALayer* b = ms.box;
   b.cornerRadius = kStyle.markRadius;
-  ms.keyline.hidden = ms.m.loading;
-  ms.keyline.cornerRadius = std::max(0.0, kStyle.markRadius - kStyle.markLine);
-  ms.keyline.borderWidth = kStyle.markKeyline;
-  ms.keyline.borderColor = [NSColor colorWithWhite:1 alpha:kStyle.markKeylineOpacity].CGColor;
   if (ms.m.loading) {
     b.borderWidth = 0;
     b.backgroundColor = [NSColor colorWithWhite:0 alpha:kStyle.loadingVeil].CGColor;
   } else {
-    NSColor* c = parseColor(ms.m.color);
     b.borderWidth = kStyle.markLine;
-    b.borderColor = c.CGColor;
-    b.backgroundColor = [c colorWithAlphaComponent:kStyle.markFill].CGColor;
+    b.borderColor = parseColor(ms.m.color).CGColor;
+    b.backgroundColor = [NSColor colorWithWhite:0 alpha:kStyle.markDim].CGColor;
   }
   [CATransaction commit];
 }
@@ -813,7 +813,9 @@ void layoutMarks(const Geo& g) {
   if (!g.ok) return;  // can't read the project right now: keep them where they are
   const unsigned long long stamp = g_host.rowsStamp ? g_host.rowsStamp() : 0;
   const double key[5] = {g.t0, g.spp, g.W, g.H, g.ok ? 1.0 : 0.0};
-  if (!g_marksDirty && stamp == g_markStamp && std::equal(key, key + 5, g_markKey)) return;
+  const bool changed = g_marksDirty || stamp != g_markStamp || !std::equal(key, key + 5, g_markKey);
+  if (changed) g_marksSettleUntil = now() + 0.15;
+  else if (now() > g_marksSettleUntil) return;
   g_marksDirty = false;
   g_markStamp = stamp;
   std::copy(key, key + 5, g_markKey);
@@ -824,8 +826,6 @@ void layoutMarks(const Geo& g) {
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         ms.box.frame = r;
-        ms.keyline.frame = CGRectInset(CGRectMake(0, 0, r.size.width, r.size.height), kStyle.markLine,
-                                       kStyle.markLine);
         [CATransaction commit];
       }
       ms.rect = r;
@@ -1126,8 +1126,9 @@ void setMarks(const std::vector<Mark>& marks) {
     std::map<std::string, const Mark*> want;
     for (const Mark& m : marks)
       if (!m.item.empty()) want.emplace(m.item, &m);
+    const double t = now();
     for (auto it = g_marks.begin(); it != g_marks.end();) {
-      if (want.count(it->first)) {
+      if (want.count(it->first) || t - it->second.lastWanted < kStyle.markLinger) {
         ++it;
         continue;
       }
@@ -1144,20 +1145,25 @@ void setMarks(const std::vector<Mark>& marks) {
         [CATransaction setDisableActions:YES];
         ms.box = [CALayer layer];
         ms.box.opacity = 0;
-        ms.keyline = [CALayer layer];
-        [ms.box addSublayer:ms.keyline];
         [g_markRoot insertSublayer:ms.box atIndex:0];
         [CATransaction commit];
         styleMark(ms);
+        ms.lastWanted = t;
         g_marks.emplace(item, std::move(ms));
         g_marksDirty = true;
-      } else if (it->second.m.color != m->color || it->second.m.name != m->name ||
-                 it->second.m.loading != m->loading) {
+        continue;
+      }
+      it->second.lastWanted = t;
+      if (it->second.m.color != m->color || it->second.m.name != m->name ||
+          it->second.m.loading != m->loading) {
         it->second.m = *m;
         styleMark(it->second);
         g_hoverLabel.clear();
       }
     }
+    // Called right after the tick applied other people's edits, which move
+    // items without touching anything the observer's cheap check watches.
+    if (!g_marks.empty()) g_marksDirty = true;
     if (g_marksDirty) glue("marks");
   }
 }
@@ -1249,7 +1255,14 @@ bool sampleLocal(Local* out) {
       g_localPoint = vp;
       if (!g_marks.empty() || g_hoverShown) layoutHover();
     }
-    if (g_demo) {
+    double it0 = 0, it1 = 0, iy = 0, ih = 0;
+    if (const char* item = getenv("REAMESH_CURSOR_DEMO_ITEM");
+        g_demo && item && g_host.itemSpan && g_host.itemSpan(item, &it0, &it1, &iy, &ih)) {
+      // Rides on an item, as if dragging it.
+      const double w = 0.06 * std::sin(2 * M_PI * 0.7 * now());
+      vp = NSMakePoint((it0 + (it1 - it0) * (0.4 + w) - g.t0) / g.spp, iy + ih * 0.45);
+      over = true;
+    } else if (g_demo) {
       vp = synthPoint(now(), g_demo * 3, g);
       over = true;
       if (std::fmod(now(), 3.0) < 0.04) {
