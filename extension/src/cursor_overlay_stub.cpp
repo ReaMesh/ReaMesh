@@ -13,5 +13,9 @@ void setFollow(const std::string&, const std::string&) {}
 void setMarks(const std::vector<Mark>&) {}
 void tick() {}
 bool sampleLocal(Local*) { return false; }
+void revert(const Revert&) {}
+bool mouseHeld() { return false; }
+bool pointerOver(void*) { return false; }
+std::string storyAway() { return {}; }
 
 }  // namespace cursor_overlay

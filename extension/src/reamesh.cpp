@@ -125,6 +125,14 @@
 #define REAPERAPI_WANT_ValidatePtr2
 #define REAPERAPI_WANT_TrackFX_GetFXName
 #define REAPERAPI_WANT_TakeFX_GetFXName
+#define REAPERAPI_WANT_GetMousePosition
+#define REAPERAPI_WANT_GetThingFromPoint
+#define REAPERAPI_WANT_MIDIEditor_GetActive
+#define REAPERAPI_WANT_MIDIEditor_GetTake
+#define REAPERAPI_WANT_GetMediaItemTake_Item
+#define REAPERAPI_WANT_SnapToGrid
+#define REAPERAPI_WANT_GetToggleCommandState
+#define REAPERAPI_WANT_CountTrackMediaItems
 #define REAPERAPI_WANT_UpdateTimeline
 #define REAPERAPI_WANT_CSurf_OnScroll
 #define REAPERAPI_WANT_MarkProjectDirty
@@ -337,6 +345,8 @@ static Mode g_mode = Mode::Idle;
 static std::string g_sessionProjectPath;  // path the session is bound to
 static Snapshot g_snapshot;               // last known state, by GUID
 static int g_lastChangeCount = -1;
+// Items this instance proposed changes to, and when (cursor_overlay::revert).
+static std::map<std::string, std::chrono::steady_clock::time_point> g_localItemEdits;
 // EMA of what one capture (serialize every track+item chunk + diff) costs on
 // this project; drives the adaptive capture/rescan throttle so huge projects
 // trade sync latency for a smooth REAPER UI instead of a choppy one.
@@ -2587,6 +2597,10 @@ static void captureLocalChanges(bool force) {
   const bool counterMoved = cc != g_lastChangeCount;
   const bool rescanDue = now - g_lastFullScan >= rescanGap;
   if (!counterMoved && !rescanDue) return;
+  // Mid-gesture (an item drag, a fader) REAPER may already have moved things
+  // it only commits when the button is let go: a rescan now would send a
+  // half-finished state. The release bumps the counter anyway.
+  if (!counterMoved && cursor_overlay::mouseHeld()) return;
   // Chunk serialization isn't free; cap capture rate (sync target is ~1s).
   if (!force && !rescanDue && now - g_lastCapture < minGap) return;
   g_lastCapture = now;
@@ -2686,6 +2700,13 @@ static void captureLocalChanges(bool force) {
             summary.c_str());
   }
 
+  // Remember which items we just proposed, so a remote version that wins over
+  // ours can be shown going back (applyItem).
+  if (changeset.find("\"items\"") != std::string::npos) {
+    const json cs = json::parse(changeset, nullptr, false);
+    if (cs.is_object() && cs.contains("items") && cs["items"].is_object())
+      for (auto& [id, _] : cs["items"].items()) g_localItemEdits[id] = std::chrono::steady_clock::now();
+  }
   reamesh_push_local(g_handle, changeset.c_str());
 }
 
@@ -2964,6 +2985,20 @@ static std::vector<std::string> missingMediaIn(const json& fields) {
 
 // Apply one item's fields (creation, move across tracks, content update,
 // deletion). Caller has verified the referenced media exists.
+static std::set<std::string> lockedItemsByOthers();
+
+// An item as it stands now, for cursor_overlay::revert.
+static cursor_overlay::Revert revertOf(const std::string& guid, MediaItem* item) {
+  cursor_overlay::Revert r;
+  r.item = guid;
+  if (MediaTrack* tr = GetMediaItem_Track(item)) r.track = trackGuid(tr);
+  r.t0 = GetMediaItemInfo_Value(item, "D_POSITION");
+  r.t1 = r.t0 + GetMediaItemInfo_Value(item, "D_LENGTH");
+  r.yOff = GetMediaItemInfo_Value(item, "I_LASTY");
+  r.h = GetMediaItemInfo_Value(item, "I_LASTH");
+  return r;
+}
+
 static void applyItem(const std::string& guid, const json& fields, bool freshMedia = false) {
   // Any remote change to this item restores its real (synced) color, so drop a
   // tint record we hold for it: reconcileItemTints will re-stash the FRESH real
@@ -2979,6 +3014,16 @@ static void applyItem(const std::string& guid, const json& fields, bool freshMed
     g_itemTints.erase(rec);
   }
   MediaItem* item = findItemByGuid(guid);
+  // Our own recent edit to this item, overruled by someone holding it: show
+  // our version going back (the remote state replaces it just below).
+  std::optional<cursor_overlay::Revert> overruled;
+  if (auto e = g_localItemEdits.find(guid); e != g_localItemEdits.end()) {
+    if (std::chrono::steady_clock::now() - e->second > std::chrono::seconds(4)) {
+      g_localItemEdits.erase(e);
+    } else if (item && lockedItemsByOthers().count(guid)) {
+      overruled = revertOf(guid, item);
+    }
+  }
   if (!jsonBool(fields, "present", true)) {
     if (item) DeleteTrackMediaItem(GetMediaItem_Track(item), item);
     g_placeholders.erase(guid);  // the owner removed it: nothing left to stand in for
@@ -3015,6 +3060,7 @@ static void applyItem(const std::string& guid, const json& fields, bool freshMed
     SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", static_cast<double>(tintedReal));
   }
   UpdateItemInProject(item);
+  if (overruled) cursor_overlay::revert(*overruled);
   noteForeignSources(item);  // never internalized and re-served by us
   // Media that only just reached this machine has no peaks yet: build them
   // and redraw once done, or the waveform only appears after a click.
@@ -3988,6 +4034,7 @@ static void revertLockedItemEdits(Snapshot& snap) {
   for (const auto& [guid, _] : g_itemTints) pinned.insert(guid);
 
   bool reverted = false;
+  std::vector<cursor_overlay::Revert> pendingReverts;
   g_applyingRemote = true;
   for (const std::string& guid : pinned) {
     auto base = g_snapshot.items.find(guid);
@@ -4003,6 +4050,8 @@ static void revertLockedItemEdits(Snapshot& snap) {
     // its grey colour can't leak: the user's edit is theirs to keep.
     if (locked.count(guid)) {
       if (MediaItem* it = findItemByGuid(guid)) {
+        const cursor_overlay::Revert ours = revertOf(guid, it);
+        pendingReverts.push_back(ours);
         // Put it back on its synced track first (setObjectStateChunk rebuilds the
         // item but never moves it across tracks), then restore the chunk. This
         // does NOT go through applyItem, so the tint record (real colour) survives.
@@ -4032,6 +4081,7 @@ static void revertLockedItemEdits(Snapshot& snap) {
     g_lastChangeCount = GetProjectStateChangeCount(nullptr);
   }
   g_applyingRemote = false;
+  for (const auto& r : pendingReverts) cursor_overlay::revert(r);
 }
 
 // ---------- pings, follow mode, session meta, verified open ----------
@@ -5610,18 +5660,33 @@ static MediaItem* cursorItem(const std::string& guid) {
   return hit;
 }
 
-static bool cursorItemSpan(const char* guid, double* t0, double* t1, double* y, double* h) {
+static bool cursorItemSpan(const char* guid, double* t0, double* t1, double* y, double* h,
+                           std::string* track) {
   MediaItem* it = cursorItem(guid);
   if (!it) return false;
   MediaTrack* tr = GetMediaItem_Track(it);
+  if (track && tr) *track = trackGuid(tr);
   if (!tr || GetMediaTrackInfo_Value(tr, "B_SHOWINTCP") == 0.0) return false;
   const double th = GetMediaTrackInfo_Value(tr, "I_TCPH");
-  const double ih = GetMediaItemInfo_Value(it, "I_LASTH");
-  if (th <= 0 || ih <= 0) return false;
+  if (th <= 0) return false;
   *t0 = GetMediaItemInfo_Value(it, "D_POSITION");
   *t1 = *t0 + GetMediaItemInfo_Value(it, "D_LENGTH");
-  *y = GetMediaTrackInfo_Value(tr, "I_TCPY") + GetMediaItemInfo_Value(it, "I_LASTY");
-  *h = ih;
+  // The item's rows as REAPER last drew them; before its first draw (a
+  // window that was never on screen) the whole track row.
+  const double ih = GetMediaItemInfo_Value(it, "I_LASTH");
+  const double ty = GetMediaTrackInfo_Value(tr, "I_TCPY");
+  *y = ih > 0 ? ty + GetMediaItemInfo_Value(it, "I_LASTY") : ty;
+  *h = ih > 0 ? ih : th;
+  return true;
+}
+
+static bool cursorTrackShift(const char* guid, int by, std::string* out) {
+  MediaTrack* tr = cursorTrack(guid);
+  if (!tr) return false;
+  const int idx = static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER")) - 1 + by;
+  MediaTrack* dst = idx >= 0 ? GetTrack(nullptr, idx) : nullptr;
+  if (!dst) return false;
+  *out = trackGuid(dst);
   return true;
 }
 
@@ -5723,6 +5788,138 @@ static void cursorStop() {
   g_cursorItems.clear();
 }
 
+// A plug-in's name as people know it: "VST3: Pro-Q 3 (FabFilter)" -> "Pro-Q 3".
+static std::string shortFxName(std::string n) {
+  if (const auto c = n.find(": "); c != std::string::npos && c <= 5) n = n.substr(c + 2);
+  if (n.size() > 2 && n.back() == ')')
+    if (const auto o = n.rfind(" ("); o != std::string::npos && o > 0) n.erase(o);
+  return n;
+}
+
+// Where we work while the mouse is away from the arrange, for the others'
+// cursor layers: the MIDI editor (on the item it edits), the mixer or the
+// track panel (on that track's row), or an FX window (with the plug-in).
+// Null when the pointer is nowhere we can point at.
+static json cursorAway() {
+  std::string kind = cursor_overlay::storyAway();  // the scripted demo only
+  MediaTrack* tr = nullptr;
+  MediaItem* item = nullptr;
+  int fxTrackNo = 0, fxItemNo = -1, fxNo = 0;
+  if (kind.empty()) {
+    int x = 0, y = 0;
+    GetMousePosition(&x, &y);
+    char info[128] = {};
+    MediaTrack* hit = GetThingFromPoint(x, y, info, sizeof info);
+    const std::string_view what(info);
+    if (HWND me = MIDIEditor_GetActive(); me && cursor_overlay::pointerOver(me)) {
+      if (MediaItem_Take* take = MIDIEditor_GetTake(me)) item = GetMediaItemTake_Item(take);
+      if (item) kind = "midi";
+    } else if (hit && what.rfind("mcp", 0) == 0) {
+      kind = "mixer";
+      tr = hit;
+    } else if (hit && what.rfind("tcp", 0) == 0) {
+      kind = "tcp";
+      tr = hit;
+    } else if (what.rfind("fx", 0) == 0 && (GetFocusedFX2(&fxTrackNo, &fxItemNo, &fxNo) & 3)) {
+      kind = "fx";
+    }
+  } else if (kind == "midi") {
+    if (const char* demo = getenv("REAMESH_CURSOR_DEMO_ITEM")) item = cursorItem(demo);
+    if (!item) return json();
+  } else if (kind == "mixer") {
+    tr = GetTrack(nullptr, 2);
+  } else if (kind == "fx" && !(GetFocusedFX2(&fxTrackNo, &fxItemNo, &fxNo) & 3)) {
+    return json();
+  }
+  if (kind.empty()) return json();
+  json a = {{"k", kind}};
+  if (kind == "midi") {
+    a["i"] = itemGuid(item);
+    if (MediaTrack* it = GetMediaItem_Track(item)) a["g"] = trackGuid(it);
+    return a;
+  }
+  if (kind == "fx") {
+    tr = fxTrackNo > 0 ? GetTrack(nullptr, fxTrackNo - 1) : nullptr;
+    if (!tr) return json();
+    char name[256] = {};
+    if (fxItemNo >= 0) {
+      MediaItem* fi = GetTrackMediaItem(tr, fxItemNo);
+      MediaItem_Take* take = fi ? GetMediaItemTake(fi, (fxNo >> 16) & 0xFFFF) : nullptr;
+      if (take) TakeFX_GetFXName(take, fxNo & 0xFFFF, name, sizeof name);
+    } else {
+      TrackFX_GetFXName(tr, fxNo, name, sizeof name);
+    }
+    a["l"] = shortFxName(name);
+  }
+  if (!tr) return json();
+  a["g"] = trackGuid(tr);
+  return a;
+}
+
+// An item drag in progress, for the others' preview. A press on an item (not
+// on its edges, where it would trim) arms it; once the pointer has moved, the
+// dragged items (the selection if the pressed item is in it) go out with how
+// far they have come in time (snapped like REAPER snaps) and in tracks.
+// Measured from the pointer, not the items: REAPER only commits the move when
+// the button is let go. Null when not dragging.
+static json cursorDrag(const cursor_overlay::Local& l, bool pressed) {
+  static bool armed = false;
+  static double pressT = 0, pressPx = 0, origStart = 0;
+  static int pressTrack = 0, lastDtr = 0;
+  static std::string hit;
+  static std::vector<std::string> items;
+  if (!l.down) {
+    armed = false;
+    items.clear();
+    return json();
+  }
+  double t0 = 0, spp = 0;
+  if (!cursorTimeAxis(&t0, &spp)) return json();
+  if (pressed && l.in) {
+    armed = false;
+    items.clear();
+    MediaTrack* tr = cursorTrack(l.guid);
+    const double th = tr ? GetMediaTrackInfo_Value(tr, "I_TCPH") : 0;
+    const double ly = l.fy * th;
+    for (int i = 0, n = tr ? CountTrackMediaItems(tr) : 0; i < n; ++i) {
+      MediaItem* it = GetTrackMediaItem(tr, i);
+      const double pos = GetMediaItemInfo_Value(it, "D_POSITION");
+      const double len = GetMediaItemInfo_Value(it, "D_LENGTH");
+      const double iy = GetMediaItemInfo_Value(it, "I_LASTY"), ih = GetMediaItemInfo_Value(it, "I_LASTH");
+      if (l.t < pos || l.t >= pos + len || (ih > 0 && (ly < iy || ly >= iy + ih))) continue;
+      if ((l.t - pos) / spp < 6 || (pos + len - l.t) / spp < 6) break;  // an edge: a trim
+      armed = true;
+      hit = itemGuid(it);
+      pressT = l.t;
+      pressPx = l.px;
+      origStart = pos;
+      pressTrack = static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"));
+      lastDtr = 0;
+      break;
+    }
+  }
+  if (!armed) return json();
+  if (items.empty()) {
+    if (std::fabs(l.px - pressPx) < 3 && l.guid.empty()) return json();
+    if (std::fabs(l.px - pressPx) < 3 && cursorTrack(l.guid) &&
+        static_cast<int>(GetMediaTrackInfo_Value(cursorTrack(l.guid), "IP_TRACKNUMBER")) == pressTrack)
+      return json();
+    // The selection as it stands now (the press has selected by now).
+    bool hitSelected = false;
+    for (int i = 0, n = CountSelectedMediaItems(nullptr); i < n && items.size() < 16; ++i)
+      if (MediaItem* it = GetSelectedMediaItem(nullptr, i)) {
+        items.push_back(itemGuid(it));
+        hitSelected |= items.back() == hit;
+      }
+    if (!hitSelected) items.assign(1, hit);
+  }
+  double dt = l.t - pressT;
+  if (GetToggleCommandState(1157) == 1) dt = SnapToGrid(nullptr, origStart + dt) - origStart;
+  if (MediaTrack* tr = l.in ? cursorTrack(l.guid) : nullptr)
+    lastDtr = static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER")) - pressTrack;
+  return {{"items", items}, {"dt", dt}, {"dtr", lastDtr}};
+}
+
 // Network side of the cursors, pumped by the layer in every run-loop pass
 // right before it draws (and from the timer, the only caller on Windows):
 // hands arrived cursor updates to the layer, and sends the local pointer,
@@ -5750,11 +5947,24 @@ static void cursorPump() {
         r.in = jsonBool(c, "in", false);
         r.click = jsonBool(c, "click", false);
         r.down = jsonBool(c, "down", false);
+        if (c.contains("away") && c["away"].is_object()) {
+          const json& a = c["away"];
+          r.away = {jsonStr(a, "k"), jsonStr(a, "g"), jsonStr(a, "i"), jsonStr(a, "l")};
+        }
+        if (c.contains("drag") && c["drag"].is_object()) {
+          const json& d = c["drag"];
+          if (d.contains("items") && d["items"].is_array())
+            for (const auto& i : d["items"])
+              if (i.is_string()) r.drag.items.push_back(i.get<std::string>());
+          r.drag.dt = jsonNum(d, "dt", 0.0);
+          r.drag.dtr = static_cast<int>(jsonNum(d, "dtr", 0.0));
+        }
         cursor_overlay::update(r);
       }
   }
 
   static cursor_overlay::Local last;
+  static std::string lastAway, lastDrag;
   static auto lastSent = std::chrono::steady_clock::time_point{};
   static auto lastSample = std::chrono::steady_clock::time_point{};
   const auto now = std::chrono::steady_clock::now();
@@ -5762,29 +5972,34 @@ static void cursorPump() {
   lastSample = now;
   cursor_overlay::Local l;
   if (!cursor_overlay::sampleLocal(&l)) return;
-  if (!g_cursorShared) {
-    if (!last.in) return;
+  static bool prevDown = false;
+  const bool pressed = l.down && !prevDown;
+  prevDown = l.down;
+  json away, drag;
+  if (g_cursorShared) {
+    if (!l.in) away = cursorAway();
+    drag = cursorDrag(l, pressed);
+  } else {
+    if (!last.in && lastAway.empty()) return;
     l = cursor_overlay::Local{};
   }
+  const std::string awayKey = away.is_null() ? "" : dumpJson(away);
+  const std::string dragKey = drag.is_null() ? "" : dumpJson(drag);
   const auto since = now - lastSent;
-  const bool changed = l.in != last.in || l.down != last.down ||
+  const bool changed = l.in != last.in || l.down != last.down || awayKey != lastAway || dragKey != lastDrag ||
                        (l.in && (std::fabs(l.px - last.px) >= 1 || std::fabs(l.py - last.py) >= 1 ||
                                  l.guid != last.guid || l.t != last.t));
   const bool send = l.click || (changed && since >= std::chrono::milliseconds(33)) ||
-                    (l.in && since >= std::chrono::seconds(3));
+                    ((l.in || !awayKey.empty()) && since >= std::chrono::seconds(3));
   if (!send) return;
-  const json m = {{"t", l.t}, {"g", l.guid}, {"fy", l.fy}, {"in", l.in}, {"click", l.click}, {"down", l.down}};
+  json m = {{"t", l.t}, {"g", l.guid}, {"fy", l.fy}, {"in", l.in}, {"click", l.click}, {"down", l.down}};
+  if (!away.is_null()) m["away"] = away;
+  if (!drag.is_null()) m["drag"] = drag;
   reamesh_send_cursor(g_handle, dumpJson(m).c_str());
   last = l;
+  lastAway = awayKey;
+  lastDrag = dragKey;
   lastSent = now;
-}
-
-// A plug-in's name as people know it: "VST3: Pro-Q 3 (FabFilter)" -> "Pro-Q 3".
-static std::string shortFxName(std::string n) {
-  if (const auto c = n.find(": "); c != std::string::npos && c <= 5) n = n.substr(c + 2);
-  if (n.size() > 2 && n.back() == ')')
-    if (const auto o = n.rfind(" ("); o != std::string::npos && o > 0) n.erase(o);
-  return n;
 }
 
 // From everyone's presence, a few times a second: whose FX window is open on
@@ -5835,8 +6050,9 @@ static void cursorPresence() {
 static void cursorTick() {
   if (!g_cursorAttached) {
     static const cursor_overlay::Host host = {
-        cursorReady, cursorTimeAxis,    cursorTrackSpan,   cursorTrackAt,  cursorItemSpan,
-        cursorRowsStamp, cursorPump,    cursorSetTimeAxis, cursorTrackGuidAt, cursorTestNudge};
+        cursorReady,     cursorTimeAxis, cursorTrackSpan,   cursorTrackAt,     cursorItemSpan,
+        cursorTrackShift, cursorRowsStamp, cursorPump, cursorSetTimeAxis, cursorTrackGuidAt,
+        cursorTestNudge};
     g_cursorAttached = cursor_overlay::attach(GetMainHwnd(), host);
     if (!g_cursorAttached) return;
   }

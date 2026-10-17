@@ -42,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -88,9 +89,16 @@ struct Style {
   // Edge indicator for peers outside the visible arrange: a pill with their
   // name and a small arrow pointing where they are.
   double edgeInset, edgeHeight, edgeFont, edgePadX, edgeArrow, edgeOpacity;
-  // Someone editing an FX: their cursor waits this far in from the arrange's
-  // left edge, on that track's row.
-  double parkInset;
+  // Someone working away from the arrange (FX window, mixer, track panel):
+  // their cursor waits this far in from the arrange's left edge, on that
+  // track's row; in the MIDI editor, this far into the item they edit.
+  double parkInset, parkItemInset;
+  // Someone dragging items: a dashed outline in their colour where the items
+  // would land; the originals are marked like a lock.
+  double dragLine, dragDash, dragGap, dragFill;
+  // Our own edit undone: a dashed copy of it holds, glides back into the
+  // item, and fades.
+  double revertHold, revertGlide, revertFade, revertOpacity;
   // Following someone: a frame round the arrange.
   double followLine, followOpacity, followTagInset;
   // Item someone else is editing: dimmed ("not yours right now") with a thin
@@ -151,6 +159,15 @@ constexpr Style kStyle = {
     .edgeArrow = 7,
     .edgeOpacity = 0.92,
     .parkInset = 8,
+    .parkItemInset = 10,
+    .dragLine = 1.5,
+    .dragDash = 5,
+    .dragGap = 4,
+    .dragFill = 0.16,
+    .revertHold = 0.25,
+    .revertGlide = 0.45,
+    .revertFade = 0.3,
+    .revertOpacity = 0.85,
     .followLine = 2,
     .followOpacity = 0.9,
     .followTagInset = 8,
@@ -183,9 +200,23 @@ struct Peer {
   // second), for prediction.
   double vt = 0, vfy = 0;
   bool predict = false;
-  // An open FX window (setActivity): where the cursor waits while away.
+  // An open FX window (setActivity, from presence): where the cursor waits
+  // while away when the cursor messages say nothing more precise.
   std::string fxTrack, fxLabel;
   double fxAt = 0;
+  // Where they work away from the arrange, from their cursor messages.
+  cursor_overlay::Away away;
+  // Their item drag, and its layers per item: the original marked, the
+  // landing spot outlined.
+  cursor_overlay::Drag drag;
+  struct DragItem {
+    CALayer* origin = nil;
+    CAShapeLayer* ghost = nil;
+    CGRect ghostRect = CGRectZero;
+    bool shown = false;
+  };
+  std::map<std::string, DragItem> dragItems;
+  std::string parkLabel;
 
   CALayer* root = nil;  // positioned at the pointer tip
   CAShapeLayer* arrow = nil;
@@ -221,7 +252,8 @@ struct Place {
   CGPoint p = CGPointZero;
   Side side = Side::Left;
   double angle = 0;     // Edge: direction from the pill to the real spot
-  bool parked = false;  // waiting beside an FX window's track
+  bool parked = false;  // waiting while they work away from the arrange
+  std::string label;    // what they work in, for the name tag
 };
 
 cursor_overlay::Host g_host{};
@@ -571,7 +603,11 @@ void buildLayers(Peer& p) {
   [CATransaction commit];
 }
 
+void dropDragItem(Peer::DragItem& d);
+
 void dropLayers(Peer& p) {
+  for (auto& [item, d] : p.dragItems) dropDragItem(d);
+  p.dragItems.clear();
   [p.root removeFromSuperlayer];
   [p.tag removeFromSuperlayer];
   [p.edge removeFromSuperlayer];
@@ -585,7 +621,7 @@ std::string displayName(const Peer& p) {
 // The name, plus the plug-in while the cursor waits beside an FX window.
 std::string displayLabel(const Peer& p) {
   std::string s = displayName(p);
-  if (p.parked && !p.fxLabel.empty()) s += " \xC2\xB7 " + p.fxLabel;  // ·
+  if (p.parked && !p.parkLabel.empty()) s += " \xC2\xB7 " + p.parkLabel;  // ·
   return s;
 }
 
@@ -681,16 +717,39 @@ Geo readGeo() {
 Place placeOf(const Peer& p, const Geo& g, double t) {
   Place pl;
   if (!g.ok) return pl;
-  const bool live = p.in && t - p.lastMsg <= kStyle.staleAfter;
-  const bool parked = !live && !p.fxTrack.empty();
+  const bool fresh = t - p.lastMsg <= kStyle.staleAfter;
+  const bool live = p.in && fresh;
+  // Away from the arrange: what their cursor messages say, else an FX window
+  // their presence reports.
+  const bool awayMsg = !p.in && fresh && !p.away.kind.empty();
+  const bool parked = !live && (awayMsg || !p.fxTrack.empty());
   if (!live && !parked) return pl;
   pl.parked = parked;
-  const std::string& guid = parked ? p.fxTrack : p.guid;
+  std::string guid = p.guid;
+  double parkX = kStyle.parkInset, parkFy = 0.5;
+  bool onItem = false;
+  double iy = 0, ih = 0;
+  if (parked) {
+    const std::string& k = awayMsg ? p.away.kind : std::string("fx");
+    guid = awayMsg ? p.away.track : p.fxTrack;
+    if (k == "fx") pl.label = awayMsg ? p.away.label : p.fxLabel;
+    else if (k == "midi") pl.label = "MIDI";
+    else if (k == "mixer") pl.label = "Mixer";
+    double i0 = 0, i1 = 0;
+    std::string itemTrack;
+    if (k == "midi" && g_host.itemSpan &&
+        g_host.itemSpan(p.away.item.c_str(), &i0, &i1, &iy, &ih, &itemTrack)) {
+      // In the MIDI editor: on the item they edit.
+      guid = itemTrack;
+      parkX = (i0 - g.t0) / g.spp + kStyle.parkItemInset;
+      onItem = true;
+    }
+  }
   double ty = 0, th = 0;
   const bool found = !guid.empty() && g_host.trackSpan(guid.c_str(), &ty, &th);
   const bool yKnown = found && th > 0;
-  double x = parked ? kStyle.parkInset : (p.t - g.t0) / g.spp;
-  double y = yKnown ? ty + (parked ? 0.5 : p.fy) * th : 0;
+  double x = parked ? parkX : (p.t - g.t0) / g.spp;
+  double y = yKnown ? (onItem ? iy + ih * 0.5 : ty + (parked ? parkFy : p.fy) * th) : 0;
   if (live && yKnown && p.predict && !g_reduceMotion) {
     // Ahead along the velocity, but never further than predictMax and never
     // off the track the pointer is on.
@@ -742,6 +801,161 @@ void updateTag(Peer& p, double t) {
   p.tagShown = want;
 }
 
+CGPathRef roundedPath(CGSize sz) {
+  return CGPathCreateWithRoundedRect(CGRectMake(0, 0, sz.width, sz.height),
+                                     std::min(kStyle.markRadius, sz.width / 2),
+                                     std::min(kStyle.markRadius, sz.height / 2), nullptr);
+}
+
+CAShapeLayer* dashedBox(NSColor* stroke, NSColor* fill) {
+  CAShapeLayer* l = [CAShapeLayer layer];
+  l.anchorPoint = CGPointZero;
+  l.strokeColor = stroke.CGColor;
+  l.fillColor = fill.CGColor;
+  l.lineWidth = kStyle.dragLine;
+  l.lineDashPattern = @[ @(kStyle.dragDash), @(kStyle.dragGap) ];
+  l.contentsScale = g_scale;
+  return l;
+}
+
+void setBox(CAShapeLayer* l, CGRect r) {
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  l.position = r.origin;
+  if (!CGSizeEqualToSize(l.bounds.size, r.size)) {
+    l.bounds = CGRectMake(0, 0, r.size.width, r.size.height);
+    CGPathRef path = roundedPath(r.size);
+    l.path = path;
+    CGPathRelease(path);
+  }
+  [CATransaction commit];
+}
+
+// Where an item is, and where it would land moved by `dt` and `dtr` tracks.
+bool itemRects(const std::string& item, double dt, int dtr, const Geo& g, CGRect* at, CGRect* to) {
+  double t0 = 0, t1 = 0, y = 0, h = 0, ty = 0, th = 0;
+  std::string track, dest;
+  if (!g.ok || !g_host.itemSpan || !g_host.itemSpan(item.c_str(), &t0, &t1, &y, &h, &track)) return false;
+  if (!g_host.trackSpan(track.c_str(), &ty, &th)) return false;
+  *at = CGRectMake((t0 - g.t0) / g.spp, y, (t1 - t0) / g.spp, h);
+  double dy = 0;
+  if (dtr != 0 && g_host.trackShift && g_host.trackShift(track.c_str(), dtr, &dest)) {
+    double dy0 = 0, dh = 0;
+    if (g_host.trackSpan(dest.c_str(), &dy0, &dh) && dh > 0) dy = dy0 - ty;
+  }
+  *to = CGRectMake(at->origin.x + dt / g.spp, y + dy, at->size.width, h);
+  return true;
+}
+
+void dropDragItem(Peer::DragItem& d) {
+  [d.origin removeFromSuperlayer];
+  [d.ghost removeFromSuperlayer];
+}
+
+// The drag preview: each dragged item's original marked like a lock, and a
+// dashed outline where it would land, moving with the person's cursor.
+void layoutDrag(Peer& p, const Geo& g, bool net) {
+  std::set<std::string> want(p.drag.items.begin(), p.drag.items.end());
+  for (auto it = p.dragItems.begin(); it != p.dragItems.end();) {
+    if (want.count(it->first)) {
+      ++it;
+      continue;
+    }
+    dropDragItem(it->second);
+    it = p.dragItems.erase(it);
+  }
+  if (want.empty() || !g.ok) return;
+  NSColor* c = parseColor(p.color);
+  for (const std::string& item : want) {
+    Peer::DragItem& d = p.dragItems[item];
+    if (!d.ghost) {
+      [CATransaction begin];
+      [CATransaction setDisableActions:YES];
+      d.origin = [CALayer layer];
+      d.origin.anchorPoint = CGPointZero;
+      d.origin.cornerRadius = kStyle.markRadius;
+      d.origin.borderWidth = kStyle.markLine;
+      d.origin.borderColor = c.CGColor;
+      d.origin.backgroundColor = [NSColor colorWithWhite:0 alpha:kStyle.markDim].CGColor;
+      d.ghost = dashedBox(c, [c colorWithAlphaComponent:kStyle.dragFill]);
+      [g_markRoot addSublayer:d.origin];
+      [g_markRoot addSublayer:d.ghost];
+      [CATransaction commit];
+    }
+    CGRect at, to;
+    if (!itemRects(item, p.drag.dt, p.drag.dtr, g, &at, &to)) continue;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    d.origin.frame = at;
+    [CATransaction commit];
+    if (net && d.shown && !g_reduceMotion) {
+      const CGPoint from = d.ghostRect.origin;
+      setBox(d.ghost, to);
+      springTo(d.ghost, from, to.origin, kStyle.springStiffness);
+    } else {
+      setBox(d.ghost, to);
+    }
+    d.ghostRect = to;
+    d.shown = true;
+  }
+}
+
+// Our undone edits, waiting for the next pass to know where the item went.
+std::vector<cursor_overlay::Revert> g_pendingReverts;
+
+void runRevert(const cursor_overlay::Revert& r, const Geo& g) {
+  double ty = 0, th = 0, t0 = 0, t1 = 0, y = 0, h = 0;
+  if (!g.ok || !g_host.trackSpan(r.track.c_str(), &ty, &th) || th <= 0) return;
+  if (!g_host.itemSpan || !g_host.itemSpan(r.item.c_str(), &t0, &t1, &y, &h, nullptr)) return;
+  const CGRect from = CGRectMake((r.t0 - g.t0) / g.spp, ty + r.yOff, (r.t1 - r.t0) / g.spp, r.h > 0 ? r.h : h);
+  const CGRect to = CGRectMake((t0 - g.t0) / g.spp, y, (t1 - t0) / g.spp, h);
+  if (CGRectEqualToRect(CGRectIntegral(from), CGRectIntegral(to))) return;
+  if (!CGRectIntersectsRect(CGRectUnion(from, to), CGRectMake(0, 0, g.W, g.H))) return;
+  CAShapeLayer* l = dashedBox([NSColor colorWithWhite:1 alpha:kStyle.revertOpacity],
+                              [NSColor colorWithWhite:1 alpha:0.08]);
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  setBox(l, to);
+  l.opacity = 0;
+  [g_markRoot addSublayer:l];
+  [CATransaction commit];
+
+  // Hold at our version, glide into the item, fade.
+  const double hold = kStyle.revertHold, glide = g_reduceMotion ? 0 : kStyle.revertGlide;
+  const double total = hold + glide + kStyle.revertFade;
+  CABasicAnimation* pos = [CABasicAnimation animationWithKeyPath:@"position"];
+  pos.fromValue = [NSValue valueWithPoint:NSPointFromCGPoint(from.origin)];
+  pos.toValue = [NSValue valueWithPoint:NSPointFromCGPoint(to.origin)];
+  pos.beginTime = hold;
+  pos.duration = std::max(glide, 0.001);
+  pos.fillMode = kCAFillModeBackwards;
+  pos.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+  CGPathRef fromPath = roundedPath(from.size), toPath = roundedPath(to.size);
+  CABasicAnimation* shape = [CABasicAnimation animationWithKeyPath:@"path"];
+  shape.fromValue = (__bridge id)fromPath;
+  shape.toValue = (__bridge id)toPath;
+  shape.beginTime = hold;
+  shape.duration = pos.duration;
+  shape.fillMode = kCAFillModeBackwards;
+  shape.timingFunction = pos.timingFunction;
+  CAKeyframeAnimation* op = [CAKeyframeAnimation animationWithKeyPath:@"opacity"];
+  op.values = @[ @0, @1, @1, @0 ];
+  op.keyTimes = @[ @0, @(0.08 / total), @((hold + glide) / total), @1 ];
+  op.duration = total;
+  CAAnimationGroup* grp = [CAAnimationGroup animation];
+  grp.animations = @[ pos, shape, op ];
+  grp.duration = total;
+  if (@available(macOS 12.0, *)) grp.preferredFrameRateRange = CAFrameRateRangeMake(60, 120, 120);
+  [CATransaction begin];
+  [CATransaction setCompletionBlock:^{
+    [l removeFromSuperlayer];
+  }];
+  [l addAnimation:grp forKey:@"revert"];
+  [CATransaction commit];
+  CGPathRelease(fromPath);
+  CGPathRelease(toPath);
+}
+
 // Moves a peer's layers to where its spot is now. With a network update
 // pending they spring toward it (or fade across on a long jump); otherwise
 // only the view moved and they snap (glued). Returns whether the view moved
@@ -751,10 +965,14 @@ bool layoutPeer(Peer& p, const Geo& g, double t) {
   bool moved = false;
   const bool net = p.pendingSpring;
   p.pendingSpring = false;
-  if (pl.parked != p.parked) {
+  if (pl.parked != p.parked || pl.label != p.parkLabel) {
     p.parked = pl.parked;
+    p.parkLabel = pl.label;
     refreshTag(p);
+    p.edgeLabel.clear();
   }
+  if (!p.drag.items.empty() && t - p.lastMsg > kStyle.staleAfter) p.drag = {};
+  layoutDrag(p, g, net);
 
   if (pl.kind == Place::Cursor) {
     const CGPoint tagAt = CGPointMake(pl.p.x + kStyle.tagDX, pl.p.y + kStyle.tagDY);
@@ -849,11 +1067,15 @@ void layoutMarks(const Geo& g);
 void glue(const char* why, bool onlyPending = false) {
   if (!g_attached) return;
   if (!NSEqualRects(g_view.frame, g_tv.bounds)) g_view.frame = g_tv.bounds;
-  if (g_peers.empty() && g_marks.empty()) return;
+  if (g_peers.empty() && g_marks.empty() && g_pendingReverts.empty()) return;
   const uint64_t a = mach_absolute_time();
   const double t = now();
   checkScale();
   const Geo g = readGeo();
+  if (!onlyPending && g.ok && !g_pendingReverts.empty()) {
+    for (const auto& r : g_pendingReverts) runRevert(r, g);
+    g_pendingReverts.clear();
+  }
   if (!onlyPending) layoutMarks(g);
   bool moved = false;
   for (auto& [id, p] : g_peers)
@@ -880,7 +1102,7 @@ void onObserver() {
       g_host.pump();
     }
   }
-  if (g_peers.empty() && g_marks.empty()) return;
+  if (g_peers.empty() && g_marks.empty() && g_pendingReverts.empty()) return;
   ++g_observerPasses;
   // Updates stopped: the pointer came to rest, so take the prediction back.
   const double t = now();
@@ -977,7 +1199,7 @@ void styleMark(MarkState& ms) {
 // Where an item is in the view now; false when it is not visible.
 bool markRect(const MarkState& ms, const Geo& g, CGRect* out) {
   double t0 = 0, t1 = 0, y = 0, h = 0;
-  if (!g.ok || !g_host.itemSpan || !g_host.itemSpan(ms.m.item.c_str(), &t0, &t1, &y, &h)) return false;
+  if (!g.ok || !g_host.itemSpan || !g_host.itemSpan(ms.m.item.c_str(), &t0, &t1, &y, &h, nullptr)) return false;
   if (!(h > 0) || !(t1 > t0)) return false;
   const double x0 = (t0 - g.t0) / g.spp, x1 = (t1 - g.t0) / g.spp;
   if (x1 <= 0 || x0 >= g.W || y + h <= 0 || y >= g.H) return false;
@@ -1076,42 +1298,63 @@ NSPoint synthPoint(double t, int k, const Geo& g) {
 }
 
 // REAMESH_CURSOR_DEMO=story: a scripted pointer showing every cursor state
-// in turn, on a 40s loop aligned to the wall clock (so a test script in the
-// same instance can open an FX window in step). Returns false while the
-// pointer is meant to be away from the arrange.
+// in turn, on a 50s loop aligned to the wall clock (so a test script in the
+// same instance can open an FX window and drop the dragged item in step).
+// Returns false while the pointer is meant to be away from the arrange.
+double storyPhase() { return std::fmod([[NSDate date] timeIntervalSince1970], 50.0); }
+
 bool storyPoint(const Geo& g, NSPoint* vp, bool* down) {
-  const double wall = [[NSDate date] timeIntervalSince1970];
-  const double ph = std::fmod(wall, 40.0);
+  const double ph = storyPhase();
   static double lastPh = 0;
-  const bool clickNow = lastPh < 9.0 && ph >= 9.0;
+  const bool clickNow = lastPh < 10.0 && ph >= 10.0;
   lastPh = ph;
   const double W = g.W, H = g.H;
   auto lerp = [](double a, double b, double u) { return a + (b - a) * std::clamp(u, 0.0, 1.0); };
   auto ease = [](double u) { u = std::clamp(u, 0.0, 1.0); return u * u * (3 - 2 * u); };
+  // The drag: grab the demo item (REAMESH_CURSOR_DEMO_ITEM) and carry it 4s
+  // later and one track down. The start is fixed when the drag begins.
+  static NSPoint grab = NSZeroPoint, drop = NSZeroPoint;
+  if (ph < 5) {
+    double t0 = 0, t1 = 0, y = 0, h = 0, ty = 0, th = 0;
+    std::string track;
+    if (const char* item = getenv("REAMESH_CURSOR_DEMO_ITEM");
+        item && g_host.itemSpan && g_host.itemSpan(item, &t0, &t1, &y, &h, &track) &&
+        g_host.trackSpan(track.c_str(), &ty, &th)) {
+      grab = NSMakePoint((t0 + (t1 - t0) * 0.4 - g.t0) / g.spp, y + h * 0.5);
+      drop = NSMakePoint(grab.x + 4.0 / g.spp, grab.y + th);
+    } else {
+      grab = NSMakePoint(0.3 * W, 0.3 * H);
+      drop = NSMakePoint(0.45 * W, 0.4 * H);
+    }
+  }
   *down = false;
-  if (ph < 6) {  // gliding about
+  if (ph < 4) {  // gliding about
     *vp = synthPoint(now(), 1, g);
-  } else if (ph < 8.5) {  // dragging: button held
-    const double u = ease((ph - 6) / 2.5);
-    *vp = NSMakePoint(lerp(0.30 * W, 0.46 * W, u), 0.36 * H);
+  } else if (ph < 6) {  // over to the item
+    const NSPoint a = synthPoint(now() - (ph - 4), 1, g);
+    const double u = ease((ph - 4) / 2);
+    *vp = NSMakePoint(lerp(a.x, grab.x, u), lerp(a.y, grab.y, u));
+  } else if (ph < 9) {  // dragging it: button held
+    const double u = ease((ph - 6.3) / 2.4);
+    *vp = NSMakePoint(lerp(grab.x, drop.x, u), lerp(grab.y, drop.y, u));
     *down = true;
-  } else if (ph < 9.5) {  // a click
-    *vp = NSMakePoint(0.46 * W, 0.36 * H);
+  } else if (ph < 11) {  // let go; a click
+    *vp = drop;
     if (clickNow) {
       g_clickPending = true;
       g_clickPoint = *vp;
     }
-  } else if (ph < 12) {  // a long jump, then a little circling
-    const double a = (ph - 9.5) * 2.4;
+  } else if (ph < 13.5) {  // a long jump, then a little circling
+    const double a = (ph - 11) * 2.4;
     *vp = NSMakePoint(0.82 * W + 30 * std::sin(a), 0.74 * H + 22 * std::cos(a));
-  } else if (ph < 17) {  // past the right edge, moving down the tracks
-    *vp = NSMakePoint(W * 1.25, lerp(0.15 * H, 0.85 * H, ease((ph - 12) / 5)));
-  } else if (ph < 19) {  // back in
-    const double u = ease((ph - 17) / 2);
+  } else if (ph < 18) {  // past the right edge, moving down the tracks
+    *vp = NSMakePoint(W * 1.25, lerp(0.15 * H, 0.85 * H, ease((ph - 13.5) / 4.5)));
+  } else if (ph < 20) {  // back in
+    const double u = ease((ph - 18) / 2);
     *vp = NSMakePoint(lerp(W * 1.02, 0.6 * W, u), lerp(0.85 * H, 0.5 * H, u));
-  } else if (ph < 27) {  // resting
+  } else if (ph < 28) {  // resting
     *vp = NSMakePoint(0.6 * W, 0.5 * H);
-  } else if (ph < 35) {  // away, editing an FX
+  } else if (ph < 43) {  // away: FX window, MIDI editor, mixer
     return false;
   } else {
     *vp = synthPoint(now(), 1, g);
@@ -1376,7 +1619,9 @@ void detach() {
     g_clickMonitor = nil;
     if (g_tvOrigClass && g_tv) object_setClass(g_tv, g_tvOrigClass);
     g_tvOrigClass = Nil;
+    for (auto& [id, p] : g_peers) p.dragItems.clear();
     g_peers.clear();
+    g_pendingReverts.clear();
     g_marks.clear();
     g_marksDirty = false;
     g_hoverTag = nil;
@@ -1554,6 +1799,12 @@ void update(const Remote& r) {
       p.predict = false;
     }
     setPressed(p, r.in && r.down);
+    const bool awayChanged = r.away.kind != p.away.kind || r.away.track != p.away.track ||
+                             r.away.item != p.away.item || r.away.label != p.away.label;
+    const bool dragChanged = r.drag.items != p.drag.items || r.drag.dt != p.drag.dt || r.drag.dtr != p.drag.dtr;
+    p.away = r.away;
+    p.drag = r.drag;
+    if (awayChanged || dragChanged) p.pendingSpring = true;
     p.t = r.t;
     p.fy = r.fy;
     p.guid = r.guid;
@@ -1605,6 +1856,35 @@ void tick() {
   }
 }
 
+void revert(const Revert& r) {
+  if (!g_attached || r.item.empty() || r.track.empty()) return;
+  g_pendingReverts.push_back(r);
+}
+
+bool mouseHeld() { return ([NSEvent pressedMouseButtons] & 1) != 0; }
+
+bool pointerOver(void* hwnd) {
+  if (!hwnd) return false;
+  @autoreleasepool {
+    id obj = (__bridge id)hwnd;
+    NSWindow* w = [obj isKindOfClass:[NSView class]]     ? [(NSView*)obj window]
+                  : [obj isKindOfClass:[NSWindow class]] ? (NSWindow*)obj
+                                                         : nil;
+    if (!w || !w.visible) return false;
+    return [NSWindow windowNumberAtPoint:[NSEvent mouseLocation] belowWindowWithWindowNumber:0] ==
+           w.windowNumber;
+  }
+}
+
+std::string storyAway() {
+  if (!g_story) return {};
+  const double ph = storyPhase();
+  if (ph >= 28 && ph < 33) return "fx";
+  if (ph >= 33 && ph < 38) return "midi";
+  if (ph >= 38 && ph < 43) return "mixer";
+  return {};
+}
+
 bool sampleLocal(Local* out) {
   if (!g_attached) return false;
   @autoreleasepool {
@@ -1631,7 +1911,7 @@ bool sampleLocal(Local* out) {
     if (g_story) {
       over = storyPoint(g, &vp, &down);
     } else if (const char* item = getenv("REAMESH_CURSOR_DEMO_ITEM");
-        g_demo && item && g_host.itemSpan && g_host.itemSpan(item, &it0, &it1, &iy, &ih)) {
+        g_demo && item && g_host.itemSpan && g_host.itemSpan(item, &it0, &it1, &iy, &ih, nullptr)) {
       // Rides on an item, as if dragging it.
       const double w = 0.06 * std::sin(2 * M_PI * 0.7 * now());
       vp = NSMakePoint((it0 + (it1 - it0) * (0.4 + w) - g.t0) / g.spp, iy + ih * 0.45);

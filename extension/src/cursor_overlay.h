@@ -35,8 +35,12 @@ struct Host {
   // false over the empty area below the last track.
   bool (*trackAt)(double y, std::string* guid, double* fy);
   // An item's extent: project seconds [*t0, *t1) and its pixel rows in the
-  // arrange. false when the item is not in this project or not visible.
-  bool (*itemSpan)(const char* guid, double* t0, double* t1, double* y, double* h);
+  // arrange, plus its track's GUID when `track` is given. false when the item
+  // is not in this project or not visible.
+  bool (*itemSpan)(const char* guid, double* t0, double* t1, double* y, double* h, std::string* track);
+  // The track `by` places below (negative: above) the given one, in this
+  // project's order. false past either end.
+  bool (*trackShift)(const char* guid, int by, std::string* out);
   // Changes whenever item rows may have moved without the time axis moving:
   // local project edits, vertical scroll, track heights. Between two
   // setMarks calls, marks are laid out again only when this or the time axis
@@ -67,6 +71,22 @@ bool draws();
 // them at once and ignores updates; item marks stay.
 void setShowCursors(bool on);
 
+// Where someone works while their mouse is away from the arrange.
+struct Away {
+  std::string kind;   // "fx", "midi", "mixer", "tcp"; empty: nowhere to show
+  std::string track;  // track GUID (fx, mixer, tcp)
+  std::string item;   // item GUID (midi)
+  std::string label;  // plug-in name (fx)
+};
+
+// An item drag in progress: the items, how far in time and by how many
+// tracks they have been dragged so far.
+struct Drag {
+  std::vector<std::string> items;
+  double dt = 0;
+  int dtr = 0;
+};
+
 // One cursor update from a peer, in arrival order.
 struct Remote {
   std::string id, name, color;  // color "#rrggbb"
@@ -75,8 +95,19 @@ struct Remote {
   bool in = false;     // false: the mouse left their arrange
   bool click = false;  // a mouse-down at this spot
   bool down = false;   // the button is held (dragging)
+  Away away;           // while !in
+  Drag drag;           // while dragging items
 };
 void update(const Remote& r);
+
+// Our own edit to an item was just undone (someone else holds it, or their
+// version won): a dashed copy of our version, at `t0..t1` on `track` with the
+// item's rows `yOff`/`h` within it, glides back into the item and fades.
+struct Revert {
+  std::string item, track;
+  double t0 = 0, t1 = 0, yOff = 0, h = 0;
+};
+void revert(const Revert& r);
 
 // What each other person is doing outside the arrange, from their presence:
 // an open FX window on a track. While their mouse is away from the arrange,
@@ -116,5 +147,14 @@ struct Local {
 };
 // Samples the local pointer; false when there is nothing to sample (no layer).
 bool sampleLocal(Local* out);
+
+// Whether the left mouse button is held anywhere.
+bool mouseHeld();
+// Whether the pointer is over the window that holds `hwnd` (an HWND / NSView*),
+// with nothing covering it.
+bool pointerOver(void* hwnd);
+// REAMESH_CURSOR_DEMO=story only: where the scripted pointer is meant to be
+// working while away ("fx", "midi", "mixer" or "").
+std::string storyAway();
 
 }  // namespace cursor_overlay

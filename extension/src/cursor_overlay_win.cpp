@@ -56,6 +56,18 @@ void setActivity(const std::vector<Activity>&) {}
 void setFollow(const std::string&, const std::string&) {}
 void setMarks(const std::vector<Mark>&) {}
 void tick() {}
+void revert(const Revert&) {}
+std::string storyAway() { return {}; }
+
+bool mouseHeld() { return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0; }
+
+bool pointerOver(void* hwnd) {
+  POINT p{};
+  HWND h = static_cast<HWND>(hwnd);
+  if (!h || !GetCursorPos(&p)) return false;
+  HWND under = WindowFromPoint(p);
+  return under && GetAncestor(under, GA_ROOT) == GetAncestor(h, GA_ROOT);
+}
 
 bool sampleLocal(Local* out) {
   if (!g_tv) return false;
