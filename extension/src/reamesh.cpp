@@ -139,6 +139,45 @@
 #define REAPERAPI_WANT_TrackFX_GetParamNormalized
 #define REAPERAPI_WANT_TrackFX_SetParamNormalized
 #define REAPERAPI_WANT_MarkProjectDirty
+// Cheap per-object fingerprints for the incremental capture (trackPrint, itemPrint).
+#define REAPERAPI_WANT_GetSetMediaItemInfo
+#define REAPERAPI_WANT_GetMediaItemTakeInfo_Value
+#define REAPERAPI_WANT_GetTakeName
+#define REAPERAPI_WANT_MIDI_GetHash
+#define REAPERAPI_WANT_PCM_Source_GetSectionInfo
+#define REAPERAPI_WANT_GetTakeNumStretchMarkers
+#define REAPERAPI_WANT_GetTakeStretchMarker
+#define REAPERAPI_WANT_GetTakeStretchMarkerSlope
+#define REAPERAPI_WANT_GetNumTakeMarkers
+#define REAPERAPI_WANT_GetTakeMarker
+#define REAPERAPI_WANT_CountTakeEnvelopes
+#define REAPERAPI_WANT_GetTakeEnvelope
+#define REAPERAPI_WANT_CountTrackEnvelopes
+#define REAPERAPI_WANT_GetTrackEnvelope
+#define REAPERAPI_WANT_CountEnvelopePointsEx
+#define REAPERAPI_WANT_GetEnvelopePointEx
+#define REAPERAPI_WANT_CountAutomationItems
+#define REAPERAPI_WANT_GetSetAutomationItemInfo
+#define REAPERAPI_WANT_GetSetEnvelopeInfo_String
+#define REAPERAPI_WANT_TrackFX_GetRecCount
+#define REAPERAPI_WANT_TrackFX_GetFXGUID
+#define REAPERAPI_WANT_TrackFX_GetEnabled
+#define REAPERAPI_WANT_TrackFX_GetOffline
+#define REAPERAPI_WANT_TrackFX_GetOpen
+#define REAPERAPI_WANT_TrackFX_GetChainVisible
+#define REAPERAPI_WANT_TrackFX_GetRecChainVisible
+#define REAPERAPI_WANT_TakeFX_GetFXGUID
+#define REAPERAPI_WANT_TakeFX_GetEnabled
+#define REAPERAPI_WANT_TakeFX_GetOffline
+#define REAPERAPI_WANT_TakeFX_GetOpen
+#define REAPERAPI_WANT_TakeFX_GetChainVisible
+#define REAPERAPI_WANT_GetTrackNumSends
+#define REAPERAPI_WANT_GetTrackSendInfo_Value
+#define REAPERAPI_WANT_GetSetTrackGroupMembership
+#define REAPERAPI_WANT_GetLastTouchedFX
+#define REAPERAPI_WANT_GetLastTouchedTrack
+#define REAPERAPI_WANT_Undo_CanUndo2
+#define REAPERAPI_WANT_Undo_CanRedo2
 
 #include "reaper_plugin.h"
 #include "reaper_plugin_functions.h"
@@ -165,6 +204,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <thread>
 #include <vector>
@@ -314,10 +354,21 @@ struct ProjectState {
   bool operator==(const ProjectState&) const = default;
 };
 
+// Cheap fingerprint of the REAPER state a track's chunk-derived fields (or an
+// item's chunk) were read from, plus the object pointer it was read through.
+// Lets the capture reuse a stored chunk while the fingerprint holds (see
+// snapshotProjectReusing). A missing print means "unknown": re-read.
+struct ObjectPrint {
+  const void* ptr = nullptr;
+  uint64_t hash = 0;
+};
+
 struct Snapshot {
   std::map<std::string, TrackState> tracks;  // track GUID -> state
   std::map<std::string, ItemState> items;    // item GUID -> state
   ProjectState project;
+  std::unordered_map<std::string, ObjectPrint> trackPrints;  // track GUID -> print
+  std::unordered_map<std::string, ObjectPrint> itemPrints;   // item GUID -> print
 };
 
 // An incoming item whose media files have not arrived yet. Re-checked every
@@ -350,9 +401,9 @@ static Snapshot g_snapshot;               // last known state, by GUID
 static int g_lastChangeCount = -1;
 // Items this instance proposed changes to, and when (cursor_overlay::revert).
 static std::map<std::string, std::chrono::steady_clock::time_point> g_localItemEdits;
-// EMA of what one capture (serialize every track+item chunk + diff) costs on
-// this project; drives the adaptive capture/rescan throttle so huge projects
-// trade sync latency for a smooth REAPER UI instead of a choppy one.
+// EMA of what one edit capture (serialize what changed + diff) costs on this
+// project; drives the adaptive capture throttle so huge projects trade a
+// little sync latency for a smooth REAPER UI instead of a choppy one.
 static std::chrono::milliseconds g_captureCost{0};
 static bool g_applyingRemote = false;  // echo-suppression / reentrancy guard
 // PreventUIRefresh nesting this extension holds right now. Every freeze goes
@@ -2129,79 +2180,524 @@ static const std::vector<std::string>& mediaPathDirs() {
   return dirs;
 }
 
-static Snapshot snapshotProject() {
+static void captureProjectFields(ProjectState& p) {
+  p.tempo = captureTempo();
+  p.markers = captureMarkers();
+  p.notes = captureProjectNotes();
+  p.title = captureProjectString("PROJECT_TITLE");
+  p.author = captureProjectString("PROJECT_AUTHOR");
+  p.groupnames = captureGroupNames();
+  p.timebase = captureProjectTimebase();
+}
+
+// Every TrackState field that comes from a plain API read (cheap): everything
+// except the chunk-derived blocks, which readTrackChunkFields fills.
+static TrackState trackScalars(MediaTrack* tr, int index) {
+  TrackState ts;
+  ts.index = index;
+  ts.name = cleanLine(trackStringAttr(tr, "P_NAME"), kMaxNameBytes);
+  ts.vol = GetMediaTrackInfo_Value(tr, "D_VOL");
+  ts.pan = GetMediaTrackInfo_Value(tr, "D_PAN");
+  ts.fxen = GetMediaTrackInfo_Value(tr, "I_FXEN") != 0.0;
+  ts.width = GetMediaTrackInfo_Value(tr, "D_WIDTH");
+  ts.panmode = (int)GetMediaTrackInfo_Value(tr, "I_PANMODE");
+  ts.dualpanl = GetMediaTrackInfo_Value(tr, "D_DUALPANL");
+  ts.dualpanr = GetMediaTrackInfo_Value(tr, "D_DUALPANR");
+  ts.panlaw = GetMediaTrackInfo_Value(tr, "D_PANLAW");
+  ts.panlawflags = (int)GetMediaTrackInfo_Value(tr, "I_PANLAW_FLAGS");
+  ts.phase = GetMediaTrackInfo_Value(tr, "B_PHASE") != 0.0;
+  ts.solodefeat = GetMediaTrackInfo_Value(tr, "B_SOLO_DEFEAT") != 0.0;
+  ts.nchan = (int)GetMediaTrackInfo_Value(tr, "I_NCHAN");
+  ts.color = colorToWire((int)GetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR"));
+  ts.folderdepth = (int)GetMediaTrackInfo_Value(tr, "I_FOLDERDEPTH");
+  ts.mainsend = GetMediaTrackInfo_Value(tr, "B_MAINSEND") != 0.0;
+  ts.mainsendoffs = (int)GetMediaTrackInfo_Value(tr, "C_MAINSEND_OFFS");
+  ts.mainsendnch = (int)GetMediaTrackInfo_Value(tr, "C_MAINSEND_NCH");
+  ts.timebase = (int)GetMediaTrackInfo_Value(tr, "C_BEATATTACHMODE");
+  ts.playoffs = GetMediaTrackInfo_Value(tr, "D_PLAY_OFFSET");
+  ts.playoffsflag = (int)GetMediaTrackInfo_Value(tr, "I_PLAY_OFFSET_FLAG");
+  ts.freemode = (int)GetMediaTrackInfo_Value(tr, "I_FREEMODE");
+  ts.numlanes = (int)GetMediaTrackInfo_Value(tr, "I_NUMFIXEDLANES");
+  ts.lanesettings = (int)GetMediaTrackInfo_Value(tr, "C_LANESETTINGS");
+  if (ts.freemode == 2 && ts.numlanes > 0) {
+    for (int lane = 0; lane < (std::min)(ts.numlanes, kMaxLanes); ++lane) {
+      char key[32];
+      snprintf(key, sizeof(key), "P_LANENAME:%d", lane);
+      if (lane) ts.lanenames += '\n';
+      ts.lanenames += cleanLine(trackStringAttr(tr, key), kMaxNameBytes);
+      snprintf(key, sizeof(key), "C_LANEPLAYS:%d", lane);
+      if (lane) ts.laneplays += ' ';
+      ts.laneplays += std::to_string((int)GetMediaTrackInfo_Value(tr, key));
+    }
+  }
+  return ts;
+}
+
+// The chunk-derived TrackState fields. The expensive part: REAPER serializes
+// the whole track, every item on it included, to produce them.
+static void readTrackChunkFields(MediaTrack* tr, TrackState& ts) {
+  TrackBlocks blocks = extractTrackBlocks(normalizeChunk(objectStateChunk(tr)));
+  ts.fxchain = std::move(blocks.fxchain);
+  ts.recfx = std::move(blocks.recfx);
+  ts.env = std::move(blocks.env);
+  ts.group = std::move(blocks.group);
+  ts.lock = std::move(blocks.lock);
+  ts.recv = transformRecvUnits(blocks.recv, [](const std::string& tok) -> std::string {
+    char* end = nullptr;
+    const long idx = strtol(tok.c_str(), &end, 10);
+    if (end == tok.c_str() || idx < 0) return "";
+    MediaTrack* src = GetTrack(nullptr, (int)idx);
+    return src ? trackGuid(src) : "";
+  });
+}
+
+static void reuseTrackChunkFields(const TrackState& from, TrackState& ts) {
+  ts.fxchain = from.fxchain;
+  ts.recfx = from.recfx;
+  ts.env = from.env;
+  ts.group = from.group;
+  ts.lock = from.lock;
+  ts.recv = from.recv;
+}
+
+static ItemState readItem(MediaItem* item, const std::string& track,
+                          const std::vector<std::string>& mediaDirs) {
+  ItemState is;
+  is.track = track;
+  is.chunk = relativizeChunkFiles(normalizeChunk(objectStateChunk(item)), mediaDirs);
+  return is;
+}
+
+// ---------- object fingerprints (incremental capture) ----------
+//
+// A print folds cheap API reads covering what the chunk-derived fields hold:
+// for a track its FX chains (per FX: identity, name, bypass, offline),
+// envelopes (points, automation items, active state), receives (every send
+// attribute, their envelopes) and membership in groups 1-32; for an item
+// every item and take attribute, take names and sources, MIDI content
+// (MIDI_GetHash), take FX, take envelopes, stretch and take markers.
+// Not covered (no cheap read): FX parameter values and plugin state, groups
+// 33-64, the track control lock, a few rarer chunk lines. Those are caught by
+// the edit hints (an FX being tweaked has its window open or is the
+// last-touched FX), by the rotating re-read and the post-edit sweep (see
+// captureLocalChanges), and for groups and the lock also by the rescan. A
+// print is only ever used to skip a re-read: an unchanged print reuses the
+// baseline's own chunk, which diffs as "no change", so a print can delay a
+// local edit, never fabricate or revert one.
+
+struct PrintHasher {
+  uint64_t h = 0x84222325cbf29ce4ull;
+  static uint64_t mix(uint64_t z) {
+    z += 0x9e3779b97f4a7c15ull;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+  }
+  void u64(uint64_t v) { h = mix(h ^ v); }
+  void num(double d) {
+    uint64_t b;
+    memcpy(&b, &d, sizeof(b));
+    u64(b);
+  }
+  void ptr(const void* p) { u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p))); }
+  void bytes(const void* data, size_t n) {
+    const unsigned char* s = static_cast<const unsigned char*>(data);
+    u64(n);
+    for (; n >= 8; s += 8, n -= 8) {
+      uint64_t v;
+      memcpy(&v, s, 8);
+      u64(v);
+    }
+    uint64_t tail = 0;
+    if (n) memcpy(&tail, s, n);
+    u64(tail);
+  }
+  void str(const char* s) {
+    if (!s) return u64(0x5a5a5a5aull);
+    bytes(s, strlen(s));
+  }
+};
+
+static void printEnvelope(PrintHasher& h, TrackEnvelope* env) {
+  h.ptr(env);
+  if (!env) return;
+  char active[64] = "";
+  GetSetEnvelopeInfo_String(env, "ACTIVE", active, false);
+  h.str(active);
+  auto points = [&](int autoitem) {
+    const int n = CountEnvelopePointsEx(env, autoitem);
+    h.u64(static_cast<uint64_t>(n));
+    for (int p = 0; p < n; ++p) {
+      double t = 0, v = 0, tension = 0;
+      int shape = 0;
+      bool sel = false;  // selection is per-user, not synced
+      GetEnvelopePointEx(env, autoitem, p, &t, &v, &shape, &tension, &sel);
+      h.num(t);
+      h.num(v);
+      h.u64(static_cast<uint64_t>(shape));
+      h.num(tension);
+    }
+  };
+  points(-1);
+  static const char* const kAutoItemParms[] = {"D_POOL_ID",  "D_POSITION",  "D_LENGTH",
+                                               "D_STARTOFFS", "D_PLAYRATE", "D_BASELINE",
+                                               "D_AMPLITUDE", "D_LOOPSRC",  "D_POOL_QNLEN"};
+  const int nai = CountAutomationItems(env);
+  h.u64(static_cast<uint64_t>(nai));
+  for (int a = 0; a < nai; ++a) {
+    for (const char* k : kAutoItemParms) h.num(GetSetAutomationItemInfo(env, a, k, 0, false));
+    points(a);
+  }
+}
+
+static void printFxGuid(PrintHasher& h, const GUID* g) {
+  if (g)
+    h.bytes(g, sizeof(GUID));
+  else
+    h.u64(0);
+}
+
+// `hinted` is set when the track is likely being edited through a path the
+// print cannot see (an FX window or the FX chain is open).
+static uint64_t trackPrint(MediaTrack* tr, bool& hinted) {
+  PrintHasher h;
+  auto chain = [&](int count, int base) {
+    h.u64(static_cast<uint64_t>(count));
+    for (int i = 0; i < count; ++i) {
+      const int fx = base + i;
+      printFxGuid(h, TrackFX_GetFXGUID(tr, fx));
+      char name[512];
+      name[0] = '\0';
+      TrackFX_GetFXName(tr, fx, name, sizeof(name));
+      h.str(name);
+      h.u64(TrackFX_GetEnabled(tr, fx) ? 1 : 0);
+      h.u64(TrackFX_GetOffline(tr, fx) ? 1 : 0);
+      if (TrackFX_GetOpen(tr, fx)) hinted = true;
+    }
+  };
+  chain(TrackFX_GetCount(tr), 0);
+  chain(TrackFX_GetRecCount(tr), 0x1000000);
+  if (TrackFX_GetChainVisible(tr) != -1 || TrackFX_GetRecChainVisible(tr) != -1) hinted = true;
+
+  const int nenv = CountTrackEnvelopes(tr);
+  h.u64(static_cast<uint64_t>(nenv));
+  for (int e = 0; e < nenv; ++e) printEnvelope(h, GetTrackEnvelope(tr, e));
+
+  static const char* const kRecvParms[] = {"B_MUTE",     "B_PHASE",    "B_MONO",     "D_VOL",
+                                           "D_PAN",      "D_PANLAW",   "I_SENDMODE", "I_AUTOMODE",
+                                           "I_SRCCHAN",  "I_DSTCHAN",  "I_MIDIFLAGS", "P_SRCTRACK"};
+  static const char* const kRecvEnvs[] = {"P_ENV:<VOLENV", "P_ENV:<PANENV", "P_ENV:<MUTEENV"};
+  const int nrecv = GetTrackNumSends(tr, -1);
+  h.u64(static_cast<uint64_t>(nrecv));
+  for (int r = 0; r < nrecv; ++r) {
+    for (const char* k : kRecvParms) h.num(GetTrackSendInfo_Value(tr, -1, r, k));
+    for (const char* k : kRecvEnvs)
+      printEnvelope(h, reinterpret_cast<TrackEnvelope*>(
+                           static_cast<uintptr_t>(GetTrackSendInfo_Value(tr, -1, r, k))));
+  }
+
+  static const char* const kGroups[] = {
+      "MEDIA_EDIT_LEAD", "MEDIA_EDIT_FOLLOW",  "VOLUME_LEAD",         "VOLUME_FOLLOW",
+      "VOLUME_VCA_LEAD", "VOLUME_VCA_FOLLOW",  "PAN_LEAD",            "PAN_FOLLOW",
+      "WIDTH_LEAD",      "WIDTH_FOLLOW",       "MUTE_LEAD",           "MUTE_FOLLOW",
+      "SOLO_LEAD",       "SOLO_FOLLOW",        "RECARM_LEAD",         "RECARM_FOLLOW",
+      "POLARITY_LEAD",   "POLARITY_FOLLOW",    "AUTOMODE_LEAD",       "AUTOMODE_FOLLOW",
+      "VOLUME_REVERSE",  "PAN_REVERSE",        "WIDTH_REVERSE",       "NO_LEAD_WHEN_FOLLOW",
+      "VOLUME_VCA_FOLLOW_ISPREFX"};
+  // Groups 1-32 only: each lookup is a string compare chain inside REAPER,
+  // and the high groups are rare enough for the sweep and the rescan.
+  for (const char* g : kGroups) h.u64(GetSetTrackGroupMembership(tr, g, 0, 0));
+  return h.h;
+}
+
+// `hinted` as for trackPrint (a take FX window or chain is open).
+static uint64_t itemPrint(MediaItem* item, bool& hinted) {
+  static const char* const kItemParms[] = {
+      "B_MUTE",       "B_MUTE_ACTUAL",    "C_MUTE_SOLO",       "B_LOOPSRC",     "B_ALLTAKESPLAY",
+      "C_BEATATTACHMODE", "C_AUTOSTRETCH", "C_LOCK",           "D_VOL",         "D_POSITION",
+      "D_LENGTH",     "D_SNAPOFFSET",     "D_FADEINLEN",       "D_FADEOUTLEN",  "D_FADEINDIR",
+      "D_FADEOUTDIR", "D_FADEINLEN_AUTO", "D_FADEOUTLEN_AUTO", "C_FADEINSHAPE", "C_FADEOUTSHAPE",
+      "I_FADELPF",    "I_GROUPID",        "I_CUSTOMCOLOR",     "I_CURTAKE",     "F_FREEMODE_Y",
+      "F_FREEMODE_H", "I_FIXEDLANE",      "C_LANEPLAYS"};
+  static const char* const kTakeParms[] = {
+      "D_STARTOFFS",  "D_VOL",          "D_PAN",       "D_PANLAW",     "D_PLAYRATE",
+      "D_PITCH",      "B_PPITCH",       "I_CHANMODE",  "I_PITCHMODE",  "I_STRETCHFLAGS",
+      "F_STRETCHFADESIZE", "I_RECPASSID", "I_TAKEFX_NCH", "I_CUSTOMCOLOR", "IP_SPECEDIT:CNT"};
+  PrintHasher h;
+  for (const char* k : kItemParms) h.num(GetMediaItemInfo_Value(item, k));
+  h.str(static_cast<const char*>(GetSetMediaItemInfo(item, "P_NOTES", nullptr)));
+  const int ntakes = CountTakes(item);
+  h.u64(static_cast<uint64_t>(ntakes));
+  for (int t = 0; t < ntakes; ++t) {
+    MediaItem_Take* take = GetMediaItemTake(item, t);
+    h.ptr(take);
+    if (!take) continue;
+    for (const char* k : kTakeParms) h.num(GetMediaItemTakeInfo_Value(take, k));
+    h.str(GetTakeName(take));
+    PCM_source* src = GetMediaItemTake_Source(take);
+    h.ptr(src);
+    if (src) {
+      char fn[4096];
+      fn[0] = '\0';
+      GetMediaSourceFileName(src, fn, sizeof(fn));
+      h.str(fn);
+      h.ptr(GetMediaSourceParent(src));
+      double offs = 0, len = 0;
+      bool rev = false;
+      if (PCM_Source_GetSectionInfo(src, &offs, &len, &rev)) {
+        h.num(offs);
+        h.num(len);
+        h.u64(rev ? 1 : 0);
+      }
+    }
+    char midi[128];
+    midi[0] = '\0';
+    if (MIDI_GetHash(take, false, midi, sizeof(midi))) h.str(midi);
+
+    const int nfx = TakeFX_GetCount(take);
+    h.u64(static_cast<uint64_t>(nfx));
+    for (int fx = 0; fx < nfx; ++fx) {
+      printFxGuid(h, TakeFX_GetFXGUID(take, fx));
+      char name[512];
+      name[0] = '\0';
+      TakeFX_GetFXName(take, fx, name, sizeof(name));
+      h.str(name);
+      h.u64(TakeFX_GetEnabled(take, fx) ? 1 : 0);
+      h.u64(TakeFX_GetOffline(take, fx) ? 1 : 0);
+      if (TakeFX_GetOpen(take, fx)) hinted = true;
+    }
+    if (nfx > 0 && TakeFX_GetChainVisible(take) != -1) hinted = true;
+
+    const int nenv = CountTakeEnvelopes(take);
+    h.u64(static_cast<uint64_t>(nenv));
+    for (int e = 0; e < nenv; ++e) printEnvelope(h, GetTakeEnvelope(take, e));
+
+    const int nstretch = GetTakeNumStretchMarkers(take);
+    h.u64(static_cast<uint64_t>(nstretch));
+    for (int m = 0; m < nstretch; ++m) {
+      double pos = 0, srcpos = 0;
+      GetTakeStretchMarker(take, m, &pos, &srcpos);
+      h.num(pos);
+      h.num(srcpos);
+      h.num(GetTakeStretchMarkerSlope(take, m));
+    }
+    const int nmarkers = GetNumTakeMarkers(take);
+    h.u64(static_cast<uint64_t>(nmarkers));
+    for (int m = 0; m < nmarkers; ++m) {
+      char name[512];
+      name[0] = '\0';
+      int color = 0;
+      h.num(GetTakeMarker(take, m, name, sizeof(name), &color));
+      h.str(name);
+      h.u64(static_cast<uint64_t>(color));
+    }
+  }
+  return h.h;
+}
+
+// Below this many tracks + items a full capture is cheap enough (a few ms) to
+// run on every edit; prints and the incremental path only pay off above it.
+static constexpr int kIncrementalMinObjects = 200;
+// The incremental capture re-reads one of this many GUID buckets in full on
+// every capture, whatever the prints say, so every object is re-serialized at
+// least once every kSweepBuckets captures.
+static constexpr unsigned kSweepBuckets = 16;
+// At most this many selected items are always re-read (an item properties
+// dialog edits the selection, and some of its fields have no cheap read).
+static constexpr int kMaxSelectedItemHints = 64;
+// At most one sweep step this often (a full lap: kSweepBuckets of them).
+static constexpr std::chrono::milliseconds kSweepStepGap{150};
+
+static bool projectWantsPrints() {
+  return CountTracks(nullptr) + CountMediaItems(nullptr) >= kIncrementalMinObjects;
+}
+
+static unsigned sweepBucketOf(const std::string& guid) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char c : guid) h = (h ^ c) * 0x100000001b3ull;
+  return static_cast<unsigned>(h % kSweepBuckets);
+}
+
+// itemGuid() formats with sprintf on every call, which adds up over thousands
+// of items per capture. Cached per item pointer and validated against the
+// item's raw GUID bytes on every use, so a recycled pointer or a changed GUID
+// misses; a miss goes through itemGuid() itself, so the string is identical.
+static std::string itemGuidCached(MediaItem* item) {
+  struct Entry {
+    GUID raw;
+    std::string str;
+  };
+  static std::unordered_map<const void*, Entry> cache;
+  const GUID* g = static_cast<const GUID*>(GetSetMediaItemInfo(item, "GUID", nullptr));
+  if (!g) return itemGuid(item);
+  auto it = cache.find(item);
+  if (it != cache.end() && memcmp(&it->second.raw, g, sizeof(GUID)) == 0) return it->second.str;
+  if (cache.size() > 100000) cache.clear();  // deleted items leave entries behind
+  Entry& e = cache[item];
+  e.raw = *g;
+  e.str = itemGuid(item);
+  return e.str;
+}
+
+static Snapshot snapshotProject(bool withPrints = true) {
   Snapshot snap;
-  snap.project.tempo = captureTempo();
-  snap.project.markers = captureMarkers();
-  snap.project.notes = captureProjectNotes();
-  snap.project.title = captureProjectString("PROJECT_TITLE");
-  snap.project.author = captureProjectString("PROJECT_AUTHOR");
-  snap.project.groupnames = captureGroupNames();
-  snap.project.timebase = captureProjectTimebase();
+  captureProjectFields(snap.project);
+  // Prints taken here too, alongside the chunk reads, so every baseline
+  // (including the re-baseline after a remote apply) can seed the next
+  // incremental capture.
+  const bool prints = withPrints && projectWantsPrints();
+  bool hint = false;  // unused on a full read
+  const std::vector<std::string>& mediaDirs = mediaPathDirs();
   const int n = CountTracks(nullptr);
   for (int i = 0; i < n; ++i) {
     MediaTrack* tr = GetTrack(nullptr, i);
-    TrackState ts;
-    ts.index = i;
-    ts.name = cleanLine(trackStringAttr(tr, "P_NAME"), kMaxNameBytes);
-    ts.vol = GetMediaTrackInfo_Value(tr, "D_VOL");
-    ts.pan = GetMediaTrackInfo_Value(tr, "D_PAN");
-    ts.fxen = GetMediaTrackInfo_Value(tr, "I_FXEN") != 0.0;
-    ts.width = GetMediaTrackInfo_Value(tr, "D_WIDTH");
-    ts.panmode = (int)GetMediaTrackInfo_Value(tr, "I_PANMODE");
-    ts.dualpanl = GetMediaTrackInfo_Value(tr, "D_DUALPANL");
-    ts.dualpanr = GetMediaTrackInfo_Value(tr, "D_DUALPANR");
-    ts.panlaw = GetMediaTrackInfo_Value(tr, "D_PANLAW");
-    ts.panlawflags = (int)GetMediaTrackInfo_Value(tr, "I_PANLAW_FLAGS");
-    ts.phase = GetMediaTrackInfo_Value(tr, "B_PHASE") != 0.0;
-    ts.solodefeat = GetMediaTrackInfo_Value(tr, "B_SOLO_DEFEAT") != 0.0;
-    ts.nchan = (int)GetMediaTrackInfo_Value(tr, "I_NCHAN");
-    ts.color = colorToWire((int)GetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR"));
-    ts.folderdepth = (int)GetMediaTrackInfo_Value(tr, "I_FOLDERDEPTH");
-    ts.mainsend = GetMediaTrackInfo_Value(tr, "B_MAINSEND") != 0.0;
-    ts.mainsendoffs = (int)GetMediaTrackInfo_Value(tr, "C_MAINSEND_OFFS");
-    ts.mainsendnch = (int)GetMediaTrackInfo_Value(tr, "C_MAINSEND_NCH");
-    ts.timebase = (int)GetMediaTrackInfo_Value(tr, "C_BEATATTACHMODE");
-    ts.playoffs = GetMediaTrackInfo_Value(tr, "D_PLAY_OFFSET");
-    ts.playoffsflag = (int)GetMediaTrackInfo_Value(tr, "I_PLAY_OFFSET_FLAG");
-    ts.freemode = (int)GetMediaTrackInfo_Value(tr, "I_FREEMODE");
-    ts.numlanes = (int)GetMediaTrackInfo_Value(tr, "I_NUMFIXEDLANES");
-    ts.lanesettings = (int)GetMediaTrackInfo_Value(tr, "C_LANESETTINGS");
-    if (ts.freemode == 2 && ts.numlanes > 0) {
-      for (int lane = 0; lane < (std::min)(ts.numlanes, kMaxLanes); ++lane) {
-        char key[32];
-        snprintf(key, sizeof(key), "P_LANENAME:%d", lane);
-        if (lane) ts.lanenames += '\n';
-        ts.lanenames += cleanLine(trackStringAttr(tr, key), kMaxNameBytes);
-        snprintf(key, sizeof(key), "C_LANEPLAYS:%d", lane);
-        if (lane) ts.laneplays += ' ';
-        ts.laneplays += std::to_string((int)GetMediaTrackInfo_Value(tr, key));
-      }
+    TrackState ts = trackScalars(tr, i);
+    readTrackChunkFields(tr, ts);
+    const std::string guid = trackGuid(tr);
+    if (prints) snap.trackPrints[guid] = {tr, trackPrint(tr, hint)};
+    snap.tracks[guid] = std::move(ts);
+    // Items track by track, the same set CountMediaItems/GetMediaItem walk
+    // (GetMediaItem(proj, i) re-walks the tracks from the start on every
+    // call, quadratic on a big project).
+    for (int j = 0, ni = CountTrackMediaItems(tr); j < ni; ++j) {
+      MediaItem* item = GetTrackMediaItem(tr, j);
+      if (!item) continue;
+      const std::string ig = itemGuidCached(item);
+      snap.items[ig] = readItem(item, guid, mediaDirs);
+      if (prints) snap.itemPrints[ig] = {item, itemPrint(item, hint)};
     }
-    TrackBlocks blocks = extractTrackBlocks(normalizeChunk(objectStateChunk(tr)));
-    ts.fxchain = std::move(blocks.fxchain);
-    ts.recfx = std::move(blocks.recfx);
-    ts.env = std::move(blocks.env);
-    ts.group = std::move(blocks.group);
-    ts.lock = std::move(blocks.lock);
-    ts.recv = transformRecvUnits(blocks.recv, [](const std::string& tok) -> std::string {
-      char* end = nullptr;
-      const long idx = strtol(tok.c_str(), &end, 10);
-      if (end == tok.c_str() || idx < 0) return "";
-      MediaTrack* src = GetTrack(nullptr, (int)idx);
-      return src ? trackGuid(src) : "";
-    });
-    snap.tracks[trackGuid(tr)] = std::move(ts);
   }
+  return snap;
+}
+
+// Objects the user is probably editing right now through a path the prints
+// cannot see: always re-read. Selected items (when few), the MIDI editor's
+// take, the focused and the last-touched FX's track/item, the last-touched
+// track.
+static void collectEditHints(std::unordered_set<const void*>& out) {
+  const int nsel = CountSelectedMediaItems(nullptr);
+  if (nsel <= kMaxSelectedItemHints)
+    for (int i = 0; i < nsel; ++i) out.insert(GetSelectedMediaItem(nullptr, i));
+  if (HWND me = MIDIEditor_GetActive())
+    if (MediaItem_Take* take = MIDIEditor_GetTake(me)) out.insert(GetMediaItemTake_Item(take));
+  if (MediaTrack* tr = GetLastTouchedTrack()) out.insert(tr);
+  auto fxOwner = [&](int trackNumber, int itemIndex) {
+    MediaTrack* tr = trackNumber > 0 ? GetTrack(nullptr, trackNumber - 1) : nullptr;
+    if (!tr) return;  // the master track is not synced
+    out.insert(tr);
+    if (itemIndex >= 0)
+      if (MediaItem* item = GetTrackMediaItem(tr, itemIndex)) out.insert(item);
+  };
+  int trackNumber = 0, itemIndex = -1, fxNumber = 0;
+  const int focused = GetFocusedFX2(&trackNumber, &itemIndex, &fxNumber);
+  if (focused & 3) fxOwner(trackNumber, (focused & 2) ? itemIndex : -1);
+  int touchedTrack = 0, touchedFx = 0, touchedParam = 0;
+  if (GetLastTouchedFX(&touchedTrack, &touchedFx, &touchedParam))
+    fxOwner(touchedTrack & 0xFFFF, ((touchedTrack >> 16) & 0xFFFF) - 1);
+}
+
+struct CaptureCounts {
+  long read = 0, reused = 0;
+  double printMs = 0;
+  std::unordered_set<std::string> reusedItems;  // verbatim baseline copies
+  std::vector<std::string> reusedTracks;        // for REAMESH_DEBUG_CAPTURE_VERIFY
+};
+
+// What a remote write (an applied changeset, a parked item or receive landing,
+// a lock-tint repaint) wrote into the project, for the re-baseline after it
+// (rebaseline). Collected from what was applied, not from REAPER.
+struct Written {
+  std::unordered_set<std::string> tracks;       // any field written
+  std::unordered_set<std::string> chunkTracks;  // the track chunk rewritten (its items too)
+  std::unordered_set<std::string> items;
+};
+
+// Besides a changed pointer, print, owning track or track index, what makes
+// snapshotProjectReusing re-read an object instead of reusing the baseline's.
+struct ReuseRules {
+  unsigned bucket = kSweepBuckets;  // every object in this GUID bucket (kSweepBuckets: none)
+  const std::unordered_set<const void*>* hints = nullptr;  // these objects
+  bool printHints = false;  // an object whose FX window or chain is open
+  const Written* written = nullptr;  // what a remote write touched
+};
+
+// The same snapshot snapshotProject() would take, except that a track's
+// chunk-derived fields and an item's chunk are copied from `base` instead of
+// re-serialized when nothing says they could have changed: same object
+// pointer, same print, same owning track / track index, and no rule (see
+// ReuseRules) names it. Everything else (project fields, every track scalar,
+// which tracks and items exist and where) is read fresh, so structural
+// changes are always seen whole. A reused value is the baseline's own, so it
+// diffs as "unchanged": reuse can only ever delay a change, never propose a
+// stale one.
+static Snapshot snapshotProjectReusing(const Snapshot& base, const ReuseRules& rules,
+                                       CaptureCounts& counts) {
+  Snapshot snap;
+  captureProjectFields(snap.project);
+  static const std::unordered_set<const void*> kNoHints;
+  const std::unordered_set<const void*>& hints = rules.hints ? *rules.hints : kNoHints;
   const std::vector<std::string>& mediaDirs = mediaPathDirs();
-  const int ni = CountMediaItems(nullptr);
-  for (int i = 0; i < ni; ++i) {
-    MediaItem* item = GetMediaItem(nullptr, i);
-    ItemState is;
-    is.track = trackGuid(GetMediaItem_Track(item));
-    is.chunk = relativizeChunkFiles(normalizeChunk(objectStateChunk(item)), mediaDirs);
-    snap.items[itemGuid(item)] = std::move(is);
+  double printMs = 0;
+  auto timedPrint = [&](auto&& fn) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t v = fn();
+    printMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                   .count();
+    return v;
+  };
+  const int n = CountTracks(nullptr);
+  for (int i = 0; i < n; ++i) {
+    MediaTrack* tr = GetTrack(nullptr, i);
+    const std::string guid = trackGuid(tr);
+    TrackState ts = trackScalars(tr, i);
+    auto b = base.tracks.find(guid);
+    auto bp = base.trackPrints.find(guid);
+    const bool known = b != base.tracks.end() && bp != base.trackPrints.end() &&
+                       bp->second.ptr == tr && b->second.index == i;
+    const bool inBucket = sweepBucketOf(guid) == rules.bucket;
+    const bool written = rules.written && rules.written->tracks.count(guid);
+    const bool chunkWritten = rules.written && rules.written->chunkTracks.count(guid);
+    bool printHint = false;
+    const uint64_t print = timedPrint([&] { return trackPrint(tr, printHint); });
+    const bool hinted = hints.count(tr) > 0 || (rules.printHints && printHint);
+    if (known && !inBucket && !hinted && !written && bp->second.hash == print) {
+      reuseTrackChunkFields(b->second, ts);
+      counts.reusedTracks.push_back(guid);
+      ++counts.reused;
+    } else {
+      readTrackChunkFields(tr, ts);
+      ++counts.read;
+    }
+    snap.trackPrints[guid] = {tr, print};
+
+    const int ni = CountTrackMediaItems(tr);
+    for (int j = 0; j < ni; ++j) {
+      MediaItem* item = GetTrackMediaItem(tr, j);
+      if (!item) continue;
+      const std::string ig = itemGuidCached(item);
+      auto bi = base.items.find(ig);
+      auto bip = base.itemPrints.find(ig);
+      const bool itemKnown = bi != base.items.end() && bip != base.itemPrints.end() &&
+                             bip->second.ptr == item && bi->second.track == guid;
+      const bool itemInBucket = sweepBucketOf(ig) == rules.bucket;
+      const bool itemWritten =
+          chunkWritten || (rules.written && rules.written->items.count(ig));
+      bool itemPrintHint = false;
+      const uint64_t ip = timedPrint([&] { return itemPrint(item, itemPrintHint); });
+      const bool itemHinted = hints.count(item) > 0 || (rules.printHints && itemPrintHint);
+      if (itemKnown && !itemInBucket && !itemHinted && !itemWritten && bip->second.hash == ip) {
+        snap.items[ig] = bi->second;
+        counts.reusedItems.insert(ig);
+        ++counts.reused;
+      } else {
+        snap.items[ig] = readItem(item, guid, mediaDirs);
+        ++counts.read;
+      }
+      snap.itemPrints[ig] = {item, ip};
+    }
+    snap.tracks[guid] = std::move(ts);
   }
+  counts.printMs = printMs;
   return snap;
 }
 
@@ -2245,7 +2741,11 @@ static json trackToJson(const TrackState& ts) {
 // Minimal changeset: full field set for new entities, changed fields only for
 // known ones, a present:false tombstone for removed ones. Empty string when
 // nothing relevant changed.
-static std::string diffSnapshots(const Snapshot& prev, const Snapshot& now) {
+// `unchangedItems` (optional) names items whose state in `now` is a verbatim
+// copy of `prev` (the incremental capture's reused items): their chunks need
+// no comparing.
+static std::string diffSnapshots(const Snapshot& prev, const Snapshot& now,
+                                 const std::unordered_set<std::string>* unchangedItems = nullptr) {
   json tracks = json::object();
   for (const auto& [guid, ts] : now.tracks) {
     auto it = prev.tracks.find(guid);
@@ -2295,23 +2795,26 @@ static std::string diffSnapshots(const Snapshot& prev, const Snapshot& now) {
     if (!now.tracks.count(guid)) tracks[guid] = json{{"present", false}};
   }
 
+  // Both maps are sorted by GUID: walk them in step (thousands of items on a
+  // big project; a lookup per item each way added up).
   json items = json::object();
+  auto p = prev.items.begin();
   for (const auto& [guid, is] : now.items) {
-    auto it = prev.items.find(guid);
-    if (it == prev.items.end()) {
+    for (; p != prev.items.end() && p->first < guid; ++p)
+      items[p->first] = json{{"present", false}};
+    if (p == prev.items.end() || p->first != guid) {
       items[guid] = json{{"present", true}, {"track", is.track}, {"chunk", is.chunk}};
       continue;
     }
-    const ItemState& old = it->second;
+    const ItemState& old = (p++)->second;
+    if (unchangedItems && unchangedItems->count(guid)) continue;
     if (old == is) continue;
     json delta = json::object();
     if (old.track != is.track) delta["track"] = is.track;
     if (old.chunk != is.chunk) delta["chunk"] = is.chunk;
     items[guid] = delta;
   }
-  for (const auto& [guid, is] : prev.items) {
-    if (!now.items.count(guid)) items[guid] = json{{"present", false}};
-  }
+  for (; p != prev.items.end(); ++p) items[p->first] = json{{"present", false}};
 
   // Project-wide state lives under section "project", single id "project".
   json project = json::object();
@@ -2443,11 +2946,26 @@ static void internalizeExternalMedia() {
              "copied " + name + " into the project folder so peers get it");
   }
 
-  // Scan for external sources and kick off copies for new ones.
+  // Scan for external sources and kick off copies for new ones. Track by
+  // track: GetMediaItem(proj, i) walks the tracks from the start on every
+  // call, which on a big project makes this loop quadratic. Sources already
+  // known to sit inside the project folder are remembered (per folder), so
+  // the per-item filesystem lookup runs once per file, not on every capture.
+  static fs::path insideFor;
+  static std::unordered_set<std::string> insideProject;
+  if (insideFor != projDir) {
+    insideFor = projDir;
+    insideProject.clear();
+  }
   g_itemsAwaitingCopy.clear();
-  const int n = CountMediaItems(nullptr);
-  for (int i = 0; i < n; ++i) {
-    MediaItem* item = GetMediaItem(nullptr, i);
+  std::vector<MediaItem*> allItems;
+  allItems.reserve(static_cast<size_t>(CountMediaItems(nullptr)));
+  for (int t = 0, nt = CountTracks(nullptr); t < nt; ++t) {
+    MediaTrack* tr = GetTrack(nullptr, t);
+    for (int j = 0, ni = CountTrackMediaItems(tr); j < ni; ++j)
+      if (MediaItem* item = GetTrackMediaItem(tr, j)) allItems.push_back(item);
+  }
+  for (MediaItem* item : allItems) {
     MediaItem_Take* take = GetActiveTake(item);
     if (!take) continue;
     PCM_source* src = GetMediaItemTake_Source(take);
@@ -2455,6 +2973,7 @@ static void internalizeExternalMedia() {
     char fn[4096] = "";
     GetMediaSourceFileName(src, fn, sizeof(fn));
     if (!fn[0]) continue;  // in-project MIDI etc.
+    if (insideProject.count(fn)) continue;
     std::error_code ec;
     fs::path source = fsPath(fn);
     fs::path rel = fs::relative(source, projDir, ec);
@@ -2463,7 +2982,10 @@ static void internalizeExternalMedia() {
     // path::native() is wide on Windows, and a directory literally named
     // "..something" must not read as "outside".
     const bool outside = !rel.empty() && *rel.begin() == fs::path("..");
-    if (!ec && !rel.empty() && !outside) continue;  // already inside
+    if (!ec && !rel.empty() && !outside) {  // already inside
+      insideProject.insert(fn);
+      continue;
+    }
     if (g_copyFailed.count(fn)) continue;
     // Only what the local user brought in, and only a regular file (never a
     // device, pipe or folder REAPER happens to report as a source).
@@ -2515,6 +3037,7 @@ static void internalizeExternalMedia() {
 static void revertLockedItemEdits(Snapshot& snap);
 static void pinLivePreviews(Snapshot& snap);
 static void liveArrived(const std::string& trackGuid, const json& fields);
+static std::set<std::string> lockedItemsByOthers();
 // Defined below, after applyChangeset.
 static void revertWhileLoading(const json& changeset, const Snapshot& base);
 
@@ -2572,6 +3095,205 @@ static std::string guardMediaBlanking(const std::string& changeset, const Snapsh
   return cs.empty() ? std::string() : dumpJson(cs);
 }
 
+// Opt-in diagnostic (launch REAPER with REAMESH_DEBUG_CAPTURE_TIMING=1): what
+// captures cost, split into edit captures (incremental, the change counter
+// moved), sweep steps and full captures, and how many tracks/items they
+// serialized afresh versus reused from the baseline. Aggregated, printed to
+// stderr at most once a second.
+enum class CaptureKind { Edit = 0, Sweep, Full };
+struct CaptureTimingWindow {
+  std::chrono::steady_clock::time_point since{};
+  int count[3] = {0, 0, 0};
+  double totalMs[3] = {0, 0, 0}, maxMs[3] = {0, 0, 0};
+  double printMs = 0;
+  long read = 0, reused = 0;
+};
+static CaptureTimingWindow g_captureTiming;
+
+static void noteCaptureTiming(CaptureKind kind, double ms, double printMs, long read,
+                              long reused) {
+  static const bool enabled = getenv("REAMESH_DEBUG_CAPTURE_TIMING") != nullptr;
+  if (!enabled) return;
+  CaptureTimingWindow& w = g_captureTiming;
+  const auto now = std::chrono::steady_clock::now();
+  if (w.count[0] + w.count[1] + w.count[2] == 0) w.since = now;
+  const int k = static_cast<int>(kind);
+  ++w.count[k];
+  w.totalMs[k] += ms;
+  w.maxMs[k] = (std::max)(w.maxMs[k], ms);
+  if (kind == CaptureKind::Edit) w.printMs += printMs;
+  w.read += read;
+  w.reused += reused;
+  if (now - w.since < std::chrono::seconds(1)) return;
+  auto avg = [&](int i) { return w.count[i] ? w.totalMs[i] / w.count[i] : 0.0; };
+  fprintf(stderr,
+          "[reamesh] capture timing: edit %dx avg %.1f max %.1f ms (prints %.1f ms avg) | "
+          "sweep %dx avg %.1f max %.1f ms | full %dx avg %.1f max %.1f ms | "
+          "serialized %ld reused %ld\n",
+          w.count[0], avg(0), w.maxMs[0], w.count[0] ? w.printMs / w.count[0] : 0.0, w.count[1],
+          avg(1), w.maxMs[1], w.count[2], avg(2), w.maxMs[2], w.read, w.reused);
+  w = CaptureTimingWindow{};
+}
+
+// Incremental-capture bookkeeping (see captureLocalChanges).
+static unsigned g_sweepBucket = 0;  // the bucket the next incremental capture re-reads
+// Buckets still to re-read since the last incremental edit capture; while
+// any are owed, every timer tick may run a sweep step.
+static unsigned g_sweepLeft = 0;
+static std::string g_captureUndoDesc, g_captureRedoDesc;
+static const void* g_captureProj = nullptr;
+static std::string g_captureProjPath;
+// EMA of what a full capture costs (g_captureCost tracks the fast path).
+static std::chrono::milliseconds g_fullCaptureCost{0};
+
+// True when an undo or redo ran since the last capture (judged by REAPER's
+// undo/redo descriptions). Undo restores state in place, through paths no
+// print sees (FX parameters, plugin state), so that capture reads everything.
+static bool undoOrRedoRan() {
+  const char* u = Undo_CanUndo2(nullptr);
+  const char* r = Undo_CanRedo2(nullptr);
+  const std::string undo = u ? u : "", redo = r ? r : "";
+  const bool ran = r ? (redo != g_captureRedoDesc || undo != g_captureUndoDesc)
+                     : !g_captureRedoDesc.empty();
+  g_captureUndoDesc = undo;
+  g_captureRedoDesc = redo;
+  return ran;
+}
+
+// Opt-in diagnostic (REAMESH_DEBUG_CAPTURE_VERIFY=1, expensive): after every
+// incremental edit capture take a full one too and name each reused track/item
+// whose fresh chunk differs, i.e. a change the prints did not see this time
+// (the sweep or the rescan picks it up later). Reports only, changes nothing.
+static void verifyIncrementalCapture(const Snapshot& snap, const CaptureCounts& counts) {
+  static const bool enabled = getenv("REAMESH_DEBUG_CAPTURE_VERIFY") != nullptr;
+  if (!enabled) return;
+  const Snapshot full = snapshotProject(/*withPrints=*/false);
+  std::string missed;
+  int n = 0;
+  for (const std::string& guid : counts.reusedTracks) {
+    auto a = snap.tracks.find(guid);
+    auto f = full.tracks.find(guid);
+    if (a == snap.tracks.end() || f == full.tracks.end()) continue;
+    const TrackState &x = a->second, &y = f->second;
+    std::string fields;
+    if (x.fxchain != y.fxchain) fields += "fxchain,";
+    if (x.recfx != y.recfx) fields += "recfx,";
+    if (x.env != y.env) fields += "env,";
+    if (x.recv != y.recv) fields += "recv,";
+    if (x.group != y.group) fields += "group,";
+    if (x.lock != y.lock) fields += "lock,";
+    if (!fields.empty()) {
+      ++n;
+      missed += " tracks/" + guid.substr(0, 8) + "[" + fields + "]";
+    }
+  }
+  for (const std::string& guid : counts.reusedItems) {
+    auto a = snap.items.find(guid);
+    auto f = full.items.find(guid);
+    if (a == snap.items.end() || f == full.items.end()) continue;
+    if (a->second.chunk != f->second.chunk) {
+      ++n;
+      missed += " items/" + guid.substr(0, 8);
+    }
+  }
+  fprintf(stderr, "[reamesh] capture verify: %d reused object(s) stale%s\n", n, missed.c_str());
+}
+
+// A sweep step (see captureLocalChanges): the change counter has not moved
+// since the last capture, so all that is owed is the re-read of one bucket.
+// A whole incremental snapshot would cost more in per-object bookkeeping than
+// the bucket's reads, so only that bucket's known tracks and items are read,
+// plus every item a lock or tint pins right now (revertLockedItemEdits must
+// see all of those, or it would take a missing one for deleted), and they are
+// diffed against their own baseline entries; the baseline is updated in
+// place. A sweep step never adds or removes anything: a structural change
+// without an undo point is the rescan's. Returns nullopt when the project is
+// still loading and the step was reverted instead (nothing to push, baseline
+// unchanged), like the capture's own loading path.
+static std::optional<std::string> captureSweepStep(unsigned bucket, CaptureCounts& counts) {
+  std::set<std::string> lockPinned = lockedItemsByOthers();
+  for (const auto& [guid, tint] : g_itemTints) lockPinned.insert(guid);
+  const std::vector<std::string>& mediaDirs = mediaPathDirs();
+  bool unusedHint = false;
+  Snapshot fresh;
+  const int n = CountTracks(nullptr);
+  for (int i = 0; i < n; ++i) {
+    MediaTrack* tr = GetTrack(nullptr, i);
+    const std::string guid = trackGuid(tr);
+    if (sweepBucketOf(guid) == bucket) {
+      auto b = g_snapshot.tracks.find(guid);
+      if (b != g_snapshot.tracks.end() && b->second.index == i) {
+        TrackState ts = trackScalars(tr, i);
+        readTrackChunkFields(tr, ts);
+        fresh.trackPrints[guid] = {tr, trackPrint(tr, unusedHint)};
+        fresh.tracks[guid] = std::move(ts);
+        ++counts.read;
+      }
+    }
+    for (int j = 0, ni = CountTrackMediaItems(tr); j < ni; ++j) {
+      MediaItem* item = GetTrackMediaItem(tr, j);
+      if (!item) continue;
+      const std::string ig = itemGuidCached(item);
+      const bool pinned = lockPinned.count(ig) > 0;
+      if (!pinned && (sweepBucketOf(ig) != bucket || g_placeholders.count(ig))) continue;
+      if (!g_snapshot.items.count(ig)) continue;  // not baselined: not a sweep's business
+      fresh.items[ig] = readItem(item, guid, mediaDirs);
+      fresh.itemPrints[ig] = {item, itemPrint(item, unusedHint)};
+      ++counts.read;
+    }
+  }
+  counts.reused = static_cast<long>(g_snapshot.tracks.size() + g_snapshot.items.size()) -
+                  counts.read;
+
+  // The same pinning as a capture (see captureLocalChanges).
+  for (const auto& [guid, srcPath] : g_itemsAwaitingCopy) {
+    auto it = fresh.items.find(guid);
+    if (it != fresh.items.end()) it->second.chunk = g_snapshot.items.at(guid).chunk;
+  }
+  revertLockedItemEdits(fresh);
+  pinLivePreviews(fresh);
+
+  // Diff against exactly the same entries of the baseline: no creations, no
+  // tombstones. (revertLockedItemEdits only ever adds baseline entries.)
+  Snapshot base;
+  for (const auto& [guid, ts] : fresh.tracks) base.tracks[guid] = g_snapshot.tracks.at(guid);
+  for (auto it = fresh.items.begin(); it != fresh.items.end();) {
+    auto b = g_snapshot.items.find(it->first);
+    if (b == g_snapshot.items.end()) {
+      it = fresh.items.erase(it);
+      continue;
+    }
+    base.items[it->first] = b->second;
+    ++it;
+  }
+  std::string changeset = diffSnapshots(base, fresh);
+  if (!changeset.empty()) changeset = guardMediaBlanking(changeset, g_snapshot);
+  if (!changeset.empty() && g_mode == Mode::ClientActive && g_mediaLoading) {
+    json cs = json::parse(changeset, nullptr, false);
+    if (cs.is_object()) revertWhileLoading(cs, g_snapshot);
+    g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+    activityEvent("loading_readonly", json::object(),
+                  "the project is still loading. Editing unlocks once everything is here");
+    return std::nullopt;
+  }
+
+  for (auto& [guid, ts] : fresh.tracks) {
+    g_snapshot.tracks[guid] = std::move(ts);
+    g_snapshot.trackPrints[guid] = fresh.trackPrints[guid];
+  }
+  for (auto& [guid, is] : fresh.items) {
+    g_snapshot.items[guid] = std::move(is);
+    auto p = fresh.itemPrints.find(guid);
+    const bool trusted = p != fresh.itemPrints.end() && !lockPinned.count(guid) &&
+                         !g_itemsAwaitingCopy.count(guid) && !g_placeholders.count(guid);
+    if (trusted)
+      g_snapshot.itemPrints[guid] = p->second;
+    else
+      g_snapshot.itemPrints.erase(guid);
+  }
+  return changeset;
+}
+
 static void captureLocalChanges(bool force) {
   // Client: stay silent until the owner's first authoritative state has landed
   // and re-baselined us (see g_bootstrapSynced). A short grace opens the gate
@@ -2589,101 +3311,191 @@ static void captureLocalChanges(bool force) {
   // (FX-parameter gestures get batched undo points, some toggles defer
   // theirs), so a full re-diff also runs unconditionally on a rescan cadence:
   // the gate is a latency optimization, never a correctness dependency.
-  //
+  const bool counterMoved = cc != g_lastChangeCount;
+  // The rest of the bucket sweep an incremental edit capture started.
+  const bool sweepOwed = g_sweepLeft > 0;
   // An edit is captured on the next timer tick. Only an expensive capture
-  // brakes the rate (EMA over the measured serialize+diff time), so a huge
-  // project keeps capture a bounded share (~1/5th at most) of main-thread
-  // time instead of making REAPER's UI choppy; the rescan cadence stretches
-  // from 2s toward 10s the same way. Latency degrades gracefully; correctness
+  // (EMA of the measured edit-capture cost) brakes the rate, so a huge project
+  // keeps capture a bounded share (~1/5th at most) of main-thread time
+  // instead of making REAPER's UI choppy. The rescan cadence (2-10 s) adapts
+  // to what a full capture costs. Latency degrades gracefully; correctness
   // never depends on either. ((std::min)) defeats SWELL's max/min macros.
   const auto minGap = (std::min)(g_captureCost * 4, std::chrono::milliseconds(500));
-  const auto rescanGap = (std::clamp)(g_captureCost * 20, std::chrono::milliseconds(2000),
+  const auto rescanGap = (std::clamp)(g_fullCaptureCost * 20, std::chrono::milliseconds(2000),
                                       std::chrono::milliseconds(10000));
-  const bool counterMoved = cc != g_lastChangeCount;
   const bool rescanDue = now - g_lastFullScan >= rescanGap;
-  if (!counterMoved && !rescanDue) return;
+  if (!counterMoved && !sweepOwed && !rescanDue) return;
   // Mid-gesture (an item drag, a fader) REAPER may already have moved things
-  // it only commits when the button is let go: a rescan now would send a
-  // half-finished state. The release bumps the counter anyway.
+  // it only commits when the button is let go: a rescan (or a sweep step) now
+  // would send a half-finished state. The release bumps the counter anyway.
   if (!counterMoved && cursor_overlay::mouseHeld()) return;
-  // Chunk serialization isn't free: brake only what costs (minGap above).
   if (!force && !rescanDue && now - g_lastCapture < minGap) return;
+  // Sweep steps are paced: each one costs about 1/kSweepBuckets of a full
+  // capture, and a lap of them per edit must stay well below what full
+  // captures used to cost.
+  if (!counterMoved && sweepOwed && !rescanDue && now - g_lastCapture < kSweepStepGap) return;
   g_lastCapture = now;
   g_lastFullScan = now;
   g_lastChangeCount = cc;
+  // An edit capture, or a sweep step completing one: nothing is pinned to the
+  // baseline (only the bare rescan pins, see below).
+  const bool fastPath = counterMoved || sweepOwed;
   const auto captureStart = std::chrono::steady_clock::now();
 
   internalizeExternalMedia();
-  Snapshot snap = snapshotProject();
 
-  // Opaque chunk fields (FX chains, input FX, envelope blocks, receives) carry
-  // plugin state that re-serializes differently on every read even when nobody
-  // touched it: a meter or analyzer plugin bakes its live display buffer into
-  // its state chunk. On the bare 2s rescan (the change counter did NOT move, so
-  // REAPER itself considers nothing undoable to have happened) we therefore pin
-  // those fields back to the baseline, so that churn never becomes a phantom
-  // edit that the owner rejects ("change overridden") or admits (re-broadcast
-  // noise). A real FX edit bumps the counter and rides the fast path below,
-  // where the fresh value is kept. This is the core of the spurious-override
-  // fix; only scalar/structural changes (which can defer their undo point) need
-  // the rescan, and they are never pinned.
-  if (!counterMoved) {
-    for (auto& [guid, ts] : snap.tracks) {
-      auto b = g_snapshot.tracks.find(guid);
-      if (b == g_snapshot.tracks.end()) continue;  // a brand-new track: keep it whole
-      ts.fxchain = b->second.fxchain;
-      ts.recfx = b->second.recfx;
-      ts.env = b->second.env;
-      ts.recv = b->second.recv;
+  // Full or incremental. A full capture serializes every track and item; on a
+  // big project that is tens to hundreds of ms. The incremental one re-reads
+  // only what its prints, the edit hints and this capture's sweep bucket
+  // name, and reuses the baseline's chunk for the rest (see
+  // snapshotProjectReusing). Safety net for what a print misses:
+  //  - every incremental capture re-reads one of kSweepBuckets GUID buckets in
+  //    full, and after an edit the bucket sweep keeps going on the following
+  //    ticks (sweep steps, captureSweepStep) until every bucket was re-read
+  //    since that edit, so an edit a print cannot see still goes out within
+  //    one lap (kSweepBuckets steps, kSweepStepGap apart: ~2.5 s);
+  //  - the periodic rescan, an undo/redo, a project switch and small projects
+  //    read everything.
+  // flushLocalEdits (force) captures incrementally too: it runs every tick
+  // from the tint reconcile, and a full read there would undo the gain.
+  char projPath[4096] = "";
+  const void* proj = EnumProjects(-1, projPath, sizeof(projPath));
+  const bool projectSwitched = proj != g_captureProj || g_captureProjPath != projPath;
+  g_captureProj = proj;
+  g_captureProjPath = projPath;
+  if (projectSwitched) g_fullCaptureCost = {};
+  const bool undoRan = undoOrRedoRan();
+  const bool incremental = fastPath && !undoRan && !projectSwitched &&
+                           !g_snapshot.tracks.empty() && projectWantsPrints();
+  CaptureCounts counts;
+  std::string changeset;
+  if (incremental && !counterMoved) {
+    std::optional<std::string> swept = captureSweepStep(g_sweepBucket, counts);
+    if (!swept) return;  // still loading: reverted, baseline kept
+    changeset = std::move(*swept);
+  } else {
+    Snapshot snap;
+    if (incremental) {
+      std::unordered_set<const void*> hints;
+      collectEditHints(hints);
+      ReuseRules rules;
+      rules.bucket = g_sweepBucket;
+      rules.hints = &hints;
+      rules.printHints = true;
+      snap = snapshotProjectReusing(g_snapshot, rules, counts);
+    } else {
+      snap = snapshotProject(/*withPrints=*/fastPath);
     }
-    for (auto& [guid, is] : snap.items) {
+    if (incremental) verifyIncrementalCapture(snap, counts);
+
+    // Opaque chunk fields (FX chains, input FX, envelope blocks, receives) carry
+    // plugin state that re-serializes differently on every read even when nobody
+    // touched it: a meter or analyzer plugin bakes its live display buffer into
+    // its state chunk. On the bare 2s rescan (the change counter did NOT move, so
+    // REAPER itself considers nothing undoable to have happened) we therefore pin
+    // those fields back to the baseline, so that churn never becomes a phantom
+    // edit that the owner rejects ("change overridden") or admits (re-broadcast
+    // noise). A real FX edit bumps the counter and rides the fast path below,
+    // where the fresh value is kept. This is the core of the spurious-override
+    // fix; only scalar/structural changes (which can defer their undo point) need
+    // the rescan, and they are never pinned. A pinned value keeps the baseline's
+    // print with it: the pair still describes the same read.
+    if (!fastPath) {
+      for (auto& [guid, ts] : snap.tracks) {
+        auto b = g_snapshot.tracks.find(guid);
+        if (b == g_snapshot.tracks.end()) continue;  // a brand-new track: keep it whole
+        ts.fxchain = b->second.fxchain;
+        ts.recfx = b->second.recfx;
+        ts.env = b->second.env;
+        ts.recv = b->second.recv;
+        auto bp = g_snapshot.trackPrints.find(guid);
+        if (bp != g_snapshot.trackPrints.end()) snap.trackPrints.insert(*bp);
+      }
+      for (auto& [guid, is] : snap.items) {
+        auto b = g_snapshot.items.find(guid);
+        if (b == g_snapshot.items.end()) continue;
+        is.chunk = b->second.chunk;
+        auto bp = g_snapshot.itemPrints.find(guid);
+        if (bp != g_snapshot.itemPrints.end()) snap.itemPrints.insert(*bp);
+      }
+    }
+
+    // Items whose media is still being copied into the project folder stay off
+    // the wire: their chunk still references the external ABSOLUTE path, which
+    // no peer could ever fetch. An already-known item keeps its baseline chunk
+    // (no phantom edit), a brand-new one stays invisible until the copy lands
+    // and its take is repointed: never a tombstone, since it was never synced.
+    for (const auto& [guid, srcPath] : g_itemsAwaitingCopy) {
+      auto it = snap.items.find(guid);
+      if (it == snap.items.end()) continue;
       auto b = g_snapshot.items.find(guid);
-      if (b != g_snapshot.items.end()) is.chunk = b->second.chunk;
+      if (b != g_snapshot.items.end())
+        it->second.chunk = b->second.chunk;
+      else
+        snap.items.erase(it);
     }
+
+    // Items locked by another peer are read-only locally. Restore their synced
+    // state without proposing the edit. Keeping the authoritative baseline
+    // also prevents the local lock tint from entering the diff.
+    revertLockedItemEdits(snap);
+    pinLivePreviews(snap);
+    pinPlaceholderItems(snap);
+    // Whatever was just pinned to (or reverted to) the baseline no longer
+    // matches the print taken from REAPER: drop those prints, so the next
+    // capture re-reads these few items instead of trusting them.
+    for (const auto& [guid, srcPath] : g_itemsAwaitingCopy) snap.itemPrints.erase(guid);
+    for (const std::string& guid : g_placeholders) snap.itemPrints.erase(guid);
+    for (const auto& [guid, tint] : g_itemTints) snap.itemPrints.erase(guid);
+    for (const std::string& guid : lockedItemsByOthers()) snap.itemPrints.erase(guid);
+
+    // Reused items are copies of g_snapshot's own entries; the pinning above
+    // only ever sets an item back to its g_snapshot entry, so they still are.
+    changeset = diffSnapshots(g_snapshot, snap, incremental ? &counts.reusedItems : nullptr);
+    if (!changeset.empty()) changeset = guardMediaBlanking(changeset, g_snapshot);
+    // Progressive join, still loading: the project is view-only until every
+    // media file is here. Snap the edit back to the baseline right away (the
+    // same move a rejected lock makes) instead of proposing it, and keep the
+    // baseline as it was: it IS the authoritative state.
+    if (!changeset.empty() && g_mode == Mode::ClientActive && g_mediaLoading) {
+      json cs = json::parse(changeset, nullptr, false);
+      if (cs.is_object()) revertWhileLoading(cs, g_snapshot);
+      g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+      activityEvent("loading_readonly", json::object(),
+                    "the project is still loading. Editing unlocks once everything is here");
+      return;
+    }
+    g_snapshot = std::move(snap);
   }
 
-  // Items whose media is still being copied into the project folder stay off
-  // the wire: their chunk still references the external ABSOLUTE path, which
-  // no peer could ever fetch. An already-known item keeps its baseline chunk
-  // (no phantom edit), a brand-new one stays invisible until the copy lands
-  // and its take is repointed: never a tombstone, since it was never synced.
-  for (const auto& [guid, srcPath] : g_itemsAwaitingCopy) {
-    auto it = snap.items.find(guid);
-    if (it == snap.items.end()) continue;
-    auto b = g_snapshot.items.find(guid);
-    if (b != g_snapshot.items.end())
-      it->second.chunk = b->second.chunk;
-    else
-      snap.items.erase(it);
+  // Sweep bookkeeping: an edit captured incrementally owes a re-read of every
+  // bucket from here on; each incremental capture pays one off.
+  if (incremental) {
+    g_sweepBucket = (g_sweepBucket + 1) % kSweepBuckets;
+    if (counterMoved)
+      g_sweepLeft = kSweepBuckets - 1;
+    else if (g_sweepLeft > 0)
+      --g_sweepLeft;
+  } else if (fastPath) {
+    g_sweepLeft = 0;  // a full read owes nothing
   }
 
-  // Items locked by another peer are read-only locally. Restore their synced
-  // state without proposing the edit. Keeping the authoritative baseline
-  // also prevents the local lock tint from entering the diff.
-  revertLockedItemEdits(snap);
-  pinLivePreviews(snap);
-  pinPlaceholderItems(snap);
-
-  std::string changeset = diffSnapshots(g_snapshot, snap);
-  if (!changeset.empty()) changeset = guardMediaBlanking(changeset, g_snapshot);
-  // Progressive join, still loading: the project is view-only until every
-  // media file is here. Snap the edit back to the baseline right away (the
-  // same move a rejected lock makes) instead of proposing it, and keep the
-  // baseline as it was: it IS the authoritative state.
-  if (!changeset.empty() && g_mode == Mode::ClientActive && g_mediaLoading) {
-    json cs = json::parse(changeset, nullptr, false);
-    if (cs.is_object()) revertWhileLoading(cs, g_snapshot);
-    g_lastChangeCount = GetProjectStateChangeCount(nullptr);
-    activityEvent("loading_readonly", json::object(),
-                  "the project is still loading. Editing unlocks once everything is here");
-    return;
-  }
-  g_snapshot = std::move(snap);
-  // Feed the adaptive throttle (EMA, 30% weight on the fresh sample) with what
-  // this capture actually cost.
-  const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - captureStart);
-  g_captureCost = (g_captureCost.count() == 0) ? spent : (g_captureCost * 7 + spent * 3) / 10;
+  // Feed the adaptive throttles (EMA, 30% weight on the fresh sample) with
+  // what this capture actually cost: an edit capture's for the capture rate,
+  // a full capture's for the rescan cadence.
+  const auto spentExact = std::chrono::steady_clock::now() - captureStart;
+  const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(spentExact);
+  auto ema = [&](std::chrono::milliseconds& v) {
+    v = (v.count() == 0) ? spent : (v * 7 + spent * 3) / 10;
+  };
+  if (counterMoved) ema(g_captureCost);
+  if (!incremental) ema(g_fullCaptureCost);
+  noteCaptureTiming(!incremental ? CaptureKind::Full
+                                 : (counterMoved ? CaptureKind::Edit : CaptureKind::Sweep),
+                    std::chrono::duration<double, std::milli>(spentExact).count(), counts.printMs,
+                    incremental ? counts.read
+                                : (long)(g_snapshot.tracks.size() + g_snapshot.items.size()),
+                    counts.reused);
   if (changeset.empty()) return;  // change count moved for something we don't sync
 
   // Opt-in diagnostic (launch REAPER with REAMESH_DEBUG_CAPTURE=1): name every
@@ -2702,8 +3514,8 @@ static void captureLocalChanges(bool force) {
               for (auto& f : ent.value().items()) summary += f.key() + ",";
             summary += "] ";
           }
-    fprintf(stderr, "[reamesh] capture %s -> %s\n", counterMoved ? "COUNTER" : "RESCAN",
-            summary.c_str());
+    fprintf(stderr, "[reamesh] capture %s -> %s\n",
+            counterMoved ? "COUNTER" : (sweepOwed ? "SWEEP" : "RESCAN"), summary.c_str());
   }
 
   // Remember which items we just proposed, so a remote version that wins over
@@ -3530,6 +4342,49 @@ static void flushLocalEdits() {
   captureLocalChanges(/*force=*/true);
 }
 
+// Record what applying `changeset` writes, for rebaseline. Any track entry
+// re-reads that track; a chunk-level part (or a new track) also re-reads its
+// items, since the splice writes the whole track chunk back.
+static void noteWritten(const json& changeset, Written& w) {
+  if (!changeset.is_object()) return;
+  if (auto t = changeset.find("tracks"); t != changeset.end() && t->is_object())
+    for (auto it = t->begin(); it != t->end(); ++it) {
+      w.tracks.insert(it.key());
+      const json& f = it.value();
+      if (!f.is_object()) continue;
+      for (const char* k : {"present", "fxchain", "recfx", "env", "group", "lock", "recv"})
+        if (f.contains(k)) {
+          w.chunkTracks.insert(it.key());
+          break;
+        }
+    }
+  if (auto i = changeset.find("items"); i != changeset.end() && i->is_object())
+    for (auto it = i->begin(); it != i->end(); ++it) w.items.insert(it.key());
+}
+
+// Re-baseline after a remote write (under g_applyingRemote), so the write is
+// never captured as a local edit. On a big project only what `written` names,
+// plus whatever a print, pointer, owning track or index says changed, is
+// re-read; every other object keeps its baseline entry. A full re-read would
+// also fold in a local edit the last incremental capture has not seen yet
+// (one only the bucket sweep would catch), and that edit would then never go
+// out. Null `written` (or no prints to trust) reads everything.
+static void rebaseline(const Written* written) {
+  const bool selective = written && !g_snapshot.tracks.empty() &&
+                         !g_snapshot.trackPrints.empty() &&
+                         (g_mode != Mode::ClientActive || g_bootstrapSynced) &&
+                         projectWantsPrints();
+  if (selective) {
+    ReuseRules rules;
+    rules.written = written;
+    CaptureCounts counts;
+    g_snapshot = snapshotProjectReusing(g_snapshot, rules, counts);
+  } else {
+    g_snapshot = snapshotProject();
+  }
+  g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+}
+
 static void applyRemoteChanges() {
   char* raw = reamesh_drain_remote(g_handle);
   std::string payload = raw ? raw : "[]";
@@ -3552,11 +4407,13 @@ static void applyRemoteChanges() {
   // re-application loop because we re-baseline below.)
   freezeUI();
   SanitizeReport rep;
+  Written written;
   for (auto& cs : changesets) {
     // A changeset is peer-authored JSON: a shape the apply code doesn't expect
     // drops that changeset, never unwinds through REAPER's timer.
     try {
       dropUnsafeMediaPaths(cs);
+      noteWritten(cs, written);
       applyChangeset(sanitizeIncoming(cs, g_noFx, rep));
     } catch (const std::exception& e) {
       logEvent("bad_changeset", {{"error", e.what()}},
@@ -3577,8 +4434,7 @@ static void applyRemoteChanges() {
   TrackList_AdjustWindows(false);
   UpdateArrange();
 
-  g_snapshot = snapshotProject();
-  g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+  rebaseline(&written);
   // The owner's authoritative state has landed and is now our baseline; a
   // client may start proposing its own edits from here (see captureLocalChanges).
   if (g_mode == Mode::ClientActive) g_bootstrapSynced = true;
@@ -3680,8 +4536,9 @@ static void processDeferredItems() {
   }
   thawUI();
   UpdateArrange();
-  g_snapshot = snapshotProject();
-  g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+  Written written;
+  for (const DeferredItem& d : ready) written.items.insert(d.guid);
+  rebaseline(&written);
   g_applyingRemote = false;
   // The media behind these items was just fetched, so it has no local peaks
   // yet: applyItem queued them for processPeakJobs, which builds the peaks and
@@ -3709,9 +4566,12 @@ static void processDeferredRecv() {
   flushLocalEdits();
   g_lastRecvRetry = now;
   bool changed = false;
+  Written written;
   g_applyingRemote = true;
   freezeUI();
   for (auto it = g_deferredRecv.begin(); it != g_deferredRecv.end();) {
+    written.tracks.insert(it->first);
+    written.chunkTracks.insert(it->first);
     const bool complete = applyRecvField(it->first, it->second.wire, &changed);
     if (complete || now - it->second.since > std::chrono::seconds(90))
       it = g_deferredRecv.erase(it);
@@ -3724,8 +4584,7 @@ static void processDeferredRecv() {
   if (changed) {
     TrackList_AdjustWindows(false);
     UpdateArrange();
-    g_snapshot = snapshotProject();
-    g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+    rebaseline(&written);
   }
   g_applyingRemote = false;
 }
@@ -3851,15 +4710,15 @@ static void restoreAllItemTints() {
   const bool inSession = g_mode == Mode::Hosting || g_mode == Mode::ClientActive;
   if (inSession) flushLocalEdits();
   g_applyingRemote = true;
-  for (const auto& [guid, rec] : g_itemTints)
+  Written written;
+  for (const auto& [guid, rec] : g_itemTints) {
+    written.items.insert(guid);
     if (MediaItem* it = findItemByGuid(guid))
       SetMediaItemInfo_Value(it, "I_CUSTOMCOLOR", static_cast<double>(rec.real));
+  }
   g_itemTints.clear();
   UpdateArrange();
-  if (inSession) {
-    g_snapshot = snapshotProject();
-    g_lastChangeCount = GetProjectStateChangeCount(nullptr);
-  }
+  if (inSession) rebaseline(&written);
   g_applyingRemote = false;
 }
 
@@ -3970,6 +4829,7 @@ static void reconcileItemTints() {
   const int tint = lockTintNative();
   const auto now = std::chrono::steady_clock::now();
   bool changed = false;
+  Written written;
 
   flushLocalEdits();
   g_applyingRemote = true;
@@ -3983,6 +4843,7 @@ static void reconcileItemTints() {
       if (!it) continue;  // not local yet (e.g. its media is still downloading)
       g_itemTints[guid] = {static_cast<int>(GetMediaItemInfo_Value(it, "I_CUSTOMCOLOR")), now, false};
       SetMediaItemInfo_Value(it, "I_CUSTOMCOLOR", static_cast<double>(tint));
+      written.items.insert(guid);
       changed = true;
     } else if (!rec->second.expired && now - rec->second.since > TINT_MAX_AGE &&
                !g_placeholders.count(guid)) {  // a placeholder stays grey until its media lands
@@ -3993,6 +4854,7 @@ static void reconcileItemTints() {
       if (MediaItem* it = findItemByGuid(guid))
         SetMediaItemInfo_Value(it, "I_CUSTOMCOLOR", static_cast<double>(rec->second.real));
       rec->second.expired = true;
+      written.items.insert(guid);
       changed = true;
     }
   }
@@ -4006,6 +4868,7 @@ static void reconcileItemTints() {
     if (!it->second.expired)
       if (MediaItem* item = findItemByGuid(it->first))
         SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", static_cast<double>(it->second.real));
+    written.items.insert(it->first);
     it = g_itemTints.erase(it);
     changed = true;
   }
@@ -4014,8 +4877,7 @@ static void reconcileItemTints() {
     UpdateArrange();
     // Re-baseline so the color writes are folded into the baseline and the next
     // capture diffs to nothing for these items. Mirrors applyRemoteChanges.
-    g_snapshot = snapshotProject();
-    g_lastChangeCount = GetProjectStateChangeCount(nullptr);
+    rebaseline(&written);
   }
   g_applyingRemote = false;
 }
