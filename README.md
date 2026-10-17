@@ -91,12 +91,23 @@ playback, selected track, view, item selection and open effect window, or ping
 a spot on the timeline that everyone can jump to. Hosts can remove guests or block their device for 30
 minutes.
 
+On macOS, everyone's mouse pointer appears right in REAPER's arrange view,
+on the same spot of the song whatever each person's zoom and scroll. While
+someone drags items you see where they will land, their faders and plugin
+knobs move as they turn them, and while they work in the mixer, an effect
+window or the MIDI editor their pointer waits beside that track or item. Showing
+other people's pointers and sharing your own are both settings. Windows gets
+this later; until then it shows locked items in grey and doesn't share the
+pointer.
+
 ## Working together
 
 Whoever edits a field first holds it until two seconds after their last change.
 Competing edits snap back, including the host's. Whole items, FX chains and sets
 of track envelopes each count as one field, so working on different tracks or
-items avoids conflicts.
+items avoids conflicts. On macOS an item someone else is editing is dimmed with
+an outline in their color (point at it to see who), and an edit of yours that
+snaps back glides back into place; on Windows the item turns grey.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/edit-lock-dark.png">
