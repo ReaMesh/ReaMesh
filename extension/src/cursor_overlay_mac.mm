@@ -1,5 +1,6 @@
 // macOS cursor layer: Core Animation layers in a click-through view on top of
-// REAPER's track view (see cursor_overlay.h).
+// REAPER's track view (see cursor_overlay.h). Draws other people's cursors and
+// an outline around every item someone else is editing.
 //
 // Motion is split in two so the cursor stays glued to the arrange and still
 // glides:
@@ -23,6 +24,7 @@
 //   REAMESH_CURSOR_STATS=1         print timing stats to stderr every 5s
 //   REAMESH_CURSOR_TRACE=1         log each local sample and each arrival (latency)
 //   REAMESH_CURSOR_PARK=t:track:fy:#rrggbb  one synthetic peer parked at a spot
+//   REAMESH_CURSOR_SNAPSHOT=<file.png>  with STATS: render the layer tree there every 5s
 
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
@@ -71,6 +73,13 @@ struct Style {
   double rippleRadius, rippleLine, rippleScaleFrom, rippleScaleTo, rippleOpacity, rippleDuration;
   // Edge indicator for peers outside the visible arrange.
   double edgeInset, edgeHeight, edgeFont, edgePadX, edgeOpacity;
+  // Item someone else is editing: an outline in their colour over a faint
+  // wash of it, with a light keyline inside so it reads on an item of the
+  // same colour. Their name shows while the local pointer is over the item.
+  double markLine, markRadius, markFill, markKeyline, markKeylineOpacity, markFadeIn, markFadeOut;
+  double markTagFont, markTagHeight, markTagPadX, markTagGap;
+  // Placeholder whose media is still downloading: a dark veil, no outline.
+  double loadingVeil;
 };
 
 constexpr Style kStyle = {
@@ -107,6 +116,18 @@ constexpr Style kStyle = {
     .edgeFont = 11,
     .edgePadX = 7,
     .edgeOpacity = 0.92,
+    .markLine = 1.5,
+    .markRadius = 3,
+    .markFill = 0.12,
+    .markKeyline = 1,
+    .markKeylineOpacity = 0.7,
+    .markFadeIn = 0.15,
+    .markFadeOut = 0.3,
+    .markTagFont = 10,
+    .markTagHeight = 16,
+    .markTagPadX = 6,
+    .markTagGap = 3,
+    .loadingVeil = 0.4,
 };
 
 // ---------- state ----------
@@ -135,6 +156,15 @@ struct Peer {
   Side edgeSide = Side::Left;
 };
 
+// One marked item.
+struct MarkState {
+  cursor_overlay::Mark m;
+  CALayer* box = nil;
+  CALayer* keyline = nil;  // inside the outline
+  bool shown = false;
+  CGRect rect = CGRectZero;  // in the view, unclipped; valid while shown
+};
+
 struct Geo {
   bool ok = false;
   double t0 = 0, spp = 0, W = 0, H = 0;
@@ -154,6 +184,20 @@ NSView* g_view = nil;
 CALayer* g_root = nil;
 CGFloat g_scale = 2;
 std::map<std::string, Peer> g_peers;
+bool g_showCursors = true;
+// Item marks live in their own layer below the cursors.
+CALayer* g_markRoot = nil;
+std::map<std::string, MarkState> g_marks;
+bool g_marksDirty = false;
+double g_markKey[5] = {};
+unsigned long long g_markStamp = 0;
+// The name of whoever edits the item under the local pointer.
+CALayer* g_hoverTag = nil;
+CATextLayer* g_hoverText = nil;
+std::string g_hoverItem, g_hoverLabel;
+bool g_hoverShown = false;
+bool g_localIn = false;
+NSPoint g_localPoint = NSZeroPoint;
 CFRunLoopObserverRef g_observer = nullptr;
 id g_clickMonitor = nil;
 Class g_tvOrigClass = Nil;
@@ -567,18 +611,26 @@ void checkScale() {
   for (auto& [id, p] : g_peers) {
     for (CALayer* l in @[ p.arrow, p.tag, p.tagText, p.edge, p.edgeText ]) l.contentsScale = s;
   }
+  if (g_hoverTag) {
+    g_hoverTag.contentsScale = s;
+    g_hoverText.contentsScale = s;
+    g_hoverLabel.clear();
+  }
   [CATransaction commit];
 }
+
+void layoutMarks(const Geo& g);
 
 // The glue pass: every peer to its current pixel (`onlyPending`: just the
 // peers with a network update waiting).
 void glue(const char* why, bool onlyPending = false) {
-  if (!g_attached || g_peers.empty()) return;
+  if (!g_attached || (g_peers.empty() && g_marks.empty())) return;
   const uint64_t a = mach_absolute_time();
   const double t = now();
   if (!NSEqualRects(g_view.frame, g_tv.bounds)) g_view.frame = g_tv.bounds;
   checkScale();
   const Geo g = readGeo();
+  if (!onlyPending) layoutMarks(g);
   bool moved = false;
   for (auto& [id, p] : g_peers)
     if (!onlyPending || p.pendingSpring || p.pendingClick) moved |= layoutPeer(p, g, t);
@@ -604,7 +656,7 @@ void onObserver() {
       g_host.pump();
     }
   }
-  if (g_peers.empty()) return;
+  if (g_peers.empty() && g_marks.empty()) return;
   ++g_observerPasses;
   if (g_sync == Sync::Commit) {
     glue("commit");
@@ -640,9 +692,151 @@ void printStats() {
        g_gluePasses ? g_glueCost / g_gluePasses : 0, g_observerPasses / span,
        (g_observerPasses && g_sync != Sync::Commit) ? g_observerCost / g_observerPasses : 0,
        g_paintPasses / span, l.size(), mean, p95, mx, g_ripples, g_clicksOut);
+  size_t shownMarks = 0;
+  for (const auto& [id, ms] : g_marks) shownMarks += ms.shown;
+  logf("marks=%zu shown=%zu hover=%d", g_marks.size(), shownMarks, (int)g_hoverShown);
+  if (const char* snap = getenv("REAMESH_CURSOR_SNAPSHOT")) {
+    const CGSize sz = g_view.bounds.size;
+    NSBitmapImageRep* rep = [[NSBitmapImageRep alloc]
+        initWithBitmapDataPlanes:nullptr pixelsWide:NSInteger(sz.width * g_scale) pixelsHigh:NSInteger(sz.height * g_scale)
+                   bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO
+                  colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
+    NSGraphicsContext* ctx = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+    CGContextRef cg = ctx.CGContext;
+    CGContextScaleCTM(cg, g_scale, g_scale);
+    CGContextTranslateCTM(cg, 0, sz.height);
+    CGContextScaleCTM(cg, 1, -1);
+    [g_root renderInContext:cg];
+    [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:@(snap) atomically:YES];
+  }
   g_lags.clear();
   g_netUpdates = g_gluePasses = g_observerPasses = g_paintPasses = 0;
   g_glueCost = g_observerCost = 0;
+}
+
+// ---------- item marks ----------
+
+// Removes a layer once its fade-out has finished (unless it came back).
+void fadeAndDrop(CALayer* l) {
+  [CATransaction begin];
+  [CATransaction setCompletionBlock:^{
+    if (l.opacity == 0) [l removeFromSuperlayer];
+  }];
+  fade(l, 0, kStyle.markFadeOut);
+  [CATransaction commit];
+}
+
+void styleMark(MarkState& ms) {
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  CALayer* b = ms.box;
+  b.cornerRadius = kStyle.markRadius;
+  ms.keyline.hidden = ms.m.loading;
+  ms.keyline.cornerRadius = std::max(0.0, kStyle.markRadius - kStyle.markLine);
+  ms.keyline.borderWidth = kStyle.markKeyline;
+  ms.keyline.borderColor = [NSColor colorWithWhite:1 alpha:kStyle.markKeylineOpacity].CGColor;
+  if (ms.m.loading) {
+    b.borderWidth = 0;
+    b.backgroundColor = [NSColor colorWithWhite:0 alpha:kStyle.loadingVeil].CGColor;
+  } else {
+    NSColor* c = parseColor(ms.m.color);
+    b.borderWidth = kStyle.markLine;
+    b.borderColor = c.CGColor;
+    b.backgroundColor = [c colorWithAlphaComponent:kStyle.markFill].CGColor;
+  }
+  [CATransaction commit];
+}
+
+// Where an item is in the view now; false when it is not visible.
+bool markRect(const MarkState& ms, const Geo& g, CGRect* out) {
+  double t0 = 0, t1 = 0, y = 0, h = 0;
+  if (!g.ok || !g_host.itemSpan || !g_host.itemSpan(ms.m.item.c_str(), &t0, &t1, &y, &h)) return false;
+  if (!(h > 0) || !(t1 > t0)) return false;
+  const double x0 = (t0 - g.t0) / g.spp, x1 = (t1 - g.t0) / g.spp;
+  if (x1 <= 0 || x0 >= g.W || y + h <= 0 || y >= g.H) return false;
+  auto px = [](double v) { return std::round(v * g_scale) / g_scale; };
+  *out = CGRectMake(px(x0), px(y), std::max(px(x1) - px(x0), 1.0 / g_scale), px(y + h) - px(y));
+  return true;
+}
+
+// The name tag above the hovered item (inside it when there is no room above).
+void layoutHover() {
+  const MarkState* hit = nullptr;
+  if (g_localIn)
+    for (const auto& [id, ms] : g_marks)
+      if (ms.shown && !ms.m.loading && CGRectContainsPoint(ms.rect, g_localPoint)) hit = &ms;
+  if (!hit) {
+    if (g_hoverShown) fade(g_hoverTag, 0, kStyle.markFadeOut);
+    g_hoverShown = false;
+    g_hoverItem.clear();
+    return;
+  }
+  if (!g_hoverTag) {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    g_hoverTag = [CALayer layer];
+    g_hoverTag.anchorPoint = CGPointZero;
+    g_hoverTag.opacity = 0;
+    g_hoverTag.contentsScale = g_scale;
+    applyShadow(g_hoverTag, nullptr);
+    g_hoverTag.shadowOpacity = kStyle.shadowOpacity * 0.6;
+    g_hoverText = [CATextLayer layer];
+    g_hoverText.contentsScale = g_scale;
+    [g_hoverTag addSublayer:g_hoverText];
+    [g_markRoot addSublayer:g_hoverTag];
+    [CATransaction commit];
+  }
+  const std::string label = hit->m.name.empty() ? "\xE2\x80\xA2" : hit->m.name;  // •
+  const std::string key = label + hit->m.color;
+  if (key != g_hoverLabel) {
+    g_hoverLabel = key;
+    setPill(g_hoverTag, g_hoverText, label, hit->m.color, kStyle.markTagFont, kStyle.markTagHeight,
+            kStyle.markTagPadX);
+  }
+  const CGRect r = hit->rect;
+  const double above = r.origin.y - kStyle.markTagGap - kStyle.markTagHeight;
+  const CGPoint at = CGPointMake(std::max(r.origin.x, 2.0),
+                                 above >= 2 ? above : r.origin.y + kStyle.markTagGap);
+  setPos(g_hoverTag, at);
+  if (!g_hoverShown) fade(g_hoverTag, 1, kStyle.markFadeIn);
+  g_hoverShown = true;
+  g_hoverItem = hit->m.item;
+}
+
+// Every mark to its item's current rectangle. Skipped while neither the time
+// axis nor the rows moved, since that takes a few API calls per item.
+void layoutMarks(const Geo& g) {
+  if (g_marks.empty()) {
+    if (g_hoverShown) layoutHover();
+    return;
+  }
+  if (!g.ok) return;  // can't read the project right now: keep them where they are
+  const unsigned long long stamp = g_host.rowsStamp ? g_host.rowsStamp() : 0;
+  const double key[5] = {g.t0, g.spp, g.W, g.H, g.ok ? 1.0 : 0.0};
+  if (!g_marksDirty && stamp == g_markStamp && std::equal(key, key + 5, g_markKey)) return;
+  g_marksDirty = false;
+  g_markStamp = stamp;
+  std::copy(key, key + 5, g_markKey);
+  for (auto& [id, ms] : g_marks) {
+    CGRect r;
+    if (markRect(ms, g, &r)) {
+      if (!CGRectEqualToRect(r, ms.rect) || !ms.shown) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        ms.box.frame = r;
+        ms.keyline.frame = CGRectInset(CGRectMake(0, 0, r.size.width, r.size.height), kStyle.markLine,
+                                       kStyle.markLine);
+        [CATransaction commit];
+      }
+      ms.rect = r;
+      if (!ms.shown) fade(ms.box, 1, kStyle.markFadeIn);
+      ms.shown = true;
+    } else if (ms.shown) {
+      fade(ms.box, 0, kStyle.markFadeOut);
+      ms.shown = false;
+    }
+  }
+  layoutHover();
 }
 
 // ---------- synthetic motion (demo sender, fake peers) ----------
@@ -841,6 +1035,10 @@ bool attach(void* mainWindow, const Host& host) {
     [tv addSubview:v positioned:NSWindowAbove relativeTo:nil];
     g_view = v;
     g_root = root;
+    g_markRoot = [CALayer layer];
+    g_markRoot.anchorPoint = CGPointZero;
+    g_markRoot.geometryFlipped = NO;
+    [root addSublayer:g_markRoot];
 
     // Before Core Animation's commit (order 2000000): whatever REAPER did to
     // its view in this pass is on screen in the same frame as our layers.
@@ -890,6 +1088,15 @@ void detach() {
     if (g_tvOrigClass && g_tv) object_setClass(g_tv, g_tvOrigClass);
     g_tvOrigClass = Nil;
     g_peers.clear();
+    g_marks.clear();
+    g_marksDirty = false;
+    g_hoverTag = nil;
+    g_hoverText = nil;
+    g_hoverItem.clear();
+    g_hoverLabel.clear();
+    g_hoverShown = false;
+    g_localIn = false;
+    g_markRoot = nil;
     [g_view removeFromSuperview];
     g_view = nil;
     g_root = nil;
@@ -898,8 +1105,65 @@ void detach() {
   }
 }
 
+bool draws() { return true; }
+
+void setShowCursors(bool on) {
+  if (on == g_showCursors) return;
+  g_showCursors = on;
+  if (on || !g_attached) return;
+  @autoreleasepool {
+    for (auto& [id, p] : g_peers) {
+      [p.root removeFromSuperlayer];
+      [p.edge removeFromSuperlayer];
+    }
+    g_peers.clear();
+  }
+}
+
+void setMarks(const std::vector<Mark>& marks) {
+  if (!g_attached) return;
+  @autoreleasepool {
+    std::map<std::string, const Mark*> want;
+    for (const Mark& m : marks)
+      if (!m.item.empty()) want.emplace(m.item, &m);
+    for (auto it = g_marks.begin(); it != g_marks.end();) {
+      if (want.count(it->first)) {
+        ++it;
+        continue;
+      }
+      fadeAndDrop(it->second.box);
+      it = g_marks.erase(it);
+      g_marksDirty = true;
+    }
+    for (const auto& [item, m] : want) {
+      auto it = g_marks.find(item);
+      if (it == g_marks.end()) {
+        MarkState ms;
+        ms.m = *m;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        ms.box = [CALayer layer];
+        ms.box.opacity = 0;
+        ms.keyline = [CALayer layer];
+        [ms.box addSublayer:ms.keyline];
+        [g_markRoot insertSublayer:ms.box atIndex:0];
+        [CATransaction commit];
+        styleMark(ms);
+        g_marks.emplace(item, std::move(ms));
+        g_marksDirty = true;
+      } else if (it->second.m.color != m->color || it->second.m.name != m->name ||
+                 it->second.m.loading != m->loading) {
+        it->second.m = *m;
+        styleMark(it->second);
+        g_hoverLabel.clear();
+      }
+    }
+    if (g_marksDirty) glue("marks");
+  }
+}
+
 void update(const Remote& r) {
-  if (!g_attached || r.id.empty()) return;
+  if (!g_attached || !g_showCursors || r.id.empty()) return;
   @autoreleasepool {
     auto it = g_peers.find(r.id);
     if (it == g_peers.end()) {
@@ -970,21 +1234,30 @@ bool sampleLocal(Local* out) {
     *out = Local{};
     const Geo g = readGeo();
     if (!g.ok) return true;
-    NSPoint vp;
+    NSPoint vp = NSZeroPoint;
+    bool over = false;
+    if (NSWindow* w = g_tv.window; w && w.visible) {
+      const NSPoint sp = [NSEvent mouseLocation];
+      if ([NSWindow windowNumberAtPoint:sp belowWindowWithWindowNumber:0] == w.windowNumber) {
+        vp = [g_view convertPoint:[w convertPointFromScreen:sp] fromView:nil];
+        over = NSPointInRect(vp, g_view.bounds);
+      }
+    }
+    // Hovering a marked item shows who is editing it.
+    if (over != g_localIn || (over && !NSEqualPoints(vp, g_localPoint))) {
+      g_localIn = over;
+      g_localPoint = vp;
+      if (!g_marks.empty() || g_hoverShown) layoutHover();
+    }
     if (g_demo) {
       vp = synthPoint(now(), g_demo * 3, g);
+      over = true;
       if (std::fmod(now(), 3.0) < 0.04) {
         g_clickPending = true;
         g_clickPoint = vp;
       }
-    } else {
-      NSWindow* w = g_tv.window;
-      if (!w || !w.visible) return true;
-      const NSPoint sp = [NSEvent mouseLocation];
-      if ([NSWindow windowNumberAtPoint:sp belowWindowWithWindowNumber:0] != w.windowNumber) return true;
-      vp = [g_view convertPoint:[w convertPointFromScreen:sp] fromView:nil];
-      if (!NSPointInRect(vp, g_view.bounds)) return true;
     }
+    if (!over) return true;
     if (g_clickPending) {
       vp = g_clickPoint;
       out->click = true;

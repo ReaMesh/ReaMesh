@@ -1,9 +1,12 @@
-// Peer cursors drawn inside REAPER's arrange view (prototype).
+// Peer cursors and edit marks drawn inside REAPER's arrange view.
 //
-// Other people's mouse cursors are drawn as compositor layers on top of
-// REAPER's track view, inside REAPER's own process: Core Animation on macOS
-// (cursor_overlay_mac.mm), DirectComposition + Direct2D on Windows later. The
-// layer is display-only and click-through; it never takes input.
+// Other people's mouse cursors, and an outline around the items someone else
+// is editing, are drawn as compositor layers on top of REAPER's track view,
+// inside REAPER's own process: Core Animation on macOS
+// (cursor_overlay_mac.mm). Windows has no drawing layer yet
+// (cursor_overlay_win.cpp only samples and sends the local pointer), so there
+// the extension keeps marking locked items with its colour tint. The layer is
+// display-only and click-through; it never takes input.
 //
 // Positions travel semantically ({project seconds, track GUID, 0..1 within the
 // track}), so every peer sees a cursor at the same musical spot whatever their
@@ -14,6 +17,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace cursor_overlay {
 
@@ -30,6 +34,13 @@ struct Host {
   // The visible track under an arrange y, with the 0..1 position inside it.
   // false over the empty area below the last track.
   bool (*trackAt)(double y, std::string* guid, double* fy);
+  // An item's extent: project seconds [*t0, *t1) and its pixel rows in the
+  // arrange. false when the item is not in this project or not visible.
+  bool (*itemSpan)(const char* guid, double* t0, double* t1, double* y, double* h);
+  // Changes whenever item rows may have moved without the time axis moving:
+  // project edits, vertical scroll, track heights. Item marks are laid out
+  // again only when this or the time axis changed.
+  unsigned long long (*rowsStamp)();
   // Exchange cursors with the session: feeds arrived updates to update() and
   // sends the local pointer. The layer calls it right before it draws, so a
   // cursor that arrived this pass is on screen in this frame.
@@ -47,6 +58,13 @@ struct Host {
 bool attach(void* mainWindow, const Host& host);
 // Remove the layer and forget every peer.
 void detach();
+// Whether this platform draws (cursors and item marks). false where attach
+// only samples the local pointer.
+bool draws();
+
+// Whether other people's cursors are shown (the app's setting). Off forgets
+// them at once and ignores updates; item marks stay.
+void setShowCursors(bool on);
 
 // One cursor update from a peer, in arrival order.
 struct Remote {
@@ -57,6 +75,14 @@ struct Remote {
   bool click = false;  // a mouse-down at this spot
 };
 void update(const Remote& r);
+
+// Items to mark, replacing the previous set (called every extension tick).
+struct Mark {
+  std::string item;         // item GUID
+  std::string name, color;  // who is editing it; color "#rrggbb"
+  bool loading = false;     // a placeholder whose media is still on its way
+};
+void setMarks(const std::vector<Mark>& marks);
 
 // Called from the extension timer: idle fades, staleness.
 void tick();

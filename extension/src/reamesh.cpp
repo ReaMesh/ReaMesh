@@ -120,8 +120,9 @@
 #define REAPERAPI_WANT_PCM_Source_BuildPeaks
 // The persisted-tint ledger (tintLedgerSave / tintLedgerLine).
 #define REAPERAPI_WANT_GetCurrentProjectInLoadSave
-// Peer cursors in the arrange (cursor_overlay.h).
+// Peer cursors and edit marks in the arrange (cursor_overlay.h).
 #define REAPERAPI_WANT_GetMainHwnd
+#define REAPERAPI_WANT_ValidatePtr2
 #define REAPERAPI_WANT_UpdateTimeline
 #define REAPERAPI_WANT_CSurf_OnScroll
 #define REAPERAPI_WANT_MarkProjectDirty
@@ -386,6 +387,10 @@ static constexpr std::chrono::seconds TINT_MAX_AGE{8};
 // Whether to paint the local lock tint, controlled by the app's set_tint
 // command. Disabling the tint leaves editing locks and local snap-back active.
 static bool g_tintEnabled = true;
+// The app's cursor settings (set_cursors): draw other people's cursors in the
+// arrange, send ours.
+static bool g_cursorsShown = true;
+static bool g_cursorShared = true;
 // Last session-ending event, shown by the app as an error toast. Structured
 // like a log entry ({code, params, text}); JSON null when there is none.
 static json g_lastError;
@@ -3693,6 +3698,10 @@ static bool jsonBool(const json& j, const char* key, bool dflt);
 static double jsonNum(const json& j, const char* key, double dflt);
 static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback);
 
+// The arrange layer (peer cursors section, near the end of the file).
+static bool g_cursorAttached = false;
+static void pushItemMarks();
+
 // ---------- item-tint lock signal (local view transform only) ----------
 //
 // When another peer holds the editing lock on a media item, that item is painted
@@ -3747,10 +3756,16 @@ static bool isSaveCommand(int command) {
   }
 }
 
-// Item GUIDs whose editing lock is currently held by a peer OTHER than us, from
-// the live lock table Rust maintains. These are the items to show as grey.
-static std::set<std::string> lockedItemsByOthers() {
-  std::set<std::string> out;
+// Who edits an item: their roster name and colour.
+struct LockHolder {
+  std::string name, color;
+};
+
+// Items whose editing lock is currently held by a peer OTHER than us, from the
+// live lock table Rust maintains, with who holds each. These are the items to
+// mark.
+static std::map<std::string, LockHolder> lockedItemHolders() {
+  std::map<std::string, LockHolder> out;
   if (!g_handle) return out;
   char* raw = reamesh_locked_entities(g_handle);
   std::string payload = raw ? raw : "[]";
@@ -3760,8 +3775,14 @@ static std::set<std::string> lockedItemsByOthers() {
   for (const auto& e : arr) {
     if (!e.is_object() || jsonStr(e, "section") != "items") continue;
     std::string id = jsonStr(e, "id");
-    if (!id.empty()) out.insert(std::move(id));
+    if (!id.empty()) out.emplace(std::move(id), LockHolder{jsonStr(e, "name"), jsonStr(e, "color")});
   }
+  return out;
+}
+
+static std::set<std::string> lockedItemsByOthers() {
+  std::set<std::string> out;
+  for (auto& [id, _] : lockedItemHolders()) out.insert(id);
   return out;
 }
 
@@ -3879,12 +3900,18 @@ static void healPersistedTints() {
 // restore color therefore tracks the live synced color, never a stale snapshot.
 static void reconcileItemTints() {
   if (g_mode != Mode::Hosting && g_mode != Mode::ClientActive) return;
-  // When the tint is switched off in the app, paint nothing (the empty desired
+  // Where the arrange layer draws (macOS), locked items and placeholders are
+  // marked there instead and nothing is tinted: the empty desired set below
+  // restores anything still grey from before the layer attached.
+  const bool drawn = g_cursorAttached && cursor_overlay::draws();
+  if (drawn) pushItemMarks();
+  // When the cue is switched off in the app, paint nothing (the empty desired
   // set restores every item to its real colour); the lock still binds: only
   // the visual cue is gone.
-  std::set<std::string> desired = g_tintEnabled ? lockedItemsByOthers() : std::set<std::string>{};
+  const bool paint = g_tintEnabled && !drawn;
+  std::set<std::string> desired = paint ? lockedItemsByOthers() : std::set<std::string>{};
   // Tint placeholders while their media is still downloading.
-  if (g_tintEnabled) desired.insert(g_placeholders.begin(), g_placeholders.end());
+  if (paint) desired.insert(g_placeholders.begin(), g_placeholders.end());
   const int tint = lockTintNative();
   const auto now = std::chrono::steady_clock::now();
   bool changed = false;
@@ -4926,8 +4953,14 @@ static void ctlDispatch(const json& cmd) {
     onLeave();
   } else if (c == "reveal_peer") {
     revealPeer(jsonStr(cmd, "peer_id"));
+  } else if (c == "set_cursors") {
+    // App settings: show other people's cursors, share our own.
+    g_cursorsShown = jsonBool(cmd, "show", true);
+    g_cursorShared = jsonBool(cmd, "share", true);
+    cursor_overlay::setShowCursors(g_cursorsShown);
   } else if (c == "set_tint") {
-    // App overlay setting: whether to paint the dark-grey lock tint.
+    // App overlay setting: whether to mark items someone else is editing (an
+    // outline in the arrange layer, or the dark-grey tint where it can't draw).
     const bool on = cmd.contains("on") && cmd["on"].is_boolean() ? cmd["on"].get<bool>() : true;
     if (on != g_tintEnabled) {
       g_tintEnabled = on;
@@ -5515,14 +5548,14 @@ static void unsupportedTick() {
   reamesh_ctl_publish(dumpJson(state).c_str());
 }
 
-// ---------- peer cursors in the arrange (prototype) ----------
+// ---------- peer cursors and edit marks in the arrange ----------
 //
-// Everyone's mouse over the arrange, drawn by cursor_overlay inside REAPER.
-// Positions go out semantically: project seconds, track GUID and the height
-// fraction inside that track, so a cursor lands on the same spot of the song
-// whatever each person's zoom and scroll.
+// Everyone's mouse over the arrange, drawn by cursor_overlay inside REAPER,
+// plus an outline around each item someone else is editing. Positions go out
+// semantically: project seconds, track GUID and the height fraction inside
+// that track, so a cursor lands on the same spot of the song whatever each
+// person's zoom and scroll.
 
-static bool g_cursorAttached = false;
 // GUID -> track, valid while the project state change count holds (adding,
 // removing or reordering tracks bumps it). nullptr caches "not here".
 static std::map<std::string, MediaTrack*> g_cursorTracks;
@@ -5541,6 +5574,10 @@ static bool cursorTimeAxis(double* t0, double* spp) {
   return *spp > 0.0;
 }
 
+// The same for items.
+static std::map<std::string, MediaItem*> g_cursorItems;
+static int g_cursorItemsStamp = -1;
+
 static MediaTrack* cursorTrack(const std::string& guid) {
   const int stamp = GetProjectStateChangeCount(nullptr);
   if (stamp != g_cursorTracksStamp) {
@@ -5548,10 +5585,83 @@ static MediaTrack* cursorTrack(const std::string& guid) {
     g_cursorTracksStamp = stamp;
   }
   auto it = g_cursorTracks.find(guid);
-  if (it != g_cursorTracks.end()) return it->second;
+  // Checked on every hit: a pointer must never outlive its track, whatever
+  // the change count did.
+  if (it != g_cursorTracks.end() && (!it->second || ValidatePtr2(nullptr, it->second, "MediaTrack*")))
+    return it->second;
   MediaTrack* hit = findTrackByGuid(guid);
   g_cursorTracks[guid] = hit;
   return hit;
+}
+
+static MediaItem* cursorItem(const std::string& guid) {
+  const int stamp = GetProjectStateChangeCount(nullptr);
+  if (stamp != g_cursorItemsStamp) {
+    g_cursorItems.clear();
+    g_cursorItemsStamp = stamp;
+  }
+  auto it = g_cursorItems.find(guid);
+  if (it != g_cursorItems.end() && (!it->second || ValidatePtr2(nullptr, it->second, "MediaItem*")))
+    return it->second;
+  MediaItem* hit = findItemByGuid(guid);
+  g_cursorItems[guid] = hit;
+  return hit;
+}
+
+static bool cursorItemSpan(const char* guid, double* t0, double* t1, double* y, double* h) {
+  MediaItem* it = cursorItem(guid);
+  if (!it) return false;
+  MediaTrack* tr = GetMediaItem_Track(it);
+  if (!tr || GetMediaTrackInfo_Value(tr, "B_SHOWINTCP") == 0.0) return false;
+  const double th = GetMediaTrackInfo_Value(tr, "I_TCPH");
+  const double ih = GetMediaItemInfo_Value(it, "I_LASTH");
+  if (th <= 0 || ih <= 0) return false;
+  *t0 = GetMediaItemInfo_Value(it, "D_POSITION");
+  *t1 = *t0 + GetMediaItemInfo_Value(it, "D_LENGTH");
+  *y = GetMediaTrackInfo_Value(tr, "I_TCPY") + GetMediaItemInfo_Value(it, "I_LASTY");
+  *h = ih;
+  return true;
+}
+
+// Changes when item rows may have moved with the time axis standing still:
+// any project change, a vertical scroll (the first track's top moves) and a
+// track height change (the last track's top or height moves).
+static unsigned long long cursorRowsStamp() {
+  unsigned long long h = static_cast<unsigned>(GetProjectStateChangeCount(nullptr));
+  auto mix = [&h](double v) { h = (h ^ static_cast<unsigned long long>(std::llround(v))) * 1099511628211ull; };
+  const int n = CountTracks(nullptr);
+  mix(n);
+  if (n > 0) {
+    MediaTrack* first = GetTrack(nullptr, 0);
+    MediaTrack* last = GetTrack(nullptr, n - 1);
+    mix(GetMediaTrackInfo_Value(first, "I_TCPY"));
+    mix(GetMediaTrackInfo_Value(last, "I_TCPY"));
+    mix(GetMediaTrackInfo_Value(last, "I_TCPH"));
+  }
+  return h;
+}
+
+// Hands the layer the items to mark: those someone else is editing (outlined
+// in their colour) and placeholders still waiting for their media (veiled).
+// Nothing while the cue is switched off in the app.
+static void pushItemMarks() {
+  std::vector<cursor_overlay::Mark> marks;
+  if (g_tintEnabled) {
+    for (auto& [id, who] : lockedItemHolders()) {
+      cursor_overlay::Mark m;
+      m.item = id;
+      m.name = who.name;
+      m.color = who.color;
+      marks.push_back(std::move(m));
+    }
+    for (const std::string& id : g_placeholders) {
+      cursor_overlay::Mark m;
+      m.item = id;
+      m.loading = true;
+      marks.push_back(std::move(m));
+    }
+  }
+  cursor_overlay::setMarks(marks);
 }
 
 static bool cursorTrackSpan(const char* guid, double* y, double* h) {
@@ -5607,14 +5717,17 @@ static void cursorStop() {
   if (!g_cursorAttached) return;
   cursor_overlay::detach();
   g_cursorAttached = false;
+  g_cursorTracks.clear();
+  g_cursorItems.clear();
 }
 
 // Network side of the cursors, pumped by the layer in every run-loop pass
-// right before it draws (and from the timer as a fallback): hands arrived
-// cursor updates to the layer, and sends the local pointer, sampled at most
-// every 16ms and sent at most every 33ms while it changes (plus a keep-alive
-// every 3s while it rests in the arrange, so peers don't fade it as stale).
-// A click goes out with the next sample.
+// right before it draws (and from the timer, the only caller on Windows):
+// hands arrived cursor updates to the layer, and sends the local pointer,
+// sampled at most every 16ms and sent at most every 33ms while it changes
+// (plus a keep-alive every 3s while it rests in the arrange, so peers don't
+// fade it as stale). A click goes out with the next sample. With sharing off
+// in the app, one last "left the arrange" goes out and then nothing.
 static void cursorPump() {
   if (!g_cursorAttached || !g_handle || !cursorReady()) return;
   char* raw = reamesh_drain_cursors(g_handle);
@@ -5646,6 +5759,10 @@ static void cursorPump() {
   lastSample = now;
   cursor_overlay::Local l;
   if (!cursor_overlay::sampleLocal(&l)) return;
+  if (!g_cursorShared) {
+    if (!last.in) return;
+    l = cursor_overlay::Local{};
+  }
   const auto since = now - lastSent;
   const bool changed = l.in != last.in ||
                        (l.in && (std::fabs(l.px - last.px) >= 1 || std::fabs(l.py - last.py) >= 1 ||
@@ -5661,9 +5778,9 @@ static void cursorPump() {
 
 static void cursorTick() {
   if (!g_cursorAttached) {
-    static const cursor_overlay::Host host = {cursorReady,       cursorTimeAxis,    cursorTrackSpan,
-                                              cursorTrackAt,     cursorPump,        cursorSetTimeAxis,
-                                              cursorTrackGuidAt, cursorTestNudge};
+    static const cursor_overlay::Host host = {
+        cursorReady, cursorTimeAxis,    cursorTrackSpan,   cursorTrackAt,  cursorItemSpan,
+        cursorRowsStamp, cursorPump,    cursorSetTimeAxis, cursorTrackGuidAt, cursorTestNudge};
     g_cursorAttached = cursor_overlay::attach(GetMainHwnd(), host);
     if (!g_cursorAttached) return;
   }
