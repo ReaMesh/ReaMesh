@@ -74,8 +74,24 @@ struct Remote {
   std::string guid;
   bool in = false;     // false: the mouse left their arrange
   bool click = false;  // a mouse-down at this spot
+  bool down = false;   // the button is held (dragging)
 };
 void update(const Remote& r);
+
+// What each other person is doing outside the arrange, from their presence:
+// an open FX window on a track. While their mouse is away from the arrange,
+// their cursor waits at the left edge of that track's row, next to its FX
+// button, labelled with the plug-in. Replaces the previous set.
+struct Activity {
+  std::string id, name, color;
+  std::string track;  // track GUID
+  std::string label;  // plug-in name
+};
+void setActivity(const std::vector<Activity>& list);
+
+// Following someone: a thin frame in their colour around the arrange with
+// their name in a corner. An empty name removes it.
+void setFollow(const std::string& name, const std::string& color);
 
 // Items to mark, replacing the previous set. Called every extension tick,
 // after remote edits were applied: lays the marks out again each time.
@@ -95,6 +111,7 @@ struct Local {
   double t = 0, fy = 0;
   std::string guid;
   bool click = false;
+  bool down = false;
   double px = 0, py = 0;  // arrange pixels, for change detection only
 };
 // Samples the local pointer; false when there is nothing to sample (no layer).

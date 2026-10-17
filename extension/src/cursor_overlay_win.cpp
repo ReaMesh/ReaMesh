@@ -52,6 +52,8 @@ void detach() {
 bool draws() { return false; }
 void setShowCursors(bool) {}
 void update(const Remote&) {}
+void setActivity(const std::vector<Activity>&) {}
+void setFollow(const std::string&, const std::string&) {}
 void setMarks(const std::vector<Mark>&) {}
 void tick() {}
 
@@ -80,6 +82,7 @@ bool sampleLocal(Local* out) {
     out->click = false;
     return true;
   }
+  out->down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
   out->t = t0 + p.x * spp;
   out->in = g_host.trackAt(p.y, &out->guid, &out->fy);
   out->px = p.x;

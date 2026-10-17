@@ -17,6 +17,9 @@
 // Prototype knobs (environment, read at attach):
 //   REAMESH_CURSOR_SYNC=commit|timer|paint  when the glue pass runs (default commit)
 //   REAMESH_CURSOR_DEMO=k          send a synthetic moving pointer (path phase k) instead of the mouse
+//   REAMESH_CURSOR_DEMO=story      send a scripted 40s tour of every cursor state (see storyPoint)
+//   REAMESH_CURSOR_IDLE=s          dim resting cursors after s seconds instead of 10
+//   REAMESH_CURSOR_REDUCE_MOTION=1 behave as with the system's "Reduce motion"
 //   REAMESH_CURSOR_DEMO_ITEM=<guid>  with DEMO: the synthetic pointer rides on that item
 //   REAMESH_CURSOR_FAKE=N          show N synthetic local peers (load test)
 //   REAMESH_CURSOR_BUSY=ms:every   block the main thread for ms every `every` ms
@@ -58,22 +61,38 @@ struct Style {
   double shadowOpacity;
   double shadowRadius;
   double shadowOffsetY;  // pt, downwards
-  // Name tag: a pill below-right of the tip.
+  // Name tag: a pill below-right of the tip, on a softer spring of its own so
+  // it trails the pointer a little.
   double tagFont;        // pt
   double tagHeight;
   double tagPadX;
   double tagDX, tagDY;   // tag origin relative to the tip
   double tagIdleAfter;   // s without movement before the tag fades
   double tagFadeOut, tagFadeIn;
+  double tagStiffness;
   // Motion. A critically damped spring (mass 1) toward each new target.
   double springStiffness;
+  // Prediction: the cursor is drawn ahead along its recent velocity, by this
+  // much time, at most this far; the push is taken back once updates stop.
+  double predictLead, predictMax, predictStopAfter;
+  // A move further than this fades across instead of flying over the arrange.
+  double jumpCrossfade, crossfade;
   double fadeIn, fadeOut;
+  double appearScale;    // a cursor grows from this as it appears, shrinks to it as it goes
+  double pressedScale, pressDuration;  // while the button is held
+  double idleDimAfter, idleOpacity, idleFade;  // a cursor resting this long dims
   double staleAfter;     // s without any update before a cursor fades out
   double forgetAfter;    // s before a silent peer's layers are dropped
   // Click ripple.
   double rippleRadius, rippleLine, rippleScaleFrom, rippleScaleTo, rippleOpacity, rippleDuration;
-  // Edge indicator for peers outside the visible arrange.
-  double edgeInset, edgeHeight, edgeFont, edgePadX, edgeOpacity;
+  // Edge indicator for peers outside the visible arrange: a pill with their
+  // name and a small arrow pointing where they are.
+  double edgeInset, edgeHeight, edgeFont, edgePadX, edgeArrow, edgeOpacity;
+  // Someone editing an FX: their cursor waits this far in from the arrange's
+  // left edge, on that track's row.
+  double parkInset;
+  // Following someone: a frame round the arrange.
+  double followLine, followOpacity, followTagInset;
   // Item someone else is editing: dimmed ("not yours right now") with a thin
   // outline in their colour; their name shows while the local pointer is over
   // it. A mark stays up a little after the lock lapses, so the pauses
@@ -102,9 +121,21 @@ constexpr Style kStyle = {
     .tagIdleAfter = 2.0,
     .tagFadeOut = 0.6,
     .tagFadeIn = 0.15,
+    .tagStiffness = 260,
     .springStiffness = 800,
+    .predictLead = 0.045,
+    .predictMax = 28,
+    .predictStopAfter = 0.075,
+    .jumpCrossfade = 360,
+    .crossfade = 0.22,
     .fadeIn = 0.18,
     .fadeOut = 0.35,
+    .appearScale = 0.9,
+    .pressedScale = 0.86,
+    .pressDuration = 0.12,
+    .idleDimAfter = 10,
+    .idleOpacity = 0.5,
+    .idleFade = 0.8,
     .staleAfter = 8,
     .forgetAfter = 60,
     .rippleRadius = 9,
@@ -117,7 +148,12 @@ constexpr Style kStyle = {
     .edgeHeight = 18,
     .edgeFont = 11,
     .edgePadX = 7,
+    .edgeArrow = 7,
     .edgeOpacity = 0.92,
+    .parkInset = 8,
+    .followLine = 2,
+    .followOpacity = 0.9,
+    .followTagInset = 8,
     .markLine = 1.5,
     .markRadius = 3,
     .markDim = 0.3,
@@ -140,20 +176,29 @@ struct Peer {
   std::string id, name, color;
   double t = 0, fy = 0;
   std::string guid;
-  bool in = false;
+  bool in = false, down = false;
   double lastMsg = 0, lastMove = 0;
   bool pendingSpring = false, pendingClick = false;
+  // Velocity from the last updates (project seconds and track fractions per
+  // second), for prediction.
+  double vt = 0, vfy = 0;
+  bool predict = false;
+  // An open FX window (setActivity): where the cursor waits while away.
+  std::string fxTrack, fxLabel;
+  double fxAt = 0;
 
   CALayer* root = nil;  // positioned at the pointer tip
   CAShapeLayer* arrow = nil;
-  CALayer* tag = nil;
+  CALayer* tag = nil;   // a sibling of root, so it can trail it
   CATextLayer* tagText = nil;
   CALayer* edge = nil;
   CATextLayer* edgeText = nil;
+  CAShapeLayer* edgeArrow = nil;
   std::string tagLabel, edgeLabel;
 
-  bool cursorShown = false, tagShown = false, edgeShown = false;
-  CGPoint cursorModel = CGPointZero, edgeModel = CGPointZero;
+  bool cursorShown = false, tagShown = false, edgeShown = false, parked = false;
+  bool idle = false, pressed = false;
+  CGPoint cursorModel = CGPointZero, tagModel = CGPointZero, edgeModel = CGPointZero;
   Side edgeSide = Side::Left;
 };
 
@@ -175,6 +220,8 @@ struct Place {
   enum Kind { Hidden, Cursor, Edge } kind = Hidden;
   CGPoint p = CGPointZero;
   Side side = Side::Left;
+  double angle = 0;     // Edge: direction from the pill to the real spot
+  bool parked = false;  // waiting beside an FX window's track
 };
 
 cursor_overlay::Host g_host{};
@@ -186,6 +233,11 @@ CALayer* g_root = nil;
 CGFloat g_scale = 2;
 std::map<std::string, Peer> g_peers;
 bool g_showCursors = true;
+// System setting "Reduce motion" (or REAMESH_CURSOR_REDUCE_MOTION): no
+// springs, no scaling, cursors fade instead of travelling.
+bool g_reduceMotion = false;
+double g_reduceMotionChecked = 0;
+double g_idleDimAfter = kStyle.idleDimAfter;  // REAMESH_CURSOR_IDLE overrides (demo)
 // Item marks live in their own layer below the cursors.
 CALayer* g_markRoot = nil;
 std::map<std::string, MarkState> g_marks;
@@ -203,6 +255,11 @@ std::string g_hoverItem, g_hoverLabel;
 bool g_hoverShown = false;
 bool g_localIn = false;
 NSPoint g_localPoint = NSZeroPoint;
+// The follow frame.
+CALayer* g_followFrame = nil;
+CALayer* g_followTag = nil;
+CATextLayer* g_followText = nil;
+std::string g_followKey;
 CFRunLoopObserverRef g_observer = nullptr;
 id g_clickMonitor = nil;
 Class g_tvOrigClass = Nil;
@@ -211,6 +268,7 @@ NSPoint g_clickPoint = NSZeroPoint;
 
 Sync g_sync = Sync::Commit;
 int g_demo = 0;  // 0 off, else the synthetic path's phase
+bool g_story = false;  // REAMESH_CURSOR_DEMO=story: the scripted feature tour
 int g_fake = 0;
 double g_busyMs = 0, g_busyEvery = 0, g_lastBusy = 0;
 std::string g_scrollTest;
@@ -258,6 +316,10 @@ bool isLight(const std::string& hex) {
   return l > 0.62;
 }
 
+NSColor* inkOn(const std::string& hex) {
+  return isLight(hex) ? [NSColor colorWithSRGBRed:0.1 green:0.1 blue:0.1 alpha:1] : [NSColor whiteColor];
+}
+
 CGPathRef pointerPath() {
   // Hotspot at (0,0), y down. Four corners: the tip, two wings and the notch
   // between them, every one rounded. The rounding pulls the drawn tip inwards,
@@ -286,23 +348,37 @@ CGPathRef pointerPath() {
   return path;
 }
 
+// A small rounded triangle pointing along +x, centred on (0,0).
+CGPathRef edgeArrowPath() {
+  static CGPathRef path = nullptr;
+  if (!path) {
+    const double a = kStyle.edgeArrow / 2;
+    CGMutablePathRef p = CGPathCreateMutable();
+    CGPathMoveToPoint(p, nullptr, -a * 0.8, -a);
+    CGPathAddLineToPoint(p, nullptr, a, 0);
+    CGPathAddLineToPoint(p, nullptr, -a * 0.8, a);
+    CGPathCloseSubpath(p);
+    path = p;
+  }
+  return path;
+}
+
 NSFont* tagFont(double size) {
   return [NSFont systemFontOfSize:size weight:NSFontWeightSemibold];
 }
 
-// Sets a pill (background layer + text layer) to `label`; returns its width.
+// Sets a pill (background layer + text layer) to `label`, leaving `lead` pt
+// free before the text; returns its width.
 double setPill(CALayer* pill, CATextLayer* text, const std::string& label, const std::string& color,
-               double fontSize, double height, double padX) {
+               double fontSize, double height, double padX, double lead = 0) {
   NSFont* f = tagFont(fontSize);
-  NSColor* fg = isLight(color) ? [NSColor colorWithSRGBRed:0.1 green:0.1 blue:0.1 alpha:1]
-                               : [NSColor whiteColor];
   NSString* s = [NSString stringWithUTF8String:label.c_str()] ?: @"";
   NSAttributedString* as = [[NSAttributedString alloc]
       initWithString:s
-          attributes:@{NSFontAttributeName : f, NSForegroundColorAttributeName : fg}];
+          attributes:@{NSFontAttributeName : f, NSForegroundColorAttributeName : inkOn(color)}];
   const double tw = std::ceil(as.size.width);
   const double lh = std::ceil(f.ascender - f.descender);
-  const double w = tw + 2 * padX;
+  const double w = tw + 2 * padX + lead;
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
   pill.bounds = CGRectMake(0, 0, w, height);
@@ -312,7 +388,7 @@ double setPill(CALayer* pill, CATextLayer* text, const std::string& label, const
   // Centre the capitals, not the line box: the baseline sits half a cap
   // height below the pill's middle.
   const double top = (height + f.capHeight) / 2 - f.ascender;
-  text.frame = CGRectMake(padX, std::round(top * g_scale) / g_scale, tw, lh);
+  text.frame = CGRectMake(padX + lead, std::round(top * g_scale) / g_scale, tw, lh);
   [CATransaction commit];
   return w;
 }
@@ -326,12 +402,12 @@ void setPos(CALayer* l, CGPoint p) {
 
 // Additive spring from `from` to `to`: the model jumps, the offset decays in
 // the render server.
-void springTo(CALayer* l, CGPoint from, CGPoint to) {
+void springTo(CALayer* l, CGPoint from, CGPoint to, double stiffness) {
   CASpringAnimation* a = [CASpringAnimation animationWithKeyPath:@"position"];
   a.additive = YES;
   a.mass = 1;
-  a.stiffness = kStyle.springStiffness;
-  a.damping = 2 * std::sqrt(kStyle.springStiffness);
+  a.stiffness = stiffness;
+  a.damping = 2 * std::sqrt(stiffness);
   a.fromValue = [NSValue valueWithPoint:NSMakePoint(from.x - to.x, from.y - to.y)];
   a.toValue = [NSValue valueWithPoint:NSZeroPoint];
   a.duration = a.settlingDuration;
@@ -343,19 +419,20 @@ void springTo(CALayer* l, CGPoint from, CGPoint to) {
   [CATransaction commit];
 }
 
+// Drops the position springs (fades and scaling stay).
 void snapTo(CALayer* l, CGPoint p) {
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
   for (NSString* k in l.animationKeys ?: @[])
-    if (![k isEqualToString:@"fade"]) [l removeAnimationForKey:k];
+    if (![k isEqualToString:@"fade"] && ![k isEqualToString:@"pop"]) [l removeAnimationForKey:k];
   l.position = p;
   [CATransaction commit];
 }
 
-void fade(CALayer* l, float to, double dur) {
+void fade(CALayer* l, float to, double dur, NSNumber* from = nil) {
   CALayer* pres = l.presentationLayer;
   CABasicAnimation* a = [CABasicAnimation animationWithKeyPath:@"opacity"];
-  a.fromValue = @(pres ? pres.opacity : l.opacity);
+  a.fromValue = from ?: @(pres ? pres.opacity : l.opacity);
   a.toValue = @(to);
   a.duration = dur;
   a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
@@ -364,6 +441,35 @@ void fade(CALayer* l, float to, double dur) {
   l.opacity = to;
   [l addAnimation:a forKey:@"fade"];
   [CATransaction commit];
+}
+
+// Animates a uniform scale (about the layer's anchor), under `key`.
+void scaleTo(CALayer* l, double to, double dur, NSString* key, NSNumber* from = nil) {
+  CALayer* pres = l.presentationLayer;
+  CABasicAnimation* a = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+  a.fromValue = from ?: [(pres ?: l) valueForKeyPath:@"transform.scale"];
+  a.toValue = @(to);
+  a.duration = dur;
+  a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  l.transform = CATransform3DMakeScale(to, to, 1);
+  [l addAnimation:a forKey:key];
+  [CATransaction commit];
+}
+
+// Appear: fade in while growing from appearScale. `fromZero` starts the fade
+// at nothing even if the layer was visible a moment ago (a crossfade).
+void popIn(CALayer* l, float opacity, bool fromZero = false) {
+  fade(l, opacity, kStyle.fadeIn, fromZero ? @0 : nil);
+  if (g_reduceMotion) return;
+  scaleTo(l, 1, kStyle.fadeIn * 1.6, @"pop", fromZero ? @(kStyle.appearScale) : nil);
+}
+
+void popOut(CALayer* l) {
+  fade(l, 0, kStyle.fadeOut);
+  if (g_reduceMotion) return;
+  scaleTo(l, kStyle.appearScale, kStyle.fadeOut, @"pop");
 }
 
 void ripple(Peer& p) {
@@ -380,8 +486,8 @@ void ripple(Peer& p) {
   r.opacity = 0;
 
   CABasicAnimation* sc = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
-  sc.fromValue = @(kStyle.rippleScaleFrom);
-  sc.toValue = @(kStyle.rippleScaleTo);
+  sc.fromValue = @(g_reduceMotion ? 1.0 : kStyle.rippleScaleFrom);
+  sc.toValue = @(g_reduceMotion ? 1.0 : kStyle.rippleScaleTo);
   CABasicAnimation* op = [CABasicAnimation animationWithKeyPath:@"opacity"];
   op.fromValue = @(kStyle.rippleOpacity);
   op.toValue = @0;
@@ -409,6 +515,18 @@ void applyShadow(CALayer* l, CGPathRef path) {
   if (path) l.shadowPath = path;
 }
 
+CAShapeLayer* makeArrow(const std::string& color) {
+  CAShapeLayer* a = [CAShapeLayer layer];
+  a.path = pointerPath();
+  a.fillColor = parseColor(color).CGColor;
+  a.strokeColor = [NSColor whiteColor].CGColor;
+  a.lineWidth = kStyle.outline;
+  a.lineJoin = kCALineJoinRound;
+  a.contentsScale = g_scale;
+  applyShadow(a, pointerPath());
+  return a;
+}
+
 void buildLayers(Peer& p) {
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
@@ -417,20 +535,13 @@ void buildLayers(Peer& p) {
   p.root.anchorPoint = CGPointZero;
   p.root.bounds = CGRectZero;
   p.root.opacity = 0;
-
-  p.arrow = [CAShapeLayer layer];
-  p.arrow.path = pointerPath();
-  p.arrow.fillColor = parseColor(p.color).CGColor;
-  p.arrow.strokeColor = [NSColor whiteColor].CGColor;
-  p.arrow.lineWidth = kStyle.outline;
-  p.arrow.lineJoin = kCALineJoinRound;
-  p.arrow.contentsScale = g_scale;
-  applyShadow(p.arrow, pointerPath());
+  // Scaling about the tip: the arrow is drawn around (0,0) of a zero-size layer.
+  p.arrow = makeArrow(p.color);
   [p.root addSublayer:p.arrow];
 
   p.tag = [CALayer layer];
   p.tag.anchorPoint = CGPointZero;
-  p.tag.position = CGPointMake(kStyle.tagDX, kStyle.tagDY);
+  p.tag.opacity = 0;
   p.tag.contentsScale = g_scale;
   applyShadow(p.tag, nullptr);
   p.tag.shadowOpacity = kStyle.shadowOpacity * 0.6;
@@ -438,8 +549,6 @@ void buildLayers(Peer& p) {
   p.tagText.contentsScale = g_scale;
   p.tagText.alignmentMode = kCAAlignmentLeft;
   [p.tag addSublayer:p.tagText];
-  [p.root addSublayer:p.tag];
-  p.tagShown = true;
 
   p.edge = [CALayer layer];
   p.edge.opacity = 0;
@@ -449,10 +558,23 @@ void buildLayers(Peer& p) {
   p.edgeText = [CATextLayer layer];
   p.edgeText.contentsScale = g_scale;
   [p.edge addSublayer:p.edgeText];
+  p.edgeArrow = [CAShapeLayer layer];
+  p.edgeArrow.path = edgeArrowPath();
+  p.edgeArrow.lineJoin = kCALineJoinRound;
+  p.edgeArrow.lineWidth = 1.5;
+  p.edgeArrow.contentsScale = g_scale;
+  [p.edge addSublayer:p.edgeArrow];
 
   [g_root addSublayer:p.edge];
+  [g_root addSublayer:p.tag];
   [g_root addSublayer:p.root];
   [CATransaction commit];
+}
+
+void dropLayers(Peer& p) {
+  [p.root removeFromSuperlayer];
+  [p.tag removeFromSuperlayer];
+  [p.edge removeFromSuperlayer];
 }
 
 std::string displayName(const Peer& p) {
@@ -460,8 +582,15 @@ std::string displayName(const Peer& p) {
   return p.id.size() > 6 ? p.id.substr(p.id.size() - 6) : p.id;
 }
 
+// The name, plus the plug-in while the cursor waits beside an FX window.
+std::string displayLabel(const Peer& p) {
+  std::string s = displayName(p);
+  if (p.parked && !p.fxLabel.empty()) s += " \xC2\xB7 " + p.fxLabel;  // ·
+  return s;
+}
+
 void refreshTag(Peer& p) {
-  const std::string label = displayName(p);
+  const std::string label = displayLabel(p);
   if (label == p.tagLabel) return;
   p.tagLabel = label;
   setPill(p.tag, p.tagText, label, p.color, kStyle.tagFont, kStyle.tagHeight, kStyle.tagPadX);
@@ -472,17 +601,17 @@ void refreshTag(Peer& p) {
 }
 
 void refreshEdge(Peer& p, Side side) {
-  const std::string name = displayName(p);
-  std::string label;
-  switch (side) {
-    case Side::Left: label = "\xE2\x97\x80 " + name; break;    // ◀
-    case Side::Right: label = name + " \xE2\x96\xB6"; break;   // ▶
-    case Side::Top: label = "\xE2\x96\xB2 " + name; break;     // ▲
-    case Side::Bottom: label = "\xE2\x96\xBC " + name; break;  // ▼
-  }
+  const std::string label = displayLabel(p);
   if (label != p.edgeLabel) {
     p.edgeLabel = label;
-    setPill(p.edge, p.edgeText, label, p.color, kStyle.edgeFont, kStyle.edgeHeight, kStyle.edgePadX);
+    const double lead = kStyle.edgeArrow + 4;
+    setPill(p.edge, p.edgeText, label, p.color, kStyle.edgeFont, kStyle.edgeHeight, kStyle.edgePadX, lead);
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    p.edgeArrow.position = CGPointMake(kStyle.edgePadX + kStyle.edgeArrow / 2, kStyle.edgeHeight / 2);
+    p.edgeArrow.fillColor = inkOn(p.color).CGColor;
+    p.edgeArrow.strokeColor = inkOn(p.color).CGColor;
+    [CATransaction commit];
   }
   CGPoint anchor = CGPointMake(0, 0.5);
   switch (side) {
@@ -495,6 +624,45 @@ void refreshEdge(Peer& p, Side side) {
   [CATransaction setDisableActions:YES];
   p.edge.anchorPoint = anchor;
   [CATransaction commit];
+}
+
+void setEdgeAngle(Peer& p, double angle) {
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  p.edgeArrow.transform = CATransform3DMakeRotation(angle, 0, 0, 1);
+  [CATransaction commit];
+}
+
+// The button is held (or let go): the pointer shrinks a little about its tip.
+void setPressed(Peer& p, bool down) {
+  if (down == p.pressed) return;
+  p.pressed = down;
+  scaleTo(p.arrow, down ? kStyle.pressedScale : 1.0, kStyle.pressDuration, @"press");
+}
+
+// The cursor fades across instead of flying: a copy fades out where it was,
+// the cursor fades (and grows) in at its new spot.
+void crossfadeTo(Peer& p, CGPoint at, CGPoint tagAt) {
+  CALayer* pres = p.root.presentationLayer;
+  const CGPoint from = pres ? pres.position : p.cursorModel;
+  const float op = (pres ? pres.opacity : 1) * p.arrow.opacity;
+  CAShapeLayer* ghost = makeArrow(p.color);
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  ghost.position = from;
+  ghost.transform = p.arrow.transform;
+  [g_root insertSublayer:ghost below:p.root];
+  [CATransaction commit];
+  [CATransaction begin];
+  [CATransaction setCompletionBlock:^{
+    [ghost removeFromSuperlayer];
+  }];
+  fade(ghost, 0, kStyle.crossfade, @(op));
+  [CATransaction commit];
+  snapTo(p.root, at);
+  snapTo(p.tag, tagAt);
+  popIn(p.root, 1, true);
+  if (p.tagShown) fade(p.tag, 1, kStyle.crossfade, @0);
 }
 
 // ---------- geometry ----------
@@ -512,12 +680,26 @@ Geo readGeo() {
 
 Place placeOf(const Peer& p, const Geo& g, double t) {
   Place pl;
-  if (!g.ok || !p.in || t - p.lastMsg > kStyle.staleAfter) return pl;
-  const double x = (p.t - g.t0) / g.spp;
+  if (!g.ok) return pl;
+  const bool live = p.in && t - p.lastMsg <= kStyle.staleAfter;
+  const bool parked = !live && !p.fxTrack.empty();
+  if (!live && !parked) return pl;
+  pl.parked = parked;
+  const std::string& guid = parked ? p.fxTrack : p.guid;
   double ty = 0, th = 0;
-  const bool found = !p.guid.empty() && g_host.trackSpan(p.guid.c_str(), &ty, &th);
+  const bool found = !guid.empty() && g_host.trackSpan(guid.c_str(), &ty, &th);
   const bool yKnown = found && th > 0;
-  const double y = yKnown ? ty + p.fy * th : 0;
+  double x = parked ? kStyle.parkInset : (p.t - g.t0) / g.spp;
+  double y = yKnown ? ty + (parked ? 0.5 : p.fy) * th : 0;
+  if (live && yKnown && p.predict && !g_reduceMotion) {
+    // Ahead along the velocity, but never further than predictMax and never
+    // off the track the pointer is on.
+    double dx = p.vt * kStyle.predictLead / g.spp, dy = p.vfy * kStyle.predictLead * th;
+    const double d = std::hypot(dx, dy);
+    if (d > kStyle.predictMax) dx *= kStyle.predictMax / d, dy *= kStyle.predictMax / d;
+    x += dx;
+    y = std::clamp(y + dy, ty, ty + th);
+  }
   const bool xIn = x >= 0 && x <= g.W;
   const bool yIn = yKnown && y >= 0 && y <= g.H;
   if (xIn && yIn) {
@@ -541,56 +723,92 @@ Place placeOf(const Peer& p, const Geo& g, double t) {
     pl.side = Side::Bottom;
     pl.p = CGPointMake(cx, g.H - in);
   }
+  // Which way the arrow in the pill points: from the pill to the real spot
+  // (straight out of the edge when the height is unknown).
+  const double ry = yKnown ? y : (pl.side == Side::Bottom ? g.H + 100 : pl.p.y);
+  pl.angle = std::atan2(ry - pl.p.y, x - pl.p.x);
+  if (!xIn && !yKnown) pl.angle = x < 0 ? M_PI : 0;
   return pl;
 }
 
 bool samePoint(CGPoint a, CGPoint b) { return std::fabs(a.x - b.x) < 0.01 && std::fabs(a.y - b.y) < 0.01; }
 
+// The name tag shows while the cursor moves, and always while it waits
+// beside an FX window.
+void updateTag(Peer& p, double t) {
+  const bool want = p.cursorShown && (p.parked || t - p.lastMove < kStyle.tagIdleAfter);
+  if (want == p.tagShown) return;
+  fade(p.tag, want ? 1 : 0, want ? kStyle.tagFadeIn : kStyle.tagFadeOut);
+  p.tagShown = want;
+}
+
 // Moves a peer's layers to where its spot is now. With a network update
-// pending they spring toward it; otherwise only the view moved and they snap
-// (glued). Returns whether the view moved them.
+// pending they spring toward it (or fade across on a long jump); otherwise
+// only the view moved and they snap (glued). Returns whether the view moved
+// them.
 bool layoutPeer(Peer& p, const Geo& g, double t) {
   const Place pl = placeOf(p, g, t);
   bool moved = false;
   const bool net = p.pendingSpring;
   p.pendingSpring = false;
+  if (pl.parked != p.parked) {
+    p.parked = pl.parked;
+    refreshTag(p);
+  }
 
   if (pl.kind == Place::Cursor) {
+    const CGPoint tagAt = CGPointMake(pl.p.x + kStyle.tagDX, pl.p.y + kStyle.tagDY);
     if (!p.cursorShown) {
       snapTo(p.root, pl.p);
-      fade(p.root, 1, kStyle.fadeIn);
+      snapTo(p.tag, tagAt);
+      popIn(p.root, 1);
       p.cursorShown = true;
       moved = true;
     } else if (!samePoint(pl.p, p.cursorModel)) {
-      if (net) springTo(p.root, p.cursorModel, pl.p);
-      else setPos(p.root, pl.p);
+      const double dist = std::hypot(pl.p.x - p.cursorModel.x, pl.p.y - p.cursorModel.y);
+      if (net && dist > kStyle.jumpCrossfade) {
+        crossfadeTo(p, pl.p, tagAt);
+      } else if (net && !g_reduceMotion) {
+        springTo(p.root, p.cursorModel, pl.p, kStyle.springStiffness);
+        springTo(p.tag, p.tagModel, tagAt, kStyle.tagStiffness);
+      } else {
+        setPos(p.root, pl.p);
+        setPos(p.tag, tagAt);
+      }
       moved = true;
     }
     p.cursorModel = pl.p;
+    p.tagModel = tagAt;
     if (p.pendingClick) ripple(p);
   } else if (p.cursorShown) {
-    fade(p.root, 0, kStyle.fadeOut);
+    popOut(p.root);
     p.cursorShown = false;
   }
   p.pendingClick = false;
+  updateTag(p, t);
 
   if (net) moved = false;
   if (pl.kind == Place::Edge) {
+    setEdgeAngle(p, pl.angle);
     if (!p.edgeShown || pl.side != p.edgeSide) {
       refreshEdge(p, pl.side);
       snapTo(p.edge, pl.p);
-      if (!p.edgeShown) fade(p.edge, kStyle.edgeOpacity, kStyle.fadeIn);
+      popIn(p.edge, kStyle.edgeOpacity, p.edgeShown);
       p.edgeShown = true;
       p.edgeSide = pl.side;
       moved = true;
-    } else if (!samePoint(pl.p, p.edgeModel)) {
-      if (net) springTo(p.edge, p.edgeModel, pl.p);
-      else setPos(p.edge, pl.p);
-      moved = !net;
+    } else {
+      refreshEdge(p, pl.side);
+      if (!samePoint(pl.p, p.edgeModel)) {
+        // Glides along the edge with the person.
+        if (net && !g_reduceMotion) springTo(p.edge, p.edgeModel, pl.p, kStyle.springStiffness);
+        else setPos(p.edge, pl.p);
+        moved = !net;
+      }
     }
     p.edgeModel = pl.p;
   } else if (p.edgeShown) {
-    fade(p.edge, 0, kStyle.fadeOut);
+    popOut(p.edge);
     p.edgeShown = false;
   }
   return moved;
@@ -614,13 +832,13 @@ void checkScale() {
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
   for (auto& [id, p] : g_peers) {
-    for (CALayer* l in @[ p.arrow, p.tag, p.tagText, p.edge, p.edgeText ]) l.contentsScale = s;
+    for (CALayer* l in @[ p.arrow, p.tag, p.tagText, p.edge, p.edgeText, p.edgeArrow ]) l.contentsScale = s;
   }
-  if (g_hoverTag) {
-    g_hoverTag.contentsScale = s;
-    g_hoverText.contentsScale = s;
-    g_hoverLabel.clear();
-  }
+  for (CALayer* l in @[ g_hoverTag ?: [CALayer layer], g_hoverText ?: [CALayer layer], g_followTag ?: [CALayer layer],
+                        g_followText ?: [CALayer layer] ])
+    l.contentsScale = s;
+  g_hoverLabel.clear();
+  g_followKey.clear();
   [CATransaction commit];
 }
 
@@ -629,10 +847,11 @@ void layoutMarks(const Geo& g);
 // The glue pass: every peer to its current pixel (`onlyPending`: just the
 // peers with a network update waiting).
 void glue(const char* why, bool onlyPending = false) {
-  if (!g_attached || (g_peers.empty() && g_marks.empty())) return;
+  if (!g_attached) return;
+  if (!NSEqualRects(g_view.frame, g_tv.bounds)) g_view.frame = g_tv.bounds;
+  if (g_peers.empty() && g_marks.empty()) return;
   const uint64_t a = mach_absolute_time();
   const double t = now();
-  if (!NSEqualRects(g_view.frame, g_tv.bounds)) g_view.frame = g_tv.bounds;
   checkScale();
   const Geo g = readGeo();
   if (!onlyPending) layoutMarks(g);
@@ -663,6 +882,14 @@ void onObserver() {
   }
   if (g_peers.empty() && g_marks.empty()) return;
   ++g_observerPasses;
+  // Updates stopped: the pointer came to rest, so take the prediction back.
+  const double t = now();
+  for (auto& [id, p] : g_peers)
+    if (p.predict && t - p.lastMsg > kStyle.predictStopAfter) {
+      p.predict = false;
+      p.vt = p.vfy = 0;
+      p.pendingSpring = true;
+    }
   if (g_sync == Sync::Commit) {
     glue("commit");
     return;
@@ -848,6 +1075,50 @@ NSPoint synthPoint(double t, int k, const Geo& g) {
                      g.H * (0.42 + 0.34 * std::sin(2 * M_PI * 0.17 * t + ph * 1.3)));
 }
 
+// REAMESH_CURSOR_DEMO=story: a scripted pointer showing every cursor state
+// in turn, on a 40s loop aligned to the wall clock (so a test script in the
+// same instance can open an FX window in step). Returns false while the
+// pointer is meant to be away from the arrange.
+bool storyPoint(const Geo& g, NSPoint* vp, bool* down) {
+  const double wall = [[NSDate date] timeIntervalSince1970];
+  const double ph = std::fmod(wall, 40.0);
+  static double lastPh = 0;
+  const bool clickNow = lastPh < 9.0 && ph >= 9.0;
+  lastPh = ph;
+  const double W = g.W, H = g.H;
+  auto lerp = [](double a, double b, double u) { return a + (b - a) * std::clamp(u, 0.0, 1.0); };
+  auto ease = [](double u) { u = std::clamp(u, 0.0, 1.0); return u * u * (3 - 2 * u); };
+  *down = false;
+  if (ph < 6) {  // gliding about
+    *vp = synthPoint(now(), 1, g);
+  } else if (ph < 8.5) {  // dragging: button held
+    const double u = ease((ph - 6) / 2.5);
+    *vp = NSMakePoint(lerp(0.30 * W, 0.46 * W, u), 0.36 * H);
+    *down = true;
+  } else if (ph < 9.5) {  // a click
+    *vp = NSMakePoint(0.46 * W, 0.36 * H);
+    if (clickNow) {
+      g_clickPending = true;
+      g_clickPoint = *vp;
+    }
+  } else if (ph < 12) {  // a long jump, then a little circling
+    const double a = (ph - 9.5) * 2.4;
+    *vp = NSMakePoint(0.82 * W + 30 * std::sin(a), 0.74 * H + 22 * std::cos(a));
+  } else if (ph < 17) {  // past the right edge, moving down the tracks
+    *vp = NSMakePoint(W * 1.25, lerp(0.15 * H, 0.85 * H, ease((ph - 12) / 5)));
+  } else if (ph < 19) {  // back in
+    const double u = ease((ph - 17) / 2);
+    *vp = NSMakePoint(lerp(W * 1.02, 0.6 * W, u), lerp(0.85 * H, 0.5 * H, u));
+  } else if (ph < 27) {  // resting
+    *vp = NSMakePoint(0.6 * W, 0.5 * H);
+  } else if (ph < 35) {  // away, editing an FX
+    return false;
+  } else {
+    *vp = synthPoint(now(), 1, g);
+  }
+  return true;
+}
+
 bool semanticAt(NSPoint vp, const Geo& g, double* tt, std::string* guid, double* fy) {
   if (!g.ok || !g_host.trackAt(vp.y, guid, fy)) return false;
   *tt = g.t0 + vp.x * g.spp;
@@ -1018,6 +1289,8 @@ bool attach(void* mainWindow, const Host& host) {
              : !strcmp(sync, "paint") ? Sync::Paint
                                       : Sync::Commit;
     g_demo = getenv("REAMESH_CURSOR_DEMO") ? std::max(1, atoi(getenv("REAMESH_CURSOR_DEMO"))) : 0;
+    g_story = getenv("REAMESH_CURSOR_DEMO") && !strcmp(getenv("REAMESH_CURSOR_DEMO"), "story");
+    if (const char* idle = getenv("REAMESH_CURSOR_IDLE")) g_idleDimAfter = std::max(0.5, atof(idle));
     g_fake = getenv("REAMESH_CURSOR_FAKE") ? atoi(getenv("REAMESH_CURSOR_FAKE")) : 0;
     if (const char* b = getenv("REAMESH_CURSOR_BUSY")) sscanf(b, "%lf:%lf", &g_busyMs, &g_busyEvery);
     g_scrollTest = getenv("REAMESH_CURSOR_SCROLLTEST") ? getenv("REAMESH_CURSOR_SCROLLTEST") : "";
@@ -1039,6 +1312,22 @@ bool attach(void* mainWindow, const Host& host) {
     g_markRoot.anchorPoint = CGPointZero;
     g_markRoot.geometryFlipped = NO;
     [root addSublayer:g_markRoot];
+    // The follow frame sits above the marks and below every cursor; it
+    // resizes with the view.
+    g_followFrame = [CALayer layer];
+    g_followFrame.frame = root.bounds;
+    g_followFrame.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+    g_followFrame.opacity = 0;
+    g_followTag = [CALayer layer];
+    g_followTag.anchorPoint = CGPointMake(1, 0);
+    g_followTag.autoresizingMask = kCALayerMinXMargin;
+    g_followTag.contentsScale = g_scale;
+    g_followText = [CATextLayer layer];
+    g_followText.contentsScale = g_scale;
+    [g_followTag addSublayer:g_followText];
+    [g_followFrame addSublayer:g_followTag];
+    [root addSublayer:g_followFrame];
+    g_reduceMotionChecked = 0;
 
     // Before Core Animation's commit (order 2000000): whatever REAPER did to
     // its view in this pass is on screen in the same frame as our layers.
@@ -1097,6 +1386,9 @@ void detach() {
     g_hoverShown = false;
     g_localIn = false;
     g_markRoot = nil;
+    g_followFrame = g_followTag = nil;
+    g_followText = nil;
+    g_followKey.clear();
     [g_view removeFromSuperview];
     g_view = nil;
     g_root = nil;
@@ -1112,11 +1404,72 @@ void setShowCursors(bool on) {
   g_showCursors = on;
   if (on || !g_attached) return;
   @autoreleasepool {
-    for (auto& [id, p] : g_peers) {
-      [p.root removeFromSuperlayer];
-      [p.edge removeFromSuperlayer];
-    }
+    for (auto& [id, p] : g_peers) dropLayers(p);
     g_peers.clear();
+  }
+}
+
+void setActivity(const std::vector<Activity>& list) {
+  if (!g_attached || !g_showCursors) return;
+  @autoreleasepool {
+    const double t = now();
+    std::map<std::string, const Activity*> by;
+    for (const Activity& a : list)
+      if (!a.id.empty() && !a.track.empty()) by.emplace(a.id, &a);
+    for (const auto& [id, a] : by) {
+      auto it = g_peers.find(id);
+      if (it == g_peers.end()) {
+        Peer p;
+        p.id = id;
+        p.name = a->name;
+        p.color = a->color;
+        it = g_peers.emplace(id, std::move(p)).first;
+        buildLayers(it->second);
+        refreshTag(it->second);
+      }
+      Peer& p = it->second;
+      p.fxAt = t;
+      if (p.fxTrack != a->track || p.fxLabel != a->label) {
+        p.fxTrack = a->track;
+        p.fxLabel = a->label;
+        p.pendingSpring = true;
+        p.tagLabel.clear();
+        p.edgeLabel.clear();
+        refreshTag(p);
+      }
+    }
+    for (auto& [id, p] : g_peers)
+      if (!by.count(id) && !p.fxTrack.empty()) {
+        p.fxTrack.clear();
+        p.fxLabel.clear();
+        p.pendingSpring = true;
+        p.tagLabel.clear();
+        p.edgeLabel.clear();
+        refreshTag(p);
+      }
+  }
+}
+
+void setFollow(const std::string& name, const std::string& color) {
+  if (!g_attached) return;
+  @autoreleasepool {
+    const std::string key = name.empty() ? "" : name + color;
+    if (key == g_followKey) return;
+    const bool was = !g_followKey.empty();
+    g_followKey = key;
+    if (key.empty()) {
+      if (was) fade(g_followFrame, 0, kStyle.fadeOut);
+      return;
+    }
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    g_followFrame.frame = g_root.bounds;
+    g_followFrame.borderWidth = kStyle.followLine;
+    g_followFrame.borderColor = parseColor(color).CGColor;
+    [CATransaction commit];
+    setPill(g_followTag, g_followText, name, color, kStyle.tagFont, kStyle.tagHeight, kStyle.tagPadX);
+    setPos(g_followTag, CGPointMake(g_root.bounds.size.width - kStyle.followTagInset, kStyle.followTagInset));
+    if (!was) fade(g_followFrame, kStyle.followOpacity, kStyle.fadeIn * 2);
   }
 }
 
@@ -1190,6 +1543,17 @@ void update(const Remote& r) {
     if (!r.name.empty()) p.name = r.name;
     refreshTag(p);
     const bool moved = r.t != p.t || r.guid != p.guid || r.fy != p.fy || r.in != p.in;
+    // Velocity for the prediction, only between close updates on one track.
+    const double dt = t - p.lastMsg;
+    if (r.in && p.in && r.guid == p.guid && dt > 0.004 && dt < 0.25) {
+      p.vt = 0.5 * p.vt + 0.5 * (r.t - p.t) / dt;
+      p.vfy = 0.5 * p.vfy + 0.5 * (r.fy - p.fy) / dt;
+      p.predict = moved;
+    } else {
+      p.vt = p.vfy = 0;
+      p.predict = false;
+    }
+    setPressed(p, r.in && r.down);
     p.t = r.t;
     p.fy = r.fy;
     p.guid = r.guid;
@@ -1211,22 +1575,29 @@ void tick() {
     fakeTick();
     parkTick();
     const double t = now();
+    if (t - g_reduceMotionChecked > 2) {
+      g_reduceMotionChecked = t;
+      g_reduceMotion = getenv("REAMESH_CURSOR_REDUCE_MOTION") ||
+                       NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion;
+    }
     // Network updates land here, with a spring; in timer mode the view glue
     // rides along. In commit mode the observer would also catch them before
     // this pass commits.
     glue("tick", g_sync != Sync::Timer);
     for (auto it = g_peers.begin(); it != g_peers.end();) {
       Peer& p = it->second;
-      if (t - p.lastMsg > kStyle.forgetAfter) {
-        [p.root removeFromSuperlayer];
-        [p.edge removeFromSuperlayer];
+      if (t - std::max(p.lastMsg, p.fxAt) > kStyle.forgetAfter) {
+        dropLayers(p);
         it = g_peers.erase(it);
         continue;
       }
-      const bool wantTag = t - p.lastMove < kStyle.tagIdleAfter;
-      if (wantTag != p.tagShown) {
-        fade(p.tag, wantTag ? 1 : 0, wantTag ? kStyle.tagFadeIn : kStyle.tagFadeOut);
-        p.tagShown = wantTag;
+      updateTag(p, t);
+      // A cursor resting a while dims to half; waiting beside an FX window is
+      // not resting.
+      const bool idle = p.cursorShown && !p.parked && t - p.lastMove > g_idleDimAfter;
+      if (idle != p.idle) {
+        fade(p.arrow, idle ? kStyle.idleOpacity : 1, idle ? kStyle.idleFade : kStyle.fadeIn);
+        p.idle = idle;
       }
       ++it;
     }
@@ -1255,8 +1626,11 @@ bool sampleLocal(Local* out) {
       g_localPoint = vp;
       if (!g_marks.empty() || g_hoverShown) layoutHover();
     }
+    bool down = over && ([NSEvent pressedMouseButtons] & 1);
     double it0 = 0, it1 = 0, iy = 0, ih = 0;
-    if (const char* item = getenv("REAMESH_CURSOR_DEMO_ITEM");
+    if (g_story) {
+      over = storyPoint(g, &vp, &down);
+    } else if (const char* item = getenv("REAMESH_CURSOR_DEMO_ITEM");
         g_demo && item && g_host.itemSpan && g_host.itemSpan(item, &it0, &it1, &iy, &ih)) {
       // Rides on an item, as if dragging it.
       const double w = 0.06 * std::sin(2 * M_PI * 0.7 * now());
@@ -1278,6 +1652,7 @@ bool sampleLocal(Local* out) {
       ++g_clicksOut;
     }
     out->in = semanticAt(vp, g, &out->t, &out->guid, &out->fy);
+    out->down = out->in && down;
     if (g_trace && out->in)
       fprintf(stderr, "[trace] tx %.3f %.9f\n", [[NSDate date] timeIntervalSince1970] * 1000, out->t);
     out->px = vp.x;

@@ -8,6 +8,8 @@ void detach() {}
 bool draws() { return false; }
 void setShowCursors(bool) {}
 void update(const Remote&) {}
+void setActivity(const std::vector<Activity>&) {}
+void setFollow(const std::string&, const std::string&) {}
 void setMarks(const std::vector<Mark>&) {}
 void tick() {}
 bool sampleLocal(Local*) { return false; }

@@ -123,6 +123,8 @@
 // Peer cursors and edit marks in the arrange (cursor_overlay.h).
 #define REAPERAPI_WANT_GetMainHwnd
 #define REAPERAPI_WANT_ValidatePtr2
+#define REAPERAPI_WANT_TrackFX_GetFXName
+#define REAPERAPI_WANT_TakeFX_GetFXName
 #define REAPERAPI_WANT_UpdateTimeline
 #define REAPERAPI_WANT_CSurf_OnScroll
 #define REAPERAPI_WANT_MarkProjectDirty
@@ -5747,6 +5749,7 @@ static void cursorPump() {
         r.fy = jsonNum(c, "fy", 0.0);
         r.in = jsonBool(c, "in", false);
         r.click = jsonBool(c, "click", false);
+        r.down = jsonBool(c, "down", false);
         cursor_overlay::update(r);
       }
   }
@@ -5764,16 +5767,69 @@ static void cursorPump() {
     l = cursor_overlay::Local{};
   }
   const auto since = now - lastSent;
-  const bool changed = l.in != last.in ||
+  const bool changed = l.in != last.in || l.down != last.down ||
                        (l.in && (std::fabs(l.px - last.px) >= 1 || std::fabs(l.py - last.py) >= 1 ||
                                  l.guid != last.guid || l.t != last.t));
   const bool send = l.click || (changed && since >= std::chrono::milliseconds(33)) ||
                     (l.in && since >= std::chrono::seconds(3));
   if (!send) return;
-  const json m = {{"t", l.t}, {"g", l.guid}, {"fy", l.fy}, {"in", l.in}, {"click", l.click}};
+  const json m = {{"t", l.t}, {"g", l.guid}, {"fy", l.fy}, {"in", l.in}, {"click", l.click}, {"down", l.down}};
   reamesh_send_cursor(g_handle, dumpJson(m).c_str());
   last = l;
   lastSent = now;
+}
+
+// A plug-in's name as people know it: "VST3: Pro-Q 3 (FabFilter)" -> "Pro-Q 3".
+static std::string shortFxName(std::string n) {
+  if (const auto c = n.find(": "); c != std::string::npos && c <= 5) n = n.substr(c + 2);
+  if (n.size() > 2 && n.back() == ')')
+    if (const auto o = n.rfind(" ("); o != std::string::npos && o > 0) n.erase(o);
+  return n;
+}
+
+// From everyone's presence, a few times a second: whose FX window is open on
+// which track (their cursor waits beside it while they are away from the
+// arrange), and the person we follow (a frame round the arrange).
+static void cursorPresence() {
+  static auto last = std::chrono::steady_clock::time_point{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::milliseconds(250)) return;
+  last = now;
+  const json peers = handleJson(reamesh_peers, json::array());
+  std::vector<cursor_overlay::Activity> acts;
+  std::string followName, followColor;
+  if (peers.is_array())
+    for (const auto& p : peers) {
+      if (!p.is_object() || jsonBool(p, "is_self", false)) continue;
+      const std::string id = jsonStr(p, "id");
+      if (!g_followPeer.empty() && id == g_followPeer) {
+        followName = jsonStr(p, "name");
+        followColor = jsonStr(p, "color");
+        if (followName.empty()) followName = id.size() > 6 ? id.substr(id.size() - 6) : id;
+      }
+      const json fx = p.contains("fx") && p["fx"].is_object() ? p["fx"] : json();
+      if (fx.is_null()) continue;
+      MediaTrack* tr = cursorTrack(jsonStr(fx, "track"));
+      if (!tr) continue;
+      const int idx = static_cast<int>(jsonNum(fx, "fx", -1));
+      char name[256] = {};
+      if (const std::string item = jsonStr(fx, "item"); !item.empty()) {
+        MediaItem* it = cursorItem(item);
+        MediaItem_Take* take = it ? GetMediaItemTake(it, static_cast<int>(jsonNum(fx, "take", 0))) : nullptr;
+        if (!take || !TakeFX_GetFXName(take, idx, name, sizeof name)) continue;
+      } else if (!TrackFX_GetFXName(tr, idx, name, sizeof name)) {
+        continue;
+      }
+      cursor_overlay::Activity a;
+      a.id = id;
+      a.name = jsonStr(p, "name");
+      a.color = jsonStr(p, "color");
+      a.track = jsonStr(fx, "track");
+      a.label = shortFxName(name);
+      acts.push_back(std::move(a));
+    }
+  cursor_overlay::setActivity(acts);
+  cursor_overlay::setFollow(followName, followColor);
 }
 
 static void cursorTick() {
@@ -5785,6 +5841,7 @@ static void cursorTick() {
     if (!g_cursorAttached) return;
   }
   cursorPump();
+  cursorPresence();
   cursor_overlay::tick();
 }
 
