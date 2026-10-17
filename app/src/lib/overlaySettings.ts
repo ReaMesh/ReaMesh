@@ -25,6 +25,11 @@ export interface OverlaySettings {
   /** Keep the HUD where the user dragged it across relaunches. Bit 4: the
    *  retired peer-playheads toggle (on by default), so it starts out on. */
   rememberPos: boolean;
+  /** Other people's mouse cursors, drawn by the extension inside REAPER.
+   *  Stored inverted as bit 32. */
+  cursors: boolean;
+  /** Send our own cursor to the others. Stored inverted as bit 64. */
+  shareCursor: boolean;
 }
 
 const KEY = "reamesh.overlay";
@@ -34,31 +39,36 @@ const DEFAULTS: OverlaySettings = {
   roster: true,
   tint: true,
   rememberPos: true,
+  cursors: true,
+  shareCursor: true,
 };
 
 // Bit layout: must match the Rust `OVERLAY_ALL` mask. Bit 8 (time-selection)
-// is retired. Bit 16 is set when the HUD is switched off (inverted, see `hud`).
-const BITS: Record<Exclude<keyof OverlaySettings, "hud">, number> = {
+// is retired. The INVERTED bits are set when their setting is off, so
+// existing installs (which never wrote them) have those settings on.
+type Key = keyof OverlaySettings;
+const BITS: Partial<Record<Key, number>> = {
   roster: 1,
   tint: 2,
   rememberPos: 4,
 };
-const HUD_HIDDEN = 16;
+const INVERTED: Partial<Record<Key, number>> = {
+  hud: 16,
+  cursors: 32,
+  shareCursor: 64,
+};
 
 function maskToSettings(mask: number): OverlaySettings {
-  return {
-    hud: !(mask & HUD_HIDDEN),
-    roster: !!(mask & BITS.roster),
-    tint: !!(mask & BITS.tint),
-    rememberPos: !!(mask & BITS.rememberPos),
-  };
+  const s = { ...DEFAULTS };
+  for (const [k, bit] of Object.entries(BITS) as [Key, number][]) s[k] = !!(mask & bit);
+  for (const [k, bit] of Object.entries(INVERTED) as [Key, number][]) s[k] = !(mask & bit);
+  return s;
 }
 
 function settingsToMask(s: OverlaySettings): number {
-  let m = s.hud ? 0 : HUD_HIDDEN;
-  for (const k of Object.keys(BITS) as (keyof typeof BITS)[]) {
-    if (s[k]) m |= BITS[k];
-  }
+  let m = 0;
+  for (const [k, bit] of Object.entries(BITS) as [Key, number][]) if (s[k]) m |= bit;
+  for (const [k, bit] of Object.entries(INVERTED) as [Key, number][]) if (!s[k]) m |= bit;
   return m;
 }
 

@@ -51,12 +51,14 @@ const SOURCE_URL = "https://github.com/ReaMesh/ReaMesh";
 type BuildInfo = { commit: string; buildTime: number; release: boolean };
 
 // `hud` rows only mean something while the HUD is shown and grey out without it.
-// The tint is drawn by REAPER itself, so it stays independent.
+// Marks and cursors are drawn inside REAPER, so they stay independent.
 const OVERLAY_TOGGLES: { key: keyof OverlaySettings; label: () => string; hud?: true }[] = [
   { key: "hud", label: () => t("olShow") },
   { key: "roster", label: () => t("olRoster"), hud: true },
   { key: "rememberPos", label: () => t("olRememberPos"), hud: true },
   { key: "tint", label: () => t("olItemTint") },
+  { key: "cursors", label: () => t("olCursors") },
+  { key: "shareCursor", label: () => t("olShareCursor") },
 ];
 
 /** A settings row: label (and optional status line) left, one control right. */

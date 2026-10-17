@@ -52,12 +52,15 @@ enum {
 // Bit 2 was the retired "activity feed" toggle; it now drives the locked-item
 // tint. Bit 4 (once peer playheads) is "remember HUD position". Bit 8
 // (time-selection) is retired. Bit 16 is set when the HUD is switched off
-// altogether (inverted, so existing installs keep it on).
+// altogether, bit 32 when other people's cursors are hidden in REAPER and bit
+// 64 when ours is not shared (all inverted, so existing installs keep them on).
 enum {
     kReaMeshOverlayRoster = 1,
     kReaMeshOverlayTint = 2,
     kReaMeshOverlayRememberPos = 4,
     kReaMeshOverlayHidden = 16,
+    kReaMeshOverlayCursorsHidden = 32,
+    kReaMeshOverlayCursorPrivate = 64,
 };
 
 // Callbacks the native window uses to read state and act. `ctx` is an opaque

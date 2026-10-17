@@ -187,6 +187,12 @@ static ReaMeshSettingsController *gController = nil;
     }
 }
 
+// Bits stored inverted, so that existing installs have them on.
+static BOOL overlayBitInverted(int32_t bit) {
+    return bit == kReaMeshOverlayHidden || bit == kReaMeshOverlayCursorsHidden ||
+           bit == kReaMeshOverlayCursorPrivate;
+}
+
 // The floating presence overlay's visibility toggles. The source of truth is
 // backend-side (a bitmask); each checkbox flips its bit and the change is
 // pushed to the live overlay webview via the set_overlay callback.
@@ -213,13 +219,18 @@ static ReaMeshSettingsController *gController = nil;
     int32_t mask = self.cb.get_overlay(self.cb.ctx);
     BOOL shown = !(mask & kReaMeshOverlayHidden);
     // The first row is the HUD itself; the HUD-only rows grey out while it is
-    // off. The tint is drawn by REAPER, not the HUD, so it stays independent.
+    // off. Marks and cursors are drawn inside REAPER, not the HUD, so they stay
+    // independent.
     NSArray *rows = @[
         @[ @(kReaMeshOverlayHidden), L(@"Show overlay", @"Overlay anzeigen"), @NO ],
         @[ @(kReaMeshOverlayRoster), L(@"Participants", @"Teilnehmende"), @YES ],
         @[ @(kReaMeshOverlayRememberPos), L(@"Remember HUD position", @"HUD-Position merken"),
            @YES ],
-        @[ @(kReaMeshOverlayTint), L(@"Tint locked items", @"Gesperrte Items einfärben"), @NO ],
+        @[ @(kReaMeshOverlayTint), L(@"Mark locked items", @"Gesperrte Items markieren"), @NO ],
+        @[ @(kReaMeshOverlayCursorsHidden),
+           L(@"Show others' cursors", @"Mauszeiger der anderen anzeigen"), @NO ],
+        @[ @(kReaMeshOverlayCursorPrivate), L(@"Share my cursor", @"Meinen Mauszeiger teilen"),
+           @NO ],
     ];
     for (NSArray *row in rows) {
         int32_t bit = (int32_t)[row[0] integerValue];
@@ -227,7 +238,7 @@ static ReaMeshSettingsController *gController = nil;
                                             target:self
                                             action:@selector(overlayToggled:)];
         cb.tag = bit;
-        BOOL on = bit == kReaMeshOverlayHidden ? shown : (mask & bit) != 0;
+        BOOL on = ((mask & bit) != 0) != overlayBitInverted(bit);
         cb.state = on ? NSControlStateValueOn : NSControlStateValueOff;
         cb.enabled = ![row[2] boolValue] || shown;
         cb.frame = NSMakeRect(kMargin, y, w, 22);
@@ -368,8 +379,8 @@ static ReaMeshSettingsController *gController = nil;
 - (void)overlayToggled:(NSButton *)sender {
     int32_t mask = self.cb.get_overlay(self.cb.ctx);
     int32_t bit = (int32_t)sender.tag;
-    // The HUD bit is stored inverted ("hidden").
-    BOOL set = (sender.state == NSControlStateValueOn) != (bit == kReaMeshOverlayHidden);
+    // Some bits are stored inverted ("hidden").
+    BOOL set = (sender.state == NSControlStateValueOn) != overlayBitInverted(bit);
     if (set) {
         mask |= bit;
     } else {

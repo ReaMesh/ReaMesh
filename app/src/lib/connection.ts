@@ -89,6 +89,7 @@ function attach(port: number, ws: WebSocket) {
     ensureActive();
     sendProfile(port);
     sendTint(port);
+    sendCursors(port);
     emit();
   };
   ws.onmessage = (ev) => {
@@ -148,19 +149,33 @@ export function startScanning() {
   const scan = () => PORTS.forEach(connect);
   scan();
   setInterval(scan, RETRY_MS);
-  // The lock tint is painted by the extension, so push the toggle to every
-  // connected instance whenever it changes (the initial value rides ws.onopen).
+  // Lock marks and cursors are drawn by the extension, so push those toggles to
+  // every connected instance whenever they change (the initial values ride
+  // ws.onopen).
   subscribeOverlaySettings(() => {
-    const tint = getOverlaySettings().tint;
-    if (tint === lastTintSent) return;
-    lastTintSent = tint;
-    for (const p of sockets.keys()) sendTint(p);
+    const { tint, cursors, shareCursor } = getOverlaySettings();
+    if (tint !== lastTintSent) {
+      lastTintSent = tint;
+      for (const p of sockets.keys()) sendTint(p);
+    }
+    const c = `${cursors}:${shareCursor}`;
+    if (c !== lastCursorsSent) {
+      lastCursorsSent = c;
+      for (const p of sockets.keys()) sendCursors(p);
+    }
   });
 }
 
 let lastTintSent: boolean | null = null;
+let lastCursorsSent: string | null = null;
 
-/** Tell the extension whether to paint the dark-grey lock tint. */
+/** Tell the extension whether to show and share mouse cursors in REAPER. */
+export function sendCursors(port: number) {
+  const { cursors, shareCursor } = getOverlaySettings();
+  send({ cmd: "set_cursors", show: cursors, share: shareCursor }, port);
+}
+
+/** Tell the extension whether to mark items someone else is editing. */
 export function sendTint(port?: number) {
   const cmd = { cmd: "set_tint", on: getOverlaySettings().tint };
   if (port !== undefined) {
