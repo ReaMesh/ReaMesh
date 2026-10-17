@@ -1473,6 +1473,26 @@ fn cursor_round_trip(pass: &str) {
     assert_eq!(o["click"], false);
     assert_eq!(o["down"], false);
 
+    // Where someone works away from the arrange, and a drag preview; unknown
+    // kinds and empty drags are dropped.
+    let items: Vec<String> = (0..20).map(|i| format!("{{I{i}}}")).collect();
+    let rich = serde_json::json!({
+        "t": 3, "g": "{T1}", "fy": 0.5, "in": false,
+        "away": { "k": "midi", "g": "{T1}", "i": "{I1}", "l": "x".repeat(100) },
+        "drag": { "dt": 1.5, "dtr": -2, "items": items },
+    });
+    assert!(owner.send_cursor(&rich.to_string()));
+    let r = next_cursor(&client).expect("rich cursor never arrived");
+    assert_eq!(r["away"]["k"], "midi");
+    assert_eq!(r["away"]["i"], "{I1}");
+    assert_eq!(r["away"]["l"].as_str().unwrap().len(), 64);
+    assert_eq!(r["drag"]["dt"], 1.5);
+    assert_eq!(r["drag"]["dtr"], -2);
+    assert_eq!(r["drag"]["items"].as_array().unwrap().len(), 16);
+    assert!(owner.send_cursor(r#"{"in":true,"away":{"k":"nope"},"drag":{"items":[]}}"#));
+    let r = next_cursor(&client).expect("plain cursor never arrived");
+    assert!(r["away"].is_null() && r["drag"].is_null());
+
     // Garbage is refused before it reaches the wire.
     assert!(!owner.send_cursor("not json"));
 

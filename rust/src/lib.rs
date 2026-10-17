@@ -170,9 +170,10 @@ const PRESENCE_FAST_INTERVAL: Duration = Duration::from_millis(100);
 /// sender's peer id), so open-topic bystanders can't inject markers.
 const TAG_MARKER: u8 = b'M';
 /// Live mouse cursor over the arrange: `'C'` + JSON
-/// `{"t","g","fy","in","click","down","mac"}` (project seconds, track GUID,
-/// 0..1 within the track, false once the mouse left the arrange, a press at
-/// this spot, the button held). Sent at most ~30
+/// `{"t","g","fy","in","click","down","away","drag","mac"}` (project seconds,
+/// track GUID, 0..1 within the track, false once the mouse left the arrange, a
+/// press at this spot, the button held; see `sanitize_cursor_away` and
+/// `sanitize_cursor_drag` for the last two). Sent at most ~30
 /// times a second and only while it changes (plus a keep-alive every few
 /// seconds); receivers queue them for the in-REAPER cursor layer. MAC'd like a
 /// beacon. Additive: builds without it drop the unknown tag unread (the
@@ -820,6 +821,52 @@ fn sanitize_sel(v: Option<&JsonValue>) -> Vec<String> {
 /// Bound a beacon's `fx` field to the known keys with their expected types
 /// (`track`/`item` GUID strings, `take`/`fx` integers, `float` bool). Anything
 /// else, or a missing track, collapses to Null (= no FX window).
+/// Largest cursor message accepted (a drag preview lists up to
+/// `CURSOR_DRAG_MAX` item GUIDs).
+const CURSOR_MAX_BYTES: usize = 2048;
+const CURSOR_DRAG_MAX: usize = 16;
+
+/// Where someone works while their mouse is away from the arrange:
+/// `{"k":"fx"|"midi"|"mixer"|"tcp","g":track GUID,"i":item GUID,"l":label}`
+/// (null when nowhere we can show).
+fn sanitize_cursor_away(v: Option<&JsonValue>) -> JsonValue {
+    let Some(o) = v.and_then(|x| x.as_object()) else {
+        return JsonValue::Null;
+    };
+    let s = |k: &str| o.get(k).and_then(|x| x.as_str()).unwrap_or("").chars().take(64).collect::<String>();
+    let k = s("k");
+    if !matches!(k.as_str(), "fx" | "midi" | "mixer" | "tcp") {
+        return JsonValue::Null;
+    }
+    json!({ "k": k, "g": s("g"), "i": s("i"), "l": s("l") })
+}
+
+/// An item drag in progress: `{"dt": seconds moved, "dtr": tracks moved,
+/// "items": [item GUIDs]}` (null when not dragging).
+fn sanitize_cursor_drag(v: Option<&JsonValue>) -> JsonValue {
+    let Some(o) = v.and_then(|x| x.as_object()) else {
+        return JsonValue::Null;
+    };
+    let items: Vec<String> = o
+        .get("items")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .filter(|x| !x.is_empty())
+                .take(CURSOR_DRAG_MAX)
+                .map(|x| x.chars().take(64).collect())
+                .collect()
+        })
+        .unwrap_or_default();
+    if items.is_empty() {
+        return JsonValue::Null;
+    }
+    let dt = o.get("dt").and_then(|x| x.as_f64()).filter(|x| x.is_finite()).unwrap_or(0.0);
+    let dtr = o.get("dtr").and_then(|x| x.as_i64()).unwrap_or(0).clamp(-1000, 1000);
+    json!({ "dt": dt, "dtr": dtr, "items": items })
+}
+
 fn sanitize_fx(v: Option<&JsonValue>) -> JsonValue {
     let Some(o) = v.and_then(|x| x.as_object()) else {
         return JsonValue::Null;
@@ -2374,6 +2421,8 @@ impl Reamesh {
             "in": v.get("in").and_then(|x| x.as_bool()).unwrap_or(false),
             "click": v.get("click").and_then(|x| x.as_bool()).unwrap_or(false),
             "down": v.get("down").and_then(|x| x.as_bool()).unwrap_or(false),
+            "away": sanitize_cursor_away(v.get("away")),
+            "drag": sanitize_cursor_drag(v.get("drag")),
         });
         self.cmd_tx.send(Command::Cursor(body)).is_ok()
     }
@@ -5533,7 +5582,7 @@ async fn run_network(
                                 }
                             }
                             (Some(&TAG_CURSOR), _) => {
-                                if plain.len() <= 1024
+                                if plain.len() <= CURSOR_MAX_BYTES
                                     && let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..])
                                 {
                                     let mac = v.get("mac").and_then(|x| x.as_str()).unwrap_or("");
@@ -5569,6 +5618,8 @@ async fn run_network(
                                         "in": v.get("in").and_then(|x| x.as_bool()).unwrap_or(false),
                                         "click": v.get("click").and_then(|x| x.as_bool()).unwrap_or(false),
                                         "down": v.get("down").and_then(|x| x.as_bool()).unwrap_or(false),
+                                        "away": sanitize_cursor_away(v.get("away")),
+                                        "drag": sanitize_cursor_drag(v.get("drag")),
                                     }));
                                 }
                             }
