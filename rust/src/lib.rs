@@ -170,8 +170,9 @@ const PRESENCE_FAST_INTERVAL: Duration = Duration::from_millis(100);
 /// sender's peer id), so open-topic bystanders can't inject markers.
 const TAG_MARKER: u8 = b'M';
 /// Live mouse cursor over the arrange: `'C'` + JSON
-/// `{"t","g","fy","in","click","mac"}` (project seconds, track GUID, 0..1
-/// within the track, false once the mouse left the arrange). Sent at most ~30
+/// `{"t","g","fy","in","click","down","mac"}` (project seconds, track GUID,
+/// 0..1 within the track, false once the mouse left the arrange, a press at
+/// this spot, the button held). Sent at most ~30
 /// times a second and only while it changes (plus a keep-alive every few
 /// seconds); receivers queue them for the in-REAPER cursor layer. MAC'd like a
 /// beacon. Additive: builds without it drop the unknown tag unread (the
@@ -2372,12 +2373,13 @@ impl Reamesh {
             "fy": num("fy").unwrap_or(0.0).clamp(0.0, 1.0),
             "in": v.get("in").and_then(|x| x.as_bool()).unwrap_or(false),
             "click": v.get("click").and_then(|x| x.as_bool()).unwrap_or(false),
+            "down": v.get("down").and_then(|x| x.as_bool()).unwrap_or(false),
         });
         self.cmd_tx.send(Command::Cursor(body)).is_ok()
     }
 
     /// Cursor updates received since the last call, oldest first, as
-    /// `[{"by","name","color","t","g","fy","in","click"}]` ("[]" when none).
+    /// `[{"by","name","color","t","g","fy","in","click","down"}]` ("[]" when none).
     pub fn drain_cursors(&self) -> String {
         let drained: Vec<JsonValue> =
             std::mem::take(&mut *self.shared.cursor_inbox.lock().unwrap());
@@ -5566,6 +5568,7 @@ async fn run_network(
                                         "fy": num("fy").clamp(0.0, 1.0),
                                         "in": v.get("in").and_then(|x| x.as_bool()).unwrap_or(false),
                                         "click": v.get("click").and_then(|x| x.as_bool()).unwrap_or(false),
+                                        "down": v.get("down").and_then(|x| x.as_bool()).unwrap_or(false),
                                     }));
                                 }
                             }

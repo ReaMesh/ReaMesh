@@ -1444,7 +1444,7 @@ fn cursor_round_trip(pass: &str) {
 
     // Out of range values are clamped and an overlong GUID is cut by the sender.
     let long_guid = format!("{{{}}}", "A".repeat(100));
-    let sent = serde_json::json!({ "t": 12.5, "g": long_guid, "fy": 1.7, "in": true, "click": true });
+    let sent = serde_json::json!({ "t": 12.5, "g": long_guid, "fy": 1.7, "in": true, "click": true, "down": true });
     // Gossip needs a moment after the mesh forms; resend until one lands.
     let mut c = None;
     for _ in 0..10 {
@@ -1460,6 +1460,7 @@ fn cursor_round_trip(pass: &str) {
     assert_eq!(c["fy"], 1.0);
     assert_eq!(c["in"], true);
     assert_eq!(c["click"], true);
+    assert_eq!(c["down"], true);
     assert_eq!(c["g"].as_str().unwrap().chars().count(), 64);
     assert!(c["color"].as_str().unwrap().starts_with('#'));
     assert!(c.get("mac").is_none(), "the MAC is not handed to the extension");
@@ -1470,6 +1471,7 @@ fn cursor_round_trip(pass: &str) {
     assert_eq!(o["by"], serde_json::json!(client_id));
     assert_eq!(o["in"], false);
     assert_eq!(o["click"], false);
+    assert_eq!(o["down"], false);
 
     // Garbage is refused before it reaches the wire.
     assert!(!owner.send_cursor("not json"));
