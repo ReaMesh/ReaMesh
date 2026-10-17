@@ -2589,13 +2589,13 @@ static void captureLocalChanges(bool force) {
   // theirs), so a full re-diff also runs unconditionally on a rescan cadence:
   // the gate is a latency optimization, never a correctness dependency.
   //
-  // Both cadences adapt to what a capture actually costs here (EMA over the
-  // measured serialize+diff time): a small project keeps the snappy 250ms /
-  // 2s floors, a huge one stretches toward the ceilings so capture stays a
-  // bounded slice (~1/8th) of main-thread time instead of making REAPER's UI
-  // choppy. Latency degrades gracefully; correctness never depends on it.
-  // ((std::max)) defeats SWELL's max/min macros.
-  const auto minGap = (std::max)(std::chrono::milliseconds(250), g_captureCost * 8);
+  // An edit is captured on the next timer tick. Only an expensive capture
+  // brakes the rate (EMA over the measured serialize+diff time), so a huge
+  // project keeps capture a bounded share (~1/5th at most) of main-thread
+  // time instead of making REAPER's UI choppy; the rescan cadence stretches
+  // from 2s toward 10s the same way. Latency degrades gracefully; correctness
+  // never depends on either. ((std::min)) defeats SWELL's max/min macros.
+  const auto minGap = (std::min)(g_captureCost * 4, std::chrono::milliseconds(500));
   const auto rescanGap = (std::clamp)(g_captureCost * 20, std::chrono::milliseconds(2000),
                                       std::chrono::milliseconds(10000));
   const bool counterMoved = cc != g_lastChangeCount;
@@ -2605,7 +2605,7 @@ static void captureLocalChanges(bool force) {
   // it only commits when the button is let go: a rescan now would send a
   // half-finished state. The release bumps the counter anyway.
   if (!counterMoved && cursor_overlay::mouseHeld()) return;
-  // Chunk serialization isn't free; cap capture rate (sync target is ~1s).
+  // Chunk serialization isn't free: brake only what costs (minGap above).
   if (!force && !rescanDue && now - g_lastCapture < minGap) return;
   g_lastCapture = now;
   g_lastFullScan = now;
