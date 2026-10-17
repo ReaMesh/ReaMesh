@@ -179,6 +179,13 @@ const TAG_MARKER: u8 = b'M';
 /// beacon. Additive: builds without it drop the unknown tag unread (the
 /// receive match's catch-all), so it needs no `PROTO` bump.
 const TAG_CURSOR: u8 = b'C';
+/// Live values while someone is in the middle of a gesture (dragging a fader,
+/// turning a plug-in knob): `'V'` + JSON `{"tracks":{guid:{"vol","pan",
+/// "width"}|{"end":true}},"fx":{"g","fx","p","v"},"mac"}`. A preview only:
+/// receivers show it and keep it out of their own capture; the real value
+/// arrives as a normal edit when the gesture ends. Sent at most ~30 times a
+/// second while values change. MAC'd like a beacon; additive like 'C'.
+const TAG_LIVE: u8 = b'V';
 /// If the extension's main-thread presence feed (`set_presence`, called every
 /// timer tick) has been silent this long while the network thread still runs,
 /// REAPER's main thread is stuck (modal dialog, plugin hang): the beacon
@@ -628,6 +635,8 @@ struct Shared {
     /// Cursor updates received from peers ('C' messages), oldest first,
     /// drained by the extension's cursor layer.
     cursor_inbox: Mutex<Vec<JsonValue>>,
+    /// Live gesture values received (`TAG_LIVE`), oldest first, capped.
+    live_inbox: Mutex<Vec<JsonValue>>,
     /// Peer ids currently banned from this session: on the owner a mirror of
     /// the process-global ban table (refreshed every tick; the tick's diff
     /// against it is what triggers the blacklist + 'B' broadcast), on a
@@ -865,6 +874,59 @@ fn sanitize_cursor_drag(v: Option<&JsonValue>) -> JsonValue {
     let dt = o.get("dt").and_then(|x| x.as_f64()).filter(|x| x.is_finite()).unwrap_or(0.0);
     let dtr = o.get("dtr").and_then(|x| x.as_i64()).unwrap_or(0).clamp(-1000, 1000);
     json!({ "dt": dt, "dtr": dtr, "items": items })
+}
+
+/// Largest live-values message accepted, and how many tracks one may carry.
+const LIVE_MAX_BYTES: usize = 8192;
+const LIVE_TRACKS_MAX: usize = 64;
+
+/// Keep only well-formed live values: per track any of `vol` (0..1e6), `pan`
+/// and `width` (-1..1), or `end`; one FX parameter `{"g","fx","p","v"}` with
+/// `v` in 0..1. Returns `{}` when nothing is left.
+fn sanitize_live(v: &JsonValue) -> JsonValue {
+    let num = |o: &serde_json::Map<String, JsonValue>, k: &str, lo: f64, hi: f64| {
+        o.get(k).and_then(|x| x.as_f64()).filter(|x| x.is_finite()).map(|x| x.clamp(lo, hi))
+    };
+    let mut out = serde_json::Map::new();
+    if let Some(tracks) = v.get("tracks").and_then(|x| x.as_object()) {
+        let mut t = serde_json::Map::new();
+        for (guid, vals) in tracks.iter().take(LIVE_TRACKS_MAX) {
+            let Some(o) = vals.as_object() else { continue };
+            if guid.is_empty() || guid.len() > 64 {
+                continue;
+            }
+            let mut e = serde_json::Map::new();
+            if o.get("end").and_then(|x| x.as_bool()) == Some(true) {
+                e.insert("end".into(), json!(true));
+            } else {
+                if let Some(x) = num(o, "vol", 0.0, 1e6) {
+                    e.insert("vol".into(), json!(x));
+                }
+                if let Some(x) = num(o, "pan", -1.0, 1.0) {
+                    e.insert("pan".into(), json!(x));
+                }
+                if let Some(x) = num(o, "width", -1.0, 1.0) {
+                    e.insert("width".into(), json!(x));
+                }
+            }
+            if !e.is_empty() {
+                t.insert(guid.clone(), JsonValue::Object(e));
+            }
+        }
+        if !t.is_empty() {
+            out.insert("tracks".into(), JsonValue::Object(t));
+        }
+    }
+    if let Some(o) = v.get("fx").and_then(|x| x.as_object()) {
+        let g = o.get("g").and_then(|x| x.as_str()).unwrap_or("");
+        let idx = |k: &str| o.get(k).and_then(|x| x.as_i64()).filter(|x| (0..1_000_000).contains(x));
+        if let (false, true, Some(fx), Some(p), Some(val)) =
+            (g.is_empty(), g.len() <= 64, idx("fx"), idx("p"), num(o, "v", 0.0, 1.0))
+        {
+            out.insert("fx".into(), json!({ "g": g, "fx": fx, "p": p, "v": val }));
+        }
+    }
+    JsonValue::Object(out)
 }
 
 fn sanitize_fx(v: Option<&JsonValue>) -> JsonValue {
@@ -1607,6 +1669,7 @@ enum Command {
     /// Publish this peer's arrange cursor (one 'C' publish, the JSON body
     /// without the MAC, which the task stamps on).
     Cursor(JsonValue),
+    Live(JsonValue),
     /// Owner-side moderation: tell `peer` to leave (one 'K' publish), and with
     /// `ban` also keep it out for BAN_DURATION (the table itself is updated
     /// synchronously by `Reamesh::moderate`; the task publishes the change).
@@ -1832,6 +1895,7 @@ impl Reamesh {
             session_meta: Mutex::new(String::new()),
             marker_inbox: Mutex::new(Vec::new()),
             cursor_inbox: Mutex::new(Vec::new()),
+            live_inbox: Mutex::new(Vec::new()),
         });
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (init_tx, init_rx) = std_mpsc::channel();
@@ -2425,6 +2489,26 @@ impl Reamesh {
             "drag": sanitize_cursor_drag(v.get("drag")),
         });
         self.cmd_tx.send(Command::Cursor(body)).is_ok()
+    }
+
+    /// Publish live gesture values (see `TAG_LIVE`). Returns whether anything
+    /// was left to send after sanitizing.
+    pub fn send_live(&self, live_json: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<JsonValue>(live_json) else {
+            return false;
+        };
+        let body = sanitize_live(&v);
+        if body.as_object().is_none_or(|o| o.is_empty()) {
+            return false;
+        }
+        self.cmd_tx.send(Command::Live(body)).is_ok()
+    }
+
+    /// Live gesture values received since the last call, oldest first, as
+    /// `[{"by","tracks","fx"}]` ("[]" when none).
+    pub fn drain_live(&self) -> String {
+        let drained: Vec<JsonValue> = std::mem::take(&mut *self.shared.live_inbox.lock().unwrap());
+        json!(drained).to_string()
     }
 
     /// Cursor updates received since the last call, oldest first, as
@@ -4326,6 +4410,48 @@ fn admit_proposal(shared: &Shared, payload: &[u8], proposer: &str) -> Option<Vec
 /// queue a retry / full sync exactly as they did with a raw publish. Callers
 /// keep (and retry with) the *plaintext* tagged message; each attempt is
 /// sealed fresh with a new nonce.
+/// Owner: publish the editing-lock table when the live set changed (an
+/// acquisition or a lapse), so peers can mark held items and snap a rejected
+/// edit back at once. Called right after every admitted edit, and as a
+/// `heartbeat` from the periodic tick, which also keeps resending while locks
+/// are live (a dropped packet self-heals) and for a few ticks after the set
+/// empties (a dropped "released" can't leave a mark stuck). `peer_locks`
+/// doubles as the owner's last-broadcast cache (the owner never receives a
+/// lock table: only clients do).
+fn publish_locks(
+    swarm: &mut Swarm<Behaviour>,
+    shared: &Shared,
+    topic: &gossipsub::IdentTopic,
+    resend: &mut i32,
+    heartbeat: bool,
+) {
+    let live = {
+        let mut ds = shared.doc.lock().unwrap();
+        live_locks(&mut ds.locks, Instant::now())
+    };
+    let current: HashMap<FieldKey, String> = live.iter().cloned().collect();
+    let current_empty = current.is_empty();
+    let changed = {
+        let mut last = shared.peer_locks.lock().unwrap();
+        if *last != current {
+            *last = current;
+            true
+        } else {
+            false
+        }
+    };
+    if !current_empty {
+        *resend = 4;
+    } else if heartbeat {
+        *resend = (*resend - 1).max(0);
+    }
+    if changed || (heartbeat && *resend > 0) {
+        let mut data = vec![TAG_LOCKS];
+        data.extend_from_slice(&lock_table_json(&live, next_ctl_seq(shared)));
+        let _ = publish_session(swarm, shared, topic, &data);
+    }
+}
+
 fn publish_session(
     swarm: &mut Swarm<Behaviour>,
     shared: &Shared,
@@ -4579,6 +4705,7 @@ fn start_join(
     shared.peers_info.lock().unwrap().clear();
     shared.marker_inbox.lock().unwrap().clear();
     shared.cursor_inbox.lock().unwrap().clear();
+    shared.live_inbox.lock().unwrap().clear();
     // Drop any proposals left in flight from a previous session
     // (e.g. before an auto-rejoin): their stale timestamps would
     // otherwise time out and surface as phantom snap-backs the
@@ -4728,10 +4855,12 @@ async fn run_network(
                 Some(Command::PublishAuthoritative(update)) => {
                     let mut data = vec![TAG_AUTHORITATIVE];
                     data.extend_from_slice(&update);
-                    if let Some(t) = &sess_topic {
-                        if !publish_session(&mut swarm, &shared, t, &data) {
+                    if let Some(t) = sess_topic.clone() {
+                        if !publish_session(&mut swarm, &shared, &t, &data) {
                             need_full_sync = true;
                         }
+                        // Our own edit took locks: announce them right away.
+                        publish_locks(&mut swarm, &shared, &t, &mut lock_resend, false);
                     }
                 }
                 Some(Command::PublishProposal(payload)) => {
@@ -4853,6 +4982,18 @@ async fn run_network(
                             }
                         }
                         None => eprintln!("[reamesh] dropped shared marker: not in a session"),
+                    }
+                }
+                Some(Command::Live(mut body)) => {
+                    // Ephemeral like cursors: never queued for retry.
+                    if let Some(t) = sess_topic.clone() {
+                        body["mac"] = json!(presence_mac(
+                            &shared.auth_token.lock().unwrap().clone(),
+                            &swarm.local_peer_id().to_string(),
+                        ));
+                        let mut data = vec![TAG_LIVE];
+                        data.extend_from_slice(body.to_string().as_bytes());
+                        let _ = publish_session(&mut swarm, &shared, &t, &data);
                     }
                 }
                 Some(Command::Cursor(mut body)) => {
@@ -5153,41 +5294,10 @@ async fn run_network(
                 }
                 // (The presence beacon has its own timer below: it needs a
                 // finer cadence than this tick while someone follows us.)
-                // Owner: republish the editing-lock table whenever the live set
-                // changes (an acquisition or a lapse), so peers can snap a
-                // rejected edit back at once and name who holds each field.
-                // `peer_locks` doubles as the owner's last-broadcast cache (the
-                // owner never receives a lock table: only clients do).
+                // Owner: the editing-lock table's heartbeat (changes also go out
+                // the moment an edit is admitted, see `publish_locks`).
                 if hosting.is_some() && let Some(t) = sess_topic.clone() {
-                    let live = {
-                        let mut ds = shared.doc.lock().unwrap();
-                        live_locks(&mut ds.locks, Instant::now())
-                    };
-                    let current: HashMap<FieldKey, String> = live.iter().cloned().collect();
-                    let current_empty = current.is_empty();
-                    let changed = {
-                        let mut last = shared.peer_locks.lock().unwrap();
-                        if *last != current {
-                            *last = current;
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    // Heartbeat: keep resending while locks are live (refreshes
-                    // clients every tick so a dropped packet self-heals), and for
-                    // a few ticks after the set empties (so a dropped "released"
-                    // can't leave a tint stuck). Idle (no locks) goes quiet.
-                    if !current_empty {
-                        lock_resend = 4;
-                    } else {
-                        lock_resend = lock_resend.saturating_sub(1);
-                    }
-                    if changed || lock_resend > 0 {
-                        let mut data = vec![TAG_LOCKS];
-                        data.extend_from_slice(&lock_table_json(&live, next_ctl_seq(&shared)));
-                        let _ = publish_session(&mut swarm, &shared, &t, &data);
-                    }
+                    publish_locks(&mut swarm, &shared, &t, &mut lock_resend, true);
                 }
                 // Owner: full-state anti-entropy.
                 if need_full_sync
@@ -5581,6 +5691,29 @@ async fn run_network(
                                     );
                                 }
                             }
+                            (Some(&TAG_LIVE), _) => {
+                                if plain.len() <= LIVE_MAX_BYTES
+                                    && let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..])
+                                {
+                                    let mac = v.get("mac").and_then(|x| x.as_str()).unwrap_or("");
+                                    let expected = presence_mac(
+                                        &shared.auth_token.lock().unwrap().clone(),
+                                        &src.to_string(),
+                                    );
+                                    if !ct_eq(mac.as_bytes(), expected.as_bytes()) {
+                                        continue;
+                                    }
+                                    let mut entry = sanitize_live(&v);
+                                    if entry.as_object().is_some_and(|o| !o.is_empty()) {
+                                        entry["by"] = json!(src.to_string());
+                                        let mut inbox = shared.live_inbox.lock().unwrap();
+                                        if inbox.len() >= 256 {
+                                            inbox.remove(0);
+                                        }
+                                        inbox.push(entry);
+                                    }
+                                }
+                            }
                             (Some(&TAG_CURSOR), _) => {
                                 if plain.len() <= CURSOR_MAX_BYTES
                                     && let Ok(v) = serde_json::from_slice::<JsonValue>(&plain[1..])
@@ -5714,9 +5847,13 @@ async fn run_network(
                                 {
                                     let mut data = vec![TAG_AUTHORITATIVE];
                                     data.extend_from_slice(&update);
-                                    if let Some(t) = sess_topic.clone()
-                                        && !publish_session(&mut swarm, &shared, &t, &data) {
-                                        need_full_sync = true;
+                                    if let Some(t) = sess_topic.clone() {
+                                        if !publish_session(&mut swarm, &shared, &t, &data) {
+                                            need_full_sync = true;
+                                        }
+                                        // The proposer now holds what it touched:
+                                        // tell everyone at once, not on the next tick.
+                                        publish_locks(&mut swarm, &shared, &t, &mut lock_resend, false);
                                     }
                                 }
                             }
@@ -7381,6 +7518,31 @@ pub extern "C" fn reamesh_drain_markers(handle: *mut Reamesh) -> *mut c_char {
     } else {
         let r = unsafe { &*handle };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.drain_markers()))
+            .unwrap_or_else(|_| "[]".to_string())
+    };
+    into_c_string(out)
+}
+
+/// Publish live gesture values (`TAG_LIVE`) to every session peer. Returns
+/// whether anything was queued.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_send_live(handle: *mut Reamesh, live_json: *const c_char) -> bool {
+    let (false, Some(c)) = (handle.is_null(), cstr_arg(live_json)) else {
+        return false;
+    };
+    let r = unsafe { &*handle };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.send_live(&c))).unwrap_or(false)
+}
+
+/// Live gesture values received since the last call, oldest first, as a JSON
+/// array of `{"by","tracks","fx"}`. Free with `reamesh_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_drain_live(handle: *mut Reamesh) -> *mut c_char {
+    let out = if handle.is_null() {
+        "[]".to_string()
+    } else {
+        let r = unsafe { &*handle };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.drain_live()))
             .unwrap_or_else(|_| "[]".to_string())
     };
     into_c_string(out)

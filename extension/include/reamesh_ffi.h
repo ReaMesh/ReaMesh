@@ -225,6 +225,18 @@ bool reamesh_share_marker(struct ReameshHandle *handle, const char *marker_json)
 char *reamesh_drain_markers(struct ReameshHandle *handle);
 
 /**
+ * Publish live gesture values (`TAG_LIVE`) to every session peer. Returns
+ * whether anything was queued.
+ */
+bool reamesh_send_live(struct ReameshHandle *handle, const char *live_json);
+
+/**
+ * Live gesture values received since the last call, oldest first, as a JSON
+ * array of `{"by","tracks","fx"}`. Free with `reamesh_free_string`.
+ */
+char *reamesh_drain_live(struct ReameshHandle *handle);
+
+/**
  * Publish the local arrange cursor (`{"t","g","fy","in","click"}`) to every
  * session peer. Returns whether it was queued.
  */

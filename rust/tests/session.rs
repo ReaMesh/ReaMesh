@@ -1503,6 +1503,46 @@ fn cursor_round_trip(pass: &str) {
 }
 
 #[test]
+fn live_values_round_trip() {
+    let project = temp_dir("proj-live");
+    let staging = temp_dir("staging-live");
+    make_project(&project);
+    let (owner, client) = establish("live-test", &project, &staging);
+    let owner_id = owner.local_peer_id().to_string();
+    let sent = serde_json::json!({
+        "tracks": { "{T1}": { "vol": 0.5, "pan": -3.0, "junk": 1 }, "{T2}": { "end": true }, "{T3}": {} },
+        "fx": { "g": "{T1}", "fx": 1, "p": 4, "v": 0.25 },
+    });
+    let mut got = None;
+    for _ in 0..10 {
+        assert!(owner.send_live(&sent.to_string()));
+        wait_until(Duration::from_secs(3), || {
+            let v: Value = serde_json::from_str(&client.drain_live()).unwrap();
+            got = v.as_array().unwrap().first().cloned();
+            got.is_some()
+        });
+        if got.is_some() {
+            break;
+        }
+    }
+    let l = got.expect("live values never arrived");
+    assert_eq!(l["by"], serde_json::json!(owner_id));
+    assert_eq!(l["tracks"]["{T1}"]["vol"], 0.5);
+    assert_eq!(l["tracks"]["{T1}"]["pan"], -1.0);
+    assert!(l["tracks"]["{T1}"].get("junk").is_none());
+    assert_eq!(l["tracks"]["{T2}"]["end"], true);
+    assert!(l["tracks"].get("{T3}").is_none());
+    assert_eq!(l["fx"]["v"], 0.25);
+    assert!(l.get("mac").is_none());
+    // Nothing usable: not sent at all.
+    assert!(!owner.send_live(r#"{"tracks":{"{T1}":{}},"fx":{"g":"","fx":0,"p":0,"v":2}}"#));
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
 fn cursor_updates_round_trip() {
     cursor_round_trip("");
 }
