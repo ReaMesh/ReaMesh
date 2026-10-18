@@ -127,6 +127,7 @@
 #define REAPERAPI_WANT_TakeFX_GetFXName
 #define REAPERAPI_WANT_GetMousePosition
 #define REAPERAPI_WANT_GetThingFromPoint
+#define REAPERAPI_WANT_GetItemFromPoint
 #define REAPERAPI_WANT_MIDIEditor_GetActive
 #define REAPERAPI_WANT_MIDIEditor_GetTake
 #define REAPERAPI_WANT_GetMediaItemTake_Item
@@ -5854,29 +5855,46 @@ static json cursorDrag(const cursor_overlay::Local& l, bool pressed) {
     armed = false;
     items.clear();
     MediaTrack* tr = cursorTrack(l.guid);
-    const double th = tr ? GetMediaTrackInfo_Value(tr, "I_TCPH") : 0;
-    const double ly = l.fy * th;
-    for (int i = 0, n = tr ? CountTrackMediaItems(tr) : 0; i < n; ++i) {
-      MediaItem* it = GetTrackMediaItem(tr, i);
+    const auto under = [&](MediaItem* it) {
+      const double pos = GetMediaItemInfo_Value(it, "D_POSITION");
+      return l.t >= pos && l.t < pos + GetMediaItemInfo_Value(it, "D_LENGTH");
+    };
+    // The item REAPER itself grabs: of overlapping items, the one drawn on
+    // top. Checked against the press, since the pointer may have moved on.
+    int mx = 0, my = 0;
+    GetMousePosition(&mx, &my);
+    MediaItem* it = GetItemFromPoint(mx, my, false, nullptr);
+    if (it && (GetMediaItem_Track(it) != tr || !under(it))) it = nullptr;
+    if (!it && tr) {
+      // Otherwise the last one under the press (later items are drawn on top).
+      const double ly = l.fy * GetMediaTrackInfo_Value(tr, "I_TCPH");
+      for (int i = 0, n = CountTrackMediaItems(tr); i < n; ++i) {
+        MediaItem* c = GetTrackMediaItem(tr, i);
+        const double iy = GetMediaItemInfo_Value(c, "I_LASTY"), ih = GetMediaItemInfo_Value(c, "I_LASTH");
+        if (under(c) && !(ih > 0 && (ly < iy || ly >= iy + ih))) it = c;
+      }
+    }
+    if (it) {
       const double pos = GetMediaItemInfo_Value(it, "D_POSITION");
       const double len = GetMediaItemInfo_Value(it, "D_LENGTH");
-      const double iy = GetMediaItemInfo_Value(it, "I_LASTY"), ih = GetMediaItemInfo_Value(it, "I_LASTH");
-      if (l.t < pos || l.t >= pos + len || (ih > 0 && (ly < iy || ly >= iy + ih))) continue;
-      if ((l.t - pos) / spp < 6 || (pos + len - l.t) / spp < 6) break;  // an edge: a trim
-      armed = true;
-      hit = itemGuid(it);
-      pressT = l.t;
-      pressPx = l.px;
-      origStart = pos;
-      pressTrack = static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"));
-      lastDtr = 0;
-      break;
+      // On an edge the press trims instead.
+      const double edge = 6 * cursor_overlay::pixelScale();
+      if ((l.t - pos) / spp >= edge && (pos + len - l.t) / spp >= edge) {
+        armed = true;
+        hit = itemGuid(it);
+        pressT = l.t;
+        pressPx = l.px;
+        origStart = pos;
+        pressTrack = static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"));
+        lastDtr = 0;
+      }
     }
   }
   if (!armed) return json();
   if (items.empty()) {
-    if (std::fabs(l.px - pressPx) < 3 && l.guid.empty()) return json();
-    if (std::fabs(l.px - pressPx) < 3 && cursorTrack(l.guid) &&
+    const bool still = std::fabs(l.px - pressPx) < 3 * cursor_overlay::pixelScale();
+    if (still && l.guid.empty()) return json();
+    if (still && cursorTrack(l.guid) &&
         static_cast<int>(GetMediaTrackInfo_Value(cursorTrack(l.guid), "IP_TRACKNUMBER")) == pressTrack)
       return json();
     // The selection as it stands now (the press has selected by now).
