@@ -5978,6 +5978,17 @@ static void cursorPump() {
   }
   const std::string awayKey = away.is_null() ? "" : dumpJson(away);
   const std::string dragKey = drag.is_null() ? "" : dumpJson(drag);
+  // Pointing nowhere the others can show (the ruler, a toolbar) goes out only
+  // once it lasts: on its way from the arrange to a track panel or the mixer
+  // the pointer crosses such spots, and the others' cursor should glide
+  // there, not vanish and pop up again.
+  static auto nowhereSince = std::chrono::steady_clock::time_point{};
+  if (g_cursorShared && !l.in && awayKey.empty() && (last.in || !lastAway.empty())) {
+    if (nowhereSince == std::chrono::steady_clock::time_point{}) nowhereSince = now;
+    if (now - nowhereSince < std::chrono::milliseconds(300)) return;
+  } else {
+    nowhereSince = {};
+  }
   const auto since = now - lastSent;
   const bool changed = l.in != last.in || l.down != last.down || awayKey != lastAway || dragKey != lastDrag ||
                        (l.in && (std::fabs(l.px - last.px) >= 1 || std::fabs(l.py - last.py) >= 1 ||
