@@ -21,7 +21,6 @@ if(APPLE)
   set(REAMESH_CURSOR_SRC src/cursor_overlay_mac.mm)
   set_source_files_properties(src/cursor_overlay_mac.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 elseif(WIN32)
-  # No arrange layer yet: pointer helpers only (see the file).
   set(REAMESH_CURSOR_SRC src/cursor_overlay_win.cpp)
 else()
   set(REAMESH_CURSOR_SRC src/cursor_overlay_stub.cpp)
@@ -76,6 +75,8 @@ if(APPLE)
 elseif(WIN32)
   target_link_libraries(reaper_reamesh PRIVATE
     ws2_32 bcrypt ntdll userenv iphlpapi crypt32 secur32 ncrypt runtimeobject propsys
-    user32  # pointer helpers (cursor_overlay_win.cpp)
+    # peer cursor layer (cursor_overlay_win.cpp); dcomp.dll is loaded at run
+    # time, so a system without it keeps the colour tint instead
+    user32 comctl32 d3d11 d2d1 dwrite dxguid
   )
 endif()

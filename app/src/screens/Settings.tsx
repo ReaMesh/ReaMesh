@@ -57,11 +57,8 @@ const OVERLAY_TOGGLES: { key: keyof OverlaySettings; label: () => string; hud?: 
   { key: "roster", label: () => t("olRoster"), hud: true },
   { key: "rememberPos", label: () => t("olRememberPos"), hud: true },
   { key: "tint", label: () => t("olItemTint") },
-  // Cursors are drawn and sent by the macOS extension only (no Windows layer yet).
-  ...(isWindows ? [] : [
-    { key: "cursors" as const, label: () => t("olCursors") },
-    { key: "shareCursor" as const, label: () => t("olShareCursor") },
-  ]),
+  { key: "cursors", label: () => t("olCursors") },
+  { key: "shareCursor", label: () => t("olShareCursor") },
 ];
 
 /** A settings row: label (and optional status line) left, one control right. */

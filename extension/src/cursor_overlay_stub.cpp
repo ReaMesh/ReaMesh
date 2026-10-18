@@ -14,6 +14,7 @@ void setMarks(const std::vector<Mark>&) {}
 void tick() {}
 bool sampleLocal(Local*) { return false; }
 void revert(const Revert&) {}
+double pixelScale() { return 1; }
 bool mouseHeld() { return false; }
 bool pointerOver(void*) { return false; }
 bool pointerOverApp() { return false; }

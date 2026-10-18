@@ -3954,7 +3954,7 @@ static void healPersistedTints() {
 // restore color therefore tracks the live synced color, never a stale snapshot.
 static void reconcileItemTints() {
   if (g_mode != Mode::Hosting && g_mode != Mode::ClientActive) return;
-  // Where the arrange layer draws (macOS), locked items and placeholders are
+  // Where the arrange layer draws, locked items and placeholders are
   // marked there instead and nothing is tinted: the empty desired set below
   // restores anything still grey from before the layer attached.
   const bool drawn = g_cursorAttached && cursor_overlay::draws();
@@ -5896,7 +5896,7 @@ static json cursorDrag(const cursor_overlay::Local& l, bool pressed) {
 }
 
 // Network side of the cursors, pumped by the layer in every run-loop pass
-// right before it draws (and from the timer, the only caller on Windows):
+// right before it draws (and from the extension timer as well):
 // hands arrived cursor updates to the layer, and sends the local pointer,
 // sampled at most every 16ms and sent at most every 33ms while it changes
 // (plus a keep-alive every 3s while it rests in the arrange, so peers don't

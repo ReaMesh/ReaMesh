@@ -1555,6 +1555,8 @@ void revert(const Revert& r) {
   g_pendingReverts.push_back(r);
 }
 
+double pixelScale() { return 1; }
+
 bool mouseHeld() { return ([NSEvent pressedMouseButtons] & 1) != 0; }
 
 bool pointerOver(void* hwnd) {

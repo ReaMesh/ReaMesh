@@ -3,11 +3,11 @@
 // Other people's mouse cursors, and an outline around the items someone else
 // is editing, are drawn as compositor layers on top of REAPER's track view,
 // inside REAPER's own process: Core Animation on macOS
-// (cursor_overlay_mac.mm). Windows has no layer yet (cursor_overlay_win.cpp
-// declines attach() and only provides the pointer helpers), so there the
-// extension keeps marking locked items with its colour tint and cursors are
-// neither drawn nor sent. The layer is display-only and click-through; it
-// never takes input.
+// (cursor_overlay_mac.mm), DirectComposition on Windows
+// (cursor_overlay_win.cpp). Where attach() fails (no track view, no
+// composition device), the extension keeps marking locked items with its
+// colour tint and cursors are neither drawn nor sent. The layer is
+// display-only and click-through; it never takes input.
 //
 // Positions travel semantically ({project seconds, track GUID, 0..1 within the
 // track}), so every peer sees a cursor at the same musical spot whatever their
@@ -142,6 +142,11 @@ struct Local {
 };
 // Samples the local pointer; false when there is nothing to sample (no layer).
 bool sampleLocal(Local* out);
+
+// Arrange units per point: the factor that turns a distance meant in points
+// into arrange coordinates (1 on macOS, where they are points; the DPI scale
+// on Windows, where they are pixels).
+double pixelScale();
 
 // Whether the left mouse button is held anywhere.
 bool mouseHeld();
