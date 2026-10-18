@@ -13,6 +13,8 @@
 //   of ./build.sh)
 
 #include "../extension/src/reamesh.cpp"
+// The cursor layer draws into REAPER's windows; none exist here.
+#include "../extension/src/cursor_overlay_stub.cpp"
 
 #include <cassert>
 #include <cstdio>
