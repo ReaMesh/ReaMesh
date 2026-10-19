@@ -33,8 +33,10 @@ tauri-plugin-dialog = "2"
 tauri-plugin-deep-link = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 # In-app updates (src/updater.rs): checks a signed manifest, downloads in the
-# background and installs only when the user clicks restart.
-tauri-plugin-updater = "2"
+# background and installs only when the user clicks restart. Without the
+# default `zip` feature: it only unpacks zipped Windows updates and Linux
+# AppImages, and the Windows update is the NSIS setup .exe itself.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls", "system-proxy"] }
 # Restores the main window's position and size, so the restart after an update
 # brings the window back where it was.
 tauri-plugin-window-state = "2"

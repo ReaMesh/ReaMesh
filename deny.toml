@@ -54,6 +54,9 @@ ignore = true
 ignore = [
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: compile-time macro crate of the Linux GTK stack (glib-macros via tauri/muda); not in the macOS or Windows build" },
     { id = "RUSTSEC-2024-0436", reason = "paste: compile-time macro crate of the netlink crates that libp2p's if-watch uses on Linux only; not in the macOS or Windows build" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: merged into zbus 6, no known vulnerability; zbus is the Linux D-Bus client of tauri-plugin-opener/single-instance, not in the macOS or Windows build" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: merged into zbus 6, no known vulnerability; Linux-only via zbus, as above" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: merged into zbus 6, no known vulnerability; Linux-only via zbus, as above" },
     { id = "RUSTSEC-2026-0215", reason = "smallstr: unmaintained, no known vulnerability; a dependency of yrs, which is pinned to 0.26 (revisit when yrs is upgraded)" },
 ]
 
