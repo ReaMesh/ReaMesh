@@ -172,10 +172,10 @@ const PRESENCE_FAST_INTERVAL: Duration = Duration::from_millis(100);
 /// sender's peer id), so open-topic bystanders can't inject markers.
 const TAG_MARKER: u8 = b'M';
 /// Live mouse cursor over the arrange: `'C'` + JSON
-/// `{"t","g","fy","in","click","down","away","drag","mac"}` (project seconds,
+/// `{"t","g","fy","in","click","down","drag","mac"}` (project seconds,
 /// track GUID, 0..1 within the track, false once the mouse left the arrange, a
-/// press at this spot, the button held; see `sanitize_cursor_away` and
-/// `sanitize_cursor_drag` for the last two). Sent at most ~30
+/// press at this spot, the button held, an item drag: see
+/// `sanitize_cursor_drag`). Sent at most ~30
 /// times a second and only while it changes (plus a keep-alive every few
 /// seconds); receivers queue them for the in-REAPER cursor layer. MAC'd like a
 /// beacon. Additive: builds without it drop the unknown tag unread (the
@@ -865,21 +865,6 @@ fn sanitize_sel(v: Option<&JsonValue>) -> Vec<String> {
 /// `CURSOR_DRAG_MAX` item GUIDs).
 const CURSOR_MAX_BYTES: usize = 2048;
 const CURSOR_DRAG_MAX: usize = 16;
-
-/// Where someone works while their mouse is away from the arrange:
-/// `{"k":"fx"|"midi"|"mixer"|"tcp","g":track GUID,"i":item GUID,"l":label}`
-/// (null when nowhere we can show).
-fn sanitize_cursor_away(v: Option<&JsonValue>) -> JsonValue {
-    let Some(o) = v.and_then(|x| x.as_object()) else {
-        return JsonValue::Null;
-    };
-    let s = |k: &str| o.get(k).and_then(|x| x.as_str()).unwrap_or("").chars().take(64).collect::<String>();
-    let k = s("k");
-    if !matches!(k.as_str(), "fx" | "midi" | "mixer" | "tcp") {
-        return JsonValue::Null;
-    }
-    json!({ "k": k, "g": s("g"), "i": s("i"), "l": s("l") })
-}
 
 /// An item drag in progress: `{"dt": seconds moved, "dtr": tracks moved,
 /// "items": [item GUIDs]}` (null when not dragging).
@@ -2578,7 +2563,6 @@ impl Reamesh {
             "in": v.get("in").and_then(|x| x.as_bool()).unwrap_or(false),
             "click": v.get("click").and_then(|x| x.as_bool()).unwrap_or(false),
             "down": v.get("down").and_then(|x| x.as_bool()).unwrap_or(false),
-            "away": sanitize_cursor_away(v.get("away")),
             "drag": sanitize_cursor_drag(v.get("drag")),
         });
         self.cmd_tx.send(Command::Cursor(body)).is_ok()
@@ -5897,7 +5881,6 @@ async fn run_network(
                                         "in": v.get("in").and_then(|x| x.as_bool()).unwrap_or(false),
                                         "click": v.get("click").and_then(|x| x.as_bool()).unwrap_or(false),
                                         "down": v.get("down").and_then(|x| x.as_bool()).unwrap_or(false),
-                                        "away": sanitize_cursor_away(v.get("away")),
                                         "drag": sanitize_cursor_drag(v.get("drag")),
                                     }));
                                 }

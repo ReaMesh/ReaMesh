@@ -66,14 +66,6 @@ bool draws();
 // them at once and ignores updates; item marks stay.
 void setShowCursors(bool on);
 
-// Where someone works while their mouse is away from the arrange.
-struct Away {
-  std::string kind;   // "fx", "midi", "mixer", "tcp"; empty: nowhere to show
-  std::string track;  // track GUID (fx, mixer, tcp)
-  std::string item;   // item GUID (midi)
-  std::string label;  // plug-in name (fx)
-};
-
 // An item drag in progress: the items, how far in time and by how many
 // tracks they have been dragged so far.
 struct Drag {
@@ -90,21 +82,9 @@ struct Remote {
   bool in = false;     // false: the mouse left their arrange
   bool click = false;  // a mouse-down at this spot
   bool down = false;   // the button is held (dragging)
-  Away away;           // while !in
   Drag drag;           // while dragging items
 };
 void update(const Remote& r);
-
-// What each other person is doing outside the arrange, from their presence:
-// an open FX window on a track. While their mouse is away from the arrange,
-// their cursor waits at the left edge of that track's row, next to its FX
-// button, labelled with the plug-in. Replaces the previous set.
-struct Activity {
-  std::string id, name, color;
-  std::string track;  // track GUID
-  std::string label;  // plug-in name
-};
-void setActivity(const std::vector<Activity>& list);
 
 // Following someone: a thin frame in their colour around the arrange with
 // their name in a corner, and their cursor (peer `id`) stands out from the
@@ -147,10 +127,5 @@ double pixelScale();
 
 // Whether the left mouse button is held anywhere.
 bool mouseHeld();
-// Whether the pointer is over the window that holds `hwnd` (an HWND / NSView*),
-// with nothing covering it.
-bool pointerOver(void* hwnd);
-// Whether the topmost window under the pointer is one of REAPER's.
-bool pointerOverApp();
 
 }  // namespace cursor_overlay

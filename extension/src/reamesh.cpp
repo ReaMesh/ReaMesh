@@ -130,7 +130,6 @@
 #define REAPERAPI_WANT_TrackFX_GetFXName
 #define REAPERAPI_WANT_TakeFX_GetFXName
 #define REAPERAPI_WANT_GetMousePosition
-#define REAPERAPI_WANT_GetThingFromPoint
 #define REAPERAPI_WANT_GetItemFromPoint
 #define REAPERAPI_WANT_MIDIEditor_GetActive
 #define REAPERAPI_WANT_MIDIEditor_GetTake
@@ -6942,67 +6941,6 @@ static void cursorStop() {
   g_cursorItems.clear();
 }
 
-// A plug-in's name as people know it: "VST3: Pro-Q 3 (FabFilter)" -> "Pro-Q 3".
-static std::string shortFxName(std::string n) {
-  if (const auto c = n.find(": "); c != std::string::npos && c <= 5) n = n.substr(c + 2);
-  if (n.size() > 2 && n.back() == ')')
-    if (const auto o = n.rfind(" ("); o != std::string::npos && o > 0) n.erase(o);
-  return n;
-}
-
-// Where we work while the mouse is away from the arrange, for the others'
-// cursor layers: the MIDI editor (on the item it edits), the mixer or the
-// track panel (on that track's row), or an FX window (with the plug-in).
-// Null when the pointer is nowhere we can point at.
-static json cursorAway() {
-  // Only where REAPER is what the pointer is over, not another app on top.
-  if (!cursor_overlay::pointerOverApp()) return json();
-  std::string kind;
-  MediaTrack* tr = nullptr;
-  MediaItem* item = nullptr;
-  int fxTrackNo = 0, fxItemNo = -1, fxNo = 0;
-  int x = 0, y = 0;
-  GetMousePosition(&x, &y);
-  char info[128] = {};
-  MediaTrack* hit = GetThingFromPoint(x, y, info, sizeof info);
-  const std::string_view what(info);
-  if (HWND me = MIDIEditor_GetActive(); me && cursor_overlay::pointerOver(me)) {
-    if (MediaItem_Take* take = MIDIEditor_GetTake(me)) item = GetMediaItemTake_Item(take);
-    if (item) kind = "midi";
-  } else if (hit && what.rfind("mcp", 0) == 0) {
-    kind = "mixer";
-    tr = hit;
-  } else if (hit && what.rfind("tcp", 0) == 0) {
-    kind = "tcp";
-    tr = hit;
-  } else if (what.rfind("fx", 0) == 0 && (GetFocusedFX2(&fxTrackNo, &fxItemNo, &fxNo) & 3)) {
-    kind = "fx";
-  }
-  if (kind.empty()) return json();
-  json a = {{"k", kind}};
-  if (kind == "midi") {
-    a["i"] = itemGuid(item);
-    if (MediaTrack* it = GetMediaItem_Track(item)) a["g"] = trackGuid(it);
-    return a;
-  }
-  if (kind == "fx") {
-    tr = fxTrackNo > 0 ? GetTrack(nullptr, fxTrackNo - 1) : nullptr;
-    if (!tr) return json();
-    char name[256] = {};
-    if (fxItemNo >= 0) {
-      MediaItem* fi = GetTrackMediaItem(tr, fxItemNo);
-      MediaItem_Take* take = fi ? GetMediaItemTake(fi, (fxNo >> 16) & 0xFFFF) : nullptr;
-      if (take) TakeFX_GetFXName(take, fxNo & 0xFFFF, name, sizeof name);
-    } else {
-      TrackFX_GetFXName(tr, fxNo, name, sizeof name);
-    }
-    a["l"] = shortFxName(name);
-  }
-  if (!tr) return json();
-  a["g"] = trackGuid(tr);
-  return a;
-}
-
 // An item drag in progress, for the others' preview. A press on an item (not
 // on its edges, where it would trim) arms it; once the pointer has moved, the
 // dragged items (the selection if the pressed item is in it) go out with how
@@ -7250,10 +7188,6 @@ static void cursorPump() {
         r.in = jsonBool(c, "in", false);
         r.click = jsonBool(c, "click", false);
         r.down = jsonBool(c, "down", false);
-        if (c.contains("away") && c["away"].is_object()) {
-          const json& a = c["away"];
-          r.away = {jsonStr(a, "k"), jsonStr(a, "g"), jsonStr(a, "i"), jsonStr(a, "l")};
-        }
         if (c.contains("drag") && c["drag"].is_object()) {
           const json& d = c["drag"];
           if (d.contains("items") && d["items"].is_array())
@@ -7268,7 +7202,7 @@ static void cursorPump() {
   }
 
   static cursor_overlay::Local last;
-  static std::string lastAway, lastDrag;
+  static std::string lastDrag;
   static auto lastSent = std::chrono::steady_clock::time_point{};
   static auto lastSample = std::chrono::steady_clock::time_point{};
   const auto now = std::chrono::steady_clock::now();
@@ -7279,86 +7213,55 @@ static void cursorPump() {
   static bool prevDown = false;
   const bool pressed = l.down && !prevDown;
   prevDown = l.down;
-  json away, drag;
+  json drag;
   if (g_cursorShared) {
-    if (!l.in) away = cursorAway();
     drag = cursorDrag(l, pressed);
   } else {
-    if (!last.in && lastAway.empty()) return;
+    if (!last.in) return;
     l = cursor_overlay::Local{};
   }
-  const std::string awayKey = away.is_null() ? "" : dumpJson(away);
   const std::string dragKey = drag.is_null() ? "" : dumpJson(drag);
-  // Pointing nowhere the others can show (the ruler, a toolbar) goes out only
-  // once it lasts: on its way from the arrange to a track panel or the mixer
-  // the pointer crosses such spots, and the others' cursor should glide
-  // there, not vanish and pop up again.
-  static auto nowhereSince = std::chrono::steady_clock::time_point{};
-  if (g_cursorShared && !l.in && awayKey.empty() && (last.in || !lastAway.empty())) {
-    if (nowhereSince == std::chrono::steady_clock::time_point{}) nowhereSince = now;
-    if (now - nowhereSince < std::chrono::milliseconds(300)) return;
+  // Leaving the arrange goes out only once it lasts: crossing the ruler or a
+  // scroll bar on the way back shouldn't make the others' cursor blink.
+  static auto outSince = std::chrono::steady_clock::time_point{};
+  if (g_cursorShared && !l.in && last.in) {
+    if (outSince == std::chrono::steady_clock::time_point{}) outSince = now;
+    if (now - outSince < std::chrono::milliseconds(300)) return;
   } else {
-    nowhereSince = {};
+    outSince = {};
   }
   const auto since = now - lastSent;
-  const bool changed = l.in != last.in || l.down != last.down || awayKey != lastAway || dragKey != lastDrag ||
+  const bool changed = l.in != last.in || l.down != last.down || dragKey != lastDrag ||
                        (l.in && (std::fabs(l.px - last.px) >= 1 || std::fabs(l.py - last.py) >= 1 ||
                                  l.guid != last.guid || l.t != last.t));
   const bool send = l.click || (changed && since >= std::chrono::milliseconds(33)) ||
-                    ((l.in || !awayKey.empty()) && since >= std::chrono::seconds(3));
+                    (l.in && since >= std::chrono::seconds(3));
   if (!send) return;
   json m = {{"t", l.t}, {"g", l.guid}, {"fy", l.fy}, {"in", l.in}, {"click", l.click}, {"down", l.down}};
-  if (!away.is_null()) m["away"] = away;
   if (!drag.is_null()) m["drag"] = drag;
   reamesh_send_cursor(g_handle, dumpJson(m).c_str());
   last = l;
-  lastAway = awayKey;
   lastDrag = dragKey;
   lastSent = now;
 }
 
-// From everyone's presence, a few times a second: whose FX window is open on
-// which track (their cursor waits beside it while they are away from the
-// arrange), and the person we follow (a frame round the arrange).
+// From everyone's presence, a few times a second: the person we follow (a
+// frame round the arrange).
 static void cursorPresence() {
   static auto last = std::chrono::steady_clock::time_point{};
   const auto now = std::chrono::steady_clock::now();
   if (now - last < std::chrono::milliseconds(250)) return;
   last = now;
   const json peers = handleJson(reamesh_peers, json::array());
-  std::vector<cursor_overlay::Activity> acts;
   std::string followName, followColor;
-  if (peers.is_array())
+  if (peers.is_array() && !g_followPeer.empty())
     for (const auto& p : peers) {
-      if (!p.is_object() || jsonBool(p, "is_self", false)) continue;
-      const std::string id = jsonStr(p, "id");
-      if (!g_followPeer.empty() && id == g_followPeer) {
-        followName = jsonStr(p, "name");
-        followColor = jsonStr(p, "color");
-        if (followName.empty()) followName = id.size() > 6 ? id.substr(id.size() - 6) : id;
-      }
-      const json fx = p.contains("fx") && p["fx"].is_object() ? p["fx"] : json();
-      if (fx.is_null()) continue;
-      MediaTrack* tr = cursorTrack(jsonStr(fx, "track"));
-      if (!tr) continue;
-      const int idx = static_cast<int>(jsonNum(fx, "fx", -1));
-      char name[256] = {};
-      if (const std::string item = jsonStr(fx, "item"); !item.empty()) {
-        MediaItem* it = cursorItem(item);
-        MediaItem_Take* take = it ? GetMediaItemTake(it, static_cast<int>(jsonNum(fx, "take", 0))) : nullptr;
-        if (!take || !TakeFX_GetFXName(take, idx, name, sizeof name)) continue;
-      } else if (!TrackFX_GetFXName(tr, idx, name, sizeof name)) {
-        continue;
-      }
-      cursor_overlay::Activity a;
-      a.id = id;
-      a.name = jsonStr(p, "name");
-      a.color = jsonStr(p, "color");
-      a.track = jsonStr(fx, "track");
-      a.label = shortFxName(name);
-      acts.push_back(std::move(a));
+      if (!p.is_object() || jsonBool(p, "is_self", false) || jsonStr(p, "id") != g_followPeer) continue;
+      followName = jsonStr(p, "name");
+      followColor = jsonStr(p, "color");
+      if (followName.empty()) followName = g_followPeer.size() > 6 ? g_followPeer.substr(g_followPeer.size() - 6) : g_followPeer;
+      break;
     }
-  cursor_overlay::setActivity(acts);
   cursor_overlay::setFollow(followName.empty() ? "" : g_followPeer, followName, followColor);
 }
 

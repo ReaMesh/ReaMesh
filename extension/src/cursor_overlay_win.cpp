@@ -85,7 +85,6 @@ struct Style {
   double forgetAfter;
   double rippleRadius, rippleLine, rippleScaleFrom, rippleScaleTo, rippleOpacity, rippleDuration;
   double edgeInset, edgeHeight, edgeFont, edgePadX, edgeArrow, edgeOpacity;
-  double parkInset, parkItemInset;
   double dragLine, dragDash, dragGap, dragFill;
   double followLine, followOpacity, followTagInset;
   double markLine, markRadius, markDim, markLinger, markFadeIn, markFadeOut;
@@ -140,8 +139,6 @@ constexpr Style kStyle = {
     .edgePadX = 7,
     .edgeArrow = 7,
     .edgeOpacity = 0.92,
-    .parkInset = 8,
-    .parkItemInset = 10,
     .dragLine = 1.5,
     .dragDash = 5,
     .dragGap = 4,
@@ -939,12 +936,6 @@ struct Peer {
   // second), for prediction.
   double vt = 0, vfy = 0;
   bool predict = false;
-  // An open FX window (setActivity, from presence): where the cursor waits
-  // while away when the cursor messages say nothing more precise.
-  std::string fxTrack, fxLabel;
-  double fxAt = 0;
-  // Where they work away from the arrange, from their cursor messages.
-  cursor_overlay::Away away;
   // Their item drag, and its visuals per item: the original marked, the
   // landing spot outlined.
   cursor_overlay::Drag drag;
@@ -954,7 +945,6 @@ struct Peer {
     bool shown = false;
   };
   std::map<std::string, DragItem> dragItems;
-  std::string parkLabel;
 
   Node root;   // positioned at the pointer tip
   Node arrow;  // child of root
@@ -964,7 +954,7 @@ struct Peer {
   Node edgeArrow;  // child of edge
   double edgeAx = 0, edgeAy = 0.5;  // which point of the edge pill sits on its spot
 
-  bool cursorShown = false, tagShown = false, edgeShown = false, parked = false;
+  bool cursorShown = false, tagShown = false, edgeShown = false;
   bool idle = false, pressed = false;
   bool fresh = false;  // heard from within staleAfter (tick notices the change)
   Pt cursorModel, tagModel, edgeModel;
@@ -990,8 +980,6 @@ struct Place {
   Pt p;
   Side side = Side::Left;
   double angle = 0;     // Edge: direction from the pill to the real spot
-  bool parked = false;  // waiting while they work away from the arrange
-  std::string label;    // what they work in, for the name tag
 };
 
 cursor_overlay::Host g_host{};
@@ -1038,12 +1026,6 @@ std::string displayName(const Peer& p) {
   return p.id.size() > 6 ? p.id.substr(p.id.size() - 6) : p.id;
 }
 
-// The name, plus the plug-in while the cursor waits beside an FX window.
-std::string displayLabel(const Peer& p) {
-  std::string s = displayName(p);
-  if (p.parked && !p.parkLabel.empty()) s += " \xC2\xB7 " + p.parkLabel;  // ·
-  return s;
-}
 
 // Re-inserts a visual above all its siblings.
 void raise(Node& n) {
@@ -1110,13 +1092,13 @@ void dropLayers(Peer& p) {
 }
 
 void refreshTag(Peer& p) {
-  drawPill(p.tag, displayLabel(p), p.color, kStyle.tagFont, kStyle.tagHeight, kStyle.tagPadX);
+  drawPill(p.tag, displayName(p), p.color, kStyle.tagFont, kStyle.tagHeight, kStyle.tagPadX);
   drawArrow(p.arrow, p.color);
 }
 
 void refreshEdge(Peer& p, Side side) {
   const double lead = kStyle.edgeArrow + 4;
-  const double w = drawPill(p.edge, displayLabel(p), p.color, kStyle.edgeFont, kStyle.edgeHeight, kStyle.edgePadX, lead);
+  const double w = drawPill(p.edge, displayName(p), p.color, kStyle.edgeFont, kStyle.edgeHeight, kStyle.edgePadX, lead);
   setPos(p.edgeArrow, {std::round(S(kStyle.edgePadX + kStyle.edgeArrow / 2)), std::round(S(kStyle.edgeHeight / 2))});
   drawEdgeArrow(p.edgeArrow, p.color);
   switch (side) {
@@ -1224,39 +1206,13 @@ Place placeOf(const Peer& p, const Geo& g, double t) {
   Place pl;
   if (!g.ok) return pl;
   const bool fresh = t - p.lastMsg <= kStyle.staleAfter;
-  const bool live = p.in && fresh;
-  // Away from the arrange: what their cursor messages say, else an FX window
-  // their presence reports.
-  const bool awayMsg = !p.in && fresh && !p.away.kind.empty();
-  const bool parked = !live && (awayMsg || !p.fxTrack.empty());
-  if (!live && !parked) return pl;
-  pl.parked = parked;
-  std::string guid = p.guid;
-  double parkX = S(kStyle.parkInset), parkFy = 0.5;
-  bool onItem = false;
-  double iy = 0, ih = 0;
-  if (parked) {
-    const std::string& k = awayMsg ? p.away.kind : std::string("fx");
-    guid = awayMsg ? p.away.track : p.fxTrack;
-    if (k == "fx") pl.label = awayMsg ? p.away.label : p.fxLabel;
-    else if (k == "midi") pl.label = "MIDI";
-    else if (k == "mixer") pl.label = "Mixer";
-    double i0 = 0, i1 = 0;
-    std::string itemTrack;
-    if (k == "midi" && g_host.itemSpan &&
-        g_host.itemSpan(p.away.item.c_str(), &i0, &i1, &iy, &ih, &itemTrack)) {
-      // In the MIDI editor: on the item they edit.
-      guid = itemTrack;
-      parkX = (i0 - g.t0) / g.spp + S(kStyle.parkItemInset);
-      onItem = true;
-    }
-  }
+  if (!p.in || !fresh) return pl;
   double ty = 0, th = 0;
-  const bool found = !guid.empty() && g_host.trackSpan(guid.c_str(), &ty, &th);
+  const bool found = !p.guid.empty() && g_host.trackSpan(p.guid.c_str(), &ty, &th);
   const bool yKnown = found && th > 0;
-  double x = parked ? parkX : (p.t - g.t0) / g.spp;
-  double y = yKnown ? (onItem ? iy + ih * 0.5 : ty + (parked ? parkFy : p.fy) * th) : 0;
-  if (live && yKnown && p.predict && !g_reduceMotion) {
+  double x = (p.t - g.t0) / g.spp;
+  double y = yKnown ? ty + p.fy * th : 0;
+  if (yKnown && p.predict && !g_reduceMotion) {
     // Ahead along the velocity, but never further than predictMax and never
     // off the track the pointer is on.
     double dx = p.vt * kStyle.predictLead / g.spp, dy = p.vfy * kStyle.predictLead * th;
@@ -1297,10 +1253,10 @@ Place placeOf(const Peer& p, const Geo& g, double t) {
   return pl;
 }
 
-// The name tag shows while the cursor moves, and always while it waits
-// beside an FX window or belongs to the person we follow.
+// The name tag shows while the cursor moves, and always for the person we
+// follow.
 void updateTag(Peer& p, double t) {
-  const bool want = p.cursorShown && (p.parked || p.followed || t - p.lastMove < kStyle.tagIdleAfter);
+  const bool want = p.cursorShown && (p.followed || t - p.lastMove < kStyle.tagIdleAfter);
   if (want == p.tagShown) return;
   fade(p.tag, want ? 1 : 0, want ? kStyle.tagFadeIn : kStyle.tagFadeOut);
   p.tagShown = want;
@@ -1373,11 +1329,6 @@ void layoutPeer(Peer& p, const Geo& g, double t) {
   const Place pl = placeOf(p, g, t);
   const bool net = p.pendingSpring;
   p.pendingSpring = false;
-  if (pl.parked != p.parked || pl.label != p.parkLabel) {
-    p.parked = pl.parked;
-    p.parkLabel = pl.label;
-    refreshTag(p);
-  }
   if (!p.drag.items.empty() && t - p.lastMsg > kStyle.staleAfter) p.drag = {};
   layoutDrag(p, g, net);
 
@@ -1825,42 +1776,6 @@ void setShowCursors(bool on) {
   commit();
 }
 
-void setActivity(const std::vector<Activity>& list) {
-  if (!g_attached || !g_showCursors) return;
-  const double t = now();
-  std::map<std::string, const Activity*> by;
-  for (const Activity& a : list)
-    if (!a.id.empty() && !a.track.empty()) by.emplace(a.id, &a);
-  for (const auto& [id, a] : by) {
-    auto it = g_peers.find(id);
-    if (it == g_peers.end()) {
-      Peer p;
-      p.id = id;
-      p.name = a->name;
-      p.color = a->color;
-      it = g_peers.emplace(id, std::move(p)).first;
-      buildLayers(it->second);
-      refreshTag(it->second);
-    }
-    Peer& p = it->second;
-    p.fxAt = t;
-    if (p.fxTrack != a->track || p.fxLabel != a->label) {
-      p.fxTrack = a->track;
-      p.fxLabel = a->label;
-      p.pendingSpring = true;
-      refreshTag(p);
-    }
-  }
-  for (auto& [id, p] : g_peers)
-    if (!by.count(id) && !p.fxTrack.empty()) {
-      p.fxTrack.clear();
-      p.fxLabel.clear();
-      p.pendingSpring = true;
-      refreshTag(p);
-    }
-  commit();
-}
-
 void setFollow(const std::string& id, const std::string& name, const std::string& color) {
   if (!g_attached) return;
   const std::string who = name.empty() ? "" : id;
@@ -1954,12 +1869,9 @@ void update(const Remote& r) {
     p.predict = false;
   }
   setPressed(p, r.in && r.down);
-  const bool awayChanged = r.away.kind != p.away.kind || r.away.track != p.away.track ||
-                           r.away.item != p.away.item || r.away.label != p.away.label;
   const bool dragChanged = r.drag.items != p.drag.items || r.drag.dt != p.drag.dt || r.drag.dtr != p.drag.dtr;
-  p.away = r.away;
   p.drag = r.drag;
-  if (awayChanged || dragChanged) p.pendingSpring = true;
+  if (dragChanged) p.pendingSpring = true;
   p.t = r.t;
   p.fy = r.fy;
   p.guid = r.guid;
@@ -1996,7 +1908,7 @@ void tick() {
   glue(true);
   for (auto it = g_peers.begin(); it != g_peers.end();) {
     Peer& p = it->second;
-    if (t - std::max(p.lastMsg, p.fxAt) > kStyle.forgetAfter) {
+    if (t - p.lastMsg > kStyle.forgetAfter) {
       dropLayers(p);
       it = g_peers.erase(it);
       continue;
@@ -2009,9 +1921,9 @@ void tick() {
       p.pendingSpring = true;
     }
     updateTag(p, t);
-    // A cursor resting a while dims to half; waiting beside an FX window is
-    // not resting, and the person we follow never dims.
-    const bool idle = p.cursorShown && !p.parked && !p.followed && t - p.lastMove > kStyle.idleDimAfter;
+    // A cursor resting a while dims to half; the person we follow never
+    // dims.
+    const bool idle = p.cursorShown && !p.followed && t - p.lastMove > kStyle.idleDimAfter;
     if (idle != p.idle) {
       fade(p.arrow, idle ? kStyle.idleOpacity : 1, idle ? kStyle.idleFade : kStyle.fadeIn);
       p.idle = idle;
@@ -2035,23 +1947,6 @@ double pixelScale() { return g_scale; }
 // The logical left button: the right one when the buttons are swapped.
 bool mouseHeld() {
   return (GetAsyncKeyState(GetSystemMetrics(SM_SWAPBUTTON) ? VK_RBUTTON : VK_LBUTTON) & 0x8000) != 0;
-}
-
-bool pointerOver(void* hwnd) {
-  POINT p{};
-  HWND h = static_cast<HWND>(hwnd);
-  if (!h || !GetCursorPos(&p)) return false;
-  HWND under = WindowFromPoint(p);
-  return under && GetAncestor(under, GA_ROOT) == GetAncestor(h, GA_ROOT);
-}
-
-bool pointerOverApp() {
-  POINT p{};
-  if (!GetCursorPos(&p)) return false;
-  HWND under = WindowFromPoint(p);
-  DWORD pid = 0;
-  if (under) GetWindowThreadProcessId(under, &pid);
-  return under && pid == GetCurrentProcessId();
 }
 
 bool sampleLocal(Local* out) {

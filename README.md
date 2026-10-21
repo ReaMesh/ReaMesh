@@ -94,9 +94,8 @@ minutes.
 Everyone's mouse pointer appears right in REAPER's arrange view,
 on the same spot of the song whatever each person's zoom and scroll. While
 someone drags items you see where they will land, their faders and plugin
-knobs move as they turn them, and while they work in the mixer, an effect
-window or the MIDI editor their pointer waits beside that track or item. Showing
-other people's pointers and sharing your own are both settings.
+knobs move as they turn them. A pointer shows only while it is over the arrange.
+Showing other people's pointers and sharing your own are both settings.
 
 ## Working together
 
