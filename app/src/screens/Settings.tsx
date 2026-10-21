@@ -80,7 +80,7 @@ function Row({
     <div className="flex min-h-11 items-center gap-3 px-3 py-2">
       <div className="min-w-0 flex-1">
         <p className="truncate text-[13px]">{label}</p>
-        {sub && <p className="truncate text-[12px] text-muted-foreground">{sub}</p>}
+        {sub && <p className="text-pretty text-[12px] leading-snug text-muted-foreground">{sub}</p>}
       </div>
       {children}
     </div>

@@ -962,7 +962,8 @@ const NEARBY_OFFER_DELAY_MS = 10_000;
 /** Bluetooth under an empty Lobby. Some networks (guest Wi-Fi) block the usual
  *  search; once nothing has shown up for a while, and only until the user
  *  decided either way, one quiet button turns the Bluetooth search on (which
- *  is what asks macOS for the permission). Once on, a line says so. */
+ *  is what asks macOS for the permission). Once on, the search runs silently;
+ *  only a refused permission is worth a line. */
 function NearbyLine() {
   const n = useNearby();
   const [waited, setWaited] = useState(false);
@@ -972,9 +973,10 @@ function NearbyLine() {
   }, []);
   if (!n.supported) return null;
   if (n.enabled === true) {
+    if (!nearbyBlocked(n)) return null;
     return (
       <p className="mt-1.5 text-[11.5px] leading-normal text-muted-foreground/80">
-        {nearbyBlocked(n) ? t("nearbyBlocked") : t("nearbySearching")}
+        {t("nearbyBlocked")}
       </p>
     );
   }
