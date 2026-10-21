@@ -74,5 +74,5 @@ windows = { version = "0.62", features = [
   "Foundation",
   "Storage_Streams",
 ] }
-windows-future = "0.3"
+windows-future = "0.100"
 
