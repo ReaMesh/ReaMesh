@@ -82,6 +82,10 @@ struct Style {
   double revertHold, revertGlide, revertFade, revertOpacity;
   // Following someone: a frame round the arrange.
   double followLine, followOpacity, followTagInset;
+  // ...and their cursor stands out: a soft disc in their colour behind the
+  // pointer, centred this far down-right of the tip (on the arrow's body, not
+  // on the tip where a click ripples), with a thin ring.
+  double haloRadius, haloCentre, haloFill, haloLine, haloLineOpacity;
   // Item someone else is editing: dimmed ("not yours right now") with a thin
   // outline in their colour; their name shows while the local pointer is over
   // it. A mark stays up a little after the lock lapses, so the pauses
@@ -152,6 +156,11 @@ constexpr Style kStyle = {
     .followLine = 2,
     .followOpacity = 0.9,
     .followTagInset = 8,
+    .haloRadius = 15,
+    .haloCentre = 8,
+    .haloFill = 0.16,
+    .haloLine = 1.5,
+    .haloLineOpacity = 0.45,
     .markLine = 1.5,
     .markRadius = 3,
     .markDim = 0.3,
@@ -200,6 +209,8 @@ struct Peer {
 
   CALayer* root = nil;  // positioned at the pointer tip
   CAShapeLayer* arrow = nil;
+  CAShapeLayer* halo = nil;  // in root, below the arrow: the person we follow
+  bool followed = false;
   CALayer* tag = nil;   // a sibling of root, so it can trail it
   CATextLayer* tagText = nil;
   CALayer* edge = nil;
@@ -272,6 +283,7 @@ CALayer* g_followFrame = nil;
 CALayer* g_followTag = nil;
 CATextLayer* g_followText = nil;
 std::string g_followKey;
+std::string g_followId;  // whose cursor stands out
 CFRunLoopObserverRef g_observer = nullptr;
 id g_clickMonitor = nil;
 bool g_clickPending = false;
@@ -516,6 +528,54 @@ CAShapeLayer* makeArrow(const std::string& color) {
   return a;
 }
 
+void updateTag(Peer& p, double t);
+
+void setHaloColor(Peer& p) {
+  if (!p.halo) return;
+  NSColor* c = parseColor(p.color);
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  p.halo.fillColor = [c colorWithAlphaComponent:kStyle.haloFill].CGColor;
+  p.halo.strokeColor = [c colorWithAlphaComponent:kStyle.haloLineOpacity].CGColor;
+  [CATransaction commit];
+}
+
+// The person we follow stands out: the disc behind the pointer, the name tag
+// always up, never dimmed, above everyone else's cursor (zPosition orders
+// siblings, so cursors added later stay below).
+void setFollowed(Peer& p, bool on) {
+  if (on == p.followed && (!on || p.halo)) return;
+  p.followed = on;
+  if (on && !p.halo && p.root) {
+    const double R = kStyle.haloRadius, c = kStyle.haloCentre, i = kStyle.haloLine / 2;
+    p.halo = [CAShapeLayer layer];
+    CGPathRef disc = CGPathCreateWithEllipseInRect(CGRectMake(c - R + i, c - R + i, 2 * (R - i), 2 * (R - i)), nullptr);
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    p.halo.path = disc;
+    p.halo.lineWidth = kStyle.haloLine;
+    p.halo.contentsScale = g_scale;
+    p.halo.opacity = 0;
+    [p.root insertSublayer:p.halo below:p.arrow];
+    [CATransaction commit];
+    CGPathRelease(disc);
+    setHaloColor(p);
+  }
+  if (p.halo) fade(p.halo, on ? 1 : 0, on ? kStyle.fadeIn * 2 : kStyle.fadeOut);
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  const CGFloat z = on ? 1 : 0;
+  p.root.zPosition = z;
+  p.tag.zPosition = z;
+  p.edge.zPosition = z;
+  [CATransaction commit];
+  if (on && p.idle) {
+    fade(p.arrow, 1, kStyle.fadeIn);
+    p.idle = false;
+  }
+  updateTag(p, now());
+}
+
 void buildLayers(Peer& p) {
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
@@ -558,6 +618,7 @@ void buildLayers(Peer& p) {
   [g_root addSublayer:p.tag];
   [g_root addSublayer:p.root];
   [CATransaction commit];
+  if (p.id == g_followId) setFollowed(p, true);
 }
 
 void dropDragItem(Peer::DragItem& d);
@@ -591,6 +652,7 @@ void refreshTag(Peer& p) {
   [CATransaction setDisableActions:YES];
   p.arrow.fillColor = parseColor(p.color).CGColor;
   [CATransaction commit];
+  setHaloColor(p);
 }
 
 void refreshEdge(Peer& p, Side side) {
@@ -750,9 +812,9 @@ Place placeOf(const Peer& p, const Geo& g, double t) {
 bool samePoint(CGPoint a, CGPoint b) { return std::fabs(a.x - b.x) < 0.01 && std::fabs(a.y - b.y) < 0.01; }
 
 // The name tag shows while the cursor moves, and always while it waits
-// beside an FX window.
+// beside an FX window or belongs to the person we follow.
 void updateTag(Peer& p, double t) {
-  const bool want = p.cursorShown && (p.parked || t - p.lastMove < kStyle.tagIdleAfter);
+  const bool want = p.cursorShown && (p.parked || p.followed || t - p.lastMove < kStyle.tagIdleAfter);
   if (want == p.tagShown) return;
   fade(p.tag, want ? 1 : 0, want ? kStyle.tagFadeIn : kStyle.tagFadeOut);
   p.tagShown = want;
@@ -997,6 +1059,7 @@ void checkScale() {
   [CATransaction setDisableActions:YES];
   for (auto& [id, p] : g_peers) {
     for (CALayer* l in @[ p.arrow, p.tag, p.tagText, p.edge, p.edgeText, p.edgeArrow ]) l.contentsScale = s;
+    if (p.halo) p.halo.contentsScale = s;
   }
   for (CALayer* l in @[ g_hoverTag ?: [CALayer layer], g_hoverText ?: [CALayer layer], g_followTag ?: [CALayer layer],
                         g_followText ?: [CALayer layer] ])
@@ -1329,6 +1392,7 @@ void detach() {
     g_followFrame = g_followTag = nil;
     g_followText = nil;
     g_followKey.clear();
+    g_followId.clear();
     [g_view removeFromSuperview];
     g_view = nil;
     g_root = nil;
@@ -1390,9 +1454,15 @@ void setActivity(const std::vector<Activity>& list) {
   }
 }
 
-void setFollow(const std::string& name, const std::string& color) {
+void setFollow(const std::string& id, const std::string& name, const std::string& color) {
   if (!g_attached) return;
   @autoreleasepool {
+    const std::string who = name.empty() ? "" : id;
+    if (who != g_followId) {
+      if (auto it = g_peers.find(g_followId); it != g_peers.end()) setFollowed(it->second, false);
+      g_followId = who;
+      if (auto it = g_peers.find(g_followId); it != g_peers.end()) setFollowed(it->second, true);
+    }
     const std::string key = name.empty() ? "" : name + color;
     if (key == g_followKey) return;
     const bool was = !g_followKey.empty();
@@ -1539,8 +1609,8 @@ void tick() {
       }
       updateTag(p, t);
       // A cursor resting a while dims to half; waiting beside an FX window is
-      // not resting.
-      const bool idle = p.cursorShown && !p.parked && t - p.lastMove > kStyle.idleDimAfter;
+      // not resting, and the person we follow never dims.
+      const bool idle = p.cursorShown && !p.parked && !p.followed && t - p.lastMove > kStyle.idleDimAfter;
       if (idle != p.idle) {
         fade(p.arrow, idle ? kStyle.idleOpacity : 1, idle ? kStyle.idleFade : kStyle.fadeIn);
         p.idle = idle;
@@ -1553,6 +1623,14 @@ void tick() {
 void revert(const Revert& r) {
   if (!g_attached || r.item.empty() || r.track.empty()) return;
   g_pendingReverts.push_back(r);
+}
+
+bool viewSize(double* w, double* h) {
+  if (!g_attached) return false;
+  const NSRect b = g_view.bounds;
+  *w = b.size.width;
+  *h = b.size.height;
+  return *w > 0 && *h > 0;
 }
 
 double pixelScale() { return 1; }

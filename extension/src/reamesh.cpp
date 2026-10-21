@@ -134,6 +134,8 @@
 #define REAPERAPI_WANT_SnapToGrid
 #define REAPERAPI_WANT_GetToggleCommandState
 #define REAPERAPI_WANT_CountTrackMediaItems
+// Follow mode keeping the followed person's item drag in view (followTrackDrag).
+#define REAPERAPI_WANT_CSurf_OnScroll
 // Live values during gestures (liveTick / liveApply).
 #define REAPERAPI_WANT_GetLastTouchedFX
 #define REAPERAPI_WANT_TrackFX_GetParamNormalized
@@ -540,6 +542,28 @@ struct FollowFx {
   bool valid = false;
 };
 static FollowFx g_followFxOpen;
+// The followed peer's item drag, from their cursor messages (cursorPump):
+// where their pointer holds the dragged items, which follow mode keeps in view
+// (followTrackDrag). `userView` is set once the local user scrolls or zooms
+// during the drag: from then on the view is theirs until the drag ends, like
+// every other follow mirror leaves the follower's own change standing.
+struct FollowDrag {
+  bool on = false;
+  double t = 0;       // project seconds under their pointer
+  std::string track;  // track GUID under their pointer ("" below the last track)
+  bool moved = false;  // the pointer moved since the view last checked it
+  bool userView = false;
+  std::chrono::steady_clock::time_point at{};        // last cursor message
+  std::chrono::steady_clock::time_point scrolled{};  // our last vertical scroll
+};
+static FollowDrag g_followDrag;
+// The arrange view as follow mode left it at the end of its last tick, to tell
+// the user's own scroll or zoom from follow mode's.
+struct FollowView {
+  bool valid = false;
+  double v0 = 0, v1 = 0, rowsY = 0;
+};
+static FollowView g_followView;
 // Presence detail this user beacons for followers: the selected item GUIDs and
 // the FX window being edited in. Sampled at most every 100ms (the fast beacon
 // cadence) because a selection walk isn't free on a big project and the beacon
@@ -5108,6 +5132,9 @@ static void addMarkerAt(const std::string& rawName, double pos, const std::strin
 // transport, since a re-seek is audible.
 static void followMirrorSelection(const json& target);
 static void followMirrorFx(const json& target);
+static void followNoteUserView();
+static void followTrackDrag();
+static void followRememberView();
 
 static void followTick() {
   if (g_followPeer.empty()) return;
@@ -5123,9 +5150,12 @@ static void followTick() {
     // The peer left (or went stale): stop following rather than freezing on
     // their last known state.
     g_followPeer.clear();
+    g_followDrag = FollowDrag{};
+    g_followView = FollowView{};
     activityEvent("follow_ended", json::object(), "you stopped following because they left the session");
     return;
   }
+  followNoteUserView();
   const bool tPlaying = target->value("playing", false);
   const double tPlay = target->value("play", 0.0);
   const std::string tFocus = jsonStr(*target, "focus");
@@ -5176,6 +5206,8 @@ static void followTick() {
   }
   followMirrorSelection(*target);
   followMirrorFx(*target);
+  followTrackDrag();
+  followRememberView();
 }
 
 // Mirror the followed peer's item selection: their beacon carries the GUIDs
@@ -5280,6 +5312,8 @@ static void stopFollowing() {
   g_followLastSeek = {};
   g_followLastSel.clear();
   g_followLastFx.clear();
+  g_followDrag = FollowDrag{};
+  g_followView = FollowView{};
   // Whatever follow mode opened stays open: the user keeps the view they had
   // when they stopped, exactly like the track focus and arrange span do.
   g_followFxOpen = FollowFx{};
@@ -6775,6 +6809,145 @@ static json cursorDrag(const cursor_overlay::Local& l, bool pressed) {
   return {{"items", items}, {"dt", dt}, {"dtr", lastDtr}};
 }
 
+// ---------- follow mode and the followed person's item drag ----------
+//
+// While the person we follow drags items, their pointer (which holds the
+// dragged items, so it sits on the drag preview) is kept in view: the arrange
+// scrolls along, horizontally and vertically, at most every 100ms and only
+// when the pointer moved. Horizontally the adopted view span (followTick)
+// mostly does this already, since their REAPER scrolls its own view along an
+// edge drag; this covers the beacon lagging behind and older peers. The
+// vertical direction is not mirrored otherwise (track heights and vertical
+// scroll differ per person), so dragging to a track off our screen scrolls it
+// in. Scrolling or zooming during the drag hands the view back to the user
+// until the drag ends.
+
+static constexpr auto kFollowDragEvery = std::chrono::milliseconds(100);
+// No cursor message for this long ends the drag: a pointer resting mid-drag
+// only sends its 3s keep-alive.
+static constexpr auto kFollowDragStale = std::chrono::seconds(4);
+// Where a pointer that left the view horizontally is brought back to: this
+// share of the view in from the edge it left by.
+static constexpr double kFollowDragMarginX = 0.1;
+// Rows kept free above and below the track under their pointer, in points.
+static constexpr double kFollowDragMarginY = 24;
+
+static void followNoteCursor(const cursor_overlay::Remote& r) {
+  FollowDrag& d = g_followDrag;
+  if (!r.in || r.drag.items.empty()) {
+    d = FollowDrag{};
+    return;
+  }
+  if (!d.on || d.t != r.t || d.track != r.guid) d.moved = true;
+  d.on = true;
+  d.t = r.t;
+  d.track = r.guid;
+  d.at = std::chrono::steady_clock::now();
+}
+
+static double followRowsY() {
+  MediaTrack* first = CountTracks(nullptr) > 0 ? GetTrack(nullptr, 0) : nullptr;
+  return first ? GetMediaTrackInfo_Value(first, "I_TCPY") : 0.0;
+}
+
+// Before follow mode moves anything this tick: did the view change since its
+// last tick? Then the user scrolled or zoomed (a rolling transport scrolls on
+// its own, so the start of the view counts only while stopped; our own
+// vertical scroll may show up a pass late).
+static void followNoteUserView() {
+  FollowDrag& d = g_followDrag;
+  if (!d.on || d.userView || !g_followView.valid) return;
+  double v0 = 0, v1 = 0;
+  GetSet_ArrangeView2(nullptr, false, 0, 0, &v0, &v1);
+  const bool rolling = (GetPlayState() & 1) != 0;
+  const bool zoomed = std::abs((v1 - v0) - (g_followView.v1 - g_followView.v0)) > 1e-6;
+  const bool panned = !rolling && std::abs(v0 - g_followView.v0) > 1e-6;
+  const bool rows = std::abs(followRowsY() - g_followView.rowsY) >= 1 &&
+                    std::chrono::steady_clock::now() - d.scrolled > std::chrono::milliseconds(150);
+  if (zoomed || panned || rows) d.userView = true;
+}
+
+// After follow mode moved what it moves this tick.
+static void followRememberView() {
+  GetSet_ArrangeView2(nullptr, false, 0, 0, &g_followView.v0, &g_followView.v1);
+  g_followView.rowsY = followRowsY();
+  g_followView.valid = true;
+}
+
+// Scrolls the arrange vertically until `tr` has moved up by `by` (down when
+// negative). REAPER has no call that sets the vertical scroll, and
+// CSurf_OnScroll steps by an amount of its own, so this steps and measures
+// the track's row until it is there, the list ends or nothing moves. Returns
+// whether anything moved.
+static bool followScrollRows(MediaTrack* tr, double by) {
+  int dir = by > 0 ? 1 : -1;
+  double left = by;
+  bool flipped = false, any = false;
+  for (int i = 0; i < 256 && std::abs(left) >= 1 && (left > 0) == (by > 0); ++i) {
+    const double before = GetMediaTrackInfo_Value(tr, "I_TCPY");
+    CSurf_OnScroll(0, dir);
+    const double moved = before - GetMediaTrackInfo_Value(tr, "I_TCPY");
+    if (moved == 0) break;
+    any = true;
+    left -= moved;
+    if ((moved > 0) != (dir > 0)) {
+      // The step went the other way: steps run opposite to what was assumed.
+      if (flipped) break;
+      flipped = true;
+      dir = -dir;
+    }
+  }
+  // A step longer than the way left the row further off than it was: one back.
+  if (any && !flipped && std::abs(left) > std::abs(by)) CSurf_OnScroll(0, -dir);
+  return any;
+}
+
+static void followTrackDrag() {
+  FollowDrag& d = g_followDrag;
+  if (!d.on) return;
+  const auto now = std::chrono::steady_clock::now();
+  if (now - d.at > kFollowDragStale) {
+    d = FollowDrag{};
+    return;
+  }
+  // Only where the drag preview is drawn: without it the view would jump for
+  // no visible reason.
+  if (d.userView || !d.moved || !g_cursorsShown || !cursor_overlay::draws() || !cursorReady()) return;
+  static auto last = std::chrono::steady_clock::time_point{};
+  if (now - last < kFollowDragEvery) return;
+  last = now;
+  d.moved = false;
+  bool scrolled = false;
+
+  double v0 = 0, v1 = 0;
+  GetSet_ArrangeView2(nullptr, false, 0, 0, &v0, &v1);
+  const double span = v1 - v0;
+  if (span > 0 && (d.t < v0 || d.t > v1)) {
+    const double m = span * kFollowDragMarginX;
+    double ns = (std::max)(0.0, d.t < v0 ? d.t - m : d.t + m - span);
+    double ne = ns + span;
+    GetSet_ArrangeView2(nullptr, true, 0, 0, &ns, &ne);
+    scrolled = true;
+  }
+
+  MediaTrack* tr = d.track.empty() ? nullptr : cursorTrack(d.track);
+  double vw = 0, vh = 0;
+  if (tr && GetMediaTrackInfo_Value(tr, "B_SHOWINTCP") != 0.0 && cursor_overlay::viewSize(&vw, &vh)) {
+    const double y = GetMediaTrackInfo_Value(tr, "I_TCPY");
+    const double h = GetMediaTrackInfo_Value(tr, "I_TCPH");
+    const double m = (std::min)(kFollowDragMarginY * cursor_overlay::pixelScale(), vh / 4);
+    double by = 0;
+    if (y < m) by = y - m;
+    // A track taller than the view keeps its top in view.
+    else if (y + h > vh - m) by = (std::min)(y + h - (vh - m), y - m);
+    if (std::abs(by) >= 1 && followScrollRows(tr, by)) {
+      d.scrolled = now;
+      scrolled = true;
+    }
+  }
+  if (scrolled) UpdateArrange();
+}
+
 // Network side of the cursors, pumped by the layer in every run-loop pass
 // right before it draws (and from the extension timer as well):
 // hands arrived cursor updates to the layer, and sends the local pointer,
@@ -6814,6 +6987,7 @@ static void cursorPump() {
           r.drag.dt = jsonNum(d, "dt", 0.0);
           r.drag.dtr = static_cast<int>(jsonNum(d, "dtr", 0.0));
         }
+        if (!g_followPeer.empty() && r.id == g_followPeer) followNoteCursor(r);
         cursor_overlay::update(r);
       }
   }
@@ -6910,7 +7084,7 @@ static void cursorPresence() {
       acts.push_back(std::move(a));
     }
   cursor_overlay::setActivity(acts);
-  cursor_overlay::setFollow(followName, followColor);
+  cursor_overlay::setFollow(followName.empty() ? "" : g_followPeer, followName, followColor);
 }
 
 static void cursorTick() {

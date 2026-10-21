@@ -89,6 +89,7 @@ struct Style {
   double dragLine, dragDash, dragGap, dragFill;
   double revertHold, revertGlide, revertFade, revertOpacity;
   double followLine, followOpacity, followTagInset;
+  double haloRadius, haloCentre, haloFill, haloLine, haloLineOpacity;
   double markLine, markRadius, markDim, markLinger, markFadeIn, markFadeOut;
   double markTagFont, markTagHeight, markTagPadX, markTagGap;
   double loadingVeil;
@@ -154,6 +155,11 @@ constexpr Style kStyle = {
     .followLine = 2,
     .followOpacity = 0.9,
     .followTagInset = 8,
+    .haloRadius = 15,
+    .haloCentre = 8,
+    .haloFill = 0.16,
+    .haloLine = 1.5,
+    .haloLineOpacity = 0.45,
     .markLine = 1.5,
     .markRadius = 3,
     .markDim = 0.3,
@@ -829,6 +835,24 @@ void drawArrow(Node& n, const std::string& color) {
   n.look = look;
 }
 
+// The disc behind the followed person's pointer, centred on the arrow's body
+// (not its tip, where a click ripples).
+void drawHalo(Node& n, const std::string& color) {
+  const std::string look = "halo" + color + scaleKey();
+  if (n.look == look) return;
+  const double R = kStyle.haloRadius, c = kStyle.haloCentre;
+  ID2D1DeviceContext* dc = beginDraw(n, 2 * R, 2 * R, 2, R - c, R - c);
+  if (!dc) return;
+  const Rgb rgb = parseColor(color);
+  const float line = static_cast<float>(kStyle.haloLine);
+  const D2D1_ELLIPSE e = D2D1::Ellipse(D2D1::Point2F(static_cast<float>(R), static_cast<float>(R)),
+                                       static_cast<float>(R) - line / 2, static_cast<float>(R) - line / 2);
+  dc->FillEllipse(e, brush(dc, rgba(rgb, kStyle.haloFill)).Get());
+  dc->DrawEllipse(e, brush(dc, rgba(rgb, kStyle.haloLineOpacity)).Get(), line);
+  endDraw(n, dc);
+  n.look = look;
+}
+
 // A pill in `color` with `label` in the matching ink, `lead` DIP free before
 // the text; returns its width in DIP.
 double drawPill(Node& n, const std::string& label, const std::string& color, double fontSize, double height,
@@ -964,6 +988,8 @@ struct Peer {
 
   Node root;   // positioned at the pointer tip
   Node arrow;  // child of root
+  Node halo;   // child of root, below the arrow: the person we follow
+  bool followed = false;
   Node tag;    // a sibling of root, so it can trail it
   Node edge;
   Node edgeArrow;  // child of edge
@@ -1029,7 +1055,7 @@ Pt g_localPoint;
 // The follow frame: four strips and the tag, children of one visual so they
 // fade together.
 Node g_follow, g_followTag, g_followEdge[4];
-std::string g_followKey, g_followName, g_followColor;
+std::string g_followKey, g_followName, g_followColor, g_followId;
 bool g_clickPending = false;
 POINT g_clickPoint{};
 
@@ -1050,6 +1076,50 @@ std::string displayLabel(const Peer& p) {
   return s;
 }
 
+// Re-inserts a visual above all its siblings.
+void raise(Node& n) {
+  if (!n || !n.parent) return;
+  n.parent->RemoveVisual(n.v.Get());
+  n.parent->AddVisual(n.v.Get(), FALSE, nullptr);
+  g_dirty = true;
+}
+
+void updateTag(Peer& p, double t);
+
+// The person we follow stands out: the disc behind the pointer, the name tag
+// always up, never dimmed, above everyone else's cursor.
+void setFollowed(Peer& p, bool on) {
+  if (on == p.followed && (!on || p.halo)) return;
+  p.followed = on;
+  if (on) {
+    if (!p.halo && p.root) {
+      p.halo = makeNode(p.root.v.Get(), Z::Bottom);
+      setOpacityNow(p.halo, 0);
+    }
+    drawHalo(p.halo, p.color);
+    fade(p.halo, 1, kStyle.fadeIn * 2);
+    raise(p.edge);
+    raise(p.tag);
+    raise(p.root);
+    if (p.idle) {
+      fade(p.arrow, 1, kStyle.fadeIn);
+      p.idle = false;
+    }
+  } else {
+    fade(p.halo, 0, kStyle.fadeOut);
+  }
+  updateTag(p, now());
+}
+
+void raiseFollowed() {
+  if (g_followId.empty()) return;
+  auto it = g_peers.find(g_followId);
+  if (it == g_peers.end()) return;
+  raise(it->second.edge);
+  raise(it->second.tag);
+  raise(it->second.root);
+}
+
 void buildLayers(Peer& p) {
   p.edge = makeNode(g_rootV.Get());
   p.edgeArrow = p.edge ? makeNode(p.edge.v.Get(), Z::Top, nullptr, true) : Node{};
@@ -1060,6 +1130,9 @@ void buildLayers(Peer& p) {
   setOpacityNow(p.tag, 0);
   setOpacityNow(p.root, 0);
   drawArrow(p.arrow, p.color);
+  // Built above every other cursor, which the followed one has to stay on.
+  if (p.id == g_followId) setFollowed(p, true);
+  else raiseFollowed();
 }
 
 void dropDragItem(Peer::DragItem& d) {
@@ -1071,6 +1144,7 @@ void dropLayers(Peer& p) {
   for (auto& [item, d] : p.dragItems) dropDragItem(d);
   p.dragItems.clear();
   dropNode(p.root);
+  p.halo = Node{};  // went with root
   dropNode(p.tag);
   dropNode(p.edge);
 }
@@ -1078,6 +1152,7 @@ void dropLayers(Peer& p) {
 void refreshTag(Peer& p) {
   drawPill(p.tag, displayLabel(p), p.color, kStyle.tagFont, kStyle.tagHeight, kStyle.tagPadX);
   drawArrow(p.arrow, p.color);
+  if (p.halo) drawHalo(p.halo, p.color);
 }
 
 void refreshEdge(Peer& p, Side side) {
@@ -1264,9 +1339,9 @@ Place placeOf(const Peer& p, const Geo& g, double t) {
 }
 
 // The name tag shows while the cursor moves, and always while it waits
-// beside an FX window.
+// beside an FX window or belongs to the person we follow.
 void updateTag(Peer& p, double t) {
-  const bool want = p.cursorShown && (p.parked || t - p.lastMove < kStyle.tagIdleAfter);
+  const bool want = p.cursorShown && (p.parked || p.followed || t - p.lastMove < kStyle.tagIdleAfter);
   if (want == p.tagShown) return;
   fade(p.tag, want ? 1 : 0, want ? kStyle.tagFadeIn : kStyle.tagFadeOut);
   p.tagShown = want;
@@ -1785,6 +1860,7 @@ void teardown() {
   g_followKey.clear();
   g_followName.clear();
   g_followColor.clear();
+  g_followId.clear();
   g_clickPending = false;
   releaseDevice();
   g_tv = nullptr;
@@ -1885,8 +1961,14 @@ void setActivity(const std::vector<Activity>& list) {
   commit();
 }
 
-void setFollow(const std::string& name, const std::string& color) {
+void setFollow(const std::string& id, const std::string& name, const std::string& color) {
   if (!g_attached) return;
+  const std::string who = name.empty() ? "" : id;
+  if (who != g_followId) {
+    if (auto it = g_peers.find(g_followId); it != g_peers.end()) setFollowed(it->second, false);
+    g_followId = who;
+    if (auto it = g_peers.find(g_followId); it != g_peers.end()) setFollowed(it->second, true);
+  }
   const std::string key = name.empty() ? "" : name + color;
   if (key == g_followKey) return;
   const bool was = !g_followKey.empty();
@@ -2028,8 +2110,8 @@ void tick() {
     }
     updateTag(p, t);
     // A cursor resting a while dims to half; waiting beside an FX window is
-    // not resting.
-    const bool idle = p.cursorShown && !p.parked && t - p.lastMove > kStyle.idleDimAfter;
+    // not resting, and the person we follow never dims.
+    const bool idle = p.cursorShown && !p.parked && !p.followed && t - p.lastMove > kStyle.idleDimAfter;
     if (idle != p.idle) {
       fade(p.arrow, idle ? kStyle.idleOpacity : 1, idle ? kStyle.idleFade : kStyle.fadeIn);
       p.idle = idle;
@@ -2042,6 +2124,15 @@ void tick() {
 void revert(const Revert& r) {
   if (!g_attached || r.item.empty() || r.track.empty()) return;
   g_pendingReverts.push_back(r);
+}
+
+bool viewSize(double* w, double* h) {
+  if (!g_attached) return false;
+  RECT rc{};
+  GetClientRect(g_tv, &rc);
+  *w = rc.right - rc.left;
+  *h = rc.bottom - rc.top;
+  return *w > 0 && *h > 0;
 }
 
 double pixelScale() { return g_scale; }

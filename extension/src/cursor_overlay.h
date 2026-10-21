@@ -116,8 +116,11 @@ struct Activity {
 void setActivity(const std::vector<Activity>& list);
 
 // Following someone: a thin frame in their colour around the arrange with
-// their name in a corner. An empty name removes it.
-void setFollow(const std::string& name, const std::string& color);
+// their name in a corner, and their cursor (peer `id`) stands out from the
+// others: a soft disc in their colour behind the pointer, the name tag always
+// up, never dimmed while resting, drawn above every other cursor. An empty
+// name removes both.
+void setFollow(const std::string& id, const std::string& name, const std::string& color);
 
 // Items to mark, replacing the previous set. Called every extension tick,
 // after remote edits were applied: lays the marks out again each time.
@@ -142,6 +145,10 @@ struct Local {
 };
 // Samples the local pointer; false when there is nothing to sample (no layer).
 bool sampleLocal(Local* out);
+
+// The arrange's size in the units of Host::trackSpan (points on macOS,
+// pixels on Windows); false without a layer.
+bool viewSize(double* w, double* h);
 
 // Arrange units per point: the factor that turns a distance meant in points
 // into arrange coordinates (1 on macOS, where they are points; the DPI scale
