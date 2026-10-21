@@ -104,8 +104,7 @@ Whoever edits a field first holds it until two seconds after their last change.
 Competing edits snap back, including the host's. Whole items, FX chains and sets
 of track envelopes each count as one field, so working on different tracks or
 items avoids conflicts. An item someone else is editing is dimmed with an
-outline in their color (point at it to see who), and an edit of yours that
-snaps back glides back into place.
+outline in their color (point at it to see who).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/edit-lock-dark.png">

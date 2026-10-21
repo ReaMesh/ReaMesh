@@ -13,7 +13,6 @@ void setFollow(const std::string&, const std::string&, const std::string&) {}
 void setMarks(const std::vector<Mark>&) {}
 void tick() {}
 bool sampleLocal(Local*) { return false; }
-void revert(const Revert&) {}
 bool viewSize(double*, double*) { return false; }
 double pixelScale() { return 1; }
 bool mouseHeld() { return false; }

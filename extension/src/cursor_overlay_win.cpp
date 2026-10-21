@@ -87,7 +87,6 @@ struct Style {
   double edgeInset, edgeHeight, edgeFont, edgePadX, edgeArrow, edgeOpacity;
   double parkInset, parkItemInset;
   double dragLine, dragDash, dragGap, dragFill;
-  double revertHold, revertGlide, revertFade, revertOpacity;
   double followLine, followOpacity, followTagInset;
   double haloRadius, haloCentre, haloFill, haloLine, haloLineOpacity;
   double markLine, markRadius, markDim, markLinger, markFadeIn, markFadeOut;
@@ -148,10 +147,6 @@ constexpr Style kStyle = {
     .dragDash = 5,
     .dragGap = 4,
     .dragFill = 0.16,
-    .revertHold = 0.25,
-    .revertGlide = 0.45,
-    .revertFade = 0.3,
-    .revertOpacity = 0.85,
     .followLine = 2,
     .followOpacity = 0.9,
     .followTagInset = 8,
@@ -263,7 +258,6 @@ struct Bezier {
   }
 };
 constexpr Bezier kEaseOut{0, 0, 0.58, 1};
-constexpr Bezier kEaseInOut{0.42, 0, 0.58, 1};
 
 // One animated scalar, evaluable here at any time.
 struct Curve {
@@ -1407,60 +1401,6 @@ void layoutDrag(Peer& p, const Geo& g, bool net) {
   }
 }
 
-// Our undone edits, waiting for the next pass to know where the item went.
-std::vector<cursor_overlay::Revert> g_pendingReverts;
-
-void runRevert(const cursor_overlay::Revert& r, const Geo& g) {
-  double ty = 0, th = 0, t0 = 0, t1 = 0, y = 0, h = 0;
-  if (!g.ok || !g_host.trackSpan(r.track.c_str(), &ty, &th) || th <= 0) return;
-  if (!g_host.itemSpan || !g_host.itemSpan(r.item.c_str(), &t0, &t1, &y, &h, nullptr)) return;
-  const Box from{std::round((r.t0 - g.t0) / g.spp), std::round(ty + r.yOff), std::round((r.t1 - r.t0) / g.spp),
-                 std::round(r.h > 0 ? r.h : h)};
-  const Box to{std::round((t0 - g.t0) / g.spp), std::round(y), std::round((t1 - t0) / g.spp), std::round(h)};
-  if (from.x == to.x && from.y == to.y && from.w == to.w && from.h == to.h) return;
-  const double ux0 = std::min(from.x, to.x), ux1 = std::max(from.x + from.w, to.x + to.w);
-  const double uy0 = std::min(from.y, to.y), uy1 = std::max(from.y + from.h, to.y + to.h);
-  if (ux1 <= 0 || ux0 >= g.W || uy1 <= 0 || uy0 >= g.H) return;
-  // The copy glides by scaling surfaces, which an item wider than any surface
-  // can't do; it isn't seen whole on screen anyway.
-  const auto fits = [](const Box& b) { return b.w >= 1 && b.h >= 1 && b.w <= 8192 && b.h <= 8192; };
-  if (!fits(from) || !fits(to)) return;
-
-  // Hold at our version, glide into the item, fade. A box drawn at one size
-  // and scaled to another would stretch its dashes, so a resized item gets
-  // two: one drawn at our size, one at the item's, crossfading as they glide.
-  const double t = now();
-  const double hold = kStyle.revertHold, glide = g_reduceMotion ? 0 : kStyle.revertGlide;
-  const double total = hold + glide + kStyle.revertFade;
-  const double move = std::max(glide, 0.001);
-  const bool resized = from.w != to.w || from.h != to.h;
-  // `at` is the size the box is drawn at; it travels from `from` to `to`.
-  const auto box = [&](const Box& at, std::vector<std::pair<double, double>> keys) {
-    Node l = makeNode(g_markV.Get());
-    if (!l) return;
-    drawBox(l, at.w, at.h, D2D1::ColorF(1, 1, 1, 0.08f),
-            D2D1::ColorF(1, 1, 1, static_cast<float>(kStyle.revertOpacity)), kStyle.dragLine, true);
-    setPos(l, {to.x, to.y});
-    l.dx = Curve::ease(t, from.x - to.x, 0, move, kEaseInOut, hold);
-    l.dy = Curve::ease(t, from.y - to.y, 0, move, kEaseInOut, hold);
-    l.sx = Curve::ease(t, from.w / at.w, to.w / at.w, move, kEaseInOut, hold);
-    l.sy = Curve::ease(t, from.h / at.h, to.h / at.h, move, kEaseInOut, hold);
-    bindMove(l, t);
-    bindScale(l, t);
-    l.op.kind = Curve::Keys;
-    l.op.start = t;
-    l.op.keys = std::move(keys);
-    bindOpacity(l, t);
-    dropLater(l, t + total + 0.05);
-  };
-  if (!resized) {
-    box(to, {{0, 0}, {0.08, 1}, {hold + glide, 1}, {total, 0}});
-    return;
-  }
-  box(from, {{0, 0}, {0.08, 1}, {hold, 1}, {hold + move, 0}});
-  box(to, {{0, 0}, {hold, 0}, {hold + move, 1}, {total, 0}});
-}
-
 // Moves a peer's visuals to where its spot is now. With a network update
 // pending they spring toward it (or fade across on a long jump); otherwise
 // only the view moved and they snap (glued).
@@ -1577,7 +1517,7 @@ bool quiet(const Geo& g, double t) {
     g_viewSettleUntil = t + 0.15;
     return false;
   }
-  if (t < g_viewSettleUntil || g_marksDirty || !g_pendingReverts.empty() || t < g_marksSettleUntil) return false;
+  if (t < g_viewSettleUntil || g_marksDirty || t < g_marksSettleUntil) return false;
   for (const auto& [id, p] : g_peers)
     if (p.pendingSpring || p.pendingClick) return false;
   return true;
@@ -1597,7 +1537,7 @@ void glue(bool onlyPending = false) {
     layoutFollow();
   }
   checkScale();
-  if (g_peers.empty() && g_marks.empty() && g_pendingReverts.empty()) return;
+  if (g_peers.empty() && g_marks.empty()) return;
   const double t = now();
   const Geo g = readGeo();
   // The project can't be read right now (a remote apply, a project opening;
@@ -1605,10 +1545,6 @@ void glue(bool onlyPending = false) {
   // everything where it is and the updates pending.
   if (!g.ok) return;
   if (!onlyPending && quiet(g, t)) return;
-  if (!onlyPending && !g_pendingReverts.empty()) {
-    for (const auto& r : g_pendingReverts) runRevert(r, g);
-    g_pendingReverts.clear();
-  }
   if (!onlyPending) layoutMarks(g);
   for (auto& [id, p] : g_peers)
     if (!onlyPending || p.pendingSpring || p.pendingClick) layoutPeer(p, g, t);
@@ -1629,7 +1565,7 @@ void onTimer() {
   if (!g_attached) return;  // the pump may have ended the session
   const double t = now();
   sweepDoomed(t);
-  if (!g_peers.empty() || !g_marks.empty() || !g_pendingReverts.empty()) {
+  if (!g_peers.empty() || !g_marks.empty()) {
     // Updates stopped: the pointer came to rest, so take the prediction back.
     for (auto& [id, p] : g_peers)
       if (p.predict && t - p.lastMsg > kStyle.predictStopAfter) {
@@ -1852,7 +1788,6 @@ void teardown() {
   if (IsWindow(g_tv)) KillTimer(g_tv, kTimerId);
   RemoveWindowSubclass(g_tv, trackViewProc, kSubclassId);
   g_peers.clear();
-  g_pendingReverts.clear();
   g_marks.clear();
   g_marksDirty = false;
   g_hoverShown = false;
@@ -2119,11 +2054,6 @@ void tick() {
     ++it;
   }
   commit();
-}
-
-void revert(const Revert& r) {
-  if (!g_attached || r.item.empty() || r.track.empty()) return;
-  g_pendingReverts.push_back(r);
 }
 
 bool viewSize(double* w, double* h) {

@@ -95,15 +95,6 @@ struct Remote {
 };
 void update(const Remote& r);
 
-// Our own edit to an item was just undone (someone else holds it, or their
-// version won): a dashed copy of our version, at `t0..t1` on `track` with the
-// item's rows `yOff`/`h` within it, glides back into the item and fades.
-struct Revert {
-  std::string item, track;
-  double t0 = 0, t1 = 0, yOff = 0, h = 0;
-};
-void revert(const Revert& r);
-
 // What each other person is doing outside the arrange, from their presence:
 // an open FX window on a track. While their mouse is away from the arrange,
 // their cursor waits at the left edge of that track's row, next to its FX

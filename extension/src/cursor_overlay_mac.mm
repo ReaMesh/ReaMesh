@@ -77,9 +77,6 @@ struct Style {
   // Someone dragging items: a dashed outline in their colour where the items
   // would land; the originals are marked like a lock.
   double dragLine, dragDash, dragGap, dragFill;
-  // Our own edit undone: a dashed copy of it holds, glides back into the
-  // item, and fades.
-  double revertHold, revertGlide, revertFade, revertOpacity;
   // Following someone: a frame round the arrange.
   double followLine, followOpacity, followTagInset;
   // ...and their cursor stands out: a soft disc in their colour behind the
@@ -149,10 +146,6 @@ constexpr Style kStyle = {
     .dragDash = 5,
     .dragGap = 4,
     .dragFill = 0.16,
-    .revertHold = 0.25,
-    .revertGlide = 0.45,
-    .revertFade = 0.3,
-    .revertOpacity = 0.85,
     .followLine = 2,
     .followOpacity = 0.9,
     .followTagInset = 8,
@@ -919,62 +912,6 @@ void layoutDrag(Peer& p, const Geo& g, bool net) {
   }
 }
 
-// Our undone edits, waiting for the next pass to know where the item went.
-std::vector<cursor_overlay::Revert> g_pendingReverts;
-
-void runRevert(const cursor_overlay::Revert& r, const Geo& g) {
-  double ty = 0, th = 0, t0 = 0, t1 = 0, y = 0, h = 0;
-  if (!g.ok || !g_host.trackSpan(r.track.c_str(), &ty, &th) || th <= 0) return;
-  if (!g_host.itemSpan || !g_host.itemSpan(r.item.c_str(), &t0, &t1, &y, &h, nullptr)) return;
-  const CGRect from = CGRectMake((r.t0 - g.t0) / g.spp, ty + r.yOff, (r.t1 - r.t0) / g.spp, r.h > 0 ? r.h : h);
-  const CGRect to = CGRectMake((t0 - g.t0) / g.spp, y, (t1 - t0) / g.spp, h);
-  if (CGRectEqualToRect(CGRectIntegral(from), CGRectIntegral(to))) return;
-  if (!CGRectIntersectsRect(CGRectUnion(from, to), CGRectMake(0, 0, g.W, g.H))) return;
-  CAShapeLayer* l = dashedBox([NSColor colorWithWhite:1 alpha:kStyle.revertOpacity],
-                              [NSColor colorWithWhite:1 alpha:0.08]);
-  [CATransaction begin];
-  [CATransaction setDisableActions:YES];
-  setBox(l, to);
-  l.opacity = 0;
-  [g_markRoot addSublayer:l];
-  [CATransaction commit];
-
-  // Hold at our version, glide into the item, fade.
-  const double hold = kStyle.revertHold, glide = g_reduceMotion ? 0 : kStyle.revertGlide;
-  const double total = hold + glide + kStyle.revertFade;
-  CABasicAnimation* pos = [CABasicAnimation animationWithKeyPath:@"position"];
-  pos.fromValue = [NSValue valueWithPoint:NSPointFromCGPoint(from.origin)];
-  pos.toValue = [NSValue valueWithPoint:NSPointFromCGPoint(to.origin)];
-  pos.beginTime = hold;
-  pos.duration = std::max(glide, 0.001);
-  pos.fillMode = kCAFillModeBackwards;
-  pos.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-  CGPathRef fromPath = roundedPath(from.size), toPath = roundedPath(to.size);
-  CABasicAnimation* shape = [CABasicAnimation animationWithKeyPath:@"path"];
-  shape.fromValue = (__bridge id)fromPath;
-  shape.toValue = (__bridge id)toPath;
-  shape.beginTime = hold;
-  shape.duration = pos.duration;
-  shape.fillMode = kCAFillModeBackwards;
-  shape.timingFunction = pos.timingFunction;
-  CAKeyframeAnimation* op = [CAKeyframeAnimation animationWithKeyPath:@"opacity"];
-  op.values = @[ @0, @1, @1, @0 ];
-  op.keyTimes = @[ @0, @(0.08 / total), @((hold + glide) / total), @1 ];
-  op.duration = total;
-  CAAnimationGroup* grp = [CAAnimationGroup animation];
-  grp.animations = @[ pos, shape, op ];
-  grp.duration = total;
-  if (@available(macOS 12.0, *)) grp.preferredFrameRateRange = CAFrameRateRangeMake(60, 120, 120);
-  [CATransaction begin];
-  [CATransaction setCompletionBlock:^{
-    [l removeFromSuperlayer];
-  }];
-  [l addAnimation:grp forKey:@"revert"];
-  [CATransaction commit];
-  CGPathRelease(fromPath);
-  CGPathRelease(toPath);
-}
-
 // Moves a peer's layers to where its spot is now. With a network update
 // pending they spring toward it (or fade across on a long jump); otherwise
 // only the view moved and they snap (glued). Returns whether the view moved
@@ -1089,7 +1026,7 @@ bool quiet(const Geo& g, double t) {
     g_viewSettleUntil = t + 0.15;
     return false;
   }
-  if (t < g_viewSettleUntil || g_marksDirty || !g_pendingReverts.empty() || t < g_marksSettleUntil) return false;
+  if (t < g_viewSettleUntil || g_marksDirty || t < g_marksSettleUntil) return false;
   for (const auto& [id, p] : g_peers)
     if (p.pendingSpring || p.pendingClick) return false;
   return true;
@@ -1100,15 +1037,11 @@ bool quiet(const Geo& g, double t) {
 void glue(bool onlyPending = false) {
   if (!g_attached) return;
   if (!NSEqualRects(g_view.frame, g_tv.bounds)) g_view.frame = g_tv.bounds;
-  if (g_peers.empty() && g_marks.empty() && g_pendingReverts.empty()) return;
+  if (g_peers.empty() && g_marks.empty()) return;
   const double t = now();
   checkScale();
   const Geo g = readGeo();
   if (!onlyPending && quiet(g, t)) return;
-  if (!onlyPending && g.ok && !g_pendingReverts.empty()) {
-    for (const auto& r : g_pendingReverts) runRevert(r, g);
-    g_pendingReverts.clear();
-  }
   if (!onlyPending) layoutMarks(g);
   for (auto& [id, p] : g_peers)
     if (!onlyPending || p.pendingSpring || p.pendingClick) layoutPeer(p, g, t);
@@ -1125,7 +1058,7 @@ void onObserver() {
       g_host.pump();
     }
   }
-  if (g_peers.empty() && g_marks.empty() && g_pendingReverts.empty()) return;
+  if (g_peers.empty() && g_marks.empty()) return;
   // Updates stopped: the pointer came to rest, so take the prediction back.
   const double t = now();
   for (auto& [id, p] : g_peers)
@@ -1379,7 +1312,6 @@ void detach() {
     g_clickMonitor = nil;
     for (auto& [id, p] : g_peers) p.dragItems.clear();
     g_peers.clear();
-    g_pendingReverts.clear();
     g_marks.clear();
     g_marksDirty = false;
     g_hoverTag = nil;
@@ -1618,11 +1550,6 @@ void tick() {
       ++it;
     }
   }
-}
-
-void revert(const Revert& r) {
-  if (!g_attached || r.item.empty() || r.track.empty()) return;
-  g_pendingReverts.push_back(r);
 }
 
 bool viewSize(double* w, double* h) {

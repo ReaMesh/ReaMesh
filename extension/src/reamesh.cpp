@@ -406,8 +406,6 @@ static Mode g_mode = Mode::Idle;
 static std::string g_sessionProjectPath;  // path the session is bound to
 static Snapshot g_snapshot;               // last known state, by GUID
 static int g_lastChangeCount = -1;
-// Items this instance proposed changes to, and when (cursor_overlay::revert).
-static std::map<std::string, std::chrono::steady_clock::time_point> g_localItemEdits;
 // EMA of what one edit capture (serialize what changed + diff) costs on this
 // project; drives the adaptive capture throttle so huge projects trade a
 // little sync latency for a smooth REAPER UI instead of a choppy one.
@@ -3851,13 +3849,6 @@ static void captureLocalChanges(bool force) {
             counterMoved ? "COUNTER" : (sweepOwed ? "SWEEP" : "RESCAN"), summary.c_str());
   }
 
-  // Remember which items we just proposed, so a remote version that wins over
-  // ours can be shown going back (applyItem).
-  if (changeset.find("\"items\"") != std::string::npos) {
-    const json cs = json::parse(changeset, nullptr, false);
-    if (cs.is_object() && cs.contains("items") && cs["items"].is_object())
-      for (auto& [id, _] : cs["items"].items()) g_localItemEdits[id] = std::chrono::steady_clock::now();
-  }
   reamesh_push_local(g_handle, changeset.c_str());
 }
 
@@ -4139,18 +4130,6 @@ static std::vector<std::string> missingMediaIn(const json& fields) {
 // deletion). Caller has verified the referenced media exists.
 static std::set<std::string> lockedItemsByOthers();
 
-// An item as it stands now, for cursor_overlay::revert.
-static cursor_overlay::Revert revertOf(const std::string& guid, MediaItem* item) {
-  cursor_overlay::Revert r;
-  r.item = guid;
-  if (MediaTrack* tr = GetMediaItem_Track(item)) r.track = trackGuid(tr);
-  r.t0 = GetMediaItemInfo_Value(item, "D_POSITION");
-  r.t1 = r.t0 + GetMediaItemInfo_Value(item, "D_LENGTH");
-  r.yOff = GetMediaItemInfo_Value(item, "I_LASTY");
-  r.h = GetMediaItemInfo_Value(item, "I_LASTH");
-  return r;
-}
-
 static void applyItem(const std::string& guid, const json& fields, bool freshMedia = false) {
   // Any remote change to this item restores its real (synced) color, so drop a
   // tint record we hold for it: reconcileItemTints will re-stash the FRESH real
@@ -4166,16 +4145,6 @@ static void applyItem(const std::string& guid, const json& fields, bool freshMed
     g_itemTints.erase(rec);
   }
   MediaItem* item = findItemByGuid(guid);
-  // Our own recent edit to this item, overruled by someone holding it: show
-  // our version going back (the remote state replaces it just below).
-  std::optional<cursor_overlay::Revert> overruled;
-  if (auto e = g_localItemEdits.find(guid); e != g_localItemEdits.end()) {
-    if (std::chrono::steady_clock::now() - e->second > std::chrono::seconds(4)) {
-      g_localItemEdits.erase(e);
-    } else if (item && lockedItemsByOthers().count(guid)) {
-      overruled = revertOf(guid, item);
-    }
-  }
   if (!jsonBool(fields, "present", true)) {
     if (item) DeleteTrackMediaItem(GetMediaItem_Track(item), item);
     g_placeholders.erase(guid);  // the owner removed it: nothing left to stand in for
@@ -4212,7 +4181,6 @@ static void applyItem(const std::string& guid, const json& fields, bool freshMed
     SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", static_cast<double>(tintedReal));
   }
   UpdateItemInProject(item);
-  if (overruled) cursor_overlay::revert(*overruled);
   noteForeignSources(item);  // never internalized and re-served by us
   // Media that only just reached this machine has no peaks yet: build them
   // and redraw once done, or the waveform only appears after a click.
@@ -5236,7 +5204,6 @@ static void revertLockedItemEdits(Snapshot& snap) {
   for (const auto& [guid, _] : g_itemTints) pinned.insert(guid);
 
   bool reverted = false;
-  std::vector<cursor_overlay::Revert> pendingReverts;
   g_applyingRemote = true;
   for (const std::string& guid : pinned) {
     auto base = g_snapshot.items.find(guid);
@@ -5252,8 +5219,6 @@ static void revertLockedItemEdits(Snapshot& snap) {
     // its grey colour can't leak: the user's edit is theirs to keep.
     if (locked.count(guid)) {
       if (MediaItem* it = findItemByGuid(guid)) {
-        const cursor_overlay::Revert ours = revertOf(guid, it);
-        pendingReverts.push_back(ours);
         // Put it back on its synced track first (setObjectStateChunk rebuilds the
         // item but never moves it across tracks), then restore the chunk. This
         // does NOT go through applyItem, so the tint record (real colour) survives.
@@ -5283,7 +5248,6 @@ static void revertLockedItemEdits(Snapshot& snap) {
     g_lastChangeCount = GetProjectStateChangeCount(nullptr);
   }
   g_applyingRemote = false;
-  for (const auto& r : pendingReverts) cursor_overlay::revert(r);
 }
 
 // ---------- pings, follow mode, session meta, verified open ----------
