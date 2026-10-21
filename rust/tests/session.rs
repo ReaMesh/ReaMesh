@@ -1651,3 +1651,80 @@ fn followed_peer_beacons_fast() {
     let _ = fs::remove_dir_all(project);
     let _ = fs::remove_dir_all(staging);
 }
+
+/// An FX chain the size of a big sampler patch: several hundred KiB of base64
+/// lines inside one <VST block (pseudo-random symbols: an already-compressed
+/// state, so only the base64 overhead comes off on the wire). `seed` makes
+/// distinct states.
+fn big_fxchain(seed: u64) -> String {
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut x = seed | 1;
+    let mut out = String::from("<FXCHAIN\n  <VST \"VSTi: Sampler\" sampler.vst3 0 \"\" 0\n");
+    for _ in 0..5000 {
+        out.push_str("    ");
+        for _ in 0..128 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.push(ALPHA[(x >> 58) as usize] as char);
+        }
+        out.push('\n');
+    }
+    out.push_str("  >\n>\n");
+    out
+}
+
+/// A large chunk field (compressed on the wire) syncs both ways: an owner
+/// edit reaches the client, a client proposal reaches the owner.
+fn big_field_round_trip(tag: &str, pass: &str) {
+    let project = temp_dir(&format!("proj-{tag}"));
+    let staging = temp_dir(&format!("staging-{tag}"));
+    make_project(&project);
+    let (owner, client) = establish_pass(&format!("{tag}-test"), &project, &staging, pass);
+
+    let first = big_fxchain(0x1234_5678);
+    assert!(first.len() > 600 * 1024);
+    let cs = serde_json::json!({"tracks":{"{TB}":{"present":true,"index":0,"name":"Keys","fxchain":first}}});
+    owner.push_local(&cs.to_string());
+    let mut client_state = serde_json::Map::new();
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            drain_into(&client, &mut client_state);
+            client_state.get("{TB}").is_some_and(|t| t["fxchain"] == first.as_str())
+        }),
+        "large owner field never reached the client"
+    );
+
+    // Creation locked every field for the owner; let that lapse.
+    std::thread::sleep(Duration::from_millis(3200));
+    let second = big_fxchain(0x8765_4321);
+    let cs = serde_json::json!({"tracks":{"{TB}":{"fxchain":second}}});
+    client.push_local(&cs.to_string());
+    let mut owner_state = serde_json::Map::new();
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            drain_into(&owner, &mut owner_state);
+            owner_state.get("{TB}").is_some_and(|t| t["fxchain"] == second.as_str())
+        }),
+        "large client proposal never surfaced on the owner"
+    );
+    assert!(wait_until(Duration::from_secs(10), || {
+        let _ = drain_into(&client, &mut client_state);
+        field(&client.snapshot_json(), "{TB}", "fxchain") == second.as_str()
+    }));
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
+#[test]
+fn large_field_syncs_compressed() {
+    big_field_round_trip("bigfield", "");
+}
+
+#[test]
+fn large_field_syncs_compressed_sealed() {
+    big_field_round_trip("bigfield-sealed", "hunter2");
+}

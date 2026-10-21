@@ -130,7 +130,9 @@ const MAX_PENDING_UPDATES: usize = 4096;
 /// per-field cap: a proposal or update must fit one maximum-size field
 /// (`limits::MAX_CHUNK_FIELD`) with room to spare, and the owner's full-state
 /// anti-entropy update of a big project travels as a single message too, so
-/// this can't shrink below what real projects need.
+/// this can't shrink below what real projects need. It bounds the *on-wire*
+/// bytes, i.e. after compression and sealing; `MAX_INFLATED_GOSSIP` bounds the
+/// tagged message itself.
 const MAX_GOSSIP_MESSAGE: usize = 2 * limits::MAX_CHUNK_FIELD;
 /// A second byte cap on the same queue. The per-message `max_transmit_size` is
 /// 64 MB, so bounding only the *count* would still let ~256 GB accumulate;
@@ -235,6 +237,35 @@ pub const BAN_DURATION: Duration = Duration::from_secs(30 * 60);
 const TAG_SEALED: u8 = b'X';
 /// XChaCha20 nonce length: 24 bytes, safe to draw at random per message.
 const SEAL_NONCE_LEN: usize = 24;
+/// Compressed envelope: `'Z'` + one zstd frame (content size recorded) of a
+/// whole tagged session-topic message, tag byte included. Applied centrally in
+/// `publish_session` *before* sealing (ciphertext doesn't compress), so on a
+/// protected session the wire carries `'X'`(`'Z'`(msg)) and the tag stays
+/// hidden. Any tag may be wrapped; in practice only messages carrying chunk
+/// text get past `COMPRESS_MIN_BYTES` (`'A'` updates, `'P'` proposals with FX
+/// chains / envelopes / item chunks, a large `'L'` lock table), while beacons,
+/// cursors and live values stay far below it and cost no CPU. Receivers unwrap
+/// right after the confidentiality gate and dispatch the inner message as if
+/// it had arrived bare; a `'Z'` (or `'X'`) inside a `'Z'` is refused.
+const TAG_COMPRESSED: u8 = b'Z';
+/// Tagged session messages shorter than this go out uncompressed: a few KB is
+/// a single packet or two either way, and small edits (a fader, a rename, one
+/// item chunk) are the common case, so they cost zero CPU. Larger ones are
+/// compressed and sent wrapped only if that actually saves bytes.
+const COMPRESS_MIN_BYTES: usize = 4 * 1024;
+/// zstd level for session gossip. The network thread compresses inline, so it
+/// must be cheap: 3 is zstd's default (~300+ MB/s), and on base64 plug-in
+/// state, which is what makes these messages big, higher levels buy almost
+/// nothing (entropy coding of the 64-symbol alphabet does most of the work).
+const COMPRESS_LEVEL: i32 = 3;
+/// Largest message a `'Z'` envelope may inflate to, and so the largest tagged
+/// message `publish_session` will send at all. `MAX_GOSSIP_MESSAGE` bounds the
+/// *on-wire* (compressed, sealed) size; compression lets a bigger full-state
+/// `'A'` of a large project fit through it, so the inflated cap sits above it,
+/// but it stays a hard ceiling: a decompression bomb gets at most this much
+/// memory (allocated exactly to the frame's declared size, never grown), and
+/// one message can't swamp `MAX_PENDING_BYTES`.
+const MAX_INFLATED_GOSSIP: usize = 2 * MAX_GOSSIP_MESSAGE;
 /// Client fallback: if the owner has been gone from the session topic this
 /// long (crash, network drop: no farewell seen), treat the session as ended.
 const OWNER_GONE_TIMEOUT: Duration = Duration::from_secs(12);
@@ -1339,6 +1370,49 @@ fn open_session_msg(key: &chacha20poly1305::Key, data: &[u8], sender: &str) -> O
             Payload { msg: &data[1 + SEAL_NONCE_LEN..], aad: sender.as_bytes() },
         )
         .ok()
+}
+
+/// Wrap a tagged session message as `'Z'` + zstd (see `TAG_COMPRESSED`) when
+/// it is at least `COMPRESS_MIN_BYTES` long and the wrapped form is smaller;
+/// otherwise hand it back untouched (no copy, no CPU).
+fn compress_session_msg(tagged: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    if tagged.len() < COMPRESS_MIN_BYTES {
+        return Cow::Borrowed(tagged);
+    }
+    match zstd::bulk::compress(tagged, COMPRESS_LEVEL) {
+        Ok(z) if z.len() + 1 < tagged.len() => {
+            let mut out = Vec::with_capacity(1 + z.len());
+            out.push(TAG_COMPRESSED);
+            out.extend_from_slice(&z);
+            Cow::Owned(out)
+        }
+        _ => Cow::Borrowed(tagged),
+    }
+}
+
+/// Undo `compress_session_msg` on a received (already unsealed) message: a
+/// non-`'Z'` message passes through as is; a `'Z'` inflates to the inner
+/// tagged message, at most `limit` bytes. `None` = refuse the message: a
+/// frame that doesn't declare its size (ours always do) or declares more than
+/// `limit`, a corrupt or over-long stream, an empty inner message, or an inner
+/// `'Z'` / `'X'` (never produced: compression happens once, before sealing).
+/// The output buffer is allocated to the declared size up front and decoding
+/// past it fails, so a bomb can't make it grow.
+fn inflate_session_msg(data: Vec<u8>, limit: usize) -> Option<Vec<u8>> {
+    if data.first() != Some(&TAG_COMPRESSED) {
+        return Some(data);
+    }
+    let frame = &data[1..];
+    let size = zstd::decompressed_size(frame)?;
+    if size == 0 || size > limit as u64 {
+        return None;
+    }
+    let inner = zstd::bulk::decompress(frame, size as usize).ok()?;
+    match inner.first() {
+        None | Some(&TAG_COMPRESSED) | Some(&TAG_SEALED) => None,
+        Some(_) => Some(inner),
+    }
 }
 
 /// Lower-case hex of a byte slice (no external dep for this one use).
@@ -4403,13 +4477,6 @@ fn admit_proposal(shared: &Shared, payload: &[u8], proposer: &str) -> Option<Vec
     Some(update)
 }
 
-/// Publish one tagged message on the session topic, sealing it first when the
-/// session is passphrase-protected (see `TAG_SEALED`). Every session-topic
-/// publish goes through here so no message class can leak plaintext by
-/// accident. Returns whether the publish succeeded: callers use a failure to
-/// queue a retry / full sync exactly as they did with a raw publish. Callers
-/// keep (and retry with) the *plaintext* tagged message; each attempt is
-/// sealed fresh with a new nonce.
 /// Owner: publish the editing-lock table when the live set changed (an
 /// acquisition or a lapse), so peers can mark held items and snap a rejected
 /// edit back at once. Called right after every admitted edit, and as a
@@ -4452,21 +4519,40 @@ fn publish_locks(
     }
 }
 
+/// Publish one tagged message on the session topic, compressing it when it is
+/// large (see `TAG_COMPRESSED`) and then sealing it when the session is
+/// passphrase-protected (see `TAG_SEALED`). Every session-topic
+/// publish goes through here so no message class can leak plaintext by
+/// accident. Returns whether the publish succeeded: callers use a failure to
+/// queue a retry / full sync exactly as they did with a raw publish. Callers
+/// keep (and retry with) the *plaintext* tagged message; each attempt is
+/// sealed fresh with a new nonce.
 fn publish_session(
     swarm: &mut Swarm<Behaviour>,
     shared: &Shared,
     topic: &gossipsub::IdentTopic,
     tagged: &[u8],
 ) -> bool {
+    // Receivers refuse to inflate past this, so don't send it at all (the
+    // on-wire cap, MAX_GOSSIP_MESSAGE, is gossipsub's to enforce below).
+    if tagged.len() > MAX_INFLATED_GOSSIP {
+        eprintln!(
+            "[reamesh] session message too large ({} bytes); not sent",
+            tagged.len()
+        );
+        return false;
+    }
+    // Compress, then seal: ciphertext is incompressible.
+    let packed = compress_session_msg(tagged);
     let data = match gossip_key(&shared.auth_token.lock().unwrap()) {
         Some(key) => {
             let sender = swarm.local_peer_id().to_string();
-            match seal_session_msg(&key, tagged, &sender) {
+            match seal_session_msg(&key, &packed, &sender) {
                 Some(sealed) => sealed,
                 None => return false,
             }
         }
-        None => tagged.to_vec(),
+        None => packed.into_owned(),
     };
     swarm
         .behaviour_mut()
@@ -5633,6 +5719,16 @@ async fn run_network(
                             }
                             (None, Some(&TAG_SEALED)) => continue, // sealed, but we have no key
                             (None, _) => message.data.clone(),
+                        };
+                        // Unwrap a compressed envelope (sealing wraps it, so
+                        // it only shows once the gate opened the message);
+                        // everything below sees the inner message exactly as
+                        // if it had been sent bare.
+                        let Some(plain) = inflate_session_msg(plain, MAX_INFLATED_GOSSIP) else {
+                            eprintln!(
+                                "[reamesh] dropped compressed session message from {src}: did not inflate"
+                            );
+                            continue;
                         };
                         match (plain.first(), cfg.role) {
                             (Some(&TAG_PRESENCE), _) => {
@@ -8182,5 +8278,145 @@ mod tests {
             zstd_decode_bounded(&comp, CHUNK_SIZE as usize).is_err(),
             "decompression past the limit must be rejected, not allocated"
         );
+    }
+
+    /// Plug-in state as REAPER stores it: binary encoded as base64 lines.
+    /// `structured` mixes in runs of repeated bytes (parameter tables, padding)
+    /// like a real sampler patch; otherwise the bytes are pseudo-random (an
+    /// already-compressed state, the worst case).
+    fn base64_state(bytes: usize, structured: bool) -> String {
+        const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut raw = Vec::with_capacity(bytes);
+        while raw.len() < bytes {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            if structured && x % 4 == 0 {
+                raw.extend(std::iter::repeat_n((x >> 8) as u8 & 0x0f, 16 + (x >> 32) as usize % 48));
+            } else {
+                raw.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        raw.truncate(bytes);
+        let mut out = String::new();
+        for (i, c) in raw.chunks(3).enumerate() {
+            if i % 43 == 0 {
+                out.push_str("\n      ");
+            }
+            let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+            for k in 0..4 {
+                out.push(ALPHA[(n >> (18 - 6 * k)) as usize & 63] as char);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn compressed_gossip_roundtrips_and_shrinks_big_state() {
+        for structured in [false, true] {
+            let state = base64_state(500 * 1024, structured);
+            let mut msg = vec![TAG_PROPOSAL];
+            msg.extend_from_slice(
+                json!({"tracks":{"{T}":{"fxchain": format!("<FXCHAIN\n<VST{state}\n>\n>\n")}}})
+                    .to_string()
+                    .as_bytes(),
+            );
+            let t0 = Instant::now();
+            let packed = compress_session_msg(&msg);
+            let took = t0.elapsed();
+            assert_eq!(packed[0], TAG_COMPRESSED);
+            assert!(packed.len() < msg.len() * 4 / 5, "base64 must shrink");
+            eprintln!(
+                "{} state: {} KiB -> {} KiB on the wire in {took:?}",
+                if structured { "structured" } else { "random" },
+                msg.len() / 1024,
+                packed.len() / 1024
+            );
+            assert_eq!(inflate_session_msg(packed.into_owned(), MAX_INFLATED_GOSSIP).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn small_or_incompressible_gossip_goes_out_bare() {
+        // Below the threshold: untouched, not even copied.
+        let small = b"N{\"name\":\"Ann\"}".to_vec();
+        assert!(matches!(compress_session_msg(&small), std::borrow::Cow::Borrowed(_)));
+        // Just below the threshold, however compressible: still bare.
+        let mut edge = vec![TAG_AUTHORITATIVE];
+        edge.resize(COMPRESS_MIN_BYTES - 1, b'a');
+        assert_eq!(&*compress_session_msg(&edge), &edge[..]);
+        // Big but incompressible: wrapping wouldn't save anything.
+        let mut noise = vec![TAG_AUTHORITATIVE];
+        let mut x: u64 = 1;
+        while noise.len() < 64 * 1024 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            noise.push((x >> 56) as u8);
+        }
+        assert_eq!(&*compress_session_msg(&noise), &noise[..]);
+        // A bare message passes the receive side unchanged.
+        assert_eq!(inflate_session_msg(small.clone(), MAX_INFLATED_GOSSIP).unwrap(), small);
+    }
+
+    fn wrap_z(inner: &[u8]) -> Vec<u8> {
+        let mut z = vec![TAG_COMPRESSED];
+        z.extend_from_slice(&zstd::bulk::compress(inner, 3).unwrap());
+        z
+    }
+
+    #[test]
+    fn compressed_gossip_refuses_nesting_and_garbage() {
+        let mut big = vec![TAG_AUTHORITATIVE];
+        big.resize(16 * 1024, b'q');
+        let once = compress_session_msg(&big).into_owned();
+        assert_eq!(once[0], TAG_COMPRESSED);
+        // A 'Z' inside a 'Z' is never produced: refused.
+        assert!(inflate_session_msg(wrap_z(&once), MAX_INFLATED_GOSSIP).is_none());
+        // Nor is an 'X' inside a 'Z' (sealing always wraps compression).
+        let key = gossip_key("tok").unwrap();
+        let sealed = seal_session_msg(&key, &big, "12D3KooPeerOne").unwrap();
+        assert!(inflate_session_msg(wrap_z(&sealed), MAX_INFLATED_GOSSIP).is_none());
+        // Empty inner message, truncated frame, plain garbage.
+        assert!(inflate_session_msg(wrap_z(b""), MAX_INFLATED_GOSSIP).is_none());
+        assert!(inflate_session_msg(once[..once.len() / 2].to_vec(), MAX_INFLATED_GOSSIP).is_none());
+        assert!(inflate_session_msg(b"Znot zstd at all".to_vec(), MAX_INFLATED_GOSSIP).is_none());
+        assert!(inflate_session_msg(vec![TAG_COMPRESSED], MAX_INFLATED_GOSSIP).is_none());
+        // Compress-then-seal round trip, the protected session's wire form.
+        let wire = seal_session_msg(&key, &once, "12D3KooPeerOne").unwrap();
+        let opened = open_session_msg(&key, &wire, "12D3KooPeerOne").unwrap();
+        assert_eq!(inflate_session_msg(opened, MAX_INFLATED_GOSSIP).unwrap(), big);
+    }
+
+    #[test]
+    fn compressed_gossip_refuses_bombs() {
+        // Declared size past the limit: refused from the frame header alone.
+        let mut bomb = vec![TAG_AUTHORITATIVE];
+        bomb.resize(1024 * 1024 + 1, 0);
+        let z = wrap_z(&bomb);
+        assert!(z.len() < 1024, "test setup: bomb must be small compressed");
+        assert!(inflate_session_msg(z.clone(), 1024 * 1024).is_none());
+        assert_eq!(inflate_session_msg(z, 2 * 1024 * 1024).unwrap(), bomb);
+
+        // A frame claiming more than the real cap, streamed so the test never
+        // holds it inflated: refused before anything is allocated.
+        let n = MAX_INFLATED_GOSSIP as u64 + 1;
+        let mut enc = zstd::stream::Encoder::new(vec![TAG_COMPRESSED], 1).unwrap();
+        enc.set_pledged_src_size(Some(n)).unwrap();
+        std::io::copy(&mut std::io::repeat(b'A').take(n), &mut enc).unwrap();
+        let huge = enc.finish().unwrap();
+        assert!(huge.len() < MAX_GOSSIP_MESSAGE, "fits the wire cap");
+        assert!(inflate_session_msg(huge, MAX_INFLATED_GOSSIP).is_none());
+
+        // A frame that doesn't declare its size (ours always do): refused.
+        let mut enc = zstd::stream::Encoder::new(vec![TAG_COMPRESSED], 1).unwrap();
+        enc.include_contentsize(false).unwrap();
+        enc.write_all(&bomb).unwrap();
+        assert!(inflate_session_msg(enc.finish().unwrap(), MAX_INFLATED_GOSSIP).is_none());
+
+        // Whatever compression allows, the inflated cap stays above the wire
+        // cap (a full-state update that fits compressed must inflate) and
+        // within the pending-update byte budget.
+        assert!(MAX_INFLATED_GOSSIP > MAX_GOSSIP_MESSAGE);
+        assert!(MAX_INFLATED_GOSSIP <= MAX_PENDING_BYTES);
     }
 }
