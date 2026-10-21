@@ -381,7 +381,7 @@ const en = {
   markerTool: "Ping",
   // Versions and in-app updates
   hostNewerVersion: "The host runs a newer ReaMesh. Update to join.",
-  hostOlderVersion: "The host runs an older ReaMesh version.",
+  hostOlderVersion: "The host runs an older version and needs to update.",
   hostOtherVersion: "This host runs a different ReaMesh version.",
   hostUnverified: "This host couldn’t confirm the password, so it isn’t the session you’re looking for.",
   nearbyOffer: "Also search nearby over Bluetooth",
@@ -797,7 +797,7 @@ const de: Record<MsgKey, string> = {
   endFollow: "Beenden",
   markerTool: "Ping",
   hostNewerVersion: "Der Host nutzt ein neueres ReaMesh. Aktualisiere, um beizutreten.",
-  hostOlderVersion: "Der Host nutzt eine ältere ReaMesh-Version",
+  hostOlderVersion: "Der Host nutzt eine ältere Version und muss aktualisieren.",
   hostOtherVersion: "Dieser Host nutzt eine andere ReaMesh-Version.",
   hostUnverified: "Dieser Host konnte das Passwort nicht bestätigen. Es ist nicht die Session, die du suchst.",
   nearbyOffer: "Auch per Bluetooth in der Nähe suchen",
