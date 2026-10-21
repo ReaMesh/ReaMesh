@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "identifier": "com.reamesh.ReaMesh",
   "build": {
-    "beforeDevCommand": "bun scripts/check-extension.ts --warn && bun run dev",
+    "beforeDevCommand": "bun scripts/check-extension.ts --rebuild && bun run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "bun scripts/check-extension.ts && bun scripts/gen-credits.ts && bun run build",
     "frontendDist": "../dist"

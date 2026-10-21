@@ -397,6 +397,11 @@ const en = {
   extOldBody: "ReaMesh was updated. Restart REAPER so it loads the matching extension.",
   extOldInstallBody:
     "REAPER runs an older ReaMesh extension. Install the matching one, then restart REAPER.",
+  extBundledOldTitle: "Extension out of date",
+  extBundledOldBody:
+    "This copy of ReaMesh carries an older REAPER extension, so restarting REAPER won't help. Reinstall ReaMesh.",
+  extBundledOldDevBody:
+    "This development build bundles an older REAPER extension. Restart tauri dev to rebuild it, then restart REAPER.",
   appOldTitle: "Update ReaMesh",
   appOldBody: "REAPER runs a newer ReaMesh extension than this app.",
   updates: "Updates",
@@ -808,6 +813,11 @@ const de: Record<MsgKey, string> = {
   extOldBody: "ReaMesh wurde aktualisiert. Starte REAPER neu, damit es die passende Erweiterung lädt.",
   extOldInstallBody:
     "In REAPER läuft eine ältere ReaMesh-Erweiterung. Installiere die passende und starte REAPER dann neu.",
+  extBundledOldTitle: "Erweiterung veraltet",
+  extBundledOldBody:
+    "Diese ReaMesh-Version enthält eine ältere REAPER-Erweiterung, ein Neustart von REAPER hilft daher nicht. Installiere ReaMesh neu.",
+  extBundledOldDevBody:
+    "Diese Entwicklungsversion enthält eine ältere REAPER-Erweiterung. Starte tauri dev neu, damit sie neu gebaut wird, und danach REAPER.",
   appOldTitle: "ReaMesh aktualisieren",
   appOldBody: "In REAPER läuft eine neuere ReaMesh-Erweiterung als diese App.",
   updates: "Updates",

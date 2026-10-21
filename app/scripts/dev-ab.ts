@@ -74,6 +74,14 @@ const envB: Record<string, string | undefined> =
     ? { ...process.env, CARGO_TARGET_DIR: resolve(app, "src-tauri", "target", "dev-b") }
     : process.env;
 
+// Both instances check the extension binary before they start. Rebuild a
+// stale one here first, so the two checks don't run build.sh at the same time.
+Bun.spawnSync([bun, "scripts/check-extension.ts", "--rebuild"], {
+  cwd: app,
+  stdout: "inherit",
+  stderr: "inherit",
+});
+
 const procs = [launch("A", ["tauri", "dev"]), launch("B", ["dev:b"], envB)];
 
 const stop = () => {

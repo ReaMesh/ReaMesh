@@ -569,7 +569,7 @@ export default function App() {
   } else if (unsupported) {
     screen = { key: "outdated", node: <Outdated info={unsupported} /> };
   } else if (skew !== "same") {
-    screen = { key: "mismatch", node: <ExtMismatch skew={skew} /> };
+    screen = { key: "mismatch", node: <ExtMismatch skew={skew} reaperLoadedInstalled={stale === false} /> };
   } else if (mode === "downloading") {
     screen = { key: "downloading", node: <Downloading state={state} port={port} /> };
   } else if (beatActive && mode === "client") {

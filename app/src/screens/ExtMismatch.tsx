@@ -9,7 +9,18 @@ import { checkForUpdate, restartToUpdate, useUpdate } from "@/lib/updater";
 // instead of driving a mismatched pair this screen replaces the lobby until
 // they match: usually REAPER still has the previous extension loaded after an
 // app update, sometimes the app is the older half.
-export function ExtMismatch({ skew }: { skew: "newer" | "older" }) {
+//
+// `reaperLoadedInstalled`: REAPER started after the installed copy was put in
+// place, so it already runs that copy. If that copy is also this app's own
+// (up to date) and still older, the app bundles a stale extension and a
+// restart would only load the same file again.
+export function ExtMismatch({
+  skew,
+  reaperLoadedInstalled,
+}: {
+  skew: "newer" | "older";
+  reaperLoadedInstalled: boolean;
+}) {
   const update = useUpdate();
   const status = useReaperStatus();
   const [installing, setInstalling] = useState(false);
@@ -18,6 +29,19 @@ export function ExtMismatch({ skew }: { skew: "newer" | "older" }) {
     // The app installs its copy at launch; if that didn't land (an unusual
     // REAPER folder, permissions), a restart alone would load the old one.
     const notInstalled = !!status && !status.upToDate;
+    const bundledOld = !!status?.upToDate && reaperLoadedInstalled;
+    if (bundledOld) {
+      return (
+        <div className="flex flex-1 flex-col items-center [justify-content:safe_center] gap-6 overflow-y-auto px-10 text-center">
+          <div className="space-y-1.5">
+            <h2 className="text-[15px] font-semibold">{t("extBundledOldTitle")}</h2>
+            <p className="text-[13px] leading-relaxed text-balance text-muted-foreground">
+              {import.meta.env.DEV ? t("extBundledOldDevBody") : t("extBundledOldBody")}
+            </p>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="flex flex-1 flex-col items-center [justify-content:safe_center] gap-6 overflow-y-auto px-10 text-center">
         <div className="space-y-1.5">

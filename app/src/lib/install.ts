@@ -97,9 +97,9 @@ export function useReaperStatus(): ReaperStatus | null | undefined {
  *  extension than the one installed (it was replaced after REAPER started;
  *  REAPER loads plugins only at startup). A REAPER started after an install
  *  already runs the new copy, so it is never asked to restart. Rechecked
- *  whenever the app installs. */
-export function useExtensionStale(pid: number | undefined): boolean {
-  const [stale, setStale] = useState(false);
+ *  whenever the app installs. `undefined` until the backend has answered. */
+export function useExtensionStale(pid: number | undefined): boolean | undefined {
+  const [stale, setStale] = useState<boolean | undefined>(undefined);
   const [installs, setInstalls] = useState(0);
   useEffect(() => {
     const un = listen("extension-installed", () => setInstalls((n) => n + 1));
@@ -112,6 +112,7 @@ export function useExtensionStale(pid: number | undefined): boolean {
       setStale(false);
       return;
     }
+    setStale(undefined);
     let live = true;
     invoke<boolean>("extension_stale", { pid })
       .then((v) => live && setStale(v))

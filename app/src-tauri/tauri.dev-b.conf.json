@@ -3,6 +3,6 @@
   "identifier": "com.reamesh.ReaMesh.b",
   "build": {
     "devUrl": "http://localhost:1421",
-    "beforeDevCommand": "bun scripts/check-extension.ts --warn && bun run dev -- --port 1421"
+    "beforeDevCommand": "bun scripts/check-extension.ts --rebuild && bun run dev -- --port 1421"
   }
 }

@@ -3,13 +3,18 @@
 // changes even when the frontend is current.
 //
 // --warn only reports the mismatch during development.
+// --rebuild (tauri dev) runs `build.sh --no-app` when the binary is older than
+// its sources, and only warns if that fails. Commits that land from another
+// checkout (a worktree) leave this checkout's binary behind; installing it
+// anyway left REAPER on an older extension that no restart could fix.
 // REAMESH_SKIP_EXT_CHECK=1 bypasses the check.
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 const root = resolve(import.meta.dirname, "../..");
-const warnOnly = process.argv.includes("--warn");
+const rebuild = process.argv.includes("--rebuild");
+const warnOnly = rebuild || process.argv.includes("--warn");
 
 const binary =
   process.platform === "win32"
@@ -62,9 +67,16 @@ const sources = [
 
 if (sources[0] > built) {
   const age = ((sources[0] - built) / 60000).toFixed(1);
-  fail(
-    `the REAPER extension binary is older than its sources (${age} min behind ${sources[1]})`,
-  );
+  const msg = `the REAPER extension binary is older than its sources (${age} min behind ${sources[1]})`;
+  if (!rebuild) fail(msg);
+  console.log(`\n[check-extension] ${msg}, rebuilding it (build.sh --no-app)\n`);
+  // Windows runs build.sh through Git Bash's bash on PATH.
+  const r = Bun.spawnSync(["bash", join(root, "build.sh"), "--no-app"], {
+    cwd: root,
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  if (r.exitCode !== 0) fail(`rebuilding the REAPER extension failed (${msg})`);
 }
 
 // macOS: the app ships one extension for Apple silicon and Intel, and REAPER
