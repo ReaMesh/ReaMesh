@@ -4915,6 +4915,10 @@ async fn run_network(
     // In-flight ticket join/check: dialing the ticket's addresses and waiting
     // for the pinned owner's announce to arrive over the direct connection.
     let mut pending_join: Option<PendingJoin> = None;
+    // Lobby entries a host replaced by announcing a newer session (see the
+    // announce handler), so a late copy of an old announce can't bring the
+    // stale card back.
+    let mut superseded: HashMap<String, Instant> = HashMap::new();
 
     // Anti-entropy (owner): whenever a peer (re)appears on the session topic,
     // or a publish fails because nobody was listening, we owe the network a
@@ -5655,11 +5659,33 @@ async fn run_network(
                                     .min(u32::MAX as u64) as u32,
                                 version: clipped("ver", 32),
                             };
+                            superseded.retain(|_, at| at.elapsed() < SESSION_STALE);
                             if signer_is_owner
                                 && valid_session_id(&info.session_id)
                                 && limits::valid_salt(&info.salt)
+                                && !superseded.contains_key(&info.session_id)
                             {
                                 let mut sessions = shared.sessions.lock().unwrap();
+                                // One peer id hosts one session at a time (each
+                                // REAPER instance has its own identity slot), so
+                                // a new session id from a known owner means it
+                                // stopped and re-hosted: drop its old card now
+                                // instead of showing both until SESSION_STALE.
+                                // Keyed on the authenticated signer, so a peer
+                                // can only retire entries it owns itself.
+                                if !sessions.contains_key(&info.session_id) {
+                                    let old: Vec<String> = sessions
+                                        .iter()
+                                        .filter(|(id, s)| s.owner == info.owner && **id != info.session_id)
+                                        .map(|(id, _)| id.clone())
+                                        .collect();
+                                    for id in old {
+                                        sessions.remove(&id);
+                                        if superseded.len() < limits::MAX_SESSIONS {
+                                            superseded.insert(id, Instant::now());
+                                        }
+                                    }
+                                }
                                 // Bounded: a stream of distinct (signed, but
                                 // freely minted) announcers can't grow the
                                 // table past MAX_SESSIONS; the stalest goes.
