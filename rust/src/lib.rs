@@ -288,7 +288,7 @@ const MANIFEST_REFRESH: Duration = Duration::from_secs(5);
 /// Every join downloads a full copy into its own directory and nothing else
 /// ever removes them, so without this a week of sessions leaves tens of
 /// gigabytes behind that no UI can clear.
-const STAGING_MAX_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+const STAGING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 type Fields = JsonMap<String, JsonValue>;
 type SectionState = HashMap<String, Fields>;
