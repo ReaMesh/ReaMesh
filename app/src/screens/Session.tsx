@@ -11,7 +11,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Menu, MenuContent, MenuItem, MenuSeparator, MenuTrigger } from "@/components/ui/menu";
-import { Switch } from "@/components/ui/switch";
 import { BanList } from "@/components/BanList";
 import { Divider, Group, SectionLabel } from "@/components/Group";
 import { HintProvider } from "@/components/Hint";
@@ -22,18 +21,9 @@ import { SwapIcon, SwapText } from "@/components/Swap";
 import { TrackNumber } from "@/components/TrackNumber";
 import { send } from "@/lib/connection";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
-import { nearbyBlocked, setNearby, useNearby } from "@/lib/nearby";
 import { t } from "@/lib/i18n";
 import { displayName, type ExtState, type Peer } from "@/lib/types";
 import { cn, focusRing, noContextMenu } from "@/lib/utils";
-
-function editingLabel(e: NonNullable<Peer["editing"]>): string {
-  if (e.kind === "track") return e.name ? t("quoted", { text: e.name }) : t("trackN", { n: e.n ?? 0 });
-  if (e.kind !== "project") return ""; // unknown shape from a newer extension
-  if (e.field === "tempo") return t("editingTempo");
-  if (e.field === "markers") return t("editingMarkers");
-  return t("editingProject");
-}
 
 /** What someone else is doing right now, as one line of text, most urgent
  *  first. Your own row has none: who follows you is said at their row. */
@@ -67,8 +57,6 @@ function PeerMeta({
   } else if (following) {
     text = t("followingShort");
     tone = "text-found";
-  } else if (peer.editing && editingLabel(peer.editing)) {
-    text = t("peerEditing", { what: editingLabel(peer.editing) });
   } else if (peer.follow) {
     const target = peers.find((p) => p.id === peer.follow);
     if (target) {
@@ -230,24 +218,6 @@ async function copyText(text: string): Promise<boolean> {
 }
 
 /** A row of the "Invite" group: content on the left, one action on the right. */
-// Bluetooth for guests nearby whose network blocks the usual search (guest
-// Wi-Fi). Only this host's network addresses are advertised; the switch is the
-// shared preference, and turning it on is what asks macOS for the permission.
-function NearbyRow() {
-  const n = useNearby();
-  const on = n.enabled === true;
-  return (
-    <InviteRow action={<Switch checked={on} onChange={setNearby} label={t("nearbyHostLabel")} />}>
-      <p className="truncate text-[13px]" title={t("nearbyHostHint")}>
-        {t("nearbyHostLabel")}
-      </p>
-      {on && nearbyBlocked(n) && (
-        <p className="truncate text-[12px] text-amber-500">{t("nearbyBlocked")}</p>
-      )}
-    </InviteRow>
-  );
-}
-
 function InviteRow({ children, action }: { children: React.ReactNode; action: React.ReactNode }) {
   return (
     <div className="flex min-h-[52px] items-center gap-3 py-2 pr-2 pl-3">
@@ -423,7 +393,6 @@ export function Session({
   }, [banTarget, state.peers]);
   const others = state.peers.length - 1;
   const hostPass = hosting ? getHostPass(port) : "";
-  const nearby = useNearby();
   const leave = () => {
     setConfirmStop(false);
     forgetHostPass(port);
@@ -491,12 +460,6 @@ export function Session({
                 {!!state.ticket && <InviteCode ticket={state.ticket} />}
                 {!!state.ticket && !!hostPass && <Divider inset={false} />}
                 {!!hostPass && <HostPassword pass={hostPass} />}
-                {!!state.ticket && nearby.supported && (
-                  <>
-                    <Divider inset={false} />
-                    <NearbyRow />
-                  </>
-                )}
               </Group>
             </section>
           )}

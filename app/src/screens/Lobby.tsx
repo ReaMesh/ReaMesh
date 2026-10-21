@@ -956,44 +956,37 @@ function VpnHint() {
   );
 }
 
-/** How long the Lobby stays empty before it offers Bluetooth. */
-const NEARBY_OFFER_DELAY_MS = 10_000;
-
-/** Bluetooth under an empty Lobby. Some networks (guest Wi-Fi) block the usual
- *  search; once nothing has shown up for a while, and only until the user
- *  decided either way, one quiet button turns the Bluetooth search on (which
- *  is what asks macOS for the permission). Once on, the search runs silently;
- *  only a refused permission is worth a line. */
+/** Bluetooth under an empty Lobby: the search runs silently once on, so only
+ *  a refused permission is worth a line. */
 function NearbyLine() {
   const n = useNearby();
-  const [waited, setWaited] = useState(false);
-  useEffect(() => {
-    const id = setTimeout(() => setWaited(true), NEARBY_OFFER_DELAY_MS);
-    return () => clearTimeout(id);
-  }, []);
-  if (!n.supported) return null;
-  if (n.enabled === true) {
-    if (!nearbyBlocked(n)) return null;
-    return (
-      <p className="mt-1.5 text-[11.5px] leading-normal text-muted-foreground/80">
-        {t("nearbyBlocked")}
-      </p>
-    );
-  }
-  if (n.enabled === false || !waited || nearbyBlocked(n)) return null;
+  if (!n.supported || n.enabled !== true || !nearbyBlocked(n)) return null;
   return (
-    <button
-      type="button"
-      onClick={() => setNearby(true)}
-      title={t("nearbyHostHint")}
-      className={cn(
-        "mx-auto mt-2 flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground",
-        focusRing,
-      )}
-    >
-      <Bluetooth className="size-3 shrink-0" aria-hidden="true" />
-      {t("nearbyOffer")}
-    </button>
+    <p className="mt-1.5 text-[11.5px] leading-normal text-muted-foreground/80">
+      {t("nearbyBlocked")}
+    </p>
+  );
+}
+
+/** Asked once, until the user decides either way; afterwards it is a switch in
+ *  Settings. Not on by default: turning it on is what asks macOS for the
+ *  Bluetooth permission, which should follow a click, not appear at launch. */
+function NearbyAsk() {
+  const n = useNearby();
+  if (!n.supported || n.enabled !== null || nearbyBlocked(n)) return null;
+  return (
+    <div className="flex shrink-0 items-center gap-2.5 rounded-xl bg-card py-2 pr-2 pl-3">
+      <Bluetooth className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+      <span className="min-w-0 flex-1 text-[12px] text-foreground/80" title={t("nearbyHostHint")}>
+        {t("nearbySettingsLabel")}
+      </span>
+      <Button variant="ghost" size="xs" onClick={() => setNearby(false)}>
+        {t("nearbyNotNow")}
+      </Button>
+      <Button variant="secondary" size="xs" onClick={() => setNearby(true)}>
+        {t("nearbyTurnOn")}
+      </Button>
+    </div>
   );
 }
 
@@ -1027,6 +1020,8 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
       <FirewallBlocked />
 
       <NameCard />
+
+      <NearbyAsk />
 
       <section className="flex min-h-0 flex-1 flex-col gap-2">
         <SectionLabel>{t("sessionsOnNetwork")}</SectionLabel>
