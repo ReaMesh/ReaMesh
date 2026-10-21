@@ -10,6 +10,7 @@ import { Switch } from "@/components/ui/switch";
 import { Divider, Group, SectionLabel } from "@/components/Group";
 import { PathField } from "@/components/PathField";
 import { ProfileEditor } from "@/components/ProfileEditor";
+import { SwapIcon } from "@/components/Swap";
 import { buildDiagnostics } from "@/lib/diagnostics";
 import { getLangPref, resolveLang, setLangPref, t, useLang, type LangPref } from "@/lib/i18n";
 import {
@@ -46,6 +47,10 @@ import { nearbyBlocked, setNearby, useNearby } from "@/lib/nearby";
 import { cn, focusRing } from "@/lib/utils";
 
 const SOURCE_URL = "https://github.com/ReaMesh/ReaMesh";
+
+// The chosen option's surface slides across, on the same spring as the join
+// mode picker in the trust dialog.
+const PILL = { type: "spring", stiffness: 400, damping: 38 } as const;
 
 /** What this binary was built from (backend `build_info`). */
 type BuildInfo = { commit: string; buildTime: number; release: boolean };
@@ -290,14 +295,21 @@ export function Settings({
                 aria-checked={getLangPref() === o.value}
                 onClick={() => setLangPref(o.value)}
                 className={cn(
-                  "h-7 flex-1 rounded-lg text-[12px] font-medium transition-colors",
+                  "relative h-7 flex-1 rounded-lg text-[12px] font-medium transition-colors",
                   getLangPref() === o.value
-                    ? "bg-foreground/[0.14] text-foreground"
+                    ? "text-foreground"
                     : "text-muted-foreground hover:text-foreground",
                   focusRing,
                 )}
               >
-                {o.label}
+                {getLangPref() === o.value && (
+                  <motion.span
+                    layoutId="language-pill"
+                    className="absolute inset-0 rounded-lg bg-foreground/[0.14]"
+                    transition={PILL}
+                  />
+                )}
+                <span className="relative">{o.label}</span>
               </button>
             ))}
           </div>
@@ -362,15 +374,22 @@ export function Settings({
                       disabled={off}
                       onClick={() => setUpdateChannel(c)}
                       className={cn(
-                        "h-6 rounded-md px-2.5 text-[12px] font-medium transition-colors",
+                        "relative h-6 rounded-md px-2.5 text-[12px] font-medium transition-colors",
                         channel.channel === c
-                          ? "bg-foreground/[0.14] text-foreground"
+                          ? "text-foreground"
                           : "text-muted-foreground hover:text-foreground",
                         off && "pointer-events-none opacity-40",
                         focusRing,
                       )}
                     >
-                      {channelLabel(c)}
+                      {channel.channel === c && (
+                        <motion.span
+                          layoutId="update-channel-pill"
+                          className="absolute inset-0 rounded-md bg-foreground/[0.14]"
+                          transition={PILL}
+                        />
+                      )}
+                      <span className="relative">{channelLabel(c)}</span>
                     </button>
                   );
                 })}
@@ -568,24 +587,13 @@ export function Settings({
               className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
             >
               <Row label={t("copyDiagnostics")}>
-                <span className="relative size-3.5 shrink-0" aria-hidden="true">
-                  <motion.span
-                    className="absolute inset-0"
-                    initial={false}
-                    animate={copied ? { opacity: 0, scale: 0.5 } : { opacity: 1, scale: 1 }}
-                    transition={{ type: "spring", duration: 0.35, bounce: 0 }}
-                  >
-                    <Copy className="size-3.5 text-muted-foreground" />
-                  </motion.span>
-                  <motion.span
-                    className="absolute inset-0"
-                    initial={false}
-                    animate={copied ? { opacity: 1, scale: 1 } : { opacity: 0, scale: 0.5 }}
-                    transition={{ type: "spring", duration: 0.35, bounce: copied ? 0.4 : 0 }}
-                  >
-                    <Check className="size-3.5 text-found" strokeWidth={2.5} />
-                  </motion.span>
-                </span>
+                <SwapIcon value={copied ? "check" : "copy"} className="size-3.5">
+                  {copied ? (
+                    <Check className="size-3.5 text-found" strokeWidth={2.5} aria-hidden="true" />
+                  ) : (
+                    <Copy className="size-3.5 text-muted-foreground" aria-hidden="true" />
+                  )}
+                </SwapIcon>
                 <span className="sr-only" aria-live="polite">
                   {copied ? t("diagnosticsCopied") : ""}
                 </span>

@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { AnimatePresence, motion, useAnimate } from "motion/react";
+import { useEffect, useState, type ReactNode } from "react";
+import { AnimatePresence, motion, useAnimate, useReducedMotion } from "motion/react";
 import { Ban, Check, Copy, Ellipsis, Eye, EyeOff, LocateFixed, UserX } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -18,6 +18,7 @@ import { HintProvider } from "@/components/Hint";
 import { HostCrown } from "@/components/HostCrown";
 import { useSlowLink } from "@/components/LinkNotice";
 import { PeerAvatar } from "@/components/PeerAvatar";
+import { SwapIcon, SwapText } from "@/components/Swap";
 import { TrackNumber } from "@/components/TrackNumber";
 import { send } from "@/lib/connection";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
@@ -256,6 +257,26 @@ function InviteRow({ children, action }: { children: React.ReactNode; action: Re
   );
 }
 
+// One person's place in the roster. Someone joining opens their row and comes
+// into focus out of a slight blur; someone leaving goes the same way back.
+const ROSTER_SPRING = { type: "spring", stiffness: 360, damping: 32, mass: 0.6 } as const;
+function RosterSlot({ children }: { children: ReactNode }) {
+  const reduce = useReducedMotion();
+  const away = reduce ? { opacity: 0 } : { height: 0, opacity: 0, filter: "blur(6px)" };
+  return (
+    <motion.div
+      layout="position"
+      initial={away}
+      animate={reduce ? { opacity: 1 } : { height: "auto", opacity: 1, filter: "blur(0px)" }}
+      exit={away}
+      transition={reduce ? { duration: 0.15 } : ROSTER_SPRING}
+      className="overflow-hidden"
+    >
+      {children}
+    </motion.div>
+  );
+}
+
 // The session's invite code. It lets someone outside mDNS reach (VPN, strict
 // LAN) join: opening it takes them straight into their app's join flow,
 // pasting it in their Lobby works too. The row names it; the link itself only
@@ -280,8 +301,10 @@ function InviteCode({ ticket }: { ticket: string }) {
             else setReveal(true);
           }}
         >
-          {copied ? <Check className="size-3.5" aria-hidden="true" /> : <Copy className="size-3.5" aria-hidden="true" />}
-          {copied ? t("copied") : t("copy")}
+          <SwapIcon value={copied ? "check" : "copy"} className="size-3.5">
+            {copied ? <Check className="size-3.5" aria-hidden="true" /> : <Copy className="size-3.5" aria-hidden="true" />}
+          </SwapIcon>
+          <SwapText value={copied ? "copied" : "copy"}>{copied ? t("copied") : t("copy")}</SwapText>
         </Button>
       }
     >
@@ -441,9 +464,9 @@ export function Session({
             <SectionLabel>{t("people")}</SectionLabel>
             <Group aria-label={t("peopleList")} onContextMenu={noContextMenu}>
               {/* Animate later roster changes, but not the initial peer list. */}
-              <AnimatePresence mode="popLayout" initial={false}>
+              <AnimatePresence initial={false}>
                 {state.peers.map((p, i) => (
-                  <motion.div key={p.id} layout="position" exit={{ opacity: 0 }}>
+                  <RosterSlot key={p.id}>
                     {i > 0 && <Divider />}
                     <PeerRow
                       peer={p}
@@ -455,7 +478,7 @@ export function Session({
                       onKick={hosting ? () => kick(p) : undefined}
                       onBan={hosting ? () => setBanTarget(p) : undefined}
                     />
-                  </motion.div>
+                  </RosterSlot>
                 ))}
               </AnimatePresence>
             </Group>

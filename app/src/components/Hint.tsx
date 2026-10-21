@@ -15,7 +15,7 @@ const BoundaryCtx = createContext<RefObject<HTMLElement | null> | null>(null);
 
 export function HintProvider({
   boundary,
-  delay = 450,
+  delay = 120,
   children,
 }: {
   /** Element the tooltips must stay inside (the overlay card). */
@@ -26,7 +26,7 @@ export function HintProvider({
   return (
     <BoundaryCtx.Provider value={boundary ?? null}>
       {/* Close when the pointer leaves the trigger, including when it enters the tooltip. */}
-      <TooltipProvider delayDuration={delay} skipDelayDuration={400} disableHoverableContent>
+      <TooltipProvider delayDuration={delay} skipDelayDuration={300} disableHoverableContent>
         {children}
       </TooltipProvider>
     </BoundaryCtx.Provider>
@@ -54,7 +54,7 @@ export function Hint({
       <TooltipTrigger asChild>{children}</TooltipTrigger>
       <TooltipContent
         side={side}
-        sideOffset={4}
+        sideOffset={6}
         collisionBoundary={boundary?.current ?? undefined}
         collisionPadding={6}
         className={cn("pointer-events-none px-2 py-1 text-[11px] font-medium", className)}

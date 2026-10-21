@@ -14,6 +14,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { SwapText } from "@/components/Swap";
 import { useActiveInstance } from "@/lib/connection";
 import { formatBytes, reaperVersionKey } from "@/lib/format";
 import { t } from "@/lib/i18n";
@@ -110,7 +111,9 @@ function PluginList({ plugins }: { plugins: string[] }) {
               focusRing,
             )}
           >
-            {copied ? t("missingCopied") : t("copyMissing")}
+            <SwapText value={copied ? "copied" : "copy"}>
+              {copied ? t("missingCopied") : t("copyMissing")}
+            </SwapText>
           </button>
         )}
       </div>
