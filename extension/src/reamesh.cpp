@@ -19,7 +19,8 @@
 //   items:  each media item as its full normalized state chunk (covers
 //            position, length, splits, fades, takes, take FX, MIDI content)
 //            plus the GUID of the track it sits on.
-//   project: tempo map, markers/regions, project notes/title/author, track
+//   project: tempo map, markers/regions with their ruler lanes, project
+//            notes/title/author, track
 //            group names and the project timebase as whole fields.
 // Media files referenced by an incoming item that are missing locally are
 // fetched from the session peers in the background; the item is applied as
@@ -87,6 +88,9 @@
 #define REAPERAPI_WANT_ColorFromNative
 #define REAPERAPI_WANT_GetSetProjectNotes
 #define REAPERAPI_WANT_GetSetProjectInfo_String
+// Ruler-lane count and per-lane settings (RULER_LANE_*), only touched when
+// rulerLanesAvailable(); the function itself is old (5.x).
+#define REAPERAPI_WANT_GetSetProjectInfo
 #define REAPERAPI_WANT_projectconfig_var_getoffs
 #define REAPERAPI_WANT_projectconfig_var_addr
 #define REAPERAPI_WANT_CountProjectMarkers
@@ -209,6 +213,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 using nlohmann::json;
@@ -1957,16 +1962,306 @@ static void applyTempo(const std::string& s) {
   }
 }
 
-// One line per marker/region: "M|R \t index \t pos \t rgnend \t color \t name".
-// Name is last so it may contain spaces; tabs/newlines become spaces and other
-// control characters go (cleanLine). A guarded action name (see the marker
-// actions note) is captured without its guard.
+// ---------- markers/regions + ruler lanes ----------
+//
+// The `markers` field holds the project's ruler lanes, then its markers and
+// regions, one line each:
+//   "L \t default \t locked \t color \t timebase \t name"          (lane order)
+//   "M|R \t number \t pos \t rgnend \t color \t lane \t name"      (enumeration order)
+// Numbers are %d / %.17g, so capture->apply->recapture is byte-identical and a
+// re-applied list never comes back as a phantom edit. Names are last so they
+// may contain spaces; tabs/newlines become spaces and other control characters
+// go (cleanLine). A guarded action name (see the marker actions note) is
+// captured without its guard. Colors are platform-neutral (colorToWire).
+// `lane` is the marker's ruler lane (I_LANENUMBER), or -1 when the sender
+// can't see lanes and has no record of this marker's: the receiver keeps the
+// lane the marker has locally (a new one gets the default lane). No L lines
+// means the sender knows no lanes, and the receiver leaves its own as they are.
+//
+// Ruler lanes need a newer REAPER than the extension's floor
+// (kMinReaperVersion), so their functions are never imported through
+// REAPERAPI_LoadAPI (one missing import puts the whole extension in stub
+// mode): loadRulerLaneApi fetches them one by one at load, and the feature is
+// off when any is missing or REAPER is older than kMinRulerLaneVersion. The
+// RULER_LANE_* attributes of the old GetSetProjectInfo(_String) are only
+// touched while it is on. A lane-blind peer must still not wipe the lanes it
+// can't see: it remembers the lanes of the last list it applied
+// (g_laneMemory) and writes them back into its own captures, so its marker
+// edits keep the owner's lanes intact; a marker it creates goes out with lane
+// -1. Lane visibility (RULER_LANE_HIDDEN) is per-user view state, like a
+// track's TCP/MCP visibility, and never synced.
+static constexpr int kMaxRulerLanes = 256;
+static constexpr const char* kMinRulerLaneVersion = "7.19";
+
+static int (*g_GetNumRegionsOrMarkers)(ReaProject*) = nullptr;
+static ProjectMarker* (*g_GetRegionOrMarker)(ReaProject*, int, const char*) = nullptr;
+static double (*g_GetRegionOrMarkerInfo_Value)(ReaProject*, ProjectMarker*, const char*) = nullptr;
+static double (*g_SetRegionOrMarkerInfo_Value)(ReaProject*, ProjectMarker*, const char*,
+                                               double) = nullptr;
+static ProjectMarker* (*g_AddRegionOrMarker)(ReaProject*, bool, double, double, const char*, int,
+                                             int) = nullptr;
+static bool g_rulerLanes = false;
+
+static void loadRulerLaneApi(void* (*getFunc)(const char*), const std::string& appVersion) {
+  g_GetNumRegionsOrMarkers =
+      reinterpret_cast<decltype(g_GetNumRegionsOrMarkers)>(getFunc("GetNumRegionsOrMarkers"));
+  g_GetRegionOrMarker = reinterpret_cast<decltype(g_GetRegionOrMarker)>(getFunc("GetRegionOrMarker"));
+  g_GetRegionOrMarkerInfo_Value = reinterpret_cast<decltype(g_GetRegionOrMarkerInfo_Value)>(
+      getFunc("GetRegionOrMarkerInfo_Value"));
+  g_SetRegionOrMarkerInfo_Value = reinterpret_cast<decltype(g_SetRegionOrMarkerInfo_Value)>(
+      getFunc("SetRegionOrMarkerInfo_Value"));
+  g_AddRegionOrMarker = reinterpret_cast<decltype(g_AddRegionOrMarker)>(getFunc("AddRegionOrMarker"));
+  const long have = reaperVersionKey(appVersion);
+  g_rulerLanes = g_GetNumRegionsOrMarkers && g_GetRegionOrMarker && g_GetRegionOrMarkerInfo_Value &&
+                 g_SetRegionOrMarkerInfo_Value && g_AddRegionOrMarker &&
+                 (have < 0 || have >= reaperVersionKey(kMinRulerLaneVersion));
+}
+
+static bool rulerLanesAvailable() { return g_rulerLanes; }
+
+struct RulerLane {
+  int deflt = 0;      // RULER_LANE_DEFAULT: &1 new regions, &2 new markers
+  int locked = 0;     // RULER_LANE_LOCKED
+  int color = 0;      // RULER_LANE_COLOR, wire form
+  int timebase = -1;  // RULER_LANE_TIMEBASE: -1 project, 0 time, 1/2 beats
+  std::string name;   // RULER_LANE_NAME
+};
+
+struct MarkerLine {
+  bool isrgn = false;
+  int num = 0;
+  double pos = 0, rgnend = 0;
+  int color = 0;     // wire form
+  int lane = -1;     // ruler lane, -1 = unknown
+  std::string name;  // wire text (unguarded)
+};
+
+struct MarkerList {
+  std::vector<RulerLane> lanes;  // empty: the sender knows no lanes
+  std::vector<MarkerLine> markers;
+};
+
 static std::string sanitizeMarkerName(const char* name) {
   return cleanLine(unguardMarkerName(name ? name : ""), kMaxNameBytes);
 }
 
-static std::string captureMarkers() {
+// A marker line up to (not including) its name; without the lane field it is
+// the marker's identity for the lane memory.
+static void appendMarkerHead(std::string& out, const MarkerLine& m, bool withLane) {
+  char buf[200];
+  if (withLane)
+    snprintf(buf, sizeof(buf), "%s\t%d\t%.17g\t%.17g\t%d\t%d\t", m.isrgn ? "R" : "M", m.num, m.pos,
+             m.rgnend, m.color, m.lane);
+  else
+    snprintf(buf, sizeof(buf), "%s\t%d\t%.17g\t%.17g\t%d\t", m.isrgn ? "R" : "M", m.num, m.pos,
+             m.rgnend, m.color);
+  out += buf;
+}
+
+static std::string formatMarkerList(const MarkerList& l) {
   std::string out;
+  for (const RulerLane& r : l.lanes) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "L\t%d\t%d\t%d\t%d\t", r.deflt, r.locked, r.color, r.timebase);
+    out += buf;
+    out += r.name;
+    out += '\n';
+  }
+  for (const MarkerLine& m : l.markers) {
+    appendMarkerHead(out, m, true);
+    out += m.name;
+    out += '\n';
+  }
+  return out;
+}
+
+// Splits `n` leading tab fields off `line`; whatever remains (the name) goes
+// to `rest`.
+static bool splitLeadingFields(const std::string& line, int n, std::vector<std::string>& f,
+                               std::string& rest) {
+  f.clear();
+  size_t p = 0;
+  for (int k = 0; k < n; ++k) {
+    const size_t tab = line.find('\t', p);
+    if (tab == std::string::npos) return false;
+    f.push_back(line.substr(p, tab - p));
+    p = tab + 1;
+  }
+  rest = line.substr(p);
+  return true;
+}
+
+// Peer-authored text: malformed lines are dropped, numbers range-checked,
+// lanes and markers capped.
+static MarkerList parseMarkerList(const std::string& s) {
+  MarkerList out;
+  std::vector<std::string> f;
+  std::string rest;
+  size_t pos = 0;
+  while (pos < s.size()) {
+    size_t eol = s.find('\n', pos);
+    if (eol == std::string::npos) eol = s.size();
+    const std::string line = s.substr(pos, eol - pos);
+    pos = eol + 1;
+    if (line.compare(0, 2, "L\t") == 0) {
+      if ((int)out.lanes.size() >= kMaxRulerLanes || !splitLeadingFields(line, 5, f, rest)) continue;
+      RulerLane r;
+      if (!parseClampedInt(f[1], 0, 3, r.deflt) || !parseClampedInt(f[2], 0, 1, r.locked) ||
+          !parseClampedInt(f[3], 0, 0x1FFFFFF, r.color) || !parseClampedInt(f[4], -1, 2, r.timebase))
+        continue;
+      r.name = std::move(rest);
+      out.lanes.push_back(std::move(r));
+    } else if (line.compare(0, 2, "M\t") == 0 || line.compare(0, 2, "R\t") == 0) {
+      if ((int)out.markers.size() >= kMaxMarkerLines || !splitLeadingFields(line, 6, f, rest))
+        continue;
+      MarkerLine m;
+      m.isrgn = f[0] == "R";
+      if (!parseClampedInt(f[1], -1, 1 << 30, m.num) || !parseFiniteDouble(f[2], m.pos) ||
+          !parseFiniteDouble(f[3], m.rgnend) || !parseClampedInt(f[4], 0, 0x1FFFFFF, m.color) ||
+          !parseClampedInt(f[5], -1, kMaxRulerLanes - 1, m.lane))
+        continue;
+      m.name = std::move(rest);
+      out.markers.push_back(std::move(m));
+    }
+  }
+  return out;
+}
+
+// Which lane each marker of a list sits on: exactly this marker first (two
+// markers may share a number), else the same marker/region number (it was
+// moved, renamed or recolored since).
+struct LaneMemory {
+  std::vector<RulerLane> lanes;
+  std::map<std::string, int> exact;
+  std::map<std::pair<bool, int>, int> byNumber;
+};
+
+static std::string markerIdentity(const MarkerLine& m) {
+  std::string key;
+  appendMarkerHead(key, m, false);
+  key += m.name;
+  return key;
+}
+
+static LaneMemory rememberLanes(const MarkerList& l) {
+  LaneMemory mem;
+  mem.lanes = l.lanes;
+  for (const MarkerLine& m : l.markers) {
+    if (m.lane < 0) continue;
+    mem.exact[markerIdentity(m)] = m.lane;
+    mem.byNumber[{m.isrgn, m.num}] = m.lane;
+  }
+  return mem;
+}
+
+static int recallLane(const LaneMemory& mem, const MarkerLine& m) {
+  if (auto it = mem.exact.find(markerIdentity(m)); it != mem.exact.end()) return it->second;
+  if (auto it = mem.byNumber.find({m.isrgn, m.num}); it != mem.byNumber.end()) return it->second;
+  return -1;
+}
+
+// A lane-blind peer's record of the lanes it last applied (see above).
+static LaneMemory g_laneMemory;
+
+static std::string captureProjectString(const char* desc);
+static void applyProjectString(const char* desc, const std::string& value);
+
+static int rulerLaneCount() {
+  return clampToInt(GetSetProjectInfo(nullptr, "RULER_LANE_COUNT", 0, false), 0, kMaxRulerLanes, 0);
+}
+
+static std::string rulerLaneKey(const char* attr, int lane) {
+  return std::string("RULER_LANE_") + attr + ":" + std::to_string(lane);
+}
+
+static double rulerLaneValue(const char* attr, int lane) {
+  return GetSetProjectInfo(nullptr, rulerLaneKey(attr, lane).c_str(), 0, false);
+}
+
+static void setRulerLaneValue(const char* attr, int lane, double v) {
+  GetSetProjectInfo(nullptr, rulerLaneKey(attr, lane).c_str(), v, true);
+}
+
+static RulerLane captureRulerLane(int x) {
+  RulerLane r;
+  r.deflt = clampToInt(rulerLaneValue("DEFAULT", x), 0, 3, 0);
+  r.locked = rulerLaneValue("LOCKED", x) != 0 ? 1 : 0;
+  r.color = colorToWire(clampToInt(rulerLaneValue("COLOR", x), 0, 0x1FFFFFF, 0));
+  r.timebase = clampToInt(rulerLaneValue("TIMEBASE", x), -1, 2, -1);
+  r.name = captureProjectString(rulerLaneKey("NAME", x).c_str());
+  return r;
+}
+
+// Brings this project's lanes to `want` (count, then each lane's settings).
+// Locks are left to setRulerLaneLocks, after the markers are back.
+static void applyRulerLanes(const std::vector<RulerLane>& want) {
+  const int n = (std::min)((int)want.size(), kMaxRulerLanes);
+  int have = rulerLaneCount();
+  if (have != n) {
+    GetSetProjectInfo(nullptr, "RULER_LANE_COUNT", n, true);
+    have = rulerLaneCount();
+  }
+  // Where the count isn't settable, insert lanes at the end one at a time.
+  for (int guard = 0; have < n && guard < kMaxRulerLanes; ++guard) {
+    GetSetProjectInfo(nullptr, "RULER_LANE_ORDER:-1", have, true);
+    int now = rulerLaneCount();
+    if (now <= have) {
+      setRulerLaneValue("ORDER", have, -1);
+      now = rulerLaneCount();
+    }
+    if (now <= have) break;
+    have = now;
+  }
+  for (int x = 0; x < (std::min)(have, n); ++x) {
+    const RulerLane& w = want[x];
+    const RulerLane cur = captureRulerLane(x);
+    if (cur.name != cleanLine(w.name, kMaxProjectInfoBytes))
+      applyProjectString(rulerLaneKey("NAME", x).c_str(), w.name);
+    if (cur.color != w.color) setRulerLaneValue("COLOR", x, colorFromWire(w.color));
+    if (cur.timebase != w.timebase) setRulerLaneValue("TIMEBASE", x, w.timebase);
+    // Default-for-new is exclusive: setting it on one lane takes it off the
+    // others, so only the lanes that should carry it are written.
+    if (w.deflt != 0 && cur.deflt != w.deflt) setRulerLaneValue("DEFAULT", x, w.deflt);
+  }
+}
+
+static std::vector<int> rulerLaneLocks() {
+  std::vector<int> out;
+  const int n = rulerLaneCount();
+  for (int x = 0; x < n; ++x) out.push_back(rulerLaneValue("LOCKED", x) != 0 ? 1 : 0);
+  return out;
+}
+
+static void setRulerLaneLocks(const std::vector<int>& locks) {
+  const int n = rulerLaneCount();
+  for (int x = 0; x < n; ++x) {
+    const int want = x < (int)locks.size() ? locks[x] : 0;
+    if ((rulerLaneValue("LOCKED", x) != 0 ? 1 : 0) != want) setRulerLaneValue("LOCKED", x, want);
+  }
+}
+
+static MarkerList captureMarkerList() {
+  MarkerList out;
+  const bool lanes = rulerLanesAvailable();
+  // Lane of every marker/region, by what EnumProjectMarkers3 reports of it
+  // (the newer API's own index is not assumed to match the enumeration's).
+  std::map<std::tuple<bool, int, double>, int> laneOf;
+  if (lanes) {
+    const int nl = rulerLaneCount();
+    for (int x = 0; x < nl; ++x) out.lanes.push_back(captureRulerLane(x));
+    const int n = (std::min)(g_GetNumRegionsOrMarkers(nullptr), 4 * kMaxMarkerLines);
+    for (int i = 0; i < n; ++i) {
+      ProjectMarker* pm = g_GetRegionOrMarker(nullptr, i, "");
+      if (!pm) continue;
+      laneOf.emplace(
+          std::make_tuple(g_GetRegionOrMarkerInfo_Value(nullptr, pm, "B_ISREGION") != 0,
+                          clampToInt(g_GetRegionOrMarkerInfo_Value(nullptr, pm, "I_NUMBER"), -1,
+                                     1 << 30, -1),
+                          g_GetRegionOrMarkerInfo_Value(nullptr, pm, "D_STARTPOS")),
+          clampToInt(g_GetRegionOrMarkerInfo_Value(nullptr, pm, "I_LANENUMBER"), -1,
+                     kMaxRulerLanes - 1, -1));
+    }
+  }
   int idx = 0, next;
   bool isrgn = false;
   double pos = 0, rgnend = 0;
@@ -1974,27 +2269,49 @@ static std::string captureMarkers() {
   int num = 0, color = 0;
   while ((next = EnumProjectMarkers3(nullptr, idx, &isrgn, &pos, &rgnend, &name, &num, &color)) !=
          0) {
-    // Shared flag markers are local by design: never on the wire.
-    if (isSharedMarkerName(name)) {
-      idx = next;
-      continue;
-    }
-    char buf[160];
-    // Colors cross the wire platform-neutral, like track colors: macOS and
-    // Windows pack native ints with opposite byte order.
-    snprintf(buf, sizeof(buf), "%s\t%d\t%.17g\t%.17g\t%d\t", isrgn ? "R" : "M", num, pos, rgnend,
-             colorToWire(color));
-    out += buf;
-    out += sanitizeMarkerName(name);
-    out += '\n';
     idx = next;
+    // Shared flag markers are local by design: never on the wire.
+    if (isSharedMarkerName(name)) continue;
+    MarkerLine m;
+    m.isrgn = isrgn;
+    m.num = num;
+    m.pos = pos;
+    m.rgnend = rgnend;
+    m.color = colorToWire(color);
+    m.name = sanitizeMarkerName(name);
+    if (lanes) {
+      if (auto it = laneOf.find(std::make_tuple(isrgn, num, pos)); it != laneOf.end())
+        m.lane = it->second;
+    } else {
+      m.lane = recallLane(g_laneMemory, m);
+    }
+    out.markers.push_back(std::move(m));
   }
+  if (!lanes) out.lanes = g_laneMemory.lanes;
   return out;
 }
+
+static std::string captureMarkers() { return formatMarkerList(captureMarkerList()); }
 
 // `owner`: this peer hosts the session (see the marker actions note for what
 // that changes about action-like names).
 static void applyMarkers(const std::string& s, bool owner) {
+  const MarkerList want = parseMarkerList(s);
+  const bool lanes = rulerLanesAvailable();
+  // With lanes: where each marker sits here now, for the lines that don't
+  // know their lane. Without: remember the sender's lanes for our captures.
+  LaneMemory local;
+  std::vector<int> locks;
+  if (lanes) {
+    local = rememberLanes(captureMarkerList());
+    // A locked lane must not get in the way of the rebuild; locks go back on
+    // (the sender's, or ours when it sent no lanes) once the markers are in.
+    locks = rulerLaneLocks();
+    setRulerLaneLocks({});
+  } else {
+    g_laneMemory = rememberLanes(want);
+  }
+
   // Rebuild only the *synced* markers: shared flag markers stay standing:
   // each person keeps or deletes their own copy (capture filters them out, so
   // the wire list never contains one to re-add either).
@@ -2018,34 +2335,26 @@ static void applyMarkers(const std::string& s, bool owner) {
   for (auto it = doomed.rbegin(); it != doomed.rend(); ++it)
     DeleteProjectMarkerByIndex(nullptr, *it);
 
-  size_t pos = 0;
-  int added = 0;
-  while (pos < s.size() && added < kMaxMarkerLines) {
-    size_t eol = s.find('\n', pos);
-    if (eol == std::string::npos) eol = s.size();
-    std::string line = s.substr(pos, eol - pos);
-    pos = eol + 1;
-    if (line.empty()) continue;
-    // Split the five leading tab fields; the name is whatever remains.
-    std::vector<std::string> f;
-    size_t p = 0;
-    for (int k = 0; k < 5; ++k) {
-      size_t tab = line.find('\t', p);
-      if (tab == std::string::npos) { f.clear(); break; }
-      f.push_back(line.substr(p, tab - p));
-      p = tab + 1;
-    }
-    if (f.size() != 5) continue;
-    const bool isrgn = f[0] == "R";
-    int num = 0, color = 0;
-    double mpos = 0, rgnend = 0;
-    if (!parseClampedInt(f[1], -1, 1 << 30, num) || !parseFiniteDouble(f[2], mpos) ||
-        !parseFiniteDouble(f[3], rgnend) || !parseClampedInt(f[4], 0, 0x1FFFFFF, color))
-      continue;
-    const std::string name = markerNameForApply(line.substr(p), owner ? &liveActions : nullptr);
-    AddProjectMarker2(nullptr, isrgn, mpos, rgnend, name.c_str(), num, colorFromWire(color));
-    ++added;
+  if (lanes && !want.lanes.empty()) {
+    applyRulerLanes(want.lanes);
+    locks.clear();
+    for (const RulerLane& r : want.lanes) locks.push_back(r.locked);
   }
+  const int laneCount = lanes ? rulerLaneCount() : 0;
+  for (const MarkerLine& m : want.markers) {
+    const std::string name = markerNameForApply(m.name, owner ? &liveActions : nullptr);
+    const int color = colorFromWire(m.color);
+    if (!lanes) {
+      AddProjectMarker2(nullptr, m.isrgn, m.pos, m.rgnend, name.c_str(), m.num, color);
+      continue;
+    }
+    ProjectMarker* pm =
+        g_AddRegionOrMarker(nullptr, m.isrgn, m.pos, m.rgnend, name.c_str(), m.num, color);
+    const int lane = m.lane >= 0 ? m.lane : recallLane(local, m);
+    if (pm && lane >= 0 && lane < laneCount)
+      g_SetRegionOrMarkerInfo_Value(nullptr, pm, "I_LANENUMBER", lane);
+  }
+  if (lanes) setRulerLaneLocks(locks);
 }
 
 // Track colors cross the wire as platform-neutral 0x1RRGGBB (the 0x1000000
@@ -5422,6 +5731,7 @@ static void leaveSession(const char* code, json params, const std::string& text)
   g_downloadBackground = false;
   g_placeholdersGivenUp = false;
   g_placeholderGraceSince = {};
+  g_laneMemory = LaneMemory{};  // lanes remembered from the session's marker list
   g_lastChangeCount = -1;
   g_groupNamesAt = -1;  // a new project invalidates the cached group names
   g_lastPeerCount = 0;
@@ -5659,6 +5969,7 @@ static void onHost(const std::string& passphrase) {
   g_sessionProjectPath = path;
   g_snapshot = Snapshot{};
   g_itemTints.clear();  // fresh session: no carried-over lock tints
+  g_laneMemory = LaneMemory{};
   g_lastChangeCount = -1;  // force a full capture; this seeds the shared doc
   g_lastCapture = {};
   g_lastFullScan = {};
@@ -7516,6 +7827,9 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
   }
 
   g_rec = rec;
+  // Ruler lanes: fetched one by one, never through REAPERAPI_LoadAPI (see
+  // loadRulerLaneApi); an older REAPER simply runs lane-blind.
+  loadRulerLaneApi(rec->GetFunc, appVersion);
   // Lasting per-install network identity: persisted under REAPER's resource
   // dir, so this machine keeps one peer id across sessions and restarts
   // (remembered hosts, tickets that survive). Resettable from the app.

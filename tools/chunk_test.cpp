@@ -67,6 +67,160 @@ static const char* kTrackChunk =
     "  >\n"
     ">\n";
 
+// ---- a fake REAPER marker list + ruler lanes, for the marker round trips ----
+namespace fake {
+struct Marker {
+  int id;
+  bool isrgn;
+  double pos, end;
+  std::string name;
+  int num, color, lane;
+};
+struct Lane {
+  int deflt = 0, locked = 0, color = 0, timebase = -1;
+  std::string name;
+};
+static std::vector<Marker> markers;
+static std::vector<Lane> lanes;
+static int nextId = 1;
+
+static Marker* byId(ProjectMarker* pm) {
+  for (Marker& m : markers)
+    if (m.id == (int)reinterpret_cast<intptr_t>(pm)) return &m;
+  return nullptr;
+}
+// The lane a new marker/region lands on: the lane marked default for it.
+static int defaultLane(bool isrgn) {
+  for (size_t x = 0; x < lanes.size(); ++x)
+    if (lanes[x].deflt & (isrgn ? 1 : 2)) return (int)x;
+  return 0;
+}
+static int enumMarkers(ReaProject*, int idx, bool* isrgn, double* pos, double* end,
+                       const char** name, int* num, int* color) {
+  if (idx < 0 || idx >= (int)markers.size()) return 0;
+  const Marker& m = markers[idx];
+  *isrgn = m.isrgn;
+  *pos = m.pos;
+  *end = m.end;
+  *name = m.name.c_str();
+  *num = m.num;
+  *color = m.color;
+  return idx + 1;
+}
+static bool deleteMarker(ReaProject*, int idx) {
+  if (idx < 0 || idx >= (int)markers.size()) return false;
+  markers.erase(markers.begin() + idx);
+  return true;
+}
+static int addMarker2(ReaProject*, bool isrgn, double pos, double end, const char* name, int want,
+                      int color) {
+  markers.push_back({nextId++, isrgn, pos, end, name, want, color, defaultLane(isrgn)});
+  return want;
+}
+static ProjectMarker* addRegionOrMarker(ReaProject* p, bool isrgn, double pos, double end,
+                                        const char* name, int want, int color) {
+  addMarker2(p, isrgn, pos, end, name, want, color);
+  return reinterpret_cast<ProjectMarker*>(static_cast<intptr_t>(markers.back().id));
+}
+static int numRegionsOrMarkers(ReaProject*) { return (int)markers.size(); }
+// Deliberately in reverse enumeration order: capture must not assume the
+// newer API's index matches EnumProjectMarkers3's.
+static ProjectMarker* regionOrMarker(ReaProject*, int idx, const char*) {
+  if (idx < 0 || idx >= (int)markers.size()) return nullptr;
+  return reinterpret_cast<ProjectMarker*>(
+      static_cast<intptr_t>(markers[markers.size() - 1 - idx].id));
+}
+static double markerInfo(ReaProject*, ProjectMarker* pm, const char* parm) {
+  const Marker* m = byId(pm);
+  if (!m) return 0;
+  const std::string p = parm;
+  if (p == "B_ISREGION") return m->isrgn;
+  if (p == "I_NUMBER") return m->num;
+  if (p == "D_STARTPOS") return m->pos;
+  if (p == "I_LANENUMBER") return m->lane;
+  return 0;
+}
+static double setMarkerInfo(ReaProject*, ProjectMarker* pm, const char* parm, double v) {
+  Marker* m = byId(pm);
+  if (m && std::string(parm) == "I_LANENUMBER") m->lane = (int)v;
+  return v;
+}
+static bool laneAttr(const char* desc, std::string& attr, int& x) {
+  const std::string d = desc;
+  if (d.rfind("RULER_LANE_", 0) != 0) return false;
+  const size_t colon = d.find(':');
+  if (colon == std::string::npos) return false;
+  attr = d.substr(11, colon - 11);
+  x = atoi(d.c_str() + colon + 1);
+  return true;
+}
+// Like a REAPER whose lane count is read-only: lanes come in through
+// RULER_LANE_ORDER:-1 only.
+static double projectInfo(ReaProject*, const char* desc, double v, bool set) {
+  if (std::string(desc) == "RULER_LANE_COUNT") return (double)lanes.size();
+  std::string attr;
+  int x = 0;
+  if (!laneAttr(desc, attr, x)) return 0;
+  if (attr == "ORDER" && x == -1) {
+    if (set) lanes.insert(lanes.begin() + (std::min)((size_t)v, lanes.size()), Lane{});
+    return 0;
+  }
+  if (x < 0 || x >= (int)lanes.size()) return 0;
+  Lane& l = lanes[x];
+  int* field = attr == "DEFAULT"    ? &l.deflt
+               : attr == "LOCKED"   ? &l.locked
+               : attr == "COLOR"    ? &l.color
+               : attr == "TIMEBASE" ? &l.timebase
+                                    : nullptr;
+  if (!field) return 0;
+  if (set) {
+    if (attr == "DEFAULT")  // exclusive: the flag moves off every other lane
+      for (Lane& o : lanes) o.deflt &= ~(int)v;
+    *field = (int)v;
+  }
+  return *field;
+}
+static bool projectInfoString(ReaProject*, const char* desc, char* buf, bool set) {
+  std::string attr;
+  int x = 0;
+  if (!laneAttr(desc, attr, x) || attr != "NAME" || x < 0 || x >= (int)lanes.size()) {
+    if (!set) buf[0] = '\0';
+    return false;
+  }
+  if (set)
+    lanes[x].name = buf;
+  else
+    strcpy(buf, lanes[x].name.c_str());
+  return true;
+}
+// Native colors in Windows byte order (0x00BBGGRR).
+static int toNative(int r, int g, int b) { return r | (g << 8) | (b << 16); }
+static void fromNative(int c, int* r, int* g, int* b) {
+  *r = c & 0xFF;
+  *g = (c >> 8) & 0xFF;
+  *b = (c >> 16) & 0xFF;
+}
+
+static void install() {
+  EnumProjectMarkers3 = enumMarkers;
+  DeleteProjectMarkerByIndex = deleteMarker;
+  AddProjectMarker2 = addMarker2;
+  GetSetProjectInfo = projectInfo;
+  GetSetProjectInfo_String = projectInfoString;
+  ColorToNative = toNative;
+  ColorFromNative = fromNative;
+  g_GetNumRegionsOrMarkers = numRegionsOrMarkers;
+  g_GetRegionOrMarker = regionOrMarker;
+  g_GetRegionOrMarkerInfo_Value = markerInfo;
+  g_SetRegionOrMarkerInfo_Value = setMarkerInfo;
+  g_AddRegionOrMarker = addRegionOrMarker;
+}
+static void reset() {
+  markers.clear();
+  lanes.clear();
+}
+}  // namespace fake
+
 int main() {
   // normalizeChunk drops volatile UI/selection lines (now incl. envelope
   // ARM/VIS: per-user automation workflow state), keeps the rest.
@@ -775,6 +929,118 @@ int main() {
     assert(clampToInt(std::nan(""), 0, 10, 5) == 5);
     assert(splitTokens("1  2 3", ' ') == (std::vector<std::string>{"1", "2", "3"}));
     assert(splitTokens("a\n\nb", '\n') == (std::vector<std::string>{"a", "", "b"}));
+  }
+
+  // Marker list + ruler lanes: the wire text parses and formats back
+  // byte-identically, malformed lines are dropped.
+  {
+    const std::string wire =
+        "L\t3\t0\t0\t-1\tMain\n"
+        "L\t0\t1\t33488896\t1\tChords and more\n"
+        "M\t1\t0\t0\t0\t0\tIntro\n"
+        "R\t1\t4\t8.5\t33488896\t1\tVerse  A\n"
+        "M\t2\t2.25\t0\t0\t-1\t\n";
+    const MarkerList l = parseMarkerList(wire);
+    assert(l.lanes.size() == 2 && l.markers.size() == 3);
+    assert(l.lanes[1].locked == 1 && l.lanes[1].timebase == 1 && l.lanes[1].name == "Chords and more");
+    assert(l.markers[1].isrgn && l.markers[1].lane == 1 && l.markers[1].name == "Verse  A");
+    assert(l.markers[2].lane == -1 && l.markers[2].name.empty());
+    assert(formatMarkerList(l) == wire);
+    // Old six-field lines, unknown kinds and bad numbers never apply.
+    const MarkerList bad = parseMarkerList(
+        "M\t1\t0\t0\t0\tOld format\nX\t1\t0\t0\t0\t0\tx\nM\t1\tnan\t0\t0\t0\tx\n"
+        "M\t1\t0\t0\t0\tlane\tx\nL\t1\t0\t0\tx\n");
+    assert(bad.lanes.empty() && bad.markers.empty());
+    assert(parseMarkerList("M\t1\t0\t0\t0\t999\tx\n").markers[0].lane == kMaxRulerLanes - 1);
+    std::string many;
+    for (int i = 0; i < kMaxRulerLanes + 5; ++i) many += "L\t0\t0\t0\t-1\tl\n";
+    assert((int)parseMarkerList(many).lanes.size() == kMaxRulerLanes);
+    // Lane memory: the exact marker first, else the same number.
+    const LaneMemory mem = rememberLanes(l);
+    MarkerLine moved = l.markers[1];
+    moved.pos = 6;
+    assert(recallLane(mem, l.markers[1]) == 1 && recallLane(mem, moved) == 1);
+    MarkerLine other = moved;
+    other.num = 9;
+    assert(recallLane(mem, other) == -1);
+  }
+
+  // Marker capture/apply against a fake REAPER, with and without ruler lanes:
+  // capture -> apply -> recapture is byte-identical either way, shared flag
+  // markers stay local, and a lane-blind peer keeps the lanes it can't see.
+  {
+    fake::install();
+    const int red = 0x1000000 | fake::toNative(0xFF, 0, 0);
+    const std::string redWire = std::to_string(0x1FF0000);
+    auto addFake = [](bool isrgn, int num, double pos, double end, const char* name, int color,
+                      int lane) {
+      fake::markers.push_back({fake::nextId++, isrgn, pos, end, name, num, color, lane});
+    };
+
+    // The owner, on a REAPER with ruler lanes.
+    g_rulerLanes = true;
+    fake::reset();
+    fake::lanes = {{3, 0, 0, -1, "Main"}, {0, 1, red, 1, "Chords"}};
+    addFake(false, 1, 0, 0, "Intro", 0, 0);
+    addFake(true, 1, 4, 8.5, "Verse", red, 1);
+    addFake(false, 2, 2.25, 0, "!40044", 0, 1);
+    addFake(false, 3, 3, 0, "\xE2\x9A\x91 ping by Dan", 0, 0);
+    const std::string wire = captureMarkers();
+    assert(wire == "L\t3\t0\t0\t-1\tMain\n"
+                   "L\t0\t1\t" + redWire + "\t1\tChords\n"
+                   "M\t1\t0\t0\t0\t0\tIntro\n"
+                   "R\t1\t4\t8.5\t" + redWire + "\t1\tVerse\n"
+                   "M\t2\t2.25\t0\t0\t1\t!40044\n");
+
+    // A client with lanes: one lane of its own, a local marker, a shared flag.
+    fake::reset();
+    fake::lanes = {{3, 0, 0, -1, "Default"}};
+    addFake(false, 9, 1, 0, "Local", 0, 0);
+    addFake(false, 7, 5, 0, "\xE2\x9A\x91 mine", 0, 0);
+    applyMarkers(wire, false);
+    assert(captureMarkers() == wire);
+    assert(fake::lanes.size() == 2 && fake::lanes[0].name == "Main" && fake::lanes[1].locked == 1);
+    bool flagKept = false, actionGuarded = false;
+    for (const fake::Marker& m : fake::markers) {
+      flagKept |= m.name == "\xE2\x9A\x91 mine";
+      actionGuarded |= m.name == std::string(kMarkerGuard) + "!40044";
+      assert(m.name != "Local");
+    }
+    assert(flagKept && actionGuarded);
+
+    // A list that knows no lanes (from a lane-blind peer): the lanes stay,
+    // a known marker keeps its lane, a new one takes the default lane.
+    applyMarkers("R\t1\t5\t9\t0\t-1\tVerse\nM\t42\t1\t0\t0\t-1\tNew\n", false);
+    assert(fake::lanes.size() == 2 && fake::lanes[1].locked == 1);
+    for (const fake::Marker& m : fake::markers) {
+      if (m.name == "Verse") assert(m.lane == 1 && m.pos == 5);
+      if (m.name == "New") assert(m.lane == 0);
+    }
+
+    // A lane-blind client (older REAPER): nothing remembered yet means no
+    // lanes and lane -1 ...
+    g_rulerLanes = false;
+    g_laneMemory = LaneMemory{};
+    fake::reset();
+    addFake(false, 4, 1, 0, "Mine", 0, 0);
+    assert(captureMarkers() == "M\t4\t1\t0\t0\t-1\tMine\n");
+    // ... and once it applied the owner's list it gives the same text back,
+    applyMarkers(wire, false);
+    assert(captureMarkers() == wire);
+    // so its own edits keep the owner's lanes: a moved region keeps lane 1,
+    // a marker it creates goes out without a lane.
+    for (fake::Marker& m : fake::markers)
+      if (m.isrgn) m.pos = 6, m.end = 10;
+    addFake(false, 5, 7, 0, "Bridge", 0, 0);
+    const MarkerList edited = parseMarkerList(captureMarkers());
+    assert(edited.lanes.size() == 2 && edited.lanes[1].name == "Chords");
+    for (const MarkerLine& m : edited.markers) {
+      if (m.isrgn) assert(m.lane == 1 && m.pos == 6);
+      if (m.name == "Bridge") assert(m.lane == -1);
+      if (m.name == "!40044") assert(m.lane == 1);
+    }
+    g_laneMemory = LaneMemory{};
+    fake::reset();
   }
 
   // Marker actions: a remote action-like name is guarded on apply, capture

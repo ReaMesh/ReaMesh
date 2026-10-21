@@ -79,12 +79,12 @@ code is valid only while that hosting session is running.
 | Audio and MIDI items | Move, split, trim, fades, takes, take FX and MIDI content |
 | Effects and automation | Track FX, input FX, plugin state and track envelopes |
 | Routing and groups | Sends, receives, send envelopes and group/VCA assignments |
-| Project settings | Tempo, time signatures, markers, regions, notes, title, author and timebase |
+| Project settings | Tempo, time signatures, markers, regions, ruler lanes, notes, title, author and timebase |
 | Media files | New recordings and imported files transfer in the background |
 
 Track mute, solo, record arm, monitoring and window layout stay local. Item mute
-does sync. Master-track state, hardware outputs, pooled automation items, marker
-ruler lanes and project extension state aren't synced.
+does sync. Master-track state, hardware outputs, pooled automation items and
+project extension state aren't synced.
 
 An optional floating roster shows who's connected. You can follow someone's
 playback, selected track, view, item selection and open effect window, or ping

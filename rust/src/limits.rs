@@ -291,9 +291,16 @@ fn is_action_marker_name(name: &str) -> bool {
     name.trim_start_matches(' ').starts_with('!')
 }
 
-/// The names in a marker list (`M|R\tidx\tpos\tend\tcolor\tname` lines).
+/// The marker/region names in a marker list: whatever follows the sixth tab
+/// of a `M|R\tnum\tpos\tend\tcolor\tlane\tname` line, exactly where
+/// `parseMarkerList` in reamesh.cpp reads the name. `L\t…` lines are ruler
+/// lanes, whose names REAPER never runs; every other line counts, so a line
+/// the extension would reject can't hide a name from this check either.
 fn marker_names(markers: &str) -> impl Iterator<Item = &str> {
-    markers.split('\n').filter_map(|line| line.splitn(6, '\t').nth(5))
+    markers
+        .split('\n')
+        .filter(|line| !line.starts_with("L\t"))
+        .filter_map(|line| line.splitn(7, '\t').nth(6))
 }
 
 /// Whether the proposed marker list brings in an action-like name that isn't
@@ -555,16 +562,24 @@ mod tests {
 
     #[test]
     fn guests_cannot_add_action_markers() {
-        let current = "M\t1\t0\t0\t0\t!1013\nM\t2\t4\t0\t0\tVerse\n";
-        // Keeping or moving the host's own action marker is fine...
-        assert!(!adds_action_marker("M\t1\t8\t0\t0\t!1013\nM\t2\t4\t0\t0\tVerse\n", current));
+        let current = "L\t3\t0\t0\t-1\t\nM\t1\t0\t0\t0\t0\t!1013\nM\t2\t4\t0\t0\t-1\tVerse\n";
+        // Keeping or moving the host's own action marker is fine, onto
+        // another lane too...
+        assert!(!adds_action_marker(
+            "L\t3\t0\t0\t-1\t\nL\t0\t0\t0\t-1\tFX\nM\t1\t8\t0\t0\t1\t!1013\nM\t2\t4\t0\t0\t-1\tVerse\n",
+            current
+        ));
         // ...adding or renaming one is not, regions included.
-        assert!(adds_action_marker("M\t1\t0\t0\t0\t!40044\n", current));
-        assert!(adds_action_marker(&format!("{current}R\t3\t1\t2\t0\t !40044\n"), current));
-        assert!(!adds_action_marker("M\t1\t0\t0\t0\tChorus !\n", ""));
+        assert!(adds_action_marker("M\t1\t0\t0\t0\t0\t!40044\n", current));
+        assert!(adds_action_marker(&format!("{current}R\t3\t1\t2\t0\t0\t !40044\n"), current));
+        assert!(!adds_action_marker("M\t1\t0\t0\t0\t0\tChorus !\n", ""));
+        // A lane name is no action; a lane field can't hide a marker's name.
+        assert!(!adds_action_marker("L\t0\t0\t0\t-1\t!40044\n", ""));
+        assert!(adds_action_marker("M\t1\t0\t0\t0\tx\t!40044\n", ""));
+        assert!(adds_action_marker("X\t1\t0\t0\t0\t0\t!40044\n", ""));
 
         let mut cs = json!({ "project": { "project": {
-            "markers": "M\t1\t0\t0\t0\t!40044\n", "title": "T" } } });
+            "markers": "M\t1\t0\t0\t0\t0\t!40044\n", "title": "T" } } });
         assert_eq!(sanitize_proposal(&mut cs, Some(current)), 1);
         assert_eq!(cs, json!({ "project": { "project": { "title": "T" } } }));
         let mut ok = json!({ "project": { "project": { "markers": current } } });

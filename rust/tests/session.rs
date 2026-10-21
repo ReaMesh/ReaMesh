@@ -382,7 +382,7 @@ fn owner_drops_malformed_proposal_fields() {
     std::thread::sleep(Duration::from_millis(3200));
     client.push_local(
         r#"{"tracks":{"{T21}":{"name":"Lead Vox","lock":"LOCK 1\n<FXCHAIN\n>\n","evil":"x"}},
-            "project":{"project":{"markers":"M\t1\t0\t0\t0\t!40044\n","title":"Song"}}}"#,
+            "project":{"project":{"markers":"M\t1\t0\t0\t0\t0\t!40044\n","title":"Song"}}}"#,
     );
     // The admitted part lands in the owner's doc...
     assert!(wait_until(Duration::from_secs(10), || {
