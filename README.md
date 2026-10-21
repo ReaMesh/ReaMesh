@@ -15,7 +15,7 @@ handles sessions, invitations and setup alongside REAPER.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/hero-dark.png">
-  <img alt="REAPER on a MacBook during a shared ReaMesh session: the people overlay over the arrange, an item another person is editing shown in grey, and the ReaMesh app beside it" src="proprietary/screenshots/hero-light.png">
+  <img alt="REAPER on a MacBook during a shared ReaMesh session: Lena's pointer in the arrange, an item Alex is editing, dimmed and outlined in Alex's color, the people overlay, and the ReaMesh app beside it" src="proprietary/screenshots/hero-light.png">
 </picture>
 
 ## Getting started
@@ -41,7 +41,7 @@ You'll need REAPER 7.12 or newer and the ReaMesh app on each computer. See
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/screens-dark.png">
-  <img alt="The ReaMesh app: sessions on the network, the check before joining with host, size and plugins, the project download, and the session with who is editing what" src="proprietary/screenshots/screens-light.png">
+  <img alt="The ReaMesh app: sessions on the network, the check before joining with host, size and plugins, the project download, and the session with everyone's track" src="proprietary/screenshots/screens-light.png">
 </picture>
 
 Everyone needs a compatible ReaMesh version. Sessions hosted with an
@@ -70,7 +70,7 @@ code is valid only while that hosting session is running.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/live-sync-dark.webp">
-  <img alt="Two REAPER windows side by side, Ben's and Lena's: Ben moves a vocal item and it moves on Lena's screen, then Lena moves a pad item and it moves on Ben's" src="proprietary/screenshots/live-sync-light.webp">
+  <img alt="Two REAPER windows side by side, Ben's and Lena's: Ben drags a vocal item while Lena's screen shows his pointer and where the item will land, then it moves there; then Lena moves a pad item the same way on Ben's screen" src="proprietary/screenshots/live-sync-light.webp">
 </picture>
 
 | Part of the project | Shared edits |
@@ -107,7 +107,7 @@ outline in their color (point at it to see who).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/edit-lock-dark.png">
-  <img alt="Lena is editing the Lead Vox item and its volume: on Ben's screen the item is grey, and the overlay tells Ben that Lena is editing Lead Vox right now after his change snapped back" src="proprietary/screenshots/edit-lock-light.png">
+  <img alt="Lena is editing the Lead Vox item and its volume: on Ben's screen the item is dimmed with a pink outline and Lena's pointer is on it, and the overlay tells Ben that Lena is editing Lead Vox right now after his change snapped back" src="proprietary/screenshots/edit-lock-light.png">
 </picture>
 
 Remote edits don't create undo points. Undoing an earlier local action can still
