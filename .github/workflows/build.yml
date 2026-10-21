@@ -1,6 +1,8 @@
 # Build the extension on Windows and macOS (universal), the Windows installer,
-# and an unbundled macOS app; check the Intel half natively on an Intel runner. Run Rust tests serially because they share sockets
-# and mDNS. Type-check and test the frontend on both platforms.
+# and an unbundled macOS app; check the Intel half natively on an Intel runner.
+# Type-check and test the frontend on both platforms. The Rust tests run in
+# their own job per platform, next to the builds: serially, because they share
+# sockets and mDNS, and that serial run is what takes longest.
 name: build
 on:
   # Pushes that only touch docs, artwork no build embeds, or other workflows
@@ -25,6 +27,11 @@ on:
 
 permissions:
   contents: read
+
+# A newer push to the same branch supersedes a run still in progress.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   windows:
@@ -60,11 +67,6 @@ jobs:
       - name: Build Rust staticlib
         run: cargo build --release
         working-directory: rust
-      # Serial: the in-process session tests use real (non-sandboxed) sockets
-      # and mDNS; run in parallel they steal each other's discovery traffic.
-      - name: Rust tests
-        run: cargo test --release -- --test-threads=1
-        working-directory: rust
       - name: Build extension DLL
         run: |
           cmake -S extension -B extension/build
@@ -73,10 +75,10 @@ jobs:
         with:
           name: reaper_reamesh-windows-x64
           path: extension/build/Release/reaper_reamesh.dll
-      - name: App lint + unit tests
+      # tsc + vite run in the app build's beforeBuildCommand below.
+      - name: App unit tests
         run: |
           bun install --frozen-lockfile
-          bun run build
           bun run test
         working-directory: app
       # The app bundles the DLL built above, so this has to come after it.
@@ -115,9 +117,6 @@ jobs:
             !app/src-tauri/target/universal-apple-darwin/
           key: cargo-target-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-${{ hashFiles('rust/Cargo.lock', 'app/src-tauri/Cargo.lock') }}
           restore-keys: cargo-target-${{ github.job }}-${{ runner.os }}-${{ steps.rust.outputs.commit }}-
-      - name: Rust tests
-        run: cargo test --release -- --test-threads=1
-        working-directory: rust
       # Universal (Apple silicon + Intel), macOS 11+.
       - name: Build extension dylib
         run: ./build.sh --no-app
@@ -125,10 +124,10 @@ jobs:
         with:
           name: reaper_reamesh-macos
           path: extension/build/reaper_reamesh.dylib
-      - name: App lint + unit tests
+      # tsc + vite run in the app build's beforeBuildCommand below.
+      - name: App unit tests
         run: |
           bun install --frozen-lockfile
-          bun run build
           bun run test
         working-directory: app
       # Compile check only; the release workflow builds the signed bundle.
@@ -139,8 +138,8 @@ jobs:
         working-directory: app
 
   # Runs the Intel half of the universal build natively: architectures and
-  # minimum macOS, loading the x86_64 extension, the C++ tests and the Rust
-  # tests, all as x86_64.
+  # minimum macOS, loading the x86_64 extension and the C++ tests, all as
+  # x86_64. Its Rust tests run in the tests job below.
   macos-intel:
     runs-on: macos-15-intel
     steps:
@@ -167,4 +166,43 @@ jobs:
       - name: Build universal extension
         run: ./build.sh --no-app
       - name: Intel check
-        run: tools/check-intel.sh
+        run: tools/check-intel.sh --quick
+
+  # The Rust tests of each platform, natively (the Intel runner covers x86_64).
+  # Serial: the in-process session tests use real (non-sandboxed) sockets and
+  # mDNS; run in parallel they steal each other's discovery traffic.
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows, os: windows-latest }
+          - { name: macos, os: macos-latest }
+          - { name: macos-intel, os: macos-15-intel }
+    name: tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Same cache scheme as the other jobs (see windows), under its own keys.
+      - name: Rust toolchain
+        id: rust
+        shell: bash
+        run: |
+          echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-tests-${{ matrix.name }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: cargo-registry-tests-${{ matrix.name }}-
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            rust/target/
+          key: cargo-target-tests-${{ matrix.name }}-${{ steps.rust.outputs.commit }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: cargo-target-tests-${{ matrix.name }}-${{ steps.rust.outputs.commit }}-
+      - name: Rust tests
+        run: cargo test --release -- --test-threads=1
+        working-directory: rust
