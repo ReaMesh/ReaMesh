@@ -1142,6 +1142,22 @@ fn claim_identity_slot(base: &Path) -> (PathBuf, Option<fs::File>) {
     (base.to_path_buf(), None)
 }
 
+/// Test-only: swarms listen on loopback and run without mDNS, so a test
+/// executable never opens a LAN-facing socket. On Windows every freshly built
+/// test binary (new hash, new path) would otherwise raise its own firewall
+/// prompt. Loopback addresses also count as dialable for tickets while this is
+/// on. The extension never sets it.
+static LOOPBACK_ONLY: AtomicBool = AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn set_loopback_only(on: bool) {
+    LOOPBACK_ONLY.store(on, Ordering::Relaxed);
+}
+
+fn loopback_only() -> bool {
+    LOOPBACK_ONLY.load(Ordering::Relaxed)
+}
+
 /// The keypair every swarm starts with: the persisted per-install identity
 /// when a path is registered (created on first use), else a fresh ephemeral
 /// one (tests, or an extension that never registered a path).
@@ -1564,6 +1580,9 @@ struct TicketInfo {
 /// host. `parse_ticket` applies the same rule to what a ticket names, so a
 /// link can't point the joiner at its own machine or a local-only service.
 fn dialable_ip(ip: &IpAddr) -> bool {
+    if loopback_only() && ip.is_loopback() {
+        return true;
+    }
     match ip {
         IpAddr::V4(v4) => {
             !v4.is_loopback()
@@ -3703,14 +3722,18 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
             .map_err(std::io::Error::other)?;
             // mDNS needs a multicast socket; in sandboxed environments that
             // can fail, in which case we still run (peers must dial directly).
-            let mdns = match mdns::tokio::Behaviour::new(
-                mdns::Config::default(),
-                key.public().to_peer_id(),
-            ) {
-                Ok(b) => Toggle::from(Some(b)),
-                Err(e) => {
-                    eprintln!("[reamesh] mDNS unavailable ({e}); discovery disabled");
-                    Toggle::from(None)
+            let mdns = if loopback_only() {
+                Toggle::from(None)
+            } else {
+                match mdns::tokio::Behaviour::new(
+                    mdns::Config::default(),
+                    key.public().to_peer_id(),
+                ) {
+                    Ok(b) => Toggle::from(Some(b)),
+                    Err(e) => {
+                        eprintln!("[reamesh] mDNS unavailable ({e}); discovery disabled");
+                        Toggle::from(None)
+                    }
                 }
             };
             let xfer = request_response::cbor::Behaviour::new(
@@ -3733,8 +3756,9 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
         .behaviour_mut()
         .gossipsub
         .subscribe(&gossipsub::IdentTopic::new(LOBBY_TOPIC))?;
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+    let host = if loopback_only() { "127.0.0.1" } else { "0.0.0.0" };
+    swarm.listen_on(format!("/ip4/{host}/tcp/0").parse()?)?;
+    swarm.listen_on(format!("/ip4/{host}/udp/0/quic-v1").parse()?)?;
     Ok(swarm)
 }
 

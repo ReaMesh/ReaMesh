@@ -13,6 +13,19 @@ use serde_json::Value;
 
 const KICK_SIZE: usize = 2 * 1024 * 1024 + 12345; // >1 chunk, not chunk-aligned
 
+/// Every test peer starts through these two: they keep the swarms on loopback
+/// (no mDNS, no LAN-facing listener), so a freshly built test binary never
+/// raises a firewall prompt on Windows. Peers find each other by explicit dial.
+fn host(name: &str, dir: &str, file: &str, pass: &str) -> anyhow::Result<Box<Reamesh>> {
+    reamesh::set_loopback_only(true);
+    Reamesh::host(name, dir, file, pass)
+}
+
+fn join(staging: &str) -> anyhow::Result<Box<Reamesh>> {
+    reamesh::set_loopback_only(true);
+    Reamesh::join(staging)
+}
+
 fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -86,9 +99,9 @@ fn establish_pass(
     staging: &Path,
     pass: &str,
 ) -> (Box<Reamesh>, Box<Reamesh>) {
-    let owner = Reamesh::host(session_name, project_dir.to_str().unwrap(), "Song.rpp", pass)
+    let owner = host(session_name, project_dir.to_str().unwrap(), "Song.rpp", pass)
         .expect("host failed");
-    let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
+    let client = join(staging.to_str().unwrap()).expect("join failed");
     let sid = session_id_of(&owner);
 
     // mDNS with explicit-dial fallback (sandboxed/multicast-less environments).
@@ -178,7 +191,7 @@ fn ticket_join_works_without_lan_discovery() {
     make_project(&project);
 
     // Passphrase-protected, so this also runs the sealed-gossip path.
-    let owner = Reamesh::host("ticket-test", project.to_str().unwrap(), "Song.rpp", "hunter2")
+    let owner = host("ticket-test", project.to_str().unwrap(), "Song.rpp", "hunter2")
         .expect("host failed");
     // The ticket appears once the host knows its listen addresses.
     let mut ticket = String::new();
@@ -190,12 +203,12 @@ fn ticket_join_works_without_lan_discovery() {
         "host never produced a ticket"
     );
     assert!(ticket.starts_with("reamesh://join/"), "unexpected ticket format: {ticket}");
-    // A dialable IP and at least one port must be in there; the loopback the
-    // host also listens on must not be.
+    // A dialable IP and at least one port must be in there. The test swarms
+    // listen on loopback only, which tickets then admit; that a real host's
+    // loopback stays out is covered by `ticket_endpoints_skip_undialable_addresses`.
     assert!(ticket.contains("&a=") && (ticket.contains("&t=") || ticket.contains("&q=")), "{ticket}");
-    assert!(!ticket.contains("127.0.0.1"), "loopback leaked into the ticket: {ticket}");
 
-    let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
+    let client = join(staging.to_str().unwrap()).expect("join failed");
     assert_eq!(client.session_ticket(), "", "clients must not mint tickets");
     // Garbage is refused outright.
     assert!(!client.join_ticket("reamesh://join/garbage!", "hunter2"));
@@ -245,7 +258,7 @@ fn ticket_join_against_dead_host_fails_instead_of_hanging() {
     let staging = temp_dir("staging-deadticket");
     make_project(&project);
 
-    let owner = Reamesh::host("dead-ticket", project.to_str().unwrap(), "Song.rpp", "hunter2")
+    let owner = host("dead-ticket", project.to_str().unwrap(), "Song.rpp", "hunter2")
         .expect("host failed");
     let mut ticket = String::new();
     assert!(
@@ -258,7 +271,7 @@ fn ticket_join_against_dead_host_fails_instead_of_hanging() {
     // Stop hosting: the ticket's addresses are now dead.
     drop(owner);
 
-    let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
+    let client = join(staging.to_str().unwrap()).expect("join failed");
     assert!(client.join_ticket(&ticket, "hunter2"), "join_ticket refused");
     // It must resolve to "failed" within the ticket-join timeout (+ margin),
     // not sit on "connecting" forever.
@@ -939,9 +952,9 @@ fn progressive_join_reports_ready_before_media() {
     )
     .unwrap();
 
-    let owner = Reamesh::host("progressive-test", project.to_str().unwrap(), "Song.rpp", "")
+    let owner = host("progressive-test", project.to_str().unwrap(), "Song.rpp", "")
         .expect("host failed");
-    let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
+    let client = join(staging.to_str().unwrap()).expect("join failed");
     let sid = session_id_of(&owner);
     let discovered = wait_until(Duration::from_secs(20), || {
         interconnect(&owner, &client);
@@ -1011,9 +1024,9 @@ fn passphrase_precheck_reports_right_and_wrong() {
     let staging = temp_dir("staging-probe");
     make_project(&project);
 
-    let owner = Reamesh::host("probe-test", project.to_str().unwrap(), "Song.rpp", "hunter2")
+    let owner = host("probe-test", project.to_str().unwrap(), "Song.rpp", "hunter2")
         .expect("host failed");
-    let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
+    let client = join(staging.to_str().unwrap()).expect("join failed");
     let sid = session_id_of(&owner);
     assert!(wait_until(Duration::from_secs(20), || {
         interconnect(&owner, &client);
@@ -1055,13 +1068,13 @@ fn passphrase_gates_download() {
     let staging_ok = temp_dir("staging-pass-ok");
     make_project(&project);
 
-    let owner = Reamesh::host("pass-test", project.to_str().unwrap(), "Song.rpp", "hunter2")
+    let owner = host("pass-test", project.to_str().unwrap(), "Song.rpp", "hunter2")
         .expect("host failed");
     let sid = session_id_of(&owner);
 
     // Wrong passphrase: the owner refuses to serve the manifest, the download
     // fails rather than handing the project to an unauthorized peer.
-    let wrong = Reamesh::join(staging_bad.to_str().unwrap()).expect("join failed");
+    let wrong = join(staging_bad.to_str().unwrap()).expect("join failed");
     assert!(wait_until(Duration::from_secs(20), || {
         interconnect(&owner, &wrong);
         wrong.sessions_json().contains(&sid)
@@ -1103,7 +1116,7 @@ fn passphrase_gates_download() {
     drop(wrong);
 
     // Right passphrase: downloads normally.
-    let good = Reamesh::join(staging_ok.to_str().unwrap()).expect("join failed");
+    let good = join(staging_ok.to_str().unwrap()).expect("join failed");
     assert!(wait_until(Duration::from_secs(20), || {
         interconnect(&owner, &good);
         good.sessions_json().contains(&sid)
@@ -1234,7 +1247,7 @@ fn moderation_ban_refuses_rejoin_until_revoked() {
     // A second guest: the ban table must reach every member, not just the
     // banned peer, because every member serves files and shows a roster.
     let staging2 = temp_dir("staging-ban-bystander");
-    let bystander = Reamesh::join(staging2.to_str().unwrap()).expect("join failed");
+    let bystander = join(staging2.to_str().unwrap()).expect("join failed");
     assert!(wait_until(Duration::from_secs(20), || {
         interconnect(&owner, &bystander);
         interconnect(&client, &bystander);
@@ -1355,10 +1368,10 @@ fn join_against_dead_owner_fails_instead_of_hanging() {
     let staging = temp_dir("staging-deadowner");
     make_project(&project);
 
-    let owner = Reamesh::host("deadowner-test", project.to_str().unwrap(), "Song.rpp", "")
+    let owner = host("deadowner-test", project.to_str().unwrap(), "Song.rpp", "")
         .expect("host failed");
     let sid = session_id_of(&owner);
-    let client = Reamesh::join(staging.to_str().unwrap()).expect("join failed");
+    let client = join(staging.to_str().unwrap()).expect("join failed");
     assert!(wait_until(Duration::from_secs(20), || {
         interconnect(&owner, &client);
         client.sessions_json().contains(&sid)

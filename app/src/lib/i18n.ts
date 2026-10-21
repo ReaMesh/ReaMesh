@@ -308,7 +308,7 @@ const en = {
   // Windows Firewall: an existing block detected
   fwBlocked: "A firewall rule blocks REAPER. Others on your network can't reach you.",
   fwOpenSettings: "Open firewall settings",
-  fwCopyFix: "Copy fix",
+  fwCopyFix: "Copy PowerShell command",
   fwFixCopied: "Copied. Paste it into PowerShell running as administrator.",
 
   // Settings: network identity
@@ -728,7 +728,7 @@ const de: Record<MsgKey, string> = {
 
   fwBlocked: "Eine Firewall-Regel blockiert REAPER. Andere im Netzwerk erreichen dich nicht.",
   fwOpenSettings: "Firewall-Einstellungen öffnen",
-  fwCopyFix: "Lösung kopieren",
+  fwCopyFix: "PowerShell-Befehl kopieren",
   fwFixCopied: "Kopiert. Öffne PowerShell als Administrator und füge den Befehl ein.",
 
   networkIdentity: "Netzwerkidentität",
