@@ -1,5 +1,5 @@
 // Overlay settings are stored as a bitmask in the Tauri backend and shared
-// by the native Settings window and webviews. Backend writes emit
+// by every webview window. Backend writes emit
 // `overlay-settings-changed`; localStorage caches the value for first render
 // and provides persistence in browser previews.
 
@@ -116,7 +116,7 @@ export function setOverlaySetting(key: keyof OverlaySettings, value: boolean) {
 }
 
 // Pull the authoritative value from the backend on load, and follow every
-// later change (including ones made in the native Settings window).
+// later change (including ones made in another window).
 void invoke<number>("get_overlay_settings")
   .then((mask) => set(maskToSettings(mask)))
   .catch(() => {

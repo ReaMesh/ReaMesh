@@ -18,7 +18,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-# Compiles the native AppKit settings window (src/settings_window.m) on macOS.
+# Compiles the native AppKit code (HUD panel, About window, Bluetooth) on macOS.
 cc = "1"
 
 [dependencies]

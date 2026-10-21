@@ -1,10 +1,9 @@
 fn main() {
-    // On macOS the Settings window and the presence HUD (a non-activating
-    // panel) are native AppKit code, compiled here; Rust talks to them over
-    // tiny C ABIs (settings_window.h, overlay_panel.h).
+    // On macOS the presence HUD (a non-activating panel), the About window and
+    // the Bluetooth radio are native AppKit code, compiled here; Rust talks to
+    // them over tiny C ABIs (overlay_panel.h, about_window.h, ble.h).
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         cc::Build::new()
-            .file("src/settings_window.m")
             .file("src/overlay_panel.m")
             .file("src/about_window.m")
             .file("src/ble.m")
@@ -17,8 +16,6 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=QuartzCore");
         // Nearby-session hints over Bluetooth LE (src/ble.m).
         println!("cargo:rustc-link-lib=framework=CoreBluetooth");
-        println!("cargo:rerun-if-changed=src/settings_window.m");
-        println!("cargo:rerun-if-changed=src/settings_window.h");
         println!("cargo:rerun-if-changed=src/overlay_panel.m");
         println!("cargo:rerun-if-changed=src/overlay_panel.h");
         println!("cargo:rerun-if-changed=src/about_window.m");

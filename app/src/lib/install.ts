@@ -5,8 +5,8 @@ import { listen } from "@tauri-apps/api/event";
 // Extension-install plumbing: the Tauri backend checks REAPER's resource
 // folder and copies the bundled reaper_reamesh.dylib into UserPlugins.
 // The custom REAPER folder (portable installs) is persisted backend-side so
-// the native macOS settings window and this webview share one source of truth;
-// we cache it here for synchronous reads in render.
+// every window (the main one and the macOS Settings window) shares one source
+// of truth; we cache it here for synchronous reads in render.
 
 export interface ReaperStatus {
   reaperFound: boolean;
@@ -35,6 +35,11 @@ export async function loadReaperPath(): Promise<void> {
 export function getReaperPath(): string | null {
   return cachedPath;
 }
+
+// A folder change or a removal in another window (the macOS Settings window).
+listen("reaper-config-changed", () => {
+  loadReaperPath().then(refreshStatus);
+}).catch(() => {});
 
 export async function setReaperPath(path: string | null): Promise<void> {
   // Mirror only what the backend actually stored: a failed write must not

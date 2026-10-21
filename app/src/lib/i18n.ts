@@ -1,6 +1,6 @@
 // Tiny i18n layer: English + German, no library. The preference
 // ("system" | "en" | "de") is persisted backend-side (like the REAPER folder)
-// so the native macOS settings window and this webview share one source of
+// so the native menu and every webview window share one source of
 // truth, and mirrored into localStorage for a synchronous first render.
 // "system" resolves through the device language; anything that isn't German
 // falls back to English.
@@ -392,6 +392,7 @@ const en = {
   nearbySettings: "Nearby sessions",
   nearbySettingsLabel: "Find and share sessions over Bluetooth",
   nearbySettingsSub: "For networks that block the usual search, such as guest Wi-Fi.",
+  openSystemSettings: "Open System Settings…",
   logVersionMismatch: "The host runs a different ReaMesh version.",
   extOldTitle: "Restart REAPER",
   extOldBody: "ReaMesh was updated. Restart REAPER so it loads the matching extension.",
@@ -808,6 +809,7 @@ const de: Record<MsgKey, string> = {
   nearbySettings: "Sessions in der Nähe",
   nearbySettingsLabel: "Sessions per Bluetooth finden und anbieten",
   nearbySettingsSub: "Für Netzwerke, die die normale Suche blockieren, z. B. Gäste-WLANs.",
+  openSystemSettings: "Systemeinstellungen öffnen…",
   logVersionMismatch: "Der Host nutzt eine andere ReaMesh-Version.",
   extOldTitle: "REAPER neu starten",
   extOldBody: "ReaMesh wurde aktualisiert. Starte REAPER neu, damit es die passende Erweiterung lädt.",
@@ -907,7 +909,7 @@ export function getLangPref(): LangPref {
 }
 
 /** Set the preference, mirror it to localStorage, and persist it backend-side
- *  (where the native macOS settings window reads it). */
+ *  (where the native menu and the other windows read it). */
 export function setLangPref(p: LangPref) {
   applyPref(p);
   invoke("set_language", { pref: p }).catch(() => {});
@@ -943,8 +945,8 @@ export function useLang(): Lang {
 }
 
 /** One-time backend sync: adopt the persisted preference (the backend file is
- *  the source of truth because native settings may have changed it while the
- *  webview was gone) and follow native-side changes live. No-ops in
+ *  the source of truth because another window may have changed it while this
+ *  one was gone) and follow later changes live. No-ops in
  *  plain-browser dev where the Tauri APIs reject. */
 export function initLanguage() {
   syncDocumentLang();

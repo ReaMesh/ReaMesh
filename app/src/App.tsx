@@ -22,7 +22,6 @@ import { startScanning, send, useActiveInstance } from "@/lib/connection";
 import { offerInvite } from "@/lib/invite";
 import { openOverlay, closeOverlay, setSessionState } from "@/lib/overlay";
 import { useOverlaySettings } from "@/lib/overlaySettings";
-import { buildDiagnostics } from "@/lib/diagnostics";
 import { loadReaperPath, refreshStatus, useExtensionStale, useReaperStatus } from "@/lib/install";
 import { t, useLang } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
@@ -272,8 +271,9 @@ export default function App() {
   const instance = useActiveInstance();
   const state = instance?.state;
   const reaper = useReaperStatus();
-  // Settings is a webview screen on Windows only (macOS has the native
-  // window), so the acknowledgements and joined projects return to it only there.
+  // Settings is a screen of this window on Windows only (macOS has its own
+  // Settings window), so the acknowledgements and joined projects return to it
+  // only there.
   const [settingsOpen, setSettingsOpen] = useState(
     resumed?.screen === "settings" ||
       ((resumed?.screen === "credits" || resumed?.screen === "joined") && isWindows),
@@ -429,12 +429,9 @@ export default function App() {
     return () => clearTimeout(id);
   }, [doneBeat, instance?.port, state?.mode]);
 
-  // Settings is opened from the native menu (ReaMesh → Settings…, Cmd+,). On
-  // macOS the backend opens a native AppKit window instead and emits
-  // `menu:settings-changed` after edits so we can re-read status; the
-  // `menu:settings` event only fires on platforms using the in-webview screen.
-  // The native window's "Copy diagnostics" asks us for the text (we hold the
-  // connection state) and the backend puts it on the pasteboard.
+  // `menu:settings` switches this window to Settings where Settings is a
+  // screen of it (not macOS: Cmd+, opens the Settings window there). The macOS
+  // About window's Acknowledgements button lands on `menu:credits`.
   useEffect(() => {
     const subs = [
       listen("menu:settings", () => {
@@ -442,14 +439,6 @@ export default function App() {
         setSettingsOpen(true);
       }),
       listen("menu:credits", () => setCreditsOpen(true)),
-      listen("menu:joined", () => setJoinedOpen(true)),
-      listen("menu:settings-changed", () => {
-        loadReaperPath().then(refreshStatus);
-      }),
-      listen("settings:copy-diagnostics", async () => {
-        await refreshStatus();
-        invoke("copy_diagnostics_text", { text: await buildDiagnostics() }).catch(() => {});
-      }),
     ];
     return () => {
       subs.forEach((un) => un.then((f) => f()));

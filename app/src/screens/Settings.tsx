@@ -39,7 +39,7 @@ import {
   setOverlaySetting,
   useOverlaySettings,
 } from "@/lib/overlaySettings";
-import { isWindows } from "@/lib/platform";
+import { isMac, isWindows } from "@/lib/platform";
 import { formatBytes } from "@/lib/format";
 import { listJoinedProjects } from "@/screens/JoinedProjects";
 import { PROTO } from "@/lib/version";
@@ -87,15 +87,17 @@ function Row({
   );
 }
 
-// Full-screen app settings, reached from the Windows title-bar gear or Ctrl+,
-// (macOS has the native AppKit settings window instead, from Cmd+,). Grouped rows with one
-// control each; your name and colour on top (the Lobby edits them too).
+// App settings. On Windows a full-screen screen of the main window, reached
+// from the title-bar gear or Ctrl+, (with `onBack`); on macOS the content of the
+// Settings window, from Cmd+, (without: the window's own title bar names it).
+// Grouped rows with one control each; your name and colour on top (the Lobby
+// edits them too).
 export function Settings({
   onBack,
   onOpenCredits,
   onOpenJoined,
 }: {
-  onBack: () => void;
+  onBack?: () => void;
   onOpenCredits: () => void;
   onOpenJoined: () => void;
 }) {
@@ -262,20 +264,22 @@ export function Settings({
     // Style WebView2's scrollbar on Windows; keep the native macOS overlay.
     <div className={cn("flex flex-1 flex-col overflow-y-auto", isWindows && "scroll-slim")}>
       <div className="w-full space-y-[18px] px-4 pt-1 pb-5">
-        <div className="relative flex h-8 items-center">
-          <Button
-            variant="ghost"
-            size="sm"
-            className="-ml-1 h-8 gap-1.5 px-2 text-[13px] text-foreground/65 hover:text-foreground"
-            onClick={onBack}
-          >
-            <ArrowLeft className="size-4" aria-hidden="true" />
-            {t("back")}
-          </Button>
-          <h1 className="pointer-events-none absolute inset-0 grid place-items-center text-[15px] font-semibold">
-            {t("settings")}
-          </h1>
-        </div>
+        {onBack && (
+          <div className="relative flex h-8 items-center">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="-ml-1 h-8 gap-1.5 px-2 text-[13px] text-foreground/65 hover:text-foreground"
+              onClick={onBack}
+            >
+              <ArrowLeft className="size-4" aria-hidden="true" />
+              {t("back")}
+            </Button>
+            <h1 className="pointer-events-none absolute inset-0 grid place-items-center text-[15px] font-semibold">
+              {t("settings")}
+            </h1>
+          </div>
+        )}
 
         <section className="space-y-2">
           <SectionLabel>{t("profile")}</SectionLabel>
@@ -540,6 +544,21 @@ export function Settings({
                   label={t("nearbySettingsLabel")}
                 />
               </Row>
+              {/* Once denied, only System Settings can allow it again. */}
+              {isMac && nearby.enabled === true && nearby.auth === "denied" && (
+                <>
+                  <Divider inset={false} />
+                  <button
+                    type="button"
+                    onClick={() => invoke("open_bluetooth_settings").catch(() => {})}
+                    className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
+                  >
+                    <Row label={t("openSystemSettings")}>
+                      <ExternalLink className="size-3.5 text-muted-foreground" aria-hidden="true" />
+                    </Row>
+                  </button>
+                </>
+              )}
             </Group>
           </section>
         )}
@@ -612,61 +631,64 @@ export function Settings({
           </Group>
         </section>
 
-        <section className="space-y-2">
-          <SectionLabel>{t("aboutTitle")}</SectionLabel>
-          <Group>
-            <Row label={t("aboutVersion")}>
-              <span className="shrink-0 text-[12px] text-muted-foreground tabular-nums">
-                {version}
-                {build?.commit &&
-                  (build.release ? (
-                    // A release build's commit is on GitHub; a dev build's may
-                    // exist only locally, so it stays plain text there.
-                    <>
-                      {" ("}
-                      <button
-                        type="button"
-                        onClick={() => openUrl(`${SOURCE_URL}/commit/${build.commit}`)}
-                        className={cn("rounded-sm text-primary hover:underline", focusRing)}
-                      >
-                        {build.commit}
-                      </button>
-                      {")"}
-                    </>
-                  ) : (
-                    ` (${build.commit})`
-                  ))}
-              </span>
-            </Row>
-            <Divider inset={false} />
-            <Row label={t("aboutBuild")}>
-              <span className="shrink-0 text-[12px] text-muted-foreground tabular-nums">
-                {build && [t(build.release ? "releaseBuild" : "devBuild"), buildDate]
-                  .filter(Boolean)
-                  .join(" · ")}
-              </span>
-            </Row>
-            <Divider inset={false} />
-            <Row label={t("aboutProtocol")}>
-              <span className="shrink-0 text-[12px] text-muted-foreground tabular-nums">{PROTO}</span>
-            </Row>
-            <Divider inset={false} />
-            <button
-              type="button"
-              onClick={() => openUrl(SOURCE_URL)}
-              className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
-            >
-              <Row label={t("sourceCode")}>
-                <ExternalLink className="size-3.5 text-muted-foreground" aria-hidden="true" />
+        {/* macOS has its own About window (ReaMesh → About ReaMesh). */}
+        {!isMac && (
+          <section className="space-y-2">
+            <SectionLabel>{t("aboutTitle")}</SectionLabel>
+            <Group>
+              <Row label={t("aboutVersion")}>
+                <span className="shrink-0 text-[12px] text-muted-foreground tabular-nums">
+                  {version}
+                  {build?.commit &&
+                    (build.release ? (
+                      // A release build's commit is on GitHub; a dev build's may
+                      // exist only locally, so it stays plain text there.
+                      <>
+                        {" ("}
+                        <button
+                          type="button"
+                          onClick={() => openUrl(`${SOURCE_URL}/commit/${build.commit}`)}
+                          className={cn("rounded-sm text-primary hover:underline", focusRing)}
+                        >
+                          {build.commit}
+                        </button>
+                        {")"}
+                      </>
+                    ) : (
+                      ` (${build.commit})`
+                    ))}
+                </span>
               </Row>
-            </button>
-          </Group>
-          <div className="space-y-1 px-1 text-[11px] leading-snug text-muted-foreground">
-            <p>{t("aboutTagline")}</p>
-            <p>{t("cockosNotice")}</p>
-            <p>© 2026 tiszu · GPL-3.0</p>
-          </div>
-        </section>
+              <Divider inset={false} />
+              <Row label={t("aboutBuild")}>
+                <span className="shrink-0 text-[12px] text-muted-foreground tabular-nums">
+                  {build && [t(build.release ? "releaseBuild" : "devBuild"), buildDate]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </span>
+              </Row>
+              <Divider inset={false} />
+              <Row label={t("aboutProtocol")}>
+                <span className="shrink-0 text-[12px] text-muted-foreground tabular-nums">{PROTO}</span>
+              </Row>
+              <Divider inset={false} />
+              <button
+                type="button"
+                onClick={() => openUrl(SOURCE_URL)}
+                className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
+              >
+                <Row label={t("sourceCode")}>
+                  <ExternalLink className="size-3.5 text-muted-foreground" aria-hidden="true" />
+                </Row>
+              </button>
+            </Group>
+            <div className="space-y-1 px-1 text-[11px] leading-snug text-muted-foreground">
+              <p>{t("aboutTagline")}</p>
+              <p>{t("cockosNotice")}</p>
+              <p>© 2026 tiszu · GPL-3.0</p>
+            </div>
+          </section>
+        )}
 
       </div>
     </div>

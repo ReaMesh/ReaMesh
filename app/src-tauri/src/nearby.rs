@@ -56,7 +56,6 @@ pub fn store_pref(app: &AppHandle, on: bool) {
     }
     // The webview re-sends scan/advertise for the screen it is on.
     let _ = app.emit("nearby-changed", ());
-    crate::refresh_native_settings(app);
 }
 
 /// macOS always (the permission is asked for on first use); Windows once an
@@ -65,7 +64,7 @@ pub fn supported() -> bool {
     ble::supported()
 }
 
-/// Bluetooth permission as the webview and settings window show it.
+/// Bluetooth permission as Settings shows it.
 pub fn authorization() -> &'static str {
     match ble::authorization() {
         0 => "undetermined",

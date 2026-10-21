@@ -2,14 +2,16 @@ import { Input } from "@/components/ui/input";
 import { inkFor } from "@/lib/colors";
 import { sendProfile } from "@/lib/connection";
 import { t } from "@/lib/i18n";
-import { PALETTE, saveProfile, useProfile, type Profile } from "@/lib/profile";
+import { PALETTE, announceProfile, saveProfile, useProfile, type Profile } from "@/lib/profile";
 import { initials } from "@/lib/types";
 import { cn, focusRing } from "@/lib/utils";
 
-/** Persist an edit and push it to every connected REAPER at once. */
+/** Persist an edit and push it to every connected REAPER and the other
+ *  windows at once. */
 export function updateProfile(p: Profile) {
   saveProfile(p);
   sendProfile();
+  announceProfile(p);
 }
 
 // Name field + colour swatches: the body of the Lobby's name card, where the

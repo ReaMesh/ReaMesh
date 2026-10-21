@@ -8,8 +8,7 @@ import { getUpdate, getUpdateChannel } from "./updater";
 import { PROTO } from "./version";
 
 /** Everything a bug report needs, as plain text: no project data, no names.
- *  Shared by the in-app Settings screen and the native macOS settings window
- *  (which asks for it over `settings:copy-diagnostics`). */
+ *  For Settings → Copy diagnostics. */
 export async function buildDiagnostics(): Promise<string> {
   const version = await getVersion().catch(() => "");
   const status = getReaperStatus();

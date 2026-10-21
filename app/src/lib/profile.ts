@@ -4,6 +4,7 @@
 // presence beacon.
 
 import { useSyncExternalStore } from "react";
+import { emit, listen } from "@tauri-apps/api/event";
 
 export interface Profile {
   name: string;
@@ -77,3 +78,18 @@ export function saveProfile(p: Profile) {
     // storage unavailable/full: the in-memory profile still reaches the extension
   }
 }
+
+// The Lobby and the macOS Settings window both edit the profile, and each
+// window keeps its own copy: an edit is announced to the others. A window skips
+// its own announcement, which can arrive after a newer keystroke.
+const WINDOW_ID = Math.random().toString(36).slice(2);
+
+export function announceProfile(p: Profile) {
+  emit("profile-changed", { from: WINDOW_ID, profile: p }).catch(() => {});
+}
+
+listen<{ from: string; profile: Profile }>("profile-changed", (e) => {
+  if (e.payload.from === WINDOW_ID) return;
+  current = e.payload.profile;
+  listeners.forEach((l) => l());
+}).catch(() => {});

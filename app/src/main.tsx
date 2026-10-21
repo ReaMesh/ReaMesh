@@ -5,11 +5,11 @@ import "./index.css";
 import { initLanguage } from "./lib/i18n";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 
-// Two entry points share this bundle. The floating presence HUD is opened as a
-// separate Tauri window pointed at `index.html?overlay=1&port=<n>`; every other
-// window is the main app. We branch with dynamic imports so the
-// overlay window never pulls in App.tsx's module-level scanning side effects
-// (and vice versa).
+// Three entry points share this bundle. The floating presence HUD is opened as
+// a separate Tauri window pointed at `index.html?overlay=1&port=<n>`, the macOS
+// Settings window at `index.html?settings=1`; every other window is the main
+// app. We branch with dynamic imports so the overlay window never pulls in
+// App.tsx's module-level scanning side effects (and vice versa).
 const params = new URLSearchParams(window.location.search);
 
 // Hidden tabs may pause requestAnimationFrame and block Motion transitions.
@@ -130,6 +130,19 @@ if (params.get("overlay") === "1") {
         <MotionConfig reducedMotion="user">
           <ErrorBoundary where="overlay">
             <Overlay port={port} />
+          </ErrorBoundary>
+        </MotionConfig>
+      </React.StrictMode>,
+    );
+  });
+} else if (params.get("settings") === "1") {
+  // The macOS Settings window (Cmd+,); Windows shows Settings in the main window.
+  import("./settings/SettingsWindow").then(({ SettingsWindow }) => {
+    root.render(
+      <React.StrictMode>
+        <MotionConfig reducedMotion="user">
+          <ErrorBoundary where="settings">
+            <SettingsWindow />
           </ErrorBoundary>
         </MotionConfig>
       </React.StrictMode>,

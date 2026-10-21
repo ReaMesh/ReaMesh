@@ -21,8 +21,7 @@ import { cn, focusRing } from "@/lib/utils";
 
 // The downloaded copies of joined sessions (one folder each under REAPER's
 // resource dir), with their size, so a big one can go to the Trash before the
-// extension's own three-day sweep gets to it. Reached from Settings (and, on
-// macOS, from the native settings window's Advanced pane).
+// extension's own three-day sweep gets to it. Reached from Settings.
 
 export interface JoinedProject {
   dir: string;

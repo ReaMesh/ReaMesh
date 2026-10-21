@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 // The in-app updater, mirrored from the backend (src-tauri/src/updater.rs),
-// which owns it so the native macOS settings window shows the same state. A
+// which owns it so every window (main, and Settings on macOS) shows the same state. A
 // newer build downloads in the background; nothing installs until the user
 // clicks restart. Outside Tauri (plain-browser dev) every call fails quietly
 // and the state stays idle.

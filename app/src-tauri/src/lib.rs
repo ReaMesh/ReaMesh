@@ -229,9 +229,8 @@ fn store_overlay(app: &AppHandle, mask: u8) {
     let _ = fs::write(p, (mask & OVERLAY_ALL).to_string());
 }
 
-/// Persist the overlay toggles and tell every webview (overlay windows + the
-/// in-app Settings screen) so they re-render. Shared by the webview command and
-/// the native settings window callback.
+/// Persist the overlay toggles and tell every webview (the overlay, the main
+/// window and, on macOS, the Settings window) so they re-render.
 fn apply_overlay(app: &AppHandle, mask: u8) {
     let mask = mask & OVERLAY_ALL;
     store_overlay(app, mask);
@@ -240,8 +239,8 @@ fn apply_overlay(app: &AppHandle, mask: u8) {
     let _ = app.emit("overlay-settings-changed", mask);
 }
 
-/// What this binary was built from, for the About section of the Settings
-/// screen (macOS shows the same in its native About window).
+/// What this binary was built from, for the About section of the Windows
+/// Settings screen (macOS shows the same in its native About window).
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BuildInfo {
@@ -268,7 +267,6 @@ fn get_overlay_settings(app: AppHandle) -> u8 {
 #[tauri::command]
 fn set_overlay_settings(app: AppHandle, mask: u8) {
     apply_overlay(&app, mask);
-    refresh_native_settings(&app);
 }
 
 // ---------- auto-install ----------
@@ -363,12 +361,10 @@ fn get_language(app: AppHandle) -> String {
 #[tauri::command]
 fn set_language(app: AppHandle, pref: String) {
     apply_language(&app, &pref);
-    refresh_native_settings(&app);
 }
 
 /// Persist the preference, rebuild the (localized) native menu, and tell every
-/// webview window so the UI re-renders. Shared by the webview command and the
-/// native settings window callback.
+/// webview window so the UI re-renders.
 fn apply_language(app: &AppHandle, pref: &str) {
     let pref = match pref {
         "en" | "de" => pref,
@@ -381,6 +377,9 @@ fn apply_language(app: &AppHandle, pref: &str) {
         let _ = app.run_on_main_thread(move || {
             if let Err(e) = build_menu(&app2) {
                 eprintln!("rebuilding menu failed: {e}");
+            }
+            if let Some(win) = app2.get_webview_window("settings") {
+                let _ = win.set_title(settings_title(resolved_lang(&app2)));
             }
         });
     }
@@ -566,7 +565,6 @@ pub(crate) fn preinstall_extension(app: &AppHandle, version: &str, bytes: &[u8])
     }
     use tauri::Emitter;
     let _ = app.emit("extension-installed", ());
-    refresh_native_settings(app);
     true
 }
 
@@ -588,8 +586,7 @@ fn do_remove(app: &AppHandle, custom_path: &Option<String>) -> Result<ReaperStat
 }
 
 /// Remove the extension and stop auto-install from putting it back on the
-/// next launch (until the user installs it again). Shared by the webview
-/// command and the native settings window.
+/// next launch (until the user installs it again).
 fn apply_remove(app: &AppHandle) -> Result<ReaperStatus, String> {
     store_auto_install(app, false);
     do_remove(app, &load_custom_path(app))
@@ -598,7 +595,7 @@ fn apply_remove(app: &AppHandle) -> Result<ReaperStatus, String> {
 #[tauri::command]
 fn remove_extension(app: AppHandle) -> Result<ReaperStatus, String> {
     let st = apply_remove(&app);
-    refresh_native_settings(&app);
+    reaper_config_changed(&app);
     st
 }
 
@@ -725,7 +722,6 @@ fn install_extension(app: AppHandle) -> Result<ReaperStatus, String> {
     // its "restart REAPER" banner for a manual install too.
     use tauri::Emitter;
     let _ = app.emit("extension-installed", ());
-    refresh_native_settings(&app);
     Ok(st)
 }
 
@@ -1305,35 +1301,33 @@ fn set_reaper_path(app: AppHandle, path: Option<String>) -> Result<(), String> {
     store_custom_path(&app, path)?;
     // A copy already in the newly chosen folder is brought up to date.
     maybe_auto_install(&app);
-    refresh_native_settings(&app);
+    reaper_config_changed(&app);
     Ok(())
 }
 
-/// The webview's half of the native window's "Copy diagnostics": it owns the
-/// connection state, assembles the text and hands it back here, because a
-/// clipboard write from an unfocused webview is refused.
-#[tauri::command]
-fn copy_diagnostics_text(app: AppHandle, text: String) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = app.run_on_main_thread(move || native_settings::set_pasteboard(&text));
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (app, text);
-    }
+/// The REAPER folder or the installed extension changed: every webview window
+/// re-reads both (a change made in the macOS Settings window has to reach the
+/// main one).
+fn reaper_config_changed(app: &AppHandle) {
+    use tauri::Emitter;
+    let _ = app.emit("reaper-config-changed", ());
 }
 
-/// Re-read state into the native macOS settings window if it is open, after a
-/// change made from the webview (or anywhere but the window itself).
-pub(crate) fn refresh_native_settings(app: &AppHandle) {
+/// Open the Bluetooth privacy pane of System Settings, for a permission the
+/// user denied earlier (macOS only; Windows asks again on its own).
+#[tauri::command]
+fn open_bluetooth_settings() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let _ = app.run_on_main_thread(native_settings::refresh);
+        std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth")
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = app;
+        Err("macOS only".into())
     }
 }
 
@@ -1734,6 +1728,50 @@ fn build_menu(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn settings_title(lang: Lang) -> &'static str {
+    tr(lang, "Settings", "Einstellungen")
+}
+
+/// Settings on macOS (ReaMesh → Settings…, Cmd+,): the webview screen Windows
+/// shows inside the main window, in a window of its own as Mac apps have it.
+/// A second Cmd+, brings the open one forward. It starts hidden and the
+/// webview shows it once painted, like the main window.
+#[cfg(target_os = "macos")]
+fn open_settings_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("settings") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+        return;
+    }
+    let built = tauri::WebviewWindowBuilder::new(
+        app,
+        "settings",
+        tauri::WebviewUrl::App("index.html?settings=1".into()),
+    )
+    .title(settings_title(resolved_lang(app)))
+    .inner_size(440.0, 640.0)
+    .min_inner_size(380.0, 420.0)
+    .resizable(true)
+    .title_bar_style(tauri::TitleBarStyle::Overlay)
+    .hidden_title(true)
+    .background_color(tauri::window::Color(0x10, 0x10, 0x13, 0xff))
+    .visible(false)
+    .build();
+    match built {
+        // Show it anyway if the webview never reports in.
+        Ok(win) => {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if !win.is_visible().unwrap_or(true) {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }
+        Err(e) => eprintln!("[reamesh] opening the settings window: {e}"),
+    }
+}
+
 /// Confirm quitting, leave the session, and allow the extension to process
 /// the command before exiting. Confirmation runs on a background thread.
 fn confirm_leave_then_exit(app: AppHandle, hosting: bool, port: u16) {
@@ -1827,7 +1865,7 @@ pub fn run() {
             reset_network_identity,
             joined_projects,
             trash_joined_project,
-            copy_diagnostics_text,
+            open_bluetooth_settings,
             build_info,
             nearby::nearby_state,
             nearby::set_nearby,
@@ -1870,14 +1908,14 @@ pub fn run() {
         })
         .on_menu_event(|app, event| {
             if event.id() == "settings" {
-                // macOS opens the native AppKit settings window; other
-                // platforms switch the main window to the in-webview screen.
+                // macOS opens Settings in a window of its own; other
+                // platforms switch the main window to the Settings screen.
                 #[cfg(target_os = "macos")]
                 {
+                    // Off the main thread: building a window from inside an
+                    // event handler waits on the event loop it runs on.
                     let app = app.clone();
-                    let _ = app
-                        .clone()
-                        .run_on_main_thread(move || native_settings::open(&app));
+                    std::thread::spawn(move || open_settings_window(&app));
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -1935,358 +1973,13 @@ pub fn run() {
 }
 
 
-/// Bridge to the native overlay panel (src/overlay_panel.m). It turns the Tauri
-/// overlay window into a non-activating panel that follows REAPER's window and
-/// shows only while REAPER is frontmost; all of that state lives on the ObjC
-/// side. Must be called on the main thread.
-/// Bridge to the native AppKit settings window (src/settings_window.m). The
-/// window calls back into these `extern "C"` functions to read status, run the
-/// install, and persist preferences. `ctx` is a leaked, stable `AppHandle`
-/// pointer.
-#[cfg(target_os = "macos")]
-mod native_settings {
-    use super::{
-        apply_language, apply_overlay, apply_remove, compute_status, do_install, do_reset_identity,
-        load_custom_path, load_lang_pref, load_overlay, maybe_auto_install, store_auto_install,
-        store_custom_path, updater, ReaperStatus,
-    };
-    use std::cell::RefCell;
-    use std::ffi::{c_char, c_void, CStr, CString};
-    use std::sync::OnceLock;
-    use tauri::{AppHandle, Emitter};
-
-    #[repr(C)]
-    struct ReaperStatusC {
-        resource_path: *const c_char,
-        reaper_found: i32,
-        is_reaper_dir: i32,
-        installed: i32,
-        up_to_date: i32,
-        has_custom_path: i32,
-    }
-
-    /// Mirrors `UpdateStatusC` in settings_window.h. `version` is owned by Rust
-    /// and only valid for the duration of the get_update call.
-    #[repr(C)]
-    struct UpdateStatusC {
-        phase: i32,
-        progress: f64,
-        version: *const c_char,
-        can_restart: i32,
-    }
-
-    #[repr(C)]
-    struct SettingsCallbacks {
-        ctx: *mut c_void,
-        get_status: extern "C" fn(*mut c_void) -> ReaperStatusC,
-        install: extern "C" fn(*mut c_void) -> i32,
-        remove: extern "C" fn(*mut c_void) -> i32,
-        set_path: extern "C" fn(*mut c_void, *const c_char),
-        get_language: extern "C" fn(*mut c_void) -> i32,
-        set_language: extern "C" fn(*mut c_void, i32),
-        get_overlay: extern "C" fn(*mut c_void) -> i32,
-        set_overlay: extern "C" fn(*mut c_void, i32),
-        get_update: extern "C" fn(*mut c_void) -> UpdateStatusC,
-        check_update: extern "C" fn(*mut c_void),
-        restart_update: extern "C" fn(*mut c_void),
-        get_update_auto: extern "C" fn(*mut c_void) -> i32,
-        set_update_auto: extern "C" fn(*mut c_void, i32),
-        show_credits: extern "C" fn(*mut c_void),
-        reset_identity: extern "C" fn(*mut c_void) -> i32,
-        copy_diagnostics: extern "C" fn(*mut c_void),
-        get_version: extern "C" fn(*mut c_void) -> *const c_char,
-        get_update_channel: extern "C" fn(*mut c_void) -> i32,
-        set_update_channel: extern "C" fn(*mut c_void, i32),
-        stable_available: extern "C" fn(*mut c_void) -> i32,
-        show_joined: extern "C" fn(*mut c_void),
-        get_nearby: extern "C" fn(*mut c_void) -> i32,
-        set_nearby: extern "C" fn(*mut c_void, i32),
-        get_nearby_auth: extern "C" fn(*mut c_void) -> i32,
-    }
-
-    extern "C" {
-        fn reamesh_settings_open(cb: SettingsCallbacks);
-        fn reamesh_settings_refresh();
-        fn reamesh_pasteboard_set(text: *const c_char);
-    }
-
-    thread_local! {
-        // Keeps the resource-path C string alive for the duration of the
-        // get_status call (the window copies it into an NSString immediately).
-        static PATH_BUF: RefCell<Option<CString>> = const { RefCell::new(None) };
-        // Same for the offered update's version string.
-        static UPDATE_VERSION_BUF: RefCell<Option<CString>> = const { RefCell::new(None) };
-    }
-
-    fn handle<'a>(ctx: *mut c_void) -> &'a AppHandle {
-        unsafe { &*(ctx as *const AppHandle) }
-    }
-
-    extern "C" fn get_status(ctx: *mut c_void) -> ReaperStatusC {
-        let app = handle(ctx);
-        let custom = load_custom_path(app);
-        let st = compute_status(app, &custom).unwrap_or(ReaperStatus {
-            reaper_found: false,
-            is_reaper_dir: false,
-            resource_path: String::new(),
-            user_plugins: String::new(),
-            installed: false,
-            up_to_date: false,
-            preinstalled: None,
-        });
-        let cstr = CString::new(st.resource_path).unwrap_or_default();
-        let ptr = cstr.as_ptr();
-        PATH_BUF.with(|b| *b.borrow_mut() = Some(cstr));
-        ReaperStatusC {
-            resource_path: ptr,
-            reaper_found: st.reaper_found as i32,
-            is_reaper_dir: st.is_reaper_dir as i32,
-            installed: st.installed as i32,
-            up_to_date: st.up_to_date as i32,
-            has_custom_path: custom.is_some() as i32,
-        }
-    }
-
-    extern "C" fn install(ctx: *mut c_void) -> i32 {
-        let app = handle(ctx);
-        let ok = do_install(app, &load_custom_path(app)).is_ok();
-        if ok {
-            // An explicit install undoes an earlier Remove.
-            store_auto_install(app, true);
-            // A running REAPER keeps the copy it loaded: the webview shows its
-            // "restart REAPER" banner.
-            let _ = app.emit("extension-installed", ());
-        }
-        let _ = app.emit("menu:settings-changed", ());
-        ok as i32
-    }
-
-    extern "C" fn remove(ctx: *mut c_void) -> i32 {
-        let app = handle(ctx);
-        let ok = apply_remove(app).is_ok();
-        let _ = app.emit("menu:settings-changed", ());
-        ok as i32
-    }
-
-    extern "C" fn set_path(ctx: *mut c_void, p: *const c_char) {
-        let app = handle(ctx);
-        let path = if p.is_null() {
-            None
-        } else {
-            Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
-        };
-        let _ = store_custom_path(app, path);
-        maybe_auto_install(app);
-        let _ = app.emit("menu:settings-changed", ());
-    }
-
-    // Language preference, 0 = system / 1 = en / 2 = de (kReaMeshLang* in
-    // settings_window.h).
-    extern "C" fn get_language(ctx: *mut c_void) -> i32 {
-        match load_lang_pref(handle(ctx)).as_str() {
-            "en" => 1,
-            "de" => 2,
-            _ => 0,
-        }
-    }
-
-    extern "C" fn set_language(ctx: *mut c_void, pref: i32) {
-        let pref = match pref {
-            1 => "en",
-            2 => "de",
-            _ => "system",
-        };
-        apply_language(handle(ctx), pref);
-    }
-
-    // Overlay toggles as a bitmask (kReaMeshOverlay* in settings_window.h).
-    extern "C" fn get_overlay(ctx: *mut c_void) -> i32 {
-        load_overlay(handle(ctx)) as i32
-    }
-
-    extern "C" fn set_overlay(ctx: *mut c_void, mask: i32) {
-        apply_overlay(handle(ctx), mask as u8);
-    }
-
-    // Updates (kReaMeshUpdate* phases in settings_window.h).
-    extern "C" fn get_update(_ctx: *mut c_void) -> UpdateStatusC {
-        let st = updater::snapshot();
-        let phase = match st.phase {
-            updater::Phase::Idle => 0,
-            updater::Phase::Checking => 1,
-            updater::Phase::Current => 2,
-            updater::Phase::Downloading => 3,
-            updater::Phase::Ready => 4,
-            updater::Phase::Failed => 5,
-        };
-        let cstr = CString::new(st.version).unwrap_or_default();
-        let ptr = cstr.as_ptr();
-        UPDATE_VERSION_BUF.with(|b| *b.borrow_mut() = Some(cstr));
-        UpdateStatusC {
-            phase,
-            progress: st.progress,
-            version: ptr,
-            can_restart: st.can_restart as i32,
-        }
-    }
-
-    extern "C" fn check_update(ctx: *mut c_void) {
-        updater::spawn_check(handle(ctx));
-    }
-
-    extern "C" fn restart_update(ctx: *mut c_void) {
-        // Off the main thread: the restart waits for the webview to fade out,
-        // which needs the event loop this callback runs on.
-        let app = handle(ctx).clone();
-        std::thread::spawn(move || {
-            let _ = updater::restart(&app);
-        });
-    }
-
-    extern "C" fn get_update_auto(ctx: *mut c_void) -> i32 {
-        updater::load_auto(handle(ctx)) as i32
-    }
-
-    extern "C" fn set_update_auto(ctx: *mut c_void, enabled: i32) {
-        updater::store_auto(handle(ctx), enabled != 0);
-    }
-
-    // Channels as kReaMeshChannel* (0 = Beta, 1 = Stable).
-    extern "C" fn get_update_channel(ctx: *mut c_void) -> i32 {
-        (updater::load_channel(handle(ctx)) == updater::Channel::Stable) as i32
-    }
-
-    extern "C" fn set_update_channel(ctx: *mut c_void, channel: i32) {
-        let channel = if channel == 1 { updater::Channel::Stable } else { updater::Channel::Beta };
-        updater::store_channel(handle(ctx), channel);
-    }
-
-    extern "C" fn stable_available(_ctx: *mut c_void) -> i32 {
-        updater::STABLE_AVAILABLE as i32
-    }
-
-    // The acknowledgements are a screen of the main window (the list is long
-    // and lives in the webview bundle): bring it forward and switch to it.
-    pub(super) extern "C" fn show_credits(ctx: *mut c_void) {
-        use tauri::Manager;
-        let app = handle(ctx);
-        if let Some(win) = app.get_webview_window("main") {
-            let _ = win.unminimize();
-            let _ = win.show();
-            let _ = win.set_focus();
-        }
-        let _ = app.emit("menu:credits", ());
-    }
-
-    // The joined-projects list is a main-window screen too (sizes, Trash).
-    extern "C" fn show_joined(ctx: *mut c_void) {
-        use tauri::Manager;
-        let app = handle(ctx);
-        if let Some(win) = app.get_webview_window("main") {
-            let _ = win.unminimize();
-            let _ = win.show();
-            let _ = win.set_focus();
-        }
-        let _ = app.emit("menu:joined", ());
-    }
-
-    extern "C" fn get_nearby(ctx: *mut c_void) -> i32 {
-        (super::nearby::load_pref(handle(ctx)) == Some(true)) as i32
-    }
-
-    extern "C" fn set_nearby(ctx: *mut c_void, on: i32) {
-        super::nearby::store_pref(handle(ctx), on != 0);
-    }
-
-    extern "C" fn get_nearby_auth(_ctx: *mut c_void) -> i32 {
-        match super::nearby::authorization() {
-            "undetermined" => 0,
-            "restricted" => 1,
-            "denied" => 2,
-            "allowed" => 3,
-            _ => -1,
-        }
-    }
-
-    extern "C" fn reset_identity(ctx: *mut c_void) -> i32 {
-        match do_reset_identity(handle(ctx)) {
-            Ok(true) => 1,
-            Ok(false) => 0,
-            Err(_) => -1,
-        }
-    }
-
-    // The webview holds the connection state the diagnostics describe; it
-    // answers with `copy_diagnostics_text`, which lands in `set_pasteboard`.
-    extern "C" fn copy_diagnostics(ctx: *mut c_void) {
-        let _ = handle(ctx).emit("settings:copy-diagnostics", ());
-    }
-
-    static VERSION: OnceLock<CString> = OnceLock::new();
-
-    extern "C" fn get_version(ctx: *mut c_void) -> *const c_char {
-        VERSION
-            .get_or_init(|| {
-                CString::new(handle(ctx).package_info().version.to_string()).unwrap_or_default()
-            })
-            .as_ptr()
-    }
-
-    // The AppHandle is leaked once so the pointer stays valid for the lifetime
-    // of the (long-lived) native window.
-    static APP_PTR: OnceLock<usize> = OnceLock::new();
-
-    pub fn open(app: &AppHandle) {
-        let ptr = *APP_PTR.get_or_init(|| Box::into_raw(Box::new(app.clone())) as usize);
-        let cb = SettingsCallbacks {
-            ctx: ptr as *mut c_void,
-            get_status,
-            install,
-            remove,
-            set_path,
-            get_language,
-            set_language,
-            get_overlay,
-            set_overlay,
-            get_update,
-            check_update,
-            restart_update,
-            get_update_auto,
-            set_update_auto,
-            show_credits,
-            reset_identity,
-            copy_diagnostics,
-            get_version,
-            get_update_channel,
-            set_update_channel,
-            stable_available,
-            show_joined,
-            get_nearby,
-            set_nearby,
-            get_nearby_auth,
-        };
-        unsafe { reamesh_settings_open(cb) };
-    }
-
-    /// Main thread only.
-    pub fn refresh() {
-        unsafe { reamesh_settings_refresh() };
-    }
-
-    /// Main thread only.
-    pub fn set_pasteboard(text: &str) {
-        let c = CString::new(text.replace('\0', "")).unwrap_or_default();
-        unsafe { reamesh_pasteboard_set(c.as_ptr()) };
-    }
-}
-
 /// Bridge to the native About window (src/about_window.m).
 #[cfg(target_os = "macos")]
 mod native_about {
-    use super::{native_settings, resolved_lang, Lang, PROTO};
+    use super::{resolved_lang, Lang, PROTO};
     use std::ffi::{c_char, c_void, CString};
     use std::sync::OnceLock;
-    use tauri::AppHandle;
+    use tauri::{AppHandle, Emitter, Manager};
 
     #[repr(C)]
     struct AboutInfo {
@@ -2309,8 +2002,20 @@ mod native_about {
     // A dev binary isn't inside a .app, so it has no bundle icon to show.
     static ICON: &[u8] = include_bytes!("../../../proprietary/icons/128x128@2x.png");
 
-    // Leaked once, like the settings window's, for the show_credits callback.
+    // Leaked once, so the pointer stays valid for the show_credits callback.
     static APP_PTR: OnceLock<usize> = OnceLock::new();
+
+    // The acknowledgements are a screen of the main window (the list is long
+    // and lives in the webview bundle): bring it forward and switch to it.
+    extern "C" fn show_credits(ctx: *mut c_void) {
+        let app = unsafe { &*(ctx as *const AppHandle) };
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.unminimize();
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        let _ = app.emit("menu:credits", ());
+    }
 
     /// Main thread only.
     pub fn open(app: &AppHandle) {
@@ -2333,12 +2038,16 @@ mod native_about {
             german: matches!(resolved_lang(app), Lang::De) as i32,
             icon_png: ICON.as_ptr(),
             icon_png_len: ICON.len(),
-            show_credits: native_settings::show_credits,
+            show_credits,
         };
         unsafe { reamesh_about_open(info) };
     }
 }
 
+/// Bridge to the native overlay panel (src/overlay_panel.m). It turns the Tauri
+/// overlay window into a non-activating panel that follows REAPER's window and
+/// shows only while REAPER is frontmost; all of that state lives on the ObjC
+/// side. Must be called on the main thread.
 #[cfg(target_os = "macos")]
 mod native_overlay {
     use std::ffi::c_void;

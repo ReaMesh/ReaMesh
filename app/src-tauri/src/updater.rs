@@ -1,8 +1,8 @@
 // In-app updates. Checks the signed release manifest of the chosen channel
 // (Beta or Stable, see "the update channel" below), downloads a newer build in the background and holds it in
 // memory; nothing is installed until the user clicks restart. The state lives
-// here rather than in the webview so the native macOS settings window and the
-// webview show the same thing.
+// here rather than in the webview so every window (the main one and, on macOS,
+// Settings) shows the same thing.
 //
 // The manifest carries the release's `proto` next to the fields Tauri reads.
 // A restart while a session is up is only offered when that number matches
@@ -100,13 +100,9 @@ pub fn snapshot() -> UpdateState {
     st
 }
 
-/// Tell the webview and the native settings window. Progress ticks only reach
-/// the webview: rebuilding the native pane on every chunk would flicker.
-fn publish(app: &AppHandle, native_too: bool) {
+/// Tell every webview window (main and, on macOS, Settings).
+fn publish(app: &AppHandle) {
     let _ = app.emit("update-state", snapshot());
-    if native_too {
-        crate::refresh_native_settings(app);
-    }
 }
 
 fn set(app: &AppHandle, f: impl FnOnce(&mut Inner)) {
@@ -114,13 +110,13 @@ fn set(app: &AppHandle, f: impl FnOnce(&mut Inner)) {
         let mut inner = INNER.lock().unwrap();
         f(&mut inner);
     }
-    publish(app, true);
+    publish(app);
 }
 
 /// The session state changed (pushed by the webview): `can_restart` may flip.
 pub fn session_changed(app: &AppHandle) {
     if INNER.lock().unwrap().pending.is_some() {
-        publish(app, true);
+        publish(app);
     }
 }
 
@@ -148,7 +144,6 @@ pub fn store_auto(app: &AppHandle, enabled: bool) {
         spawn_check(app);
     }
     let _ = app.emit("update-auto-changed", enabled);
-    crate::refresh_native_settings(app);
 }
 
 // ---------- the update channel ----------
@@ -236,7 +231,7 @@ pub fn store_channel(app: &AppHandle, channel: Channel) {
         }
     }
     let _ = app.emit("update-channel-changed", channel);
-    publish(app, true);
+    publish(app);
     spawn_check(app);
 }
 
@@ -255,7 +250,7 @@ pub fn spawn_check(app: &AppHandle) {
         }
         inner.state.phase = Phase::Checking;
     }
-    publish(app, true);
+    publish(app);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(e) = check_and_download(&app).await {
@@ -313,7 +308,7 @@ async fn check_and_download(app: &AppHandle) -> Result<(), String> {
                 if pct != last_pct {
                     last_pct = pct;
                     INNER.lock().unwrap().state.progress = progress;
-                    publish(app, false);
+                    publish(app);
                 }
             },
             || {},

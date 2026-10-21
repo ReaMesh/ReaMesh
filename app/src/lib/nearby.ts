@@ -42,7 +42,7 @@ function start() {
   if (started) return;
   started = true;
   refresh();
-  // Turned on or off in the native settings window.
+  // Turned on or off in another window (Settings on macOS, the Session screen).
   listen("nearby-changed", refresh).catch(() => {});
   // Back from the system's permission prompt or System Settings.
   window.addEventListener("focus", refresh);

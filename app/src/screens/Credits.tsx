@@ -10,7 +10,7 @@ import credits from "@/assets/credits.json";
 // Acknowledgements: the projects ReaMesh is built on. A short list of the
 // ones that carry it, then every shipped package with its licence, generated
 // at build time by scripts/gen-credits.ts. Reached from Settings (and, on
-// macOS, from the native settings window's Advanced pane).
+// macOS, from the About window).
 
 interface Credit {
   n: string;
