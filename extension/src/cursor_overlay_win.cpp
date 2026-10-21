@@ -88,7 +88,6 @@ struct Style {
   double parkInset, parkItemInset;
   double dragLine, dragDash, dragGap, dragFill;
   double followLine, followOpacity, followTagInset;
-  double haloRadius, haloCentre, haloFill, haloLine, haloLineOpacity;
   double markLine, markRadius, markDim, markLinger, markFadeIn, markFadeOut;
   double markTagFont, markTagHeight, markTagPadX, markTagGap;
   double loadingVeil;
@@ -150,11 +149,6 @@ constexpr Style kStyle = {
     .followLine = 2,
     .followOpacity = 0.9,
     .followTagInset = 8,
-    .haloRadius = 15,
-    .haloCentre = 8,
-    .haloFill = 0.16,
-    .haloLine = 1.5,
-    .haloLineOpacity = 0.45,
     .markLine = 1.5,
     .markRadius = 3,
     .markDim = 0.3,
@@ -829,24 +823,6 @@ void drawArrow(Node& n, const std::string& color) {
   n.look = look;
 }
 
-// The disc behind the followed person's pointer, centred on the arrow's body
-// (not its tip, where a click ripples).
-void drawHalo(Node& n, const std::string& color) {
-  const std::string look = "halo" + color + scaleKey();
-  if (n.look == look) return;
-  const double R = kStyle.haloRadius, c = kStyle.haloCentre;
-  ID2D1DeviceContext* dc = beginDraw(n, 2 * R, 2 * R, 2, R - c, R - c);
-  if (!dc) return;
-  const Rgb rgb = parseColor(color);
-  const float line = static_cast<float>(kStyle.haloLine);
-  const D2D1_ELLIPSE e = D2D1::Ellipse(D2D1::Point2F(static_cast<float>(R), static_cast<float>(R)),
-                                       static_cast<float>(R) - line / 2, static_cast<float>(R) - line / 2);
-  dc->FillEllipse(e, brush(dc, rgba(rgb, kStyle.haloFill)).Get());
-  dc->DrawEllipse(e, brush(dc, rgba(rgb, kStyle.haloLineOpacity)).Get(), line);
-  endDraw(n, dc);
-  n.look = look;
-}
-
 // A pill in `color` with `label` in the matching ink, `lead` DIP free before
 // the text; returns its width in DIP.
 double drawPill(Node& n, const std::string& label, const std::string& color, double fontSize, double height,
@@ -982,7 +958,6 @@ struct Peer {
 
   Node root;   // positioned at the pointer tip
   Node arrow;  // child of root
-  Node halo;   // child of root, below the arrow: the person we follow
   bool followed = false;
   Node tag;    // a sibling of root, so it can trail it
   Node edge;
@@ -1080,18 +1055,12 @@ void raise(Node& n) {
 
 void updateTag(Peer& p, double t);
 
-// The person we follow stands out: the disc behind the pointer, the name tag
-// always up, never dimmed, above everyone else's cursor.
+// The person we follow stands out: the name tag always up, never dimmed,
+// above everyone else's cursor.
 void setFollowed(Peer& p, bool on) {
-  if (on == p.followed && (!on || p.halo)) return;
+  if (!on && !p.followed) return;
   p.followed = on;
   if (on) {
-    if (!p.halo && p.root) {
-      p.halo = makeNode(p.root.v.Get(), Z::Bottom);
-      setOpacityNow(p.halo, 0);
-    }
-    drawHalo(p.halo, p.color);
-    fade(p.halo, 1, kStyle.fadeIn * 2);
     raise(p.edge);
     raise(p.tag);
     raise(p.root);
@@ -1099,8 +1068,6 @@ void setFollowed(Peer& p, bool on) {
       fade(p.arrow, 1, kStyle.fadeIn);
       p.idle = false;
     }
-  } else {
-    fade(p.halo, 0, kStyle.fadeOut);
   }
   updateTag(p, now());
 }
@@ -1138,7 +1105,6 @@ void dropLayers(Peer& p) {
   for (auto& [item, d] : p.dragItems) dropDragItem(d);
   p.dragItems.clear();
   dropNode(p.root);
-  p.halo = Node{};  // went with root
   dropNode(p.tag);
   dropNode(p.edge);
 }
@@ -1146,7 +1112,6 @@ void dropLayers(Peer& p) {
 void refreshTag(Peer& p) {
   drawPill(p.tag, displayLabel(p), p.color, kStyle.tagFont, kStyle.tagHeight, kStyle.tagPadX);
   drawArrow(p.arrow, p.color);
-  if (p.halo) drawHalo(p.halo, p.color);
 }
 
 void refreshEdge(Peer& p, Side side) {

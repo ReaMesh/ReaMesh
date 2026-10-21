@@ -79,10 +79,6 @@ struct Style {
   double dragLine, dragDash, dragGap, dragFill;
   // Following someone: a frame round the arrange.
   double followLine, followOpacity, followTagInset;
-  // ...and their cursor stands out: a soft disc in their colour behind the
-  // pointer, centred this far down-right of the tip (on the arrow's body, not
-  // on the tip where a click ripples), with a thin ring.
-  double haloRadius, haloCentre, haloFill, haloLine, haloLineOpacity;
   // Item someone else is editing: dimmed ("not yours right now") with a thin
   // outline in their colour; their name shows while the local pointer is over
   // it. A mark stays up a little after the lock lapses, so the pauses
@@ -149,11 +145,6 @@ constexpr Style kStyle = {
     .followLine = 2,
     .followOpacity = 0.9,
     .followTagInset = 8,
-    .haloRadius = 15,
-    .haloCentre = 8,
-    .haloFill = 0.16,
-    .haloLine = 1.5,
-    .haloLineOpacity = 0.45,
     .markLine = 1.5,
     .markRadius = 3,
     .markDim = 0.3,
@@ -202,7 +193,6 @@ struct Peer {
 
   CALayer* root = nil;  // positioned at the pointer tip
   CAShapeLayer* arrow = nil;
-  CAShapeLayer* halo = nil;  // in root, below the arrow: the person we follow
   bool followed = false;
   CALayer* tag = nil;   // a sibling of root, so it can trail it
   CATextLayer* tagText = nil;
@@ -523,38 +513,12 @@ CAShapeLayer* makeArrow(const std::string& color) {
 
 void updateTag(Peer& p, double t);
 
-void setHaloColor(Peer& p) {
-  if (!p.halo) return;
-  NSColor* c = parseColor(p.color);
-  [CATransaction begin];
-  [CATransaction setDisableActions:YES];
-  p.halo.fillColor = [c colorWithAlphaComponent:kStyle.haloFill].CGColor;
-  p.halo.strokeColor = [c colorWithAlphaComponent:kStyle.haloLineOpacity].CGColor;
-  [CATransaction commit];
-}
-
-// The person we follow stands out: the disc behind the pointer, the name tag
-// always up, never dimmed, above everyone else's cursor (zPosition orders
-// siblings, so cursors added later stay below).
+// The person we follow stands out: the name tag always up, never dimmed,
+// above everyone else's cursor (zPosition orders siblings, so cursors added
+// later stay below).
 void setFollowed(Peer& p, bool on) {
-  if (on == p.followed && (!on || p.halo)) return;
+  if (!on && !p.followed) return;
   p.followed = on;
-  if (on && !p.halo && p.root) {
-    const double R = kStyle.haloRadius, c = kStyle.haloCentre, i = kStyle.haloLine / 2;
-    p.halo = [CAShapeLayer layer];
-    CGPathRef disc = CGPathCreateWithEllipseInRect(CGRectMake(c - R + i, c - R + i, 2 * (R - i), 2 * (R - i)), nullptr);
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    p.halo.path = disc;
-    p.halo.lineWidth = kStyle.haloLine;
-    p.halo.contentsScale = g_scale;
-    p.halo.opacity = 0;
-    [p.root insertSublayer:p.halo below:p.arrow];
-    [CATransaction commit];
-    CGPathRelease(disc);
-    setHaloColor(p);
-  }
-  if (p.halo) fade(p.halo, on ? 1 : 0, on ? kStyle.fadeIn * 2 : kStyle.fadeOut);
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
   const CGFloat z = on ? 1 : 0;
@@ -645,7 +609,6 @@ void refreshTag(Peer& p) {
   [CATransaction setDisableActions:YES];
   p.arrow.fillColor = parseColor(p.color).CGColor;
   [CATransaction commit];
-  setHaloColor(p);
 }
 
 void refreshEdge(Peer& p, Side side) {
@@ -996,7 +959,6 @@ void checkScale() {
   [CATransaction setDisableActions:YES];
   for (auto& [id, p] : g_peers) {
     for (CALayer* l in @[ p.arrow, p.tag, p.tagText, p.edge, p.edgeText, p.edgeArrow ]) l.contentsScale = s;
-    if (p.halo) p.halo.contentsScale = s;
   }
   for (CALayer* l in @[ g_hoverTag ?: [CALayer layer], g_hoverText ?: [CALayer layer], g_followTag ?: [CALayer layer],
                         g_followText ?: [CALayer layer] ])

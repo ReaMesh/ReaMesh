@@ -108,9 +108,8 @@ void setActivity(const std::vector<Activity>& list);
 
 // Following someone: a thin frame in their colour around the arrange with
 // their name in a corner, and their cursor (peer `id`) stands out from the
-// others: a soft disc in their colour behind the pointer, the name tag always
-// up, never dimmed while resting, drawn above every other cursor. An empty
-// name removes both.
+// others: the name tag always up, never dimmed while resting, drawn above
+// every other cursor. An empty name removes both.
 void setFollow(const std::string& id, const std::string& name, const std::string& color);
 
 // Items to mark, replacing the previous set. Called every extension tick,
