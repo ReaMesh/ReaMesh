@@ -27,6 +27,7 @@ import { Divider, Group, SectionLabel } from "@/components/Group";
 import { ProfileFields } from "@/components/ProfileEditor";
 import { FirewallBlocked } from "@/components/FirewallNotice";
 import { TrustDialog } from "@/components/TrustDialog";
+import { SwapText } from "@/components/Swap";
 import { FOUND_COLOR, inkFor } from "@/lib/colors";
 import { send } from "@/lib/connection";
 import { stageHostPass } from "@/lib/hostPass";
@@ -159,29 +160,57 @@ async function readClipboard(): Promise<string> {
   }
 }
 
-// Shake rejected passphrases without remounting or moving focus.
+// Shake rejected passphrases without remounting or moving focus: one short,
+// tight swing that overshoots once on the way back.
 function useShake() {
   const [scope, animate] = useAnimate();
   const reduce = useReducedMotion();
   const shake = () => {
     if (reduce || !scope.current) return;
-    animate(scope.current, { x: [0, -7, 6, -4, 3, 0] }, { duration: 0.4, ease: "easeOut" });
+    animate(
+      scope.current,
+      { x: [0, 6, -6, 4, 0] },
+      { duration: 0.28, times: [0, 0.2857, 0.5714, 0.7857, 1], ease: [0.22, 1, 0.36, 1] },
+    );
   };
   return { scope, shake };
 }
 
-/** Fading slide-in for the small red "wrong password" line. */
+/** The small red "wrong password" line, coming into focus out of a slight blur. */
 function ErrorLine({ children }: { children: React.ReactNode }) {
+  const reduce = useReducedMotion();
   return (
     <motion.p
       role="status"
-      initial={{ opacity: 0, y: -3 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.2, ease: "easeOut" }}
+      initial={reduce ? { opacity: 0 } : { opacity: 0, y: -4, filter: "blur(4px)" }}
+      animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+      transition={{ duration: 0.2, ease: "easeOut", delay: reduce ? 0 : 0.06 }}
       className="px-0.5 text-[12px] text-red-400"
     >
       {children}
     </motion.p>
+  );
+}
+
+/** Opens room for an error line on the fold spring before the line arrives,
+ *  and closes it again when the error clears, so the card around it grows and
+ *  shrinks instead of jumping. `gap` is the space above the line. */
+function ErrorFold({ children, gap }: { children: React.ReactNode; gap: string }) {
+  return (
+    <AnimatePresence initial={false}>
+      {children && (
+        <motion.div
+          key="error"
+          initial={{ height: 0 }}
+          animate={{ height: "auto" }}
+          exit={{ height: 0, opacity: 0 }}
+          transition={FOLD}
+          className="overflow-hidden"
+        >
+          <div className={gap}>{children}</div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 
@@ -195,7 +224,8 @@ function LockIcon() {
   );
 }
 
-/** Keep the button's accessible name while its visible label becomes a spinner. */
+/** Keep the button's accessible name while its visible label becomes a spinner.
+ *  The two trade places with the same blur crossfade as the copy buttons. */
 function PendingButton({
   busy,
   label,
@@ -204,14 +234,14 @@ function PendingButton({
 }: React.ComponentProps<typeof Button> & { busy: boolean; label: string }) {
   return (
     <Button {...rest} aria-busy={busy || undefined} className={className}>
-      {busy ? (
-        <>
+      <SwapText value={busy ? "busy" : "idle"}>
+        {busy ? (
           <LoaderCircle className="size-3.5 motion-safe:animate-spin" aria-hidden="true" />
-          <span className="sr-only">{label}</span>
-        </>
-      ) : (
-        label
-      )}
+        ) : (
+          label
+        )}
+      </SwapText>
+      {busy && <span className="sr-only">{label}</span>}
     </Button>
   );
 }
@@ -498,9 +528,9 @@ function SessionCard({
           </div>
           {!session.auth && joinButton(false)}
         </div>
-        {/* Always mounted (empty:hidden when idle) so a failed probe on an open
-            session still gets its "no answer" line and the shake. */}
-        <div ref={shakeScope} className="mt-2 space-y-1.5 empty:hidden">
+        {/* Always mounted so a failed probe on an open session still gets its
+            "no answer" line and the shake. */}
+        <div ref={shakeScope} className={cn(session.auth && "mt-2")}>
           {session.auth && (
             <div className="flex gap-2">
               <PasswordInput
@@ -520,7 +550,9 @@ function SessionCard({
               {joinButton(true)}
             </div>
           )}
-          {error && <ErrorLine>{checkErrorText(error)}</ErrorLine>}
+          <ErrorFold gap={session.auth ? "pt-1.5" : "pt-2"}>
+            {error && <ErrorLine>{checkErrorText(error)}</ErrorLine>}
+          </ErrorFold>
         </div>
       </div>
 
