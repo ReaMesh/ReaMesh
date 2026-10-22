@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Check, Crown } from "lucide-react";
 import {
   AnimatePresence,
@@ -17,7 +17,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ArcRing } from "@/components/ArcRing";
-import { Hint, HintProvider } from "@/components/Hint";
 import { SlowHostLine } from "@/components/LinkNotice";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { PluginBox, PluginRow } from "@/components/TrustDialog";
@@ -25,7 +24,7 @@ import { FOUND_COLOR } from "@/lib/colors";
 import { send } from "@/lib/connection";
 import { formatBytes, useTransfer } from "@/lib/format";
 import { resolveLang, t } from "@/lib/i18n";
-import { displayName, type ExtState } from "@/lib/types";
+import { displayName, type ExtState, type Peer } from "@/lib/types";
 
 // The beacon covers three stages: connecting, downloading, and opening the
 // project in REAPER. Phase 3 is the brief completion state owned by App.
@@ -37,6 +36,14 @@ function phaseIndex(state: ExtState): number {
   if (state.state === "downloading") return 1;
   return 0; // connecting: join sent, waiting for the host's manifest
 }
+
+// The narration line's swap: the arriving line springs in, the leaving one is
+// a little quicker so the two cross as one change (as in components/Swap.tsx).
+const LINE_IN = {
+  scale: { type: "spring", stiffness: 460, damping: 30, mass: 0.55 },
+  default: { duration: 0.2, ease: [0.16, 1, 0.3, 1] },
+} as const;
+const LINE_OUT = { duration: 0.16, ease: [0.16, 1, 0.3, 1] } as const;
 
 /** Use the same spring for the percentage and ring to keep them in sync. */
 function GlidingPercent({ progress }: { progress: number }) {
@@ -132,32 +139,115 @@ function WhoIsThere({ state }: { state: ExtState }) {
   const host = others.find((p) => p.is_owner);
   if (!host) return null;
   const people = [host, ...others.filter((p) => !p.is_owner)];
-  const shown = people.slice(0, MAX_FACES);
-  const rest = people.length - shown.length;
+  return <Faces shown={people.slice(0, MAX_FACES)} rest={Math.max(0, people.length - MAX_FACES)} />;
+}
+
+// One name tag for the whole row instead of a tooltip per face: it glides from
+// face to face and fits its width to the name, so moving along the row reads
+// as one thing following the pointer rather than tags closing and opening.
+const TAG_GLIDE = { type: "spring", stiffness: 360, damping: 32, mass: 0.6 } as const;
+const TAG_EASE = [0.16, 1, 0.3, 1] as const;
+const TAG_DELAY_MS = 120; // as long as the other hints in the app wait
+const TAG_WARM_MS = 300; // shortly after it closed, the next face shows at once
+
+function Faces({ shown, rest }: { shown: Peer[]; rest: number }) {
+  const faces = useRef<(HTMLSpanElement | null)[]>([]);
+  const measure = useRef<HTMLSpanElement>(null);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const closedAt = useRef(0);
+  const [at, setAt] = useState<number | null>(null);
+  const [width, setWidth] = useState(0);
+  // Gliding from one face to the next; a fresh tag just takes its size.
+  const [moved, setMoved] = useState(false);
+
+  const label = (p: Peer) => (p.is_owner ? `${displayName(p)} · ${t("sessionHost")}` : displayName(p));
+  const current = at != null ? shown[at] : undefined;
+  const text = current ? label(current) : "";
+  const face = at != null ? faces.current[at] : null;
+  const x = face ? face.offsetLeft + face.offsetWidth / 2 : 0;
+
+  useLayoutEffect(() => {
+    // + 2 for the border; the measuring span carries the padding.
+    if (text && measure.current) setWidth(measure.current.offsetWidth + 2);
+  }, [text]);
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  const enter = (i: number) => {
+    clearTimeout(timer.current);
+    setMoved(at != null);
+    if (at != null || Date.now() - closedAt.current < TAG_WARM_MS) setAt(i);
+    else timer.current = setTimeout(() => setAt(i), TAG_DELAY_MS);
+  };
+  const leave = () => {
+    clearTimeout(timer.current);
+    if (at != null) closedAt.current = Date.now();
+    setAt(null);
+  };
+
   return (
-    <HintProvider>
-      <div className="flex items-center gap-2">
-        {shown.map((p) => (
-          <Hint
-            key={p.id}
-            label={p.is_owner ? `${displayName(p)} · ${t("sessionHost")}` : displayName(p)}
-          >
-            <span className="relative">
-              <PeerAvatar peer={p} size="sm" />
-              {p.is_owner && (
-                <span className="absolute -top-1.5 -right-1.5 grid size-3.5 place-items-center rounded-full bg-background">
-                  <Crown className="size-2.5 text-amber-400" aria-hidden="true" />
-                  <span className="sr-only">{t("sessionHost")}</span>
-                </span>
-              )}
+    <div className="relative flex items-center gap-2" onPointerLeave={leave}>
+      {shown.map((p, i) => (
+        <span
+          key={p.id}
+          ref={(el) => {
+            faces.current[i] = el;
+          }}
+          className="relative"
+          onPointerEnter={() => enter(i)}
+        >
+          <PeerAvatar peer={p} size="sm" />
+          {p.is_owner && (
+            <span className="absolute -top-1.5 -right-1.5 grid size-3.5 place-items-center rounded-full bg-background">
+              <Crown className="size-2.5 text-amber-400" aria-hidden="true" />
+              <span className="sr-only">{t("sessionHost")}</span>
             </span>
-          </Hint>
-        ))}
-        {rest > 0 && (
-          <span className="text-[12px] tabular-nums text-muted-foreground">+{rest}</span>
+          )}
+        </span>
+      ))}
+      {rest > 0 && <span className="text-[12px] tabular-nums text-muted-foreground">+{rest}</span>}
+      {/* Sizes the tag for the name it is about to show. */}
+      <span
+        ref={measure}
+        aria-hidden="true"
+        className="invisible absolute top-0 left-0 px-2 text-[11px] font-medium whitespace-nowrap"
+      >
+        {text}
+      </span>
+      {/* The faces carry their names for screen readers; the tag is for eyes. */}
+      <AnimatePresence>
+        {current && (
+          <motion.div
+            key="tag"
+            aria-hidden="true"
+            className="pointer-events-none absolute top-full left-0 z-50 mt-1.5"
+            initial={{ x, opacity: 0, scale: 0.95 }}
+            animate={{ x, opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.98, transition: { duration: 0.12, ease: TAG_EASE } }}
+            transition={{ x: TAG_GLIDE, default: { duration: 0.18, ease: TAG_EASE } }}
+          >
+            <motion.div
+              className="-translate-x-1/2 overflow-hidden rounded-lg border border-border bg-background px-2 py-1 text-[11px] font-medium whitespace-nowrap text-foreground shadow-lg"
+              initial={false}
+              animate={{ width }}
+              transition={moved ? TAG_GLIDE : { duration: 0 }}
+            >
+              <AnimatePresence mode="popLayout" initial={false}>
+                <motion.span
+                  key={text}
+                  className="inline-block"
+                  initial={{ opacity: 0, filter: "blur(2px)" }}
+                  animate={{ opacity: 1, filter: "blur(0px)" }}
+                  exit={{ opacity: 0, filter: "blur(2px)" }}
+                  transition={{ duration: 0.16, ease: TAG_EASE }}
+                >
+                  {text}
+                </motion.span>
+              </AnimatePresence>
+            </motion.div>
+          </motion.div>
         )}
-      </div>
-    </HintProvider>
+      </AnimatePresence>
+    </div>
   );
 }
 
@@ -227,17 +317,17 @@ export function Downloading({
         >
           {state.session || t("sessionFallback")}
         </h2>
-        {/* One narration line per wait, crossfading on phase changes; the
-            stats update in place without re-animating. Fixed-height so the
-            swap never shifts the beacon above. */}
+        {/* One narration line per wait, trading places on phase changes with
+            the blur swap the join button uses; the stats update in place
+            without re-animating. Fixed-height so the swap never shifts the
+            beacon above. */}
         <div className="relative h-[18px]" role="status" aria-live="polite">
           <AnimatePresence initial={false}>
             <motion.p
               key={lineKey}
-              initial={{ y: 6, opacity: 0 }}
-              animate={{ y: 0, opacity: 1 }}
-              exit={{ y: -6, opacity: 0 }}
-              transition={{ duration: 0.2, ease: "easeOut" }}
+              initial={{ opacity: 0, scale: 0.9, filter: "blur(2px)" }}
+              animate={{ opacity: 1, scale: 1, filter: "blur(0px)", transition: LINE_IN }}
+              exit={{ opacity: 0, scale: 0.96, filter: "blur(2px)", transition: LINE_OUT }}
               className="absolute inset-0 truncate text-[13px] tabular-nums text-foreground/65"
               style={phase >= 3 ? { color: FOUND_COLOR } : undefined}
             >
