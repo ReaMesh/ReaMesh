@@ -46,6 +46,14 @@ listenForRestart();
  *  and show the window only once REAPER's state is in. */
 const resumed = takeResume();
 
+// Screen changes: the swap spring for the movement, a short ease-out for the
+// fade and the focus, which a spring would push past zero.
+const SCREEN_IN = {
+  y: { type: "spring", stiffness: 460, damping: 30, mass: 0.55 },
+  default: { duration: 0.22, ease: [0.16, 1, 0.3, 1] },
+} as const;
+const SCREEN_OUT = { duration: 0.12, ease: [0.16, 1, 0.3, 1] } as const;
+
 /** Show join and leave toasts during a session.
  *  Ignore mode changes so existing peers are not announced as new. If both
  *  this window and REAPER are out of view, badge the app and return unseen
@@ -657,10 +665,19 @@ export default function App() {
           // instead of the screen remounting and fading a new one in.
           key={screen.key === "disconnected" ? screen.key : screen.key + (port ?? "")}
           className="flex min-h-0 flex-1 flex-col"
-          initial={{ opacity: 0, y: 6 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: -6 }}
-          transition={{ duration: 0.18, ease: "easeOut" }}
+          // The old screen goes out of focus quickly and the new one comes
+          // into focus on the swap spring, so the window is barely empty in
+          // between. `filter: none` afterwards: a lingering filter would make
+          // this the containing block of everything fixed inside it.
+          initial={{ opacity: 0, y: 4, filter: "blur(4px)" }}
+          animate={{
+            opacity: 1,
+            y: 0,
+            filter: "blur(0px)",
+            transition: SCREEN_IN,
+            transitionEnd: { filter: "none" },
+          }}
+          exit={{ opacity: 0, filter: "blur(4px)", transition: SCREEN_OUT }}
         >
           {screen.node}
         </motion.main>
