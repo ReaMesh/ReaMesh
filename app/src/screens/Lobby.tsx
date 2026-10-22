@@ -26,6 +26,7 @@ import { BanList } from "@/components/BanList";
 import { Divider, Group, SectionLabel } from "@/components/Group";
 import { ProfileFields } from "@/components/ProfileEditor";
 import { FirewallBlocked } from "@/components/FirewallNotice";
+import { ListSlot } from "@/components/ListSlot";
 import { TrustDialog } from "@/components/TrustDialog";
 import { SwapText } from "@/components/Swap";
 import { FOUND_COLOR, inkFor } from "@/lib/colors";
@@ -483,11 +484,8 @@ function SessionCard({
       // Position only: a full layout animation scale-tweens the row's
       // contents when the error line below appears, which reads as the row
       // stretching for a moment before the refusal shows.
+      // Coming and going is the list slot's job (ListSlot).
       layout="position"
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: 0.2, ease: "easeOut" }}
       className="relative flex items-start gap-3 px-3 py-2.5"
     >
       {fresh && (
@@ -1058,37 +1056,50 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
       <section className="flex min-h-0 flex-1 flex-col gap-2">
         <SectionLabel>{t("sessionsOnNetwork")}</SectionLabel>
         <Group className="min-h-0 shrink">
-          {count > 0 ? (
-            <div className="scroll-slim min-h-0 overflow-y-auto">
-              <AnimatePresence mode="popLayout" initial={false}>
-                {state.sessions.map((s, i) => (
-                  <motion.div key={s.session_id} layout="position" exit={{ opacity: 0 }}>
-                    {i > 0 && <Divider />}
-                    <SessionCard
-                      session={s}
-                      probe={state.probe}
-                      lobbyMountedAt={mountedAt}
-                      port={port}
-                    />
-                  </motion.div>
-                ))}
-              </AnimatePresence>
-            </div>
-          ) : (
-            /* Quiet on purpose: no permanent discovery spinner. */
-            <div className="px-6 py-6 text-center">
-              <p className="text-[13px] text-muted-foreground">{t("noSessionsYet")}</p>
-              <VpnHint />
-              <NearbyLine />
-            </div>
-          )}
+          {/* Sessions open and close their rows like people in the roster,
+              and the empty note folds away as the first one arrives (and back
+              when the last one goes), so the card grows instead of jumping. */}
+          <div className="scroll-slim min-h-0 overflow-y-auto">
+            <AnimatePresence initial={false}>
+              {state.sessions.map((s, i) => (
+                <ListSlot key={s.session_id}>
+                  {i > 0 && <Divider />}
+                  <SessionCard
+                    session={s}
+                    probe={state.probe}
+                    lobbyMountedAt={mountedAt}
+                    port={port}
+                  />
+                </ListSlot>
+              ))}
+            </AnimatePresence>
+          </div>
+          <AnimatePresence initial={false}>
+            {count === 0 && (
+              <motion.div
+                key="empty"
+                initial={{ height: 0, opacity: 0, filter: "blur(4px)" }}
+                animate={{ height: "auto", opacity: 1, filter: "blur(0px)" }}
+                exit={{ height: 0, opacity: 0, filter: "blur(4px)" }}
+                transition={FOLD}
+                className="shrink-0 overflow-hidden"
+              >
+                {/* Quiet on purpose: no permanent discovery spinner. */}
+                <div className="px-6 py-6 text-center">
+                  <p className="text-[13px] text-muted-foreground">{t("noSessionsYet")}</p>
+                  <VpnHint />
+                  <NearbyLine />
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
         </Group>
         {/* A session you can't see here is still a session. */}
         <InviteCard sessions={state.sessions} probe={state.probe} port={port} />
       </section>
 
       {/* Blocks outlive the session they were made in: keep them revocable. */}
-      <BanList bans={state.bans ?? []} port={port} />
+      <BanList bans={state.bans ?? []} port={port} gap={18} />
 
       {/* No section label: the card's own Host button already says it. */}
       <section className="flex shrink-0 flex-col gap-2">

@@ -1,5 +1,5 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { AnimatePresence, motion, useAnimate, useReducedMotion } from "motion/react";
+import { useEffect, useState } from "react";
+import { AnimatePresence, motion, useAnimate } from "motion/react";
 import { Ban, Copy, Ellipsis, Eye, EyeOff, LocateFixed, UserX } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -15,6 +15,7 @@ import { BanList } from "@/components/BanList";
 import { Divider, Group, SectionLabel } from "@/components/Group";
 import { HintProvider } from "@/components/Hint";
 import { HostCrown } from "@/components/HostCrown";
+import { ListSlot } from "@/components/ListSlot";
 import { useSlowLink } from "@/components/LinkNotice";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { DrawnCheck, SwapIcon, SwapText } from "@/components/Swap";
@@ -227,26 +228,6 @@ function InviteRow({ children, action }: { children: React.ReactNode; action: Re
   );
 }
 
-// One person's place in the roster. Someone joining opens their row and comes
-// into focus out of a slight blur; someone leaving goes the same way back.
-const ROSTER_SPRING = { type: "spring", stiffness: 360, damping: 32, mass: 0.6 } as const;
-function RosterSlot({ children }: { children: ReactNode }) {
-  const reduce = useReducedMotion();
-  const away = reduce ? { opacity: 0 } : { height: 0, opacity: 0, filter: "blur(6px)" };
-  return (
-    <motion.div
-      layout="position"
-      initial={away}
-      animate={reduce ? { opacity: 1 } : { height: "auto", opacity: 1, filter: "blur(0px)" }}
-      exit={away}
-      transition={reduce ? { duration: 0.15 } : ROSTER_SPRING}
-      className="overflow-hidden"
-    >
-      {children}
-    </motion.div>
-  );
-}
-
 // The session's invite code. It lets someone outside mDNS reach (VPN, strict
 // LAN) join: opening it takes them straight into their app's join flow,
 // pasting it in their Lobby works too. The row names it; the link itself only
@@ -435,7 +416,7 @@ export function Session({
               {/* Animate later roster changes, but not the initial peer list. */}
               <AnimatePresence initial={false}>
                 {state.peers.map((p, i) => (
-                  <RosterSlot key={p.id}>
+                  <ListSlot key={p.id}>
                     {i > 0 && <Divider />}
                     <PeerRow
                       peer={p}
@@ -447,7 +428,7 @@ export function Session({
                       onKick={hosting ? () => kick(p) : undefined}
                       onBan={hosting ? () => setBanTarget(p) : undefined}
                     />
-                  </RosterSlot>
+                  </ListSlot>
                 ))}
               </AnimatePresence>
             </Group>
@@ -464,7 +445,7 @@ export function Session({
             </section>
           )}
 
-          {hosting && <BanList bans={state.bans ?? []} port={port} />}
+          {hosting && <BanList bans={state.bans ?? []} port={port} gap={14} />}
         </div>
 
         {/* One anchored action; toasts appear at the top and never cover it. */}
