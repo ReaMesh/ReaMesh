@@ -27,17 +27,21 @@ function variants(from: number, to: number, reduce: boolean | null): Variants {
   };
 }
 
-/** An icon slot of a fixed size; `value` keys which icon is showing. */
+/** An icon slot of a fixed size; `value` keys which icon is showing. `from` is
+ *  the scale the arriving icon grows from: a `DrawnCheck` draws itself, so it
+ *  only needs to start a little small. */
 export function SwapIcon({
   value,
   children,
   className,
+  from = 0.25,
 }: {
   value: string;
   children: ReactNode;
   className?: string;
+  from?: number;
 }) {
-  const v = variants(0.25, 0.25, useReducedMotion());
+  const v = variants(from, 0.25, useReducedMotion());
   return (
     <span className={`relative inline-block shrink-0 ${className ?? ""}`}>
       <AnimatePresence initial={false}>
@@ -53,6 +57,37 @@ export function SwapIcon({
         </motion.span>
       </AnimatePresence>
     </span>
+  );
+}
+
+/** Lucide's check, drawn as a stroke when it appears: the "it worked" moment
+ *  of a copy button. */
+export function DrawnCheck({
+  className,
+  strokeWidth = 2,
+}: {
+  className?: string;
+  strokeWidth?: number;
+}) {
+  const reduce = useReducedMotion();
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={strokeWidth}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <motion.path
+        d="M20 6 9 17l-5-5"
+        initial={reduce ? false : { pathLength: 0 }}
+        animate={{ pathLength: 1 }}
+        transition={{ duration: 0.22, ease: EASE_OUT, delay: 0.04 }}
+      />
+    </svg>
   );
 }
 

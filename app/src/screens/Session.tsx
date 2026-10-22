@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { AnimatePresence, motion, useAnimate, useReducedMotion } from "motion/react";
-import { Ban, Check, Copy, Ellipsis, Eye, EyeOff, LocateFixed, UserX } from "lucide-react";
+import { Ban, Copy, Ellipsis, Eye, EyeOff, LocateFixed, UserX } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -17,7 +17,7 @@ import { HintProvider } from "@/components/Hint";
 import { HostCrown } from "@/components/HostCrown";
 import { useSlowLink } from "@/components/LinkNotice";
 import { PeerAvatar } from "@/components/PeerAvatar";
-import { SwapIcon, SwapText } from "@/components/Swap";
+import { DrawnCheck, SwapIcon, SwapText } from "@/components/Swap";
 import { TrackNumber } from "@/components/TrackNumber";
 import { send } from "@/lib/connection";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
@@ -271,8 +271,8 @@ function InviteCode({ ticket }: { ticket: string }) {
             else setReveal(true);
           }}
         >
-          <SwapIcon value={copied ? "check" : "copy"} className="size-3.5">
-            {copied ? <Check className="size-3.5" aria-hidden="true" /> : <Copy className="size-3.5" aria-hidden="true" />}
+          <SwapIcon value={copied ? "check" : "copy"} from={copied ? 0.85 : 0.25} className="size-3.5">
+            {copied ? <DrawnCheck className="size-3.5" /> : <Copy className="size-3.5" aria-hidden="true" />}
           </SwapIcon>
           <SwapText value={copied ? "copied" : "copy"}>{copied ? t("copied") : t("copy")}</SwapText>
         </Button>

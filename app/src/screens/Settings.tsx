@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, Check, ChevronRight, Copy, ExternalLink } from "lucide-react";
+import { ArrowLeft, ChevronRight, Copy, ExternalLink } from "lucide-react";
 import { motion } from "motion/react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -10,7 +10,7 @@ import { Switch } from "@/components/ui/switch";
 import { Divider, Group, SectionLabel } from "@/components/Group";
 import { PathField } from "@/components/PathField";
 import { ProfileEditor } from "@/components/ProfileEditor";
-import { SwapIcon } from "@/components/Swap";
+import { DrawnCheck, SwapIcon } from "@/components/Swap";
 import { buildDiagnostics } from "@/lib/diagnostics";
 import { getLangPref, resolveLang, setLangPref, t, useLang, type LangPref } from "@/lib/i18n";
 import {
@@ -606,9 +606,9 @@ export function Settings({
               className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
             >
               <Row label={t("copyDiagnostics")}>
-                <SwapIcon value={copied ? "check" : "copy"} className="size-3.5">
+                <SwapIcon value={copied ? "check" : "copy"} from={copied ? 0.85 : 0.25} className="size-3.5">
                   {copied ? (
-                    <Check className="size-3.5 text-found" strokeWidth={2.5} aria-hidden="true" />
+                    <DrawnCheck className="size-3.5 text-found" strokeWidth={2.5} />
                   ) : (
                     <Copy className="size-3.5 text-muted-foreground" aria-hidden="true" />
                   )}
