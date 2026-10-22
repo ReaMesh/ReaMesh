@@ -142,3 +142,68 @@
 .scroll-slim::-webkit-scrollbar-corner {
   display: none;
 }
+
+/* Springs the CSS-driven surfaces share with the Motion ones, sampled into
+   linear() easings (no overshoot). WebKit before Safari 17.2 has no linear():
+   it falls back to the app's ease-out curve. */
+:root {
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  /* stiffness 300, damping 35: settles in about 0.53 s */
+  --spring-panel: var(--ease-out);
+  /* stiffness 420, damping 34, mass 0.75: settles in about 0.36 s */
+  --spring-toast: var(--ease-out);
+}
+@supports (animation-timing-function: linear(0, 1)) {
+  :root {
+    --spring-panel: linear(0, 0.038, 0.116, 0.219, 0.327, 0.43, 0.518, 0.601, 0.673, 0.73, 0.781,
+      0.823, 0.858, 0.885, 0.908, 0.927, 0.942, 0.953, 0.963, 0.971, 0.976, 0.981, 0.985, 0.988,
+      0.991, 0.993, 0.994, 0.995, 0.996, 0.997, 0.998, 0.998, 1);
+    --spring-toast: linear(0, 0.032, 0.103, 0.203, 0.302, 0.398, 0.489, 0.578, 0.649, 0.711, 0.764,
+      0.808, 0.848, 0.878, 0.903, 0.923, 0.941, 0.953, 0.963, 0.971, 0.978, 0.983, 0.987, 0.99,
+      0.992, 0.994, 0.996, 0.997, 0.998, 0.998, 0.999, 0.999, 1);
+  }
+}
+
+/* Dialogs rise 8px into place on a spring that never overshoots; the fade is
+   done well before the movement. Closing is shorter and travels half as far.
+   `transform` is free here: the centring uses the separate `translate`. Radix
+   unmounts on the first animationend, so both closing animations share a
+   duration. */
+.dialog-scrim[data-state="open"] { animation: rm-fade-in 240ms var(--ease-out) both; }
+.dialog-scrim[data-state="closed"] { animation: rm-fade-out 180ms var(--ease-out) both; }
+.dialog-panel[data-state="open"] {
+  animation: rm-fade-in 160ms var(--ease-out) both, rm-rise-in 530ms var(--spring-panel) both;
+}
+.dialog-panel[data-state="closed"] {
+  animation: rm-fade-out 160ms var(--ease-out) both, rm-rise-out 160ms var(--ease-out) both;
+}
+@keyframes rm-fade-in { from { opacity: 0; } }
+@keyframes rm-fade-out { to { opacity: 0; } }
+@keyframes rm-rise-in { from { transform: translateY(8px) scale(0.96); } }
+@keyframes rm-rise-out { to { transform: translateY(4px) scale(0.98); } }
+
+/* Toasts come into focus 12px above their place out of a slight blur and
+   settle on a spring; they leave quickly the same way. Sonner unmounts 200ms
+   after removal, so the exit stays under that. Its own swipe and
+   reduced-motion rules still win (they switch transitions off). */
+[data-sonner-toaster] [data-sonner-toast]:not([data-swiping="true"]) {
+  transition: transform 360ms var(--spring-toast), opacity 200ms var(--ease-out),
+    filter 260ms var(--ease-out), height 400ms var(--ease-out);
+}
+[data-sonner-toaster] [data-sonner-toast][data-y-position="top"][data-mounted="false"] {
+  --y: translateY(-12px) scale(0.96);
+  filter: blur(8px);
+}
+[data-sonner-toaster] [data-sonner-toast][data-y-position="top"][data-removed="true"][data-swipe-out="false"] {
+  --y: translateY(calc(var(--lift) * var(--offset) - 6px)) scale(0.97);
+  filter: blur(6px);
+  opacity: 0;
+  transition: transform 180ms var(--ease-out), opacity 180ms var(--ease-out),
+    filter 180ms var(--ease-out);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dialog-panel[data-state="open"] { animation: rm-fade-in 160ms var(--ease-out) both; }
+  .dialog-panel[data-state="closed"] { animation: rm-fade-out 160ms var(--ease-out) both; }
+  [data-sonner-toaster] [data-sonner-toast] { filter: none !important; }
+}
