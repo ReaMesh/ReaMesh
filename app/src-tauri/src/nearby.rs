@@ -117,8 +117,9 @@ fn on_found(raw: &str) {
 }
 
 /// Support or permission changed behind the webview's back (Windows finds
-/// its adapter after startup): it reads the state again.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// its adapter after startup, macOS reports the answer to its permission
+/// prompt): it reads the state again.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 fn changed() {
     if let Some(app) = APP.get() {
         let _ = app.emit("nearby-changed", ());
@@ -140,10 +141,13 @@ pub struct NearbyState {
 
 #[tauri::command]
 pub fn nearby_state(app: AppHandle) -> NearbyState {
+    let enabled = if supported() { load_pref(&app) } else { Some(false) };
     NearbyState {
         supported: supported(),
-        enabled: if supported() { load_pref(&app) } else { Some(false) },
-        auth: authorization(),
+        enabled,
+        // Bluetooth isn't touched at all, not even to read the permission,
+        // until the user turned the feature on.
+        auth: if enabled == Some(true) { authorization() } else { "undetermined" },
     }
 }
 
@@ -171,7 +175,7 @@ mod ble {
     use std::ffi::{c_char, CStr, CString};
 
     extern "C" {
-        fn reamesh_ble_init(found: extern "C" fn(*const c_char));
+        fn reamesh_ble_init(found: extern "C" fn(*const c_char), changed: extern "C" fn());
         fn reamesh_ble_authorization() -> i32;
         fn reamesh_ble_advertise(payload: *const c_char);
         fn reamesh_ble_scan(on: i32);
@@ -185,8 +189,12 @@ mod ble {
         super::on_found(&s);
     }
 
+    extern "C" fn changed() {
+        super::changed();
+    }
+
     pub fn init() {
-        unsafe { reamesh_ble_init(found) }
+        unsafe { reamesh_ble_init(found, changed) }
     }
 
     pub fn supported() -> bool {

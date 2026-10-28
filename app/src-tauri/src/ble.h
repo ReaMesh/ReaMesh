@@ -26,8 +26,11 @@ enum {
 // Called on a private queue with a payload read from a nearby host (UTF-8,
 // at most 512 bytes, not validated).
 typedef void (*ReaMeshBleFound)(const char *payload);
+// Called on a private queue when a manager's state changed, which includes
+// the user answering the permission prompt: the authorization may differ.
+typedef void (*ReaMeshBleChanged)(void);
 
-void reamesh_ble_init(ReaMeshBleFound found);
+void reamesh_ble_init(ReaMeshBleFound found, ReaMeshBleChanged changed);
 int32_t reamesh_ble_authorization(void);
 // Advertise `payload` (UTF-8, at most 512 bytes); NULL or "" stops.
 void reamesh_ble_advertise(const char *payload);

@@ -20,6 +20,7 @@ static const NSUInteger kMaxRemembered = 256;
     : NSObject <CBPeripheralManagerDelegate, CBCentralManagerDelegate, CBPeripheralDelegate>
 @property (strong) dispatch_queue_t queue;
 @property (assign) ReaMeshBleFound found;
+@property (assign) ReaMeshBleChanged changed;
 // Host side.
 @property (strong) CBPeripheralManager *pm;
 @property (strong) CBMutableService *service;
@@ -92,6 +93,7 @@ static ReaMeshBle *gBle = nil;
 }
 
 - (void)peripheralManagerDidUpdateState:(CBPeripheralManager *)peripheral {
+    if (self.changed) self.changed();
     if (peripheral.state == CBManagerStatePoweredOn) {
         [self startAdvertisingIfReady];
     } else {
@@ -152,6 +154,7 @@ static ReaMeshBle *gBle = nil;
 }
 
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central {
+    if (self.changed) self.changed();
     if (central.state != CBManagerStatePoweredOn) [self.connecting removeAllObjects];
     [self updateScan];
 }
@@ -254,10 +257,11 @@ static ReaMeshBle *ble(void) {
     return gBle;
 }
 
-void reamesh_ble_init(ReaMeshBleFound found) {
+void reamesh_ble_init(ReaMeshBleFound found, ReaMeshBleChanged changed) {
     ReaMeshBle *b = ble();
     dispatch_async(b.queue, ^{
         b.found = found;
+        b.changed = changed;
     });
 }
 
