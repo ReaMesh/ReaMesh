@@ -25,6 +25,8 @@ export function ExtMismatch({
   const status = useReaperStatus();
   const [installing, setInstalling] = useState(false);
   const [error, setError] = useState("");
+  // The outcome line only answers a check made here, not one from launch.
+  const [checked, setChecked] = useState(false);
   if (skew === "older") {
     // The app installs its copy at launch; if that didn't land (an unusual
     // REAPER folder, permissions), a restart alone would load the old one.
@@ -86,14 +88,34 @@ export function ExtMismatch({
       <Button
         className="w-full max-w-[240px]"
         disabled={update.phase === "checking" || update.phase === "downloading"}
-        onClick={() => (ready ? restartToUpdate().catch(() => {}) : checkForUpdate())}
+        onClick={() => {
+          if (ready) {
+            restartToUpdate().catch(() => {});
+            return;
+          }
+          setChecked(true);
+          checkForUpdate();
+        }}
       >
         {ready
           ? t("restartNow")
           : update.phase === "downloading"
             ? t("updateDownloading", { version: update.version })
-            : t("checkUpdates")}
+            : update.phase === "checking"
+              ? t("updateChecking")
+              : t("appOldCheck")}
       </Button>
+      {checked && (update.phase === "current" || update.phase === "failed") && (
+        <p
+          className={
+            update.phase === "failed"
+              ? "-mt-3 text-[12px] text-amber-500"
+              : "-mt-3 text-[12px] text-muted-foreground"
+          }
+        >
+          {update.phase === "failed" ? t("updateCheckFailed") : t("appOldCurrent")}
+        </p>
+      )}
     </div>
   );
 }
