@@ -986,18 +986,6 @@ function VpnHint() {
   );
 }
 
-/** Bluetooth under an empty Lobby: the search runs silently once on, so only
- *  a refused permission is worth a line. */
-function NearbyLine() {
-  const n = useNearby();
-  if (!n.supported || n.enabled !== true || !nearbyBlocked(n)) return null;
-  return (
-    <p className="mt-1.5 text-[11.5px] leading-normal text-muted-foreground/80">
-      {t("nearbyBlocked")}
-    </p>
-  );
-}
-
 /** Asked once, until the user decides either way; afterwards it is a switch in
  *  Settings. Not on by default: turning it on is what asks macOS for the
  *  Bluetooth permission, which should follow a click, not appear at launch. */
@@ -1088,7 +1076,6 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
                 <div className="px-6 py-6 text-center">
                   <p className="text-[13px] text-muted-foreground">{t("noSessionsYet")}</p>
                   <VpnHint />
-                  <NearbyLine />
                 </div>
               </motion.div>
             )}
