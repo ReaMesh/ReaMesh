@@ -12,6 +12,7 @@ everything up from this folder and the code needs no changes.
 | Path | Used by |
 | --- | --- |
 | `logo/mark.svg` | The R in the app UI (`app/src/components/RMark.tsx` reads its paths at build time) |
+| `logo/mark.txt`, `logo/mark-blocks.txt` | The R in braille and in half blocks, printed by `reamesh-relay` (`relay/src/term.rs` includes them at build time); `bun run icons:terminal` renders them from `mark.svg` |
 | `logo/lockup-on-*.svg` | Source artwork for the lockup (R + wordmark) |
 | `logo/lockup-*.png` | The README header |
 | `screenshots/*.png`, `screenshots/*.webp` | README screenshots, the README animation and the social preview images |

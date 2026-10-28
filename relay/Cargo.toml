@@ -8,6 +8,7 @@ description = "Self-hostable libp2p relay that lets ReaMesh sessions reach each 
 publish = false
 
 [dependencies]
+anstream = "1.0"
 anyhow = "1.0"
 blake3 = "1.8"
 clap = { version = "4.6", features = ["derive", "env"] }
@@ -16,6 +17,8 @@ getrandom = "0.4"
 hex = "0.4"
 # Local interface addresses, to find the public IPs the relay code advertises.
 if-addrs = "0.15"
+# Local time for log lines and key dates.
+jiff = "0.2"
 # The relay code and auth exchange, shared with ReaMesh itself.
 reamesh-relay-proto = { path = "../relay-proto" }
 libp2p = { version = "0.57.0", features = ["tokio", "tcp", "quic", "noise", "yamux", "relay", "identify", "ping", "autonat", "macros", "request-response", "cbor"] }
@@ -26,7 +29,7 @@ toml = "0.9"
 # Edits config.toml from the `key` commands without dropping its comments.
 toml_edit = "0.25"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 tempfile = "3"

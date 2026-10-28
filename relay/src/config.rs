@@ -13,6 +13,8 @@ use serde::Deserialize;
 
 use reamesh_relay_proto::AccessKey;
 
+use crate::term::problem;
+
 pub const CONFIG_FILE: &str = "config.toml";
 pub const IDENTITY_FILE: &str = "identity.key";
 pub const TRAFFIC_FILE: &str = "traffic.json";
@@ -63,6 +65,10 @@ pub struct Limits {
 pub struct KeyEntry {
     pub label: String,
     pub key: String,
+    /// When `key add` (or the first start) created it; keys from before
+    /// there was a date have none.
+    #[serde(default)]
+    pub added: Option<toml::value::Datetime>,
 }
 
 impl Default for Config {
@@ -99,9 +105,26 @@ impl Default for Limits {
 impl Config {
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
         let path = dir.join(CONFIG_FILE);
-        let text =
-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("in {}", path.display()))
+        let text = fs::read_to_string(&path).map_err(|e| io_problem("read", &path, &e))?;
+        Self::parse(&text).map_err(|e| {
+            let what = match e.downcast_ref::<toml::de::Error>() {
+                Some(t) => {
+                    let line = t
+                        .span()
+                        .map_or(1, |sp| text[..sp.start].matches('\n').count() + 1);
+                    format!(
+                        "{}, line {line}: {}",
+                        crate::term::path(&path),
+                        t.message().trim()
+                    )
+                }
+                None => format!("{}: {e:#}", crate::term::path(&path)),
+            };
+            problem(
+                what,
+                "Fix it and start again; the comments in the file explain each setting.",
+            )
+        })
     }
 
     pub fn parse(text: &str) -> anyhow::Result<Self> {
@@ -184,6 +207,43 @@ pub fn parse_key(hex_key: &str) -> anyhow::Result<AccessKey> {
         .context("an access key is 32 bytes (64 hex characters)")
 }
 
+/// What tells keys apart without showing them.
+pub fn fingerprint(key: &AccessKey) -> String {
+    blake3::hash(key).to_hex()[..8].to_owned()
+}
+
+/// Today in the local time zone, as a TOML date.
+fn today() -> toml_edit::Datetime {
+    let d = jiff::Zoned::now().date();
+    toml_edit::Datetime {
+        date: Some(toml_edit::Date {
+            year: d.year() as u16,
+            month: d.month() as u8,
+            day: d.day() as u8,
+        }),
+        time: None,
+        offset: None,
+    }
+}
+
+/// A file the relay can't read or write, said plainly.
+pub fn io_problem(verb: &str, path: &Path, e: &std::io::Error) -> anyhow::Error {
+    let dir = path.parent().unwrap_or(path);
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => problem(
+            format!("No permission to {verb} {}.", crate::term::path(path)),
+            format!(
+                "Run it as the user that owns {}, or pick another data dir with --data.",
+                crate::term::path(dir)
+            ),
+        ),
+        _ => problem(
+            format!("Cannot {verb} {}: {e}.", crate::term::path(path)),
+            "",
+        ),
+    }
+}
+
 pub fn new_key() -> AccessKey {
     let mut k = [0u8; 32];
     getrandom::fill(&mut k).expect("OS random number generator");
@@ -207,7 +267,7 @@ pub fn default_data_dir() -> PathBuf {
 /// Creates the data dir on first start: identity, one access key labeled
 /// "default" and a commented config. Returns whether anything was created.
 pub fn init(dir: &Path) -> anyhow::Result<bool> {
-    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    fs::create_dir_all(dir).map_err(|e| io_problem("create", dir, &e))?;
     restrict_dir(dir);
     let mut created = false;
     let id_path = dir.join(IDENTITY_FILE);
@@ -218,7 +278,7 @@ pub fn init(dir: &Path) -> anyhow::Result<bool> {
     }
     let cfg_path = dir.join(CONFIG_FILE);
     if !cfg_path.exists() {
-        let text = template(&hex::encode(new_key()));
+        let text = template(&hex::encode(new_key()), &today().to_string());
         write_private(&cfg_path, text.as_bytes())?;
         created = true;
     }
@@ -227,13 +287,18 @@ pub fn init(dir: &Path) -> anyhow::Result<bool> {
 
 pub fn load_identity(dir: &Path) -> anyhow::Result<Keypair> {
     let path = dir.join(IDENTITY_FILE);
-    let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    Keypair::from_protobuf_encoding(&bytes).context("identity.key is damaged")
+    let bytes = fs::read(&path).map_err(|e| io_problem("read", &path, &e))?;
+    Keypair::from_protobuf_encoding(&bytes).map_err(|_| {
+        problem(
+            format!("{} is damaged.", crate::term::path(&path)),
+            "Restore it from a backup. Deleting it gives the relay a new identity, and every relay code has to be handed out again.",
+        )
+    })
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::write(&tmp, bytes).map_err(|e| io_problem("write", path, &e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -245,7 +310,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
             let _ = std::os::unix::fs::chown(&tmp, Some(m.uid()), Some(m.gid()));
         }
     }
-    fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+    fs::rename(&tmp, path).map_err(|e| io_problem("write", path, &e))
 }
 
 fn restrict_dir(_dir: &Path) {
@@ -261,7 +326,10 @@ pub fn add_key(dir: &Path, label: &str) -> anyhow::Result<AccessKey> {
     validate_label(label)?;
     let cfg = Config::load(dir)?;
     if cfg.keys.iter().any(|k| k.label == label) {
-        bail!("a key labeled {label:?} already exists");
+        return Err(problem(
+            format!("A key named {label} already exists."),
+            "Pick another name, or see the keys with: reamesh-relay key list",
+        ));
     }
     let key = new_key();
     edit_config(dir, |doc| {
@@ -273,6 +341,7 @@ pub fn add_key(dir: &Path, label: &str) -> anyhow::Result<AccessKey> {
         let mut t = toml_edit::Table::new();
         t["label"] = toml_edit::value(label);
         t["key"] = toml_edit::value(hex::encode(key));
+        t["added"] = toml_edit::value(today());
         keys.push(t);
         Ok(())
     })?;
@@ -282,7 +351,7 @@ pub fn add_key(dir: &Path, label: &str) -> anyhow::Result<AccessKey> {
 pub fn remove_key(dir: &Path, label: &str) -> anyhow::Result<()> {
     let cfg = Config::load(dir)?;
     if !cfg.keys.iter().any(|k| k.label == label) {
-        bail!("no key labeled {label:?}");
+        return Err(no_such_key(label));
     }
     edit_config(dir, |doc| {
         let keys = doc
@@ -334,7 +403,14 @@ fn edit_config(
 }
 
 /// The config written on first start: every setting, commented.
-pub fn template(default_key: &str) -> String {
+pub fn no_such_key(label: &str) -> anyhow::Error {
+    problem(
+        format!("No key named {label}."),
+        "See the keys with: reamesh-relay key list",
+    )
+}
+
+pub fn template(default_key: &str, added: &str) -> String {
     format!(
         r#"# ReaMesh relay configuration.
 #
@@ -396,6 +472,7 @@ monthly_budget_gb = 500
 [[keys]]
 label = "default"
 key = "{default_key}"
+added = {added}
 "#
     )
 }
@@ -407,11 +484,12 @@ mod tests {
     #[test]
     fn template_parses_to_defaults() {
         let key = hex::encode([7u8; 32]);
-        let cfg = Config::parse(&template(&key)).unwrap();
+        let cfg = Config::parse(&template(&key, "2026-10-28")).unwrap();
         let want = Config {
             keys: vec![KeyEntry {
                 label: "default".into(),
                 key,
+                added: Some("2026-10-28".parse().unwrap()),
             }],
             ..Config::default()
         };
@@ -440,6 +518,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Lena"]
         );
+    }
+
+    #[test]
+    fn config_errors_name_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path()).unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let text = fs::read_to_string(&path)
+            .unwrap()
+            .replace("tcp_port = 4001", "tcp_port = \"4001\"");
+        let line = text
+            .lines()
+            .position(|l| l.starts_with("tcp_port"))
+            .unwrap()
+            + 1;
+        fs::write(&path, text).unwrap();
+        let e = Config::load(dir.path()).unwrap_err();
+        let p = e.downcast_ref::<crate::term::Problem>().unwrap();
+        assert!(p.what.contains(&format!("line {line}: ")), "{}", p.what);
     }
 
     #[test]

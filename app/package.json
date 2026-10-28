@@ -17,7 +17,8 @@
     "dmg:full": "bash scripts/build-dmg.sh",
     "dmg:sign": "bash scripts/sign-dmg.sh",
     "icons:mac": "bun scripts/render-mac-icon.ts",
-    "icons:windows": "bun scripts/render-windows-icon.ts"
+    "icons:windows": "bun scripts/render-windows-icon.ts",
+    "icons:terminal": "bun scripts/render-terminal-mark.ts"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

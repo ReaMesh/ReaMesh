@@ -10,10 +10,10 @@ use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, noise, relay, tcp, yamux};
 use reamesh_relay::config::{self, Config};
-use reamesh_relay_proto::{self as proto, AuthRequest, AuthResponse};
 use reamesh_relay::server::{self, COORDINATION_CIRCUIT_BYTES, Options, RelayHandle};
 use reamesh_relay::status::Status;
 use reamesh_relay::traffic::{Ledger, current_month};
+use reamesh_relay_proto::{self as proto, AuthRequest, AuthResponse};
 
 const WAIT: Duration = Duration::from_secs(15);
 
@@ -37,7 +37,10 @@ fn client() -> Swarm<Client> {
         .with_behaviour(|_, relay| Client {
             relay,
             auth: request_response::cbor::Behaviour::new(
-                [(StreamProtocol::new(proto::RELAY_AUTH_PROTOCOL), ProtocolSupport::Outbound)],
+                [(
+                    StreamProtocol::new(proto::RELAY_AUTH_PROTOCOL),
+                    ProtocolSupport::Outbound,
+                )],
                 request_response::Config::default(),
             ),
         })
@@ -93,7 +96,7 @@ fn start(dir: &Path) -> RelayHandle {
     server::spawn(Options {
         reload_poll: Duration::from_millis(100),
         tick: Duration::from_millis(100),
-        print_codes: false,
+        banner: false,
         ..Options::new(dir)
     })
     .unwrap()

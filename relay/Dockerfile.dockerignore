@@ -1,0 +1,10 @@
+# The build context is the repository root; send only what the image builds
+# from.
+*
+!relay-proto/Cargo.toml
+!relay-proto/src/
+!relay/Cargo.toml
+!relay/Cargo.lock
+!relay/src/
+!proprietary/logo/mark.txt
+!proprietary/logo/mark-blocks.txt

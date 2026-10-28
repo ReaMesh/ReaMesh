@@ -2,7 +2,10 @@
 # relay code. Keys: `docker compose exec relay reamesh-relay key add <label>`.
 services:
   relay:
-    build: .
+    # The repository root: the build also needs relay-proto/ and proprietary/.
+    build:
+      context: ..
+      dockerfile: relay/Dockerfile
     image: reamesh-relay
     restart: unless-stopped
     # Host networking: the relay sees the server's real addresses (for the

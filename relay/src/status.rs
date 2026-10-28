@@ -5,10 +5,12 @@
 
 use std::net::IpAddr;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Mode, STATUS_FILE};
+use crate::term::{self, Style};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
@@ -39,8 +41,15 @@ pub struct Status {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostStatus {
+    /// The label of the key it authenticated with.
     pub label: String,
     pub peer_id: String,
+    /// The key's fingerprint, as `key list` shows it.
+    pub fingerprint: String,
+    /// Unix seconds since it holds its reservation.
+    pub since: u64,
+    /// Relayed connections to it right now.
+    pub guests: usize,
 }
 
 /// A status older than this means the relay is gone (it writes every 5s).
@@ -62,75 +71,133 @@ impl Status {
         self.running && now.saturating_sub(self.updated) <= STALE_AFTER_SECS
     }
 
-    pub fn render(&self, now: u64) -> String {
-        let mut out = String::new();
-        let state = if self.is_live(now) {
-            format!(
-                "running (pid {}, up {})",
-                self.pid,
-                duration(now.saturating_sub(self.started))
-            )
+    /// What `reamesh-relay status` prints for a running relay.
+    pub fn render(&self, now: u64, s: Style) -> String {
+        let mode = match self.mode {
+            Mode::Full => "full",
+            Mode::Coordination => "coordination",
+        };
+        let up = term::duration(Duration::from_secs(now.saturating_sub(self.started)));
+        let dot = if s.rich {
+            format!("{} ", s.strong("●"))
         } else {
-            format!(
-                "not running (last update {} ago)",
-                duration(now.saturating_sub(self.updated))
-            )
+            String::new()
         };
-        let mode = match (self.mode, self.budget_exhausted) {
-            (Mode::Full, _) => "full".to_owned(),
-            (Mode::Coordination, true) => "coordination (monthly budget used up)".to_owned(),
-            (Mode::Coordination, false) => "coordination".to_owned(),
-        };
-        let budget = if self.budget == 0 {
-            "unlimited".to_owned()
-        } else {
-            format!(
-                "{} ({:.0}% used)",
-                bytes(self.budget),
-                self.sent as f64 * 100.0 / self.budget as f64
-            )
-        };
-        out += &format!("Relay:      {state}\n");
-        out += &format!("Version:    {}\n", self.version);
-        out += &format!("Peer ID:    {}\n", self.peer_id);
-        out += &format!("Mode:       {mode}\n");
-        out += &format!(
-            "Traffic:    {} sent, {} received in {}\n",
-            bytes(self.sent),
-            bytes(self.received),
-            self.month
+        let mut out = format!(
+            "{dot}{}  {} {up}   {} {}   {} {}\n\n",
+            s.strong("running"),
+            s.dim("for"),
+            s.dim("mode"),
+            s.strong(mode),
+            s.dim("version"),
+            self.version,
         );
-        out += &format!("Budget:     {budget}\n");
-        out += &format!("Circuits:   {}\n", self.circuits);
-        out += &format!("Peers:      {}\n", self.peers);
-        out += &format!("Hosts:      {}\n", self.hosts.len());
-        for h in &self.hosts {
-            out += &format!("  {:<24} {}\n", h.label, h.peer_id);
+        out += &s.field(
+            "traffic",
+            &format!("{} this month\n", term::bytes(self.sent)),
+        );
+        if self.budget == 0 {
+            out += &s.field("budget", "none\n");
+        } else {
+            let used = self.sent as f64 / self.budget as f64;
+            let pct = match used * 100.0 {
+                p if p > 0.0 && p < 1.0 => "<1".to_owned(),
+                p => format!("{:.0}", p.min(100.0).floor()),
+            };
+            let mut line = format!("{pct} % of {}", term::bytes(self.budget));
+            if self.budget_exhausted {
+                line += &format!(
+                    ", coordination only until {}",
+                    term::next_month_start(&self.month)
+                );
+            }
+            let line = if s.rich {
+                let bar = term::bar(used, 20);
+                let bar = if used >= 0.8 { s.amber(&bar) } else { bar };
+                format!("{bar}  {line}")
+            } else {
+                line
+            };
+            out += &s.field("budget", &format!("{line}\n"));
         }
-        out
+        out.push('\n');
+        if self.hosts.is_empty() {
+            out += &s.dim("No hosts connected.\n");
+            return out;
+        }
+        let rows: Vec<Vec<String>> = self
+            .hosts
+            .iter()
+            .map(|h| {
+                let shared = self.hosts.iter().filter(|o| o.label == h.label).count() > 1;
+                let name = if shared {
+                    let id = &h.peer_id[h.peer_id.len().saturating_sub(6)..];
+                    format!("{} {}{id}", h.label, s.sym("…", "..."))
+                } else {
+                    h.label.clone()
+                };
+                let guests = match h.guests {
+                    0 => "none".to_owned(),
+                    1 => "1 guest".to_owned(),
+                    n => format!("{n} guests"),
+                };
+                vec![
+                    name,
+                    h.fingerprint.clone(),
+                    term::duration(Duration::from_secs(now.saturating_sub(h.since))),
+                    guests,
+                ]
+            })
+            .collect();
+        out + &term::table(s, &["HOST", "KEY", "ONLINE", "RELAYED"], &rows)
     }
 }
 
-pub fn bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut v = n as f64;
-    let mut u = 0;
-    while v >= 1000.0 && u < UNITS.len() - 1 {
-        v /= 1000.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn duration(secs: u64) -> String {
-    match secs {
-        s if s < 120 => format!("{s}s"),
-        s if s < 7200 => format!("{}m", s / 60),
-        s if s < 172_800 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86_400),
+    fn host(label: &str, id: &str, guests: usize) -> HostStatus {
+        HostStatus {
+            label: label.into(),
+            peer_id: id.into(),
+            fingerprint: "ec24d153".into(),
+            since: 1000,
+            guests,
+        }
+    }
+
+    #[test]
+    fn plain_status_names_hosts_by_key() {
+        let st = Status {
+            running: true,
+            pid: 1,
+            updated: 9000,
+            started: 1000,
+            version: "0.1.0".into(),
+            peer_id: String::new(),
+            mode: Mode::Full,
+            configured_mode: Mode::Full,
+            budget_exhausted: false,
+            month: "2026-10".into(),
+            sent: 5_000_000_000,
+            received: 0,
+            budget: 500_000_000_000,
+            hosts: vec![
+                host("band", "12D3KooWaaaaaa", 1),
+                host("band", "12D3KooWbbbbbb", 0),
+                host("lena", "x", 2),
+            ],
+            circuits: 3,
+            peers: 6,
+            observed_ips: Vec::new(),
+            listening: Vec::new(),
+        };
+        let out = st.render(9000, Style::plain());
+        assert!(out.starts_with("running  for 2 h 13 min   mode full   version 0.1.0\n"));
+        assert!(out.contains("budget    1 % of 500 GB\n"));
+        assert!(out.contains("band ...aaaaaa   ec24d153   2 h 13 min   1 guest\n"));
+        assert!(out.contains("lena             ec24d153   2 h 13 min   2 guests\n"));
+        assert!(!out.contains('\x1b'));
     }
 }

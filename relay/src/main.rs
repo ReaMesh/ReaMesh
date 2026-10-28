@@ -1,36 +1,93 @@
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, bail};
-use clap::{Parser, Subcommand};
+use clap::builder::styling::{AnsiColor, Effects, Styles};
+use clap::{Parser, Subcommand, ValueEnum};
 use reamesh_relay::addrs;
 use reamesh_relay::config::{self, Config};
-use reamesh_relay_proto::{RelayAddr, RelayCode};
 use reamesh_relay::server::{self, Options};
 use reamesh_relay::status::Status;
+use reamesh_relay::term::{self, Problem, Style};
+use reamesh_relay_proto::{RelayAddr, RelayCode};
+
+// The top-level help, laid out by hand: clap's own lists `key` as one command
+// and has no examples section. The escapes are stripped by clap wherever
+// colour is off.
+const HELP: &str = concat!(
+    "\x1b[1mReaMesh Relay ",
+    env!("CARGO_PKG_VERSION"),
+    "\x1b[0m\n",
+    "\x1b[90mLets ReaMesh hosts be reached across routers and firewalls.\x1b[0m\n\n",
+    "\x1b[1mUsage\x1b[0m\n  {usage}\n\n",
+    "\x1b[1mCommands\x1b[0m\n",
+    "  \x1b[1mrun\x1b[0m                  Run the relay (what it does without a command)\n",
+    "  \x1b[1mstatus\x1b[0m               Whether it runs, this month's traffic, the hosts online\n",
+    "  \x1b[1mcode\x1b[0m [name]          Print the relay code for a key (every key without a name)\n",
+    "  \x1b[1mkey add\x1b[0m <name>       Create a key and print its relay code\n",
+    "  \x1b[1mkey list\x1b[0m             List the keys\n",
+    "  \x1b[1mkey remove\x1b[0m <name>    Delete a key; hosts using it lose access within a few seconds\n\n",
+    "\x1b[1mOptions\x1b[0m\n{options}\n\n",
+    "\x1b[1mExamples\x1b[0m\n",
+    "  reamesh-relay                  \x1b[90mRun it; the first start prints the relay code\x1b[0m\n",
+    "  reamesh-relay key add band     \x1b[90mA key for your band, and its relay code\x1b[0m\n",
+    "  reamesh-relay --data /srv/rr   \x1b[90mKeep the identity, keys and config in /srv/rr\x1b[0m\n",
+);
+
+fn styles() -> Styles {
+    Styles::styled()
+        .header(Effects::BOLD.into())
+        .usage(Effects::BOLD.into())
+        .literal(Effects::BOLD.into())
+        .placeholder(AnsiColor::BrightBlack.on_default())
+        .valid(Effects::BOLD.into())
+        .invalid(AnsiColor::Red.on_default())
+        .error(AnsiColor::Red.on_default())
+}
 
 #[derive(Parser)]
 #[command(
+    name = "reamesh-relay",
     version,
-    about = "Self-hosted relay for ReaMesh sessions across NATs and firewalls"
+    about = "Lets ReaMesh hosts be reached across routers and firewalls.",
+    help_template = HELP,
+    styles = styles(),
+    disable_help_subcommand = true
 )]
 struct Cli {
-    /// Data directory (identity, config.toml, traffic counter, status).
-    #[arg(long, global = true, env = "REAMESH_RELAY_DATA")]
+    /// Where the identity, keys and config live.
+    #[arg(long, global = true, env = "REAMESH_RELAY_DATA", value_name = "DIR")]
     data: Option<PathBuf>,
+    /// plain (the default), or json for log collectors.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value_t = LogFormat::Plain,
+        value_name = "FORMAT",
+        hide_possible_values = true,
+        hide_default_value = true
+    )]
+    log_format: LogFormat,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LogFormat {
+    Plain,
+    Json,
+}
+
 #[derive(Subcommand)]
 enum Command {
-    /// Run the relay (the default).
+    /// Run the relay (what it does without a command).
     Run,
-    /// Show the running relay's hosts, traffic and mode.
+    /// Whether it runs, this month's traffic, the hosts online.
     Status,
-    /// Print the relay code for a key (every key without a label).
-    Code { label: Option<String> },
-    /// Manage access keys.
+    /// Print the relay code for a key (every key without a name).
+    Code { name: Option<String> },
+    /// Create, list and delete access keys.
     Key {
         #[command(subcommand)]
         command: KeyCommand,
@@ -40,61 +97,103 @@ enum Command {
 #[derive(Subcommand)]
 enum KeyCommand {
     /// Create a key and print its relay code.
-    Add { label: String },
+    Add { name: String },
     /// List the keys.
     List,
-    /// Delete a key; a running relay disconnects its hosts within a few seconds.
-    Remove { label: String },
+    /// Delete a key; hosts using it lose access within a few seconds.
+    Remove { name: String },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
     let dir = cli.data.unwrap_or_else(config::default_data_dir);
-    match cli.command.unwrap_or(Command::Run) {
-        Command::Run => run(dir),
+    let result = match cli.command.unwrap_or(Command::Run) {
+        Command::Run => run(dir, cli.log_format).map(|()| ExitCode::SUCCESS),
         Command::Status => status(&dir),
-        Command::Code { label } => code(&dir, label.as_deref()),
-        Command::Key { command } => {
-            config::init(&dir)?;
-            match command {
-                KeyCommand::Add { label } => {
-                    config::add_key(&dir, &label)?;
-                    println!("Added key \"{label}\".");
-                    code(&dir, Some(&label))
-                }
-                KeyCommand::List => {
-                    let cfg = Config::load(&dir)?;
-                    if cfg.keys.is_empty() {
-                        println!("No keys. Add one: reamesh-relay key add <label>");
-                    }
-                    for (label, key) in cfg.keys() {
-                        // A fingerprint, so keys can be told apart without
-                        // showing them.
-                        let fp = &blake3::hash(&key).to_hex()[..8];
-                        println!("{label:<32} {fp}");
-                    }
-                    Ok(())
-                }
-                KeyCommand::Remove { label } => {
-                    config::remove_key(&dir, &label)?;
-                    println!(
-                        "Removed key \"{label}\". A running relay disconnects its hosts within a few seconds."
-                    );
-                    Ok(())
-                }
-            }
-        }
-    }
+        Command::Code { name } => code(&dir, name.as_deref()).map(|()| ExitCode::SUCCESS),
+        Command::Key { command } => key(&dir, command).map(|()| ExitCode::SUCCESS),
+    };
+    result.unwrap_or_else(|e| {
+        let (what, hint) = match e.chain().find_map(|c| c.downcast_ref::<Problem>()) {
+            Some(p) => (p.what.clone(), p.hint.clone()),
+            None => (format!("{e:#}"), String::new()),
+        };
+        anstream::eprint!("{}", Style::stderr().error(&what, &hint));
+        ExitCode::FAILURE
+    })
 }
 
-fn run(dir: PathBuf) -> anyhow::Result<()> {
-    init_logging();
+fn key(dir: &Path, command: KeyCommand) -> anyhow::Result<()> {
+    config::init(dir)?;
+    let s = Style::stdout();
+    match command {
+        KeyCommand::Add { name } => {
+            config::add_key(dir, &name)?;
+            let cfg = Config::load(dir)?;
+            let code = relay_code(dir, &cfg, &name)?;
+            let done = s.done(&format!("Key {} added.", s.strong(&name)));
+            if code.addr.is_usable() {
+                anstream::print!(
+                    "{}",
+                    term::code_block(s, &format!("{done} Relay code:"), &code.encode())
+                );
+            } else {
+                anstream::println!("{done}\n");
+                anstream::print!(
+                    "{}",
+                    term::no_address_hint(s, &dir.join(config::CONFIG_FILE))
+                );
+            }
+        }
+        KeyCommand::List => {
+            let cfg = Config::load(dir)?;
+            if cfg.keys.is_empty() {
+                anstream::println!(
+                    "No keys. {}",
+                    s.dim("Add one with: reamesh-relay key add <name>")
+                );
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = cfg
+                .keys
+                .iter()
+                .map(|k| {
+                    let fp = config::parse_key(&k.key)
+                        .map(|key| config::fingerprint(&key))
+                        .unwrap_or_default();
+                    let added = k.added.as_ref().map_or("-".to_owned(), ToString::to_string);
+                    vec![k.label.clone(), fp, added]
+                })
+                .collect();
+            anstream::print!(
+                "{}",
+                term::table(s, &["NAME", "FINGERPRINT", "ADDED"], &rows)
+            );
+        }
+        KeyCommand::Remove { name } => {
+            config::remove_key(dir, &name)?;
+            anstream::println!(
+                "{}",
+                s.done(&format!(
+                    "Key {} removed. Hosts using it lose access within a few seconds.",
+                    s.strong(&name)
+                ))
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run(dir: PathBuf, format: LogFormat) -> anyhow::Result<()> {
+    init_logging(format);
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        if config::init(&dir)? {
-            println!("Created a new relay in {}", dir.display());
-        }
-        let handle = server::spawn(Options::new(&dir))?;
+        let first_start = config::init(&dir)?;
+        let mut opts = Options::new(&dir);
+        opts.first_start = first_start;
+        // JSON logs are for machines; the banner would only get in the way.
+        opts.banner = format == LogFormat::Plain;
+        let handle = server::spawn(opts)?;
         let stop = handle.shutdown_sender();
         tokio::spawn(async move {
             shutdown_signal().await;
@@ -118,67 +217,108 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-fn init_logging() {
+fn init_logging(format: LogFormat) {
     use tracing_subscriber::EnvFilter;
     // libp2p's own logs stay quiet: at debug level they include addresses.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("reamesh_relay=info,warn,libp2p_swarm=error"));
-    use std::io::IsTerminal;
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        // Plain text for journald and `docker logs`.
-        .with_ansi(std::io::stderr().is_terminal())
-        .init();
+    let fmt = tracing_subscriber::fmt().with_env_filter(filter);
+    match format {
+        LogFormat::Plain => fmt
+            .event_format(term::log::Plain {
+                style: Style::stderr(),
+            })
+            .with_writer(anstream::stderr)
+            .init(),
+        LogFormat::Json => fmt
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_writer(std::io::stderr)
+            .init(),
+    }
 }
 
-fn status(dir: &Path) -> anyhow::Result<()> {
-    let Some(s) = Status::read(dir) else {
-        bail!(
-            "no status in {} (is the relay running with this --data dir?)",
-            dir.display()
-        );
-    };
-    print!("{}", s.render(unix_now()));
-    Ok(())
+fn status(dir: &Path) -> anyhow::Result<ExitCode> {
+    let s = Style::stdout();
+    match Status::read(dir).filter(|st| st.is_live(unix_now())) {
+        Some(st) => {
+            anstream::print!("{}", st.render(unix_now(), s));
+            Ok(ExitCode::SUCCESS)
+        }
+        None => {
+            let dot = if s.rich {
+                format!("{} ", s.dim("○"))
+            } else {
+                String::new()
+            };
+            anstream::println!("{dot}{}", s.strong("not running"));
+            anstream::println!(
+                "{}",
+                s.dim("Start it with reamesh-relay or systemctl start reamesh-relay")
+            );
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }
 
-fn code(dir: &Path, label: Option<&str>) -> anyhow::Result<()> {
+fn code(dir: &Path, name: Option<&str>) -> anyhow::Result<()> {
     config::init(dir)?;
     let cfg = Config::load(dir)?;
-    let key = config::load_identity(dir)?;
-    let status = Status::read(dir);
-    let observed = status
-        .as_ref()
-        .map(|s| s.observed_ips.clone())
-        .unwrap_or_default();
-    let labels: Vec<String> = match label {
-        Some(l) => {
-            if cfg.key(l).is_none() {
-                bail!("no key labeled {l:?} (see: reamesh-relay key list)");
+    let names: Vec<String> = match name {
+        Some(n) => {
+            if cfg.key(n).is_none() {
+                return Err(config::no_such_key(n));
             }
-            vec![l.to_owned()]
+            vec![n.to_owned()]
         }
         None => cfg.keys.iter().map(|k| k.label.clone()).collect(),
     };
-    let codes: Vec<RelayCode> = labels
-        .iter()
-        .map(|l| {
-            Ok(RelayCode {
-                addr: RelayAddr {
-                    peer: key.public().to_peer_id(),
-                    ips: addrs::advertised(&cfg.public_addrs, &observed),
-                    dns: cfg.dns_name.clone().unwrap_or_default(),
-                    tcp: cfg.tcp_port,
-                    quic: cfg.quic_port,
-                },
-                key: cfg.key(l).context("key vanished")?,
-                label: l.clone(),
-            })
-        })
-        .collect::<anyhow::Result<_>>()?;
-    server::print_code_banner(&codes, dir);
+    let s = Style::stdout();
+    if names.is_empty() {
+        anstream::println!(
+            "No keys. {}",
+            s.dim("Add one with: reamesh-relay key add <name>")
+        );
+        return Ok(());
+    }
+    let mut out = String::new();
+    for n in &names {
+        let code = relay_code(dir, &cfg, n)?;
+        if !code.addr.is_usable() {
+            anstream::print!(
+                "{}",
+                term::no_address_hint(s, &dir.join(config::CONFIG_FILE))
+            );
+            return Ok(());
+        }
+        let intro = format!("{}{}{}", s.dim("Relay code for "), s.strong(n), s.dim(":"));
+        out += &term::code_block(s, &intro, &code.encode());
+    }
+    out += &term::share_hint(s);
+    anstream::print!("{out}");
     Ok(())
+}
+
+/// The code for key `name` as the relay hands it out: the configured and
+/// detected public addresses, plus those its hosts saw while it ran.
+fn relay_code(dir: &Path, cfg: &Config, name: &str) -> anyhow::Result<RelayCode> {
+    let identity = config::load_identity(dir)?;
+    let observed = Status::read(dir)
+        .map(|s| s.observed_ips)
+        .unwrap_or_default();
+    Ok(RelayCode {
+        addr: RelayAddr {
+            peer: identity.public().to_peer_id(),
+            ips: addrs::advertised(&cfg.public_addrs, &observed),
+            dns: cfg.dns_name.clone().unwrap_or_default(),
+            tcp: cfg.tcp_port,
+            quic: cfg.quic_port,
+        },
+        key: cfg.key(name).ok_or_else(|| config::no_such_key(name))?,
+        label: name.to_owned(),
+    })
 }
 
 fn unix_now() -> u64 {

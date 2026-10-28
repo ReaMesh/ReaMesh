@@ -7,4 +7,5 @@ pub mod auth;
 pub mod config;
 pub mod server;
 pub mod status;
+pub mod term;
 pub mod traffic;

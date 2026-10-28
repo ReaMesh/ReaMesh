@@ -38,9 +38,12 @@ docker compose up -d && docker compose logs
 The log shows the relay code. Keys and status:
 
 ```sh
-docker compose exec relay reamesh-relay key add Lena
+docker compose exec relay reamesh-relay key add lena
 docker compose exec relay reamesh-relay status
 ```
+
+The image builds from the repository root (compose sets that up), since the
+relay shares its protocol crate (`relay-proto/`) with ReaMesh.
 
 The config lives in the `data` volume (`/data/config.toml` in the container);
 `docker compose exec relay reamesh-relay code` prints the codes again.
@@ -67,7 +70,7 @@ The config lives in the `data` volume (`/data/config.toml` in the container);
    journalctl -u reamesh-relay
    ```
 
-Manage keys with `sudo reamesh-relay --data /var/lib/reamesh-relay key add Lena`;
+Manage keys with `sudo reamesh-relay --data /var/lib/reamesh-relay key add lena`;
 the running relay picks the change up by itself.
 
 ### Raspberry Pi
@@ -130,20 +133,73 @@ data inside the encrypted connections: real traffic is a few percent higher.
 ## Commands
 
 ```
-reamesh-relay [run]            run the relay (creates the data dir on first start)
-reamesh-relay status           hosts, relayed connections, traffic, mode
-reamesh-relay code [<label>]   print the relay code(s)
-reamesh-relay key add <label>  new access key, prints its code
-reamesh-relay key list         labels and fingerprints
-reamesh-relay key remove <label>  revoke a key; its hosts are cut off at once
+reamesh-relay [run]           run the relay (creates the data dir on first start)
+reamesh-relay status          whether it runs, this month's traffic, the hosts online
+reamesh-relay code [name]     print the relay code for a key (every key without a name)
+reamesh-relay key add <name>  create a key and print its relay code
+reamesh-relay key list        names, fingerprints and dates
+reamesh-relay key remove <name>  delete a key; its hosts lose access within a few seconds
 ```
 
-All take `--data <dir>` (or `REAMESH_RELAY_DATA`).
+All take `--data <dir>` (or `REAMESH_RELAY_DATA`). `run` also takes
+`--log-format json` for log collectors. To type less, add
+`alias rr=reamesh-relay` to your shell profile.
+
+A first start, in a terminal (the ReaMesh R sits left of the block):
+
+```
+ReaMesh Relay 0.1.0
+
+● running   mode full
+port      4001, TCP and QUIC, IPv4 and IPv6
+address   203.0.113.7
+data      ~/.reamesh-relay
+
+New relay set up. Relay code for default:
+
+reamesh://relay/12D3KooW…?a=203.0.113.7&t=4001&q=4001&k=…&n=default
+
+Paste it in ReaMesh under Settings › Relay. It lets whoever has it host
+through this relay, so keep it within your circle.
+
+21:28:38  ready
+21:28:44  host band connected
+21:28:46  guest joined band via relay
+21:29:02  relayed connection to band ended
+```
+
+`status` while it runs:
+
+```
+● running  for 2 h 14 min   mode full   version 0.1.0
+
+traffic   3.2 GB this month
+budget    █░░░░░░░░░░░░░░░░░░░  1 % of 500 GB
+
+HOST   KEY        ONLINE      RELAYED
+band   ec24d153   1 h 2 min   1 guest
+lena   96f676b3   12 min      none
+```
+
+Warnings worth acting on are tagged: `limit` when a host, a guest address or
+the relay as a whole is at its limit, `budget` when the month's budget is used
+up. In `docker logs`, journald or any other non-terminal (and with `NO_COLOR`
+set) the output is the same text without colour or symbols.
 
 ## Privacy
 
-The relay logs events and counts, not who connected from where; set
-`log_addresses = true` to log client IPs. Relayed sessions stay end-to-end
+The relay logs events by key name and counts, not who connected from where;
+set `log_addresses = true` to log client IPs. Relayed sessions stay end-to-end
 encrypted between host and guests; the relay sees only that bytes pass.
 `status.json` in the data dir lists the hosts currently connected (key label
 and ID).
+
+## License and the logo
+
+The relay is licensed under [GPL-3.0-only](../LICENSE) like the rest of
+ReaMesh. The R it prints comes from [`proprietary/`](../proprietary/) and isn't
+covered by the GPL, but unmodified builds of the relay may carry it: building,
+running and sharing them, a Docker image on a registry included, is fine. A
+modified relay must replace `proprietary/logo/mark.txt` and
+`proprietary/logo/mark-blocks.txt` with its own artwork under the same names
+(see [License and trademark](../README.md#license-and-trademark)).
