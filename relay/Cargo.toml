@@ -16,9 +16,10 @@ getrandom = "0.4"
 hex = "0.4"
 # Local interface addresses, to find the public IPs the relay code advertises.
 if-addrs = "0.15"
+# The relay code and auth exchange, shared with ReaMesh itself.
+reamesh-relay-proto = { path = "../relay-proto" }
 libp2p = { version = "0.57.0", features = ["tokio", "tcp", "quic", "noise", "yamux", "relay", "identify", "ping", "autonat", "macros", "request-response", "cbor"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_bytes = "0.11"
 serde_json = "1.0"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "fs"] }
 toml = "0.9"

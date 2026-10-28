@@ -33,7 +33,6 @@
 mod ctl;
 mod limits;
 mod relay;
-mod relay_proto;
 
 pub use relay::set_relays;
 

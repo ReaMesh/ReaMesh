@@ -5,7 +5,6 @@
 pub mod addrs;
 pub mod auth;
 pub mod config;
-pub mod proto;
 pub mod server;
 pub mod status;
 pub mod traffic;

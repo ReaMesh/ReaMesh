@@ -11,7 +11,7 @@ use anyhow::{Context, bail};
 use libp2p::{PeerId, identity::Keypair};
 use serde::Deserialize;
 
-use crate::proto::AccessKey;
+use reamesh_relay_proto::AccessKey;
 
 pub const CONFIG_FILE: &str = "config.toml";
 pub const IDENTITY_FILE: &str = "identity.key";
@@ -123,8 +123,10 @@ impl Config {
         if self.listen_addrs.is_empty() {
             bail!("listen_addrs is empty");
         }
+        // The same rule ReaMesh applies to a pasted code, so the relay never
+        // hands out one that would be refused.
         if let Some(d) = &self.dns_name
-            && (d.is_empty() || d.contains(['/', ' ', ',', '&', '?']))
+            && !reamesh_relay_proto::valid_dns_name(d)
         {
             bail!("dns_name {d:?} is not a host name");
         }

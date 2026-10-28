@@ -8,9 +8,9 @@ use futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, Swarm, noise, relay, tcp, yamux};
+use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, noise, relay, tcp, yamux};
 use reamesh_relay::config::{self, Config};
-use reamesh_relay::proto::{self, AuthRequest, AuthResponse};
+use reamesh_relay_proto::{self as proto, AuthRequest, AuthResponse};
 use reamesh_relay::server::{self, COORDINATION_CIRCUIT_BYTES, Options, RelayHandle};
 use reamesh_relay::status::Status;
 use reamesh_relay::traffic::{Ledger, current_month};
@@ -37,7 +37,7 @@ fn client() -> Swarm<Client> {
         .with_behaviour(|_, relay| Client {
             relay,
             auth: request_response::cbor::Behaviour::new(
-                [(proto::PROTOCOL, ProtocolSupport::Outbound)],
+                [(StreamProtocol::new(proto::RELAY_AUTH_PROTOCOL), ProtocolSupport::Outbound)],
                 request_response::Config::default(),
             ),
         })
@@ -154,7 +154,7 @@ async fn connect(swarm: &mut Swarm<Client>, relay: &Multiaddr, relay_id: PeerId)
 
 async fn authenticate(swarm: &mut Swarm<Client>, relay_id: PeerId, key: &[u8; 32]) -> AuthResponse {
     let me = *swarm.local_peer_id();
-    let proof = proto::proof(key, &relay_id, &me).to_vec();
+    let proof = proto::auth_proof(key, &relay_id, &me).to_vec();
     let id: OutboundRequestId = swarm
         .behaviour_mut()
         .auth
@@ -228,7 +228,7 @@ async fn reservation_needs_auth_and_guests_reach_only_hosts() {
 
     // A proof made for another peer is refused, even with the right key.
     let other = PeerId::random();
-    let proof = proto::proof(&default_key(dir.path()), &relay_id, &other).to_vec();
+    let proof = proto::auth_proof(&default_key(dir.path()), &relay_id, &other).to_vec();
     host.behaviour_mut()
         .auth
         .send_request(&relay_id, AuthRequest { proof });

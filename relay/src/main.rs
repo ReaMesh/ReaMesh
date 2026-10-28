@@ -5,7 +5,7 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use reamesh_relay::addrs;
 use reamesh_relay::config::{self, Config};
-use reamesh_relay::proto::RelayCode;
+use reamesh_relay_proto::{RelayAddr, RelayCode};
 use reamesh_relay::server::{self, Options};
 use reamesh_relay::status::Status;
 
@@ -165,11 +165,13 @@ fn code(dir: &Path, label: Option<&str>) -> anyhow::Result<()> {
         .iter()
         .map(|l| {
             Ok(RelayCode {
-                peer_id: key.public().to_peer_id(),
-                ips: addrs::advertised(&cfg.public_addrs, &observed),
-                dns: cfg.dns_name.clone(),
-                tcp_port: cfg.tcp_port,
-                quic_port: cfg.quic_port,
+                addr: RelayAddr {
+                    peer: key.public().to_peer_id(),
+                    ips: addrs::advertised(&cfg.public_addrs, &observed),
+                    dns: cfg.dns_name.clone().unwrap_or_default(),
+                    tcp: cfg.tcp_port,
+                    quic: cfg.quic_port,
+                },
                 key: cfg.key(l).context("key vanished")?,
                 label: l.clone(),
             })

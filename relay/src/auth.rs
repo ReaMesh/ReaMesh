@@ -1,5 +1,5 @@
 //! Which peers may hold a reservation: filled by the auth handler (see
-//! `proto` for the protocol), read by the relay's reservation limiter.
+//! `reamesh-relay-proto` for the protocol), read by the relay's reservation limiter.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};

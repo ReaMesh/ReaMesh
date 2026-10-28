@@ -30,7 +30,7 @@ use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{
-    Multiaddr, PeerId, Swarm, autonat, connection_limits, identify, noise, ping, quic, relay, tcp,
+    Multiaddr, PeerId, StreamProtocol, Swarm, autonat, connection_limits, identify, noise, ping, quic, relay, tcp,
     yamux,
 };
 use tokio::sync::watch;
@@ -39,7 +39,7 @@ use tracing::{debug, info, warn};
 use crate::addrs;
 use crate::auth::AuthState;
 use crate::config::{self, Config, Mode};
-use crate::proto::{self, AuthRequest, AuthResponse, RelayCode};
+use reamesh_relay_proto::{self as proto, AuthRequest, AuthResponse, RelayAddr, RelayCode};
 use crate::status::{HostStatus, Status};
 use crate::traffic::{Counters, CountingMuxer, Ledger};
 
@@ -400,7 +400,7 @@ impl Relay {
                     ),
                     relay: relay::Behaviour::new(peer_id, relay_config),
                     auth: request_response::cbor::Behaviour::new(
-                        [(proto::PROTOCOL, ProtocolSupport::Inbound)],
+                        [(StreamProtocol::new(proto::RELAY_AUTH_PROTOCOL), ProtocolSupport::Inbound)],
                         request_response::Config::default()
                             .with_request_timeout(Duration::from_secs(20)),
                     ),
@@ -671,7 +671,7 @@ impl Relay {
 
     fn authenticate(&mut self, peer: &PeerId, req: &AuthRequest) -> AuthResponse {
         let keys = self.cfg.keys();
-        let label = proto::verify(
+        let label = proto::verify_proof(
             keys.iter().map(|(l, k)| (l.as_str(), k)),
             &self.peer_id,
             peer,
@@ -798,11 +798,13 @@ impl Relay {
     fn code_for(&self, label: &str) -> Option<RelayCode> {
         let (tcp_port, quic_port) = self.ports();
         Some(RelayCode {
-            peer_id: self.peer_id,
-            ips: self.advertised_ips(),
-            dns: self.cfg.dns_name.clone(),
-            tcp_port,
-            quic_port,
+            addr: RelayAddr {
+                peer: self.peer_id,
+                ips: self.advertised_ips(),
+                dns: self.cfg.dns_name.clone().unwrap_or_default(),
+                tcp: tcp_port,
+                quic: quic_port,
+            },
             key: self.cfg.key(label)?,
             label: label.to_owned(),
         })
@@ -874,7 +876,7 @@ pub fn print_code_banner(codes: &[RelayCode], data_dir: &Path) {
     for code in codes {
         println!("  Relay code for key \"{}\":\n", code.label);
         println!("  {}\n", code.encode());
-        no_addr |= code.ips.is_empty() && code.dns.is_none();
+        no_addr |= code.addr.ips.is_empty() && code.addr.dns.is_empty();
     }
     if !codes.is_empty() {
         println!("  Paste it in ReaMesh under Settings > Relay. Whoever has it can host");

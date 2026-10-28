@@ -2,9 +2,9 @@
 //! relay code format, the addresses it expands to, and the
 //! `/reamesh/relay-auth/1` exchange (message types and proof).
 //!
-//! Nothing from the rest of the core (only libp2p, serde, serde_bytes and
-//! blake3), so the relay server can share it. `app/src/lib/relay.ts` mirrors
-//! the parser.
+//! Its own crate so the core (`rust/`) and the relay server (`relay/`) build
+//! it from one source and can't drift apart; it needs only libp2p, serde,
+//! serde_bytes and blake3. `app/src/lib/relay.ts` mirrors the parser.
 //!
 //! Relay code:
 //! `reamesh://relay/<relay peer id>?a=<ip>,<ip>&d=<dns name>&t=<tcp>&q=<quic>&k=<key>&n=<label>`
@@ -29,8 +29,13 @@ pub const RELAY_AUTH_PROTOCOL: &str = "/reamesh/relay-auth/1";
 /// Domain separation for the auth proof (see `auth_proof`).
 const AUTH_DOMAIN: &[u8] = b"reamesh-relay-auth/1";
 const RELAY_CODE_MAX_LEN: usize = 1024;
-const RELAY_MAX_IPS: usize = 8;
-const RELAY_LABEL_MAX: usize = 64;
+/// Most IPs a code (or an invite link's relay entry) names.
+pub const RELAY_MAX_IPS: usize = 8;
+/// Longest label a code carries, in characters; the rest is cut off.
+pub const RELAY_LABEL_MAX: usize = 64;
+
+/// A relay access key (`k` in a relay code).
+pub type AccessKey = [u8; 32];
 
 pub const REASON_BAD_KEY: &str = "bad_key";
 pub const REASON_BANNED: &str = "banned";
@@ -105,8 +110,6 @@ impl RelayAddr {
 
 impl RelayCode {
     /// The code in its canonical form (what `parse_relay_code` reads back).
-    /// Only the relay server writes codes; the core just parses them.
-    #[allow(dead_code)]
     pub fn encode(&self) -> String {
         let a = &self.addr;
         let mut s = format!("{RELAY_CODE_PREFIX}{}?", a.peer);
@@ -232,7 +235,6 @@ fn parse_key(v: &str) -> Option<[u8; 32]> {
 }
 
 /// Everything but the RFC 3986 unreserved characters, as `%XX`.
-#[allow(dead_code)]
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -286,6 +288,35 @@ pub struct AuthResponse {
     pub reason: Option<String>,
     /// The operator's name for the key that matched.
     pub key_label: Option<String>,
+}
+
+impl AuthResponse {
+    pub fn accepted(label: &str) -> Self {
+        Self { ok: true, reason: None, key_label: Some(label.to_owned()) }
+    }
+
+    pub fn refused(reason: &str) -> Self {
+        Self { ok: false, reason: Some(reason.to_owned()), key_label: None }
+    }
+}
+
+/// The label of the key `proof` was made with, if any. Every key is checked,
+/// each in constant time (`blake3::Hash` equality), so neither timing nor an
+/// early exit reveals which key came close.
+pub fn verify_proof<'a>(
+    keys: impl IntoIterator<Item = (&'a str, &'a [u8; 32])>,
+    relay: &PeerId,
+    client: &PeerId,
+    proof: &[u8],
+) -> Option<&'a str> {
+    let given = blake3::Hash::from_bytes(<[u8; 32]>::try_from(proof).ok()?);
+    let mut found = None;
+    for (label, key) in keys {
+        if blake3::Hash::from_bytes(auth_proof(key, relay, client)) == given && found.is_none() {
+            found = Some(label);
+        }
+    }
+    found
 }
 
 /// A refusal's reason as one of the stable codes; anything else (or none)
@@ -394,5 +425,54 @@ mod tests {
         assert_eq!(refusal_reason(&r(Some("full"))), "full");
         assert_eq!(refusal_reason(&r(Some("weird"))), "refused");
         assert_eq!(refusal_reason(&r(None)), "refused");
+    }
+
+    #[test]
+    fn relay_code_expands_every_host_in_order() {
+        let peer = PeerId::random();
+        let c = RelayCode {
+            addr: RelayAddr {
+                peer,
+                ips: vec!["203.0.113.7".parse().unwrap(), "2001:db8::1".parse().unwrap()],
+                dns: "relay.example.org".into(),
+                tcp: 4001,
+                quic: 443,
+            },
+            key: [0xab; 32],
+            label: "Bens Band & Co/ü".into(),
+        };
+        let text = c.encode();
+        assert!(text.contains("a=203.0.113.7,2001:db8::1&"));
+        assert!(text.contains("n=Bens%20Band%20%26%20Co%2F%C3%BC"));
+        assert_eq!(parse(&text), Some(c.clone()));
+        let addrs: Vec<String> = c.addr.relay_addrs().iter().map(|a| a.to_string()).collect();
+        assert_eq!(
+            addrs,
+            vec![
+                format!("/ip4/203.0.113.7/tcp/4001/p2p/{peer}"),
+                format!("/ip4/203.0.113.7/udp/443/quic-v1/p2p/{peer}"),
+                format!("/ip6/2001:db8::1/tcp/4001/p2p/{peer}"),
+                format!("/ip6/2001:db8::1/udp/443/quic-v1/p2p/{peer}"),
+                format!("/dns/relay.example.org/tcp/4001/p2p/{peer}"),
+                format!("/dns/relay.example.org/udp/443/quic-v1/p2p/{peer}"),
+            ]
+        );
+        // A plus is a plus, as in the app's decodeURIComponent.
+        let plus = text.replace("n=Bens%20Band%20%26%20Co%2F%C3%BC", "n=a+b");
+        assert_eq!(parse(&plus).unwrap().label, "a+b");
+    }
+
+    #[test]
+    fn verify_proof_finds_the_key_and_refuses_everything_else() {
+        let (relay, client, other) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let keys = [("alice".to_owned(), [1u8; 32]), ("bob".to_owned(), [2u8; 32])];
+        let iter = || keys.iter().map(|(l, k)| (l.as_str(), k));
+        let p = auth_proof(&[2u8; 32], &relay, &client);
+        assert_eq!(verify_proof(iter(), &relay, &client, &p), Some("bob"));
+        assert_eq!(verify_proof(iter(), &relay, &client, &auth_proof(&[9u8; 32], &relay, &client)), None);
+        // Made for another client, or for another relay: a replay fails.
+        assert_eq!(verify_proof(iter(), &relay, &client, &auth_proof(&[1u8; 32], &relay, &other)), None);
+        assert_eq!(verify_proof(iter(), &relay, &client, &auth_proof(&[1u8; 32], &other, &client)), None);
+        assert_eq!(verify_proof(iter(), &relay, &client, &[0u8; 31]), None);
     }
 }

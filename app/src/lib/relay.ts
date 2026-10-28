@@ -1,5 +1,5 @@
 // Relay codes, as the operator of a self-hosted `reamesh-relay` hands them out.
-// Mirrors `parse_relay_code` (rust/src/relay_proto.rs), so the app never
+// Mirrors `parse_relay_code` (relay-proto/src/lib.rs), so the app never
 // stores a code the extension would refuse.
 //
 //   reamesh://relay/<relay peer id>?a=<ip>,<ip>&d=<dns name>&t=<tcp>&q=<quic>

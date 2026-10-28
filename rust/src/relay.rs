@@ -8,7 +8,7 @@
 //! relay only ever forwards ciphertext.
 //!
 //! What the relay server must agree on (code format, auth messages, proof)
-//! lives in `relay_proto`. This module has the parts that don't need session
+//! lives in the `reamesh-relay-proto` crate, which the server shares. This module has the parts that don't need session
 //! state: the configured relays, a relay's invite-link form, the Settings test,
 //! and two swarm behaviours: [`LanOnly`] keeps the lobby off relayed and
 //! non-LAN connections, [`IpLimits`] caps inbound connections per IP.
@@ -36,21 +36,19 @@ use libp2p::swarm::{
 use libp2p::{Multiaddr, PeerId, StreamProtocol, noise, tcp, yamux};
 use serde_json::{Value as JsonValue, json};
 
-pub use crate::relay_proto::{AuthRequest, AuthResponse, RelayAddr, RelayCode, auth_proof, refusal_reason};
-use crate::relay_proto::{RELAY_AUTH_PROTOCOL, valid_dns_name};
+pub use reamesh_relay_proto::{AuthRequest, AuthResponse, RelayAddr, RelayCode, auth_proof, refusal_reason};
+use reamesh_relay_proto::{RELAY_AUTH_PROTOCOL, RELAY_LABEL_MAX, RELAY_MAX_IPS, valid_dns_name};
 
 /// Most relays a user can configure. The host reserves on all of them and the
 /// invite link names all of them.
 pub(crate) const MAX_RELAYS: usize = 3;
-const RELAY_MAX_IPS: usize = 8;
-const RELAY_LABEL_MAX: usize = 64;
 /// How long the relay test may take as a whole.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Parse a relay code (`relay_proto::parse_relay_code`); loopback relays only
+/// Parse a relay code (`reamesh_relay_proto::parse_relay_code`); loopback relays only
 /// in the loopback-only test mode. Mirrored by `app/src/lib/relay.ts`.
 pub fn parse_relay_code(code: &str) -> Option<RelayCode> {
-    crate::relay_proto::parse_relay_code(code, crate::loopback_only())
+    reamesh_relay_proto::parse_relay_code(code, crate::loopback_only())
 }
 
 /// The compact form an invite link carries in an `r=` parameter:

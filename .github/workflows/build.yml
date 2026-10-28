@@ -208,6 +208,7 @@ jobs:
         working-directory: rust
 
   # The self-hosted relay (relay/): its own crate and lockfile, Linux only.
+  # Also tests relay-proto/, the contract it shares with the core.
   relay:
     runs-on: ubuntu-latest
     steps:
@@ -223,11 +224,11 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             relay/target/
-          key: cargo-relay-${{ steps.rust.outputs.commit }}-${{ hashFiles('relay/Cargo.lock') }}
+          key: cargo-relay-${{ steps.rust.outputs.commit }}-${{ hashFiles('relay/Cargo.lock', 'relay-proto/Cargo.toml') }}
           restore-keys: cargo-relay-${{ steps.rust.outputs.commit }}-
       - name: Build
         run: cargo build --release --locked
         working-directory: relay
       - name: Test
-        run: cargo test --release --locked
+        run: cargo test --release --locked -p reamesh-relay -p reamesh-relay-proto
         working-directory: relay

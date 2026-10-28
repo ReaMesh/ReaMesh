@@ -2651,8 +2651,8 @@ dependencies = [
  "hex",
  "if-addrs",
  "libp2p",
+ "reamesh-relay-proto",
  "serde",
- "serde_bytes",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2660,6 +2660,16 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "reamesh-relay-proto"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "libp2p",
+ "serde",
+ "serde_bytes",
 ]
 
 [[package]]

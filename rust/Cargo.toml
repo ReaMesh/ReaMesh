@@ -40,6 +40,8 @@ if-addrs = "0.15"
 # The lobby gossip wrapper hands relayed connections a do-nothing handler
 # (`relay::LanOnly`). Already in the tree through libp2p.
 either = "1"
+# The relay code and auth exchange, shared with the relay server (`relay/`).
+reamesh-relay-proto = { path = "../relay-proto" }
 
 # Free disk space before a download or fetch (`available_space`; on Windows it
 # calls kernel32 directly). Already in the tree through libp2p.
