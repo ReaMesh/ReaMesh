@@ -1,0 +1,40 @@
+# systemd unit for the ReaMesh relay.
+#   sudo cp reamesh-relay.service /etc/systemd/system/
+#   sudo systemctl enable --now reamesh-relay
+#   journalctl -u reamesh-relay        (shows the relay code)
+#   sudo systemctl reload reamesh-relay (re-reads config.toml)
+[Unit]
+Description=ReaMesh relay
+Documentation=https://github.com/ReaMesh/ReaMesh/tree/main/relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/reamesh-relay --data /var/lib/reamesh-relay run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Runs as a throwaway user; its data lives in /var/lib/reamesh-relay.
+DynamicUser=yes
+StateDirectory=reamesh-relay
+StateDirectoryMode=0700
+# Uncomment for ports below 1024 (e.g. 443):
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
