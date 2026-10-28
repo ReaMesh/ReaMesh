@@ -20,7 +20,7 @@ mod updater;
 /// `PROTO` (rust/src/lib.rs; app/src/lib/version.test.ts checks the copies
 /// agree). An update is restarted into mid-session only when its manifest
 /// names the same number.
-pub(crate) const PROTO: u32 = 4;
+pub(crate) const PROTO: u32 = 5;
 
 #[cfg(target_os = "macos")]
 const PLUGIN_NAME: &str = "reaper_reamesh.dylib";
@@ -172,6 +172,75 @@ fn store_lang_pref(app: &AppHandle, pref: &str) {
         let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(p, pref);
+}
+
+// Settings → Relay: the pasted relay codes, one per line, in `relays` next to
+// the other prefs. The codes carry access keys, so the file is owner-only. The
+// webview validates them and hands them to the extension; this only stores
+// them.
+
+/// Most codes kept (the extension uses up to three).
+const RELAYS_MAX: usize = 3;
+const RELAY_CODE_MAX: usize = 1024;
+
+fn relays_file(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|d| d.join("relays"))
+}
+
+#[tauri::command]
+fn get_relays(app: AppHandle) -> Vec<String> {
+    relays_file(&app)
+        .and_then(|p| fs::read_to_string(p).ok())
+        .map(|s| {
+            s.lines()
+                .map(str::trim)
+                .filter(|l| l.starts_with("reamesh://relay/") && l.len() <= RELAY_CODE_MAX)
+                .take(RELAYS_MAX)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn set_relays(app: AppHandle, codes: Vec<String>) -> Result<(), String> {
+    let Some(p) = relays_file(&app) else { return Err("no config folder".into()) };
+    let body: Vec<&str> = codes
+        .iter()
+        .map(|c| c.trim())
+        .filter(|c| c.starts_with("reamesh://relay/") && c.len() <= RELAY_CODE_MAX && !c.contains('\n'))
+        .take(RELAYS_MAX)
+        .collect();
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if body.is_empty() {
+        let _ = fs::remove_file(&p);
+    } else {
+        write_private(&p, &body.join("\n")).map_err(|e| e.to_string())?;
+    }
+    use tauri::Emitter;
+    let _ = app.emit("relays-changed", ());
+    Ok(())
+}
+
+/// Write a file only its owner can read (the relay codes hold access keys).
+fn write_private(p: &Path, body: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(p)?;
+        // An older file keeps its mode through `open`; tighten it either way.
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(p, fs::Permissions::from_mode(0o600))?;
+        f.write_all(body.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        // The per-user AppData folder is already private to the account.
+        fs::write(p, body)
+    }
 }
 
 // Overlay visibility toggles, persisted backend-side as a small bitmask so the
@@ -1842,6 +1911,8 @@ pub fn run() {
             set_reaper_path,
             get_language,
             set_language,
+            get_relays,
+            set_relays,
             get_overlay_settings,
             set_overlay_settings,
             set_session_state,

@@ -7,7 +7,8 @@
 <a href="LICENSE"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/License-GPL--3.0--only-3f3f46.svg?variant=outline&amp;logo=ri%3AGoLaw&amp;mode=dark&amp;valueColor=f0f6fc&amp;labelTextColor=f0f6fc&amp;logoColor=f0f6fc&amp;labelOpacity=1"><img alt="License: GPL-3.0-only" src="https://shieldcn.dev/badge/License-GPL--3.0--only-d4d4d8.svg?variant=outline&amp;logo=ri%3AGoLaw&amp;mode=light&amp;valueColor=1f2328&amp;labelTextColor=1f2328&amp;logoColor=1f2328&amp;labelOpacity=1"></picture></a>
 
 Work on a REAPER project together. ReaMesh shares project files and keeps edits
-in sync between computers on a local network or VPN. No account or server needed.
+in sync between computers on a local network or VPN, or over the internet
+through a relay you run yourself. No account needed.
 
 One person hosts a project, the others join and get a local copy. Everyone can
 then edit tracks, arrange audio and MIDI, and work on effects. A desktop app
@@ -55,9 +56,18 @@ can be shared; files a plugin loads from outside the folder aren't shared.
 Dotfiles, `.rpp-bak` backups and `.reapeaks` caches are never sent.
 
 Sessions are discovered automatically on the LAN. For a VPN or a network where
-discovery doesn't work, use an invite code. Both computers still need a direct
-network route to each other; ReaMesh has no relay or NAT traversal. An invite
-code is valid only while that hosting session is running.
+discovery doesn't work, use an invite code. An invite code is valid only while
+that hosting session is running.
+
+To work together over the internet without a VPN, run your own relay
+(`reamesh-relay`) and paste its relay code in Settings → Relay. There is no
+public relay. While you host, the invite code also names your relay (never its
+access key), so guests set nothing up. Computers connect directly when they
+can, punching through NATs where possible, and use the relay only when that
+fails. The relay forwards encrypted traffic it can't read. A session reachable
+through a relay always has a secret: its password, or for an open session a
+random secret that travels inside the invite code. Open sessions stay open on
+the local network.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/invite-dark.png">

@@ -34,6 +34,10 @@ export interface Peer {
   editing?:
     | { kind: "track"; name: string; n?: number }
     | { kind: "project"; field: string };
+  /** How this person is connected: "relay" through a relay circuit, "direct"
+   *  once a relayed connection was upgraded to a direct one; "" / absent for
+   *  the plain LAN or VPN case. */
+  link?: "relay" | "direct" | "";
 }
 
 /** Join preview from the owner's manifest. Sizes and metadata are host-reported;
@@ -207,6 +211,44 @@ export interface Instance {
   state?: ExtState;
   /** True while REAPER's main thread isn't ticking (modal dialog open there). */
   busy?: boolean;
+  /** Relay reservations while hosting and the latest relay test. */
+  relay?: RelayInfo;
+}
+
+/** One relay as the hosting run sees it. */
+export interface RelayStatus {
+  peer: string;
+  /** The relay's name for the key, else the code's label ("" for none). */
+  label: string;
+  host: string;
+  state: "connecting" | "reserved" | "retrying" | "refused";
+  /** Why the last attempt failed: bad_key, banned, full, not_relay,
+   *  unreachable, timeout, lost, refused ("" = it didn't). */
+  reason: string;
+}
+
+/** Outcome of Settings → Relay → Test, keyed by the request's id. */
+export interface RelayTest {
+  id: string;
+  peer: string;
+  /** testing | ok | bad_key | banned | full | not_relay | unreachable |
+   *  timeout | invalid | refused */
+  outcome: string;
+  label?: string;
+}
+
+export interface RelayInfo {
+  status: RelayStatus[];
+  test: RelayTest | null;
+}
+
+export function normalizeRelay(msg: Record<string, unknown>): RelayInfo {
+  const status = Array.isArray(msg.status) ? (msg.status as RelayStatus[]) : [];
+  const test =
+    msg.test && typeof msg.test === "object" && typeof (msg.test as RelayTest).id === "string"
+      ? (msg.test as RelayTest)
+      : null;
+  return { status, test };
 }
 
 export function displayName(p: Peer): string {

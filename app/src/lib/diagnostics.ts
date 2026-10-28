@@ -5,6 +5,7 @@ import { getReaperStatus } from "./install";
 import { localizeLogEntry } from "./log";
 import { getOverlaySettings } from "./overlaySettings";
 import { getUpdate, getUpdateChannel } from "./updater";
+import { getRelays } from "./relays";
 import { PROTO } from "./version";
 
 /** Everything a bug report needs, as plain text: no project data, no names.
@@ -22,8 +23,14 @@ export async function buildDiagnostics(): Promise<string> {
     `Instances: ${instances.length}`,
     ...instances.map(
       (i) =>
-        `  :${i.port} ext=${i.version ?? "?"}/${i.proto ?? "?"} mode=${i.state?.mode ?? "?"} state=${i.state?.state ?? "?"} people=${i.state?.peers.length ?? 0} busy=${!!i.busy}`,
+        `  :${i.port} ext=${i.version ?? "?"}/${i.proto ?? "?"} mode=${i.state?.mode ?? "?"} state=${i.state?.state ?? "?"} people=${i.state?.peers.length ?? 0} busy=${!!i.busy}` +
+        // Relay states and reasons only: no addresses, no keys.
+        (i.relay?.status.length
+          ? ` relays=${i.relay.status.map((r) => `${r.state}${r.reason ? `:${r.reason}` : ""}`).join(",")}`
+          : "") +
+        ` links=${(i.state?.peers ?? []).filter((p) => p.link).map((p) => p.link).join(",") || "-"}`,
     ),
+    `Relays configured: ${getRelays().length}`,
     "Recent events:",
     ...(instances[0]?.state?.log ?? []).slice(-12).map((e) => `  ${e.code || "-"}: ${localizeLogEntry(e)}`),
   ].join("\n");

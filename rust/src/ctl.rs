@@ -8,9 +8,13 @@
 //! out through `reamesh_ctl_publish`, which this server broadcasts to every
 //! connected app. Nothing here ever touches REAPER or the session directly.
 //!
-//! The only command handled server-side is `set_profile` (display name +
-//! color): it updates the process-wide profile used by presence beacons, so
-//! it works even while no session handle exists.
+//! Three commands are handled server-side, because they need no session handle
+//! and must work before one exists: `set_profile` (display name + color for
+//! presence beacons), `set_relays` (`{codes:[relay code…]}`, taken by the next
+//! hosting run) and `relay_test` (`{code,id}`: dial the relay and run its auth
+//! exchange). The server also sends `{"type":"relay", status, test}` whenever
+//! the hosting run's relay status or a test result changes, and to every new
+//! client.
 //!
 //! Multiple REAPER instances on one machine (the documented dev setup) each
 //! bind the first free port in `CTL_PORTS`; the app scans the whole range and
@@ -311,6 +315,23 @@ pub fn start() -> u16 {
                             }
                         });
                     }
+                    // Relay status / test results come from the network
+                    // task and the test task, not the extension's state.
+                    {
+                        let shared = shared.clone();
+                        tokio::spawn(async move {
+                            let mut sent = 0u64;
+                            let mut iv = tokio::time::interval(Duration::from_millis(250));
+                            loop {
+                                iv.tick().await;
+                                let (generation, msg) = crate::relay::ctl_message();
+                                if generation != sent {
+                                    sent = generation;
+                                    broadcast(&shared.clients, &msg);
+                                }
+                            }
+                        });
+                    }
                     accept_loop(listener, shared).await;
                 });
             });
@@ -457,6 +478,7 @@ async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<CtlShared>) 
                 if !last.is_empty() {
                     let _ = tx.try_send(last);
                 }
+                let _ = tx.try_send(crate::relay::ctl_message().1);
             }
             shared.clients.lock().unwrap().push(tx);
             loop {
@@ -482,15 +504,42 @@ async fn accept_loop(listener: tokio::net::TcpListener, shared: Arc<CtlShared>) 
     }
 }
 
+/// Most relay codes a `set_relays` may carry (the core keeps
+/// `relay::MAX_RELAYS` of them).
+const SET_RELAYS_MAX: usize = 8;
+
 fn handle_inbound(shared: &CtlShared, msg: String) {
-    // set_profile is the one command resolved here: the profile is global and
-    // must be settable before any session exists.
-    if let Ok(v) = serde_json::from_str::<JsonValue>(&msg)
-        && v.get("cmd").and_then(|c| c.as_str()) == Some("set_profile")
-    {
+    // Resolved here (see the module docs): global, and needed before any
+    // session exists.
+    if let Ok(v) = serde_json::from_str::<JsonValue>(&msg) {
         let get = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
-        crate::set_profile(get("name"), get("color"));
-        return;
+        match v.get("cmd").and_then(|c| c.as_str()) {
+            Some("set_profile") => {
+                crate::set_profile(get("name"), get("color"));
+                return;
+            }
+            Some("set_relays") => {
+                let codes: Vec<String> = v
+                    .get("codes")
+                    .and_then(|c| c.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|c| c.as_str())
+                            .take(SET_RELAYS_MAX)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                crate::set_relays(&codes);
+                return;
+            }
+            Some("relay_test") => {
+                let (code, id) = (get("code").to_string(), crate::limits::clip(get("id"), 64));
+                tokio::spawn(crate::relay::run_test(code, id));
+                return;
+            }
+            _ => {}
+        }
     }
     let mut q = shared.inbound.lock().unwrap();
     if q.len() < INBOUND_CAP {

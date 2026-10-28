@@ -7,10 +7,11 @@
 // the extension streams back one `state` message whenever anything changes.
 
 import { useSyncExternalStore } from "react";
-import { normalizeState, type Instance } from "./types";
+import { normalizeRelay, normalizeState, type Instance } from "./types";
 import { getProfile } from "./profile";
 import { getOverlaySettings, subscribeOverlaySettings } from "./overlaySettings";
 import { openCtlSocket } from "./ctlSocket";
+import { getRelays, subscribeRelays } from "./relays";
 import { PROTO } from "./version";
 
 const ALL_PORTS = [47415, 47416, 47417, 47418];
@@ -90,6 +91,7 @@ function attach(port: number, ws: WebSocket) {
     sendProfile(port);
     sendTint(port);
     sendCursors(port);
+    sendRelays(port);
     emit();
   };
   ws.onmessage = (ev) => {
@@ -118,6 +120,9 @@ function attach(port: number, ws: WebSocket) {
       // Watchdog from the control server: REAPER's main thread stopped
       // ticking (usually a modal dialog waiting for an answer over there).
       inst.busy = Boolean(msg.busy);
+    } else if (msg.type === "relay") {
+      // The hosting run's relay reservations and the latest relay test.
+      inst.relay = normalizeRelay(msg);
     }
     live.set(port, inst);
     ensureActive();
@@ -164,6 +169,17 @@ export function startScanning() {
       for (const p of sockets.keys()) sendCursors(p);
     }
   });
+}
+
+// Relays changed in Settings: every extension gets the new list.
+subscribeRelays(() => {
+  for (const p of sockets.keys()) sendRelays(p);
+});
+
+/** Hand the configured relays (codes, keys included: the extension needs
+ *  them to authenticate) to one extension. */
+export function sendRelays(port: number) {
+  send({ cmd: "set_relays", codes: getRelays().map((c) => c.code) }, port);
 }
 
 let lastTintSent: boolean | null = null;

@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, ChevronRight, Copy, ExternalLink } from "lucide-react";
+import { ArrowLeft, ChevronRight, Copy, ExternalLink, Plus } from "lucide-react";
 import { motion } from "motion/react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Divider, Group, SectionLabel } from "@/components/Group";
 import { PathField } from "@/components/PathField";
@@ -45,6 +46,10 @@ import { listJoinedProjects } from "@/screens/JoinedProjects";
 import { PROTO } from "@/lib/version";
 import { nearbyBlocked, setNearby, useNearby } from "@/lib/nearby";
 import { cn, focusRing } from "@/lib/utils";
+import { send } from "@/lib/connection";
+import { MAX_RELAYS, parseRelayCode, relayHost, type RelayCode } from "@/lib/relay";
+import { addRelay, removeRelay, useRelays } from "@/lib/relays";
+import type { Instance, RelayTest } from "@/lib/types";
 
 const SOURCE_URL = "https://github.com/ReaMesh/ReaMesh";
 
@@ -84,6 +89,183 @@ function Row({
       </div>
       {children}
     </div>
+  );
+}
+
+/** What a relay test said, as one short line. */
+function relayOutcomeText(outcome: string): string {
+  switch (outcome) {
+    case "testing":
+      return t("relayTesting");
+    case "ok":
+      return t("relayOk");
+    case "bad_key":
+      return t("relayBadKey");
+    case "banned":
+      return t("relayBanned");
+    case "full":
+      return t("relayIsFull");
+    case "not_relay":
+      return t("relayNotRelay");
+    case "unreachable":
+      return t("relayUnreachable");
+    case "timeout":
+      return t("relayTimeout");
+    case "invalid":
+      return t("relayInvalid");
+    default:
+      return t("relayRefused");
+  }
+}
+
+// The relays this install hosts through. A test answers on the `relay`
+// message, so it is matched to its row by request id.
+function RelaySection({ instance, ghost }: { instance: Instance | null; ghost: string }) {
+  const relays = useRelays();
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState<Record<string, string>>({});
+  const [results, setResults] = useState<Record<string, RelayTest>>({});
+  const test = instance?.relay?.test ?? null;
+  useEffect(() => {
+    if (!test || pending[test.peer] !== test.id) return;
+    setResults((r) => ({ ...r, [test.peer]: test }));
+    if (test.outcome !== "testing") {
+      setPending((p) => {
+        const { [test.peer]: _, ...rest } = p;
+        return rest;
+      });
+    }
+  }, [test, pending]);
+  // A hosting run keeps the relays it started with.
+  const hosting = instance?.state?.mode === "hosting";
+  const changed = () => {
+    if (hosting) toast(t("relayNextHost"));
+  };
+
+  const runTest = (r: RelayCode) => {
+    const id = `${r.peer.slice(-8)}-${Date.now()}`;
+    setPending((p) => ({ ...p, [r.peer]: id }));
+    setResults((x) => ({ ...x, [r.peer]: { id, peer: r.peer, outcome: "testing" } }));
+    send({ cmd: "relay_test", code: r.code, id }, instance?.port);
+  };
+  const cancel = () => {
+    setAdding(false);
+    setDraft("");
+    setError("");
+  };
+  const submit = async () => {
+    const parsed = parseRelayCode(draft);
+    if (!parsed) return setError(t("relayInvalid"));
+    if (relays.some((r) => r.peer === parsed.peer)) return setError(t("relayDuplicate"));
+    if (await addRelay(draft)) {
+      cancel();
+      changed();
+      if (instance) runTest(parsed);
+    }
+  };
+  const remove = (peer: string) =>
+    removeRelay(peer).then(changed, (e) => toast.error(String(e)));
+
+  return (
+    <section className="space-y-2">
+      <SectionLabel>{t("relaySettings")}</SectionLabel>
+      <Group>
+        {relays.map((r, i) => {
+          const result = results[r.peer];
+          // Neutral when it works; only a failure is worth a colour.
+          const failed = !!result && result.outcome !== "testing" && result.outcome !== "ok";
+          return (
+            <div key={r.peer}>
+              {i > 0 && <Divider inset={false} />}
+              <Row
+                label={r.label || relayHost(r)}
+                sub={
+                  result ? (
+                    <span className={cn(failed && "text-amber-500")}>
+                      {relayOutcomeText(result.outcome)}
+                    </span>
+                  ) : r.label ? (
+                    relayHost(r)
+                  ) : undefined
+                }
+              >
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className={ghost}
+                  disabled={!instance || !!pending[r.peer]}
+                  onClick={() => runTest(r)}
+                >
+                  {t("relayTest")}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className={cn(ghost, "text-muted-foreground hover:text-destructive")}
+                  onClick={() => remove(r.peer)}
+                >
+                  {t("removeShort")}
+                </Button>
+              </Row>
+            </div>
+          );
+        })}
+        {relays.length > 0 && (adding || relays.length < MAX_RELAYS) && <Divider inset={false} />}
+        {adding ? (
+          <form
+            className="space-y-2 p-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              submit().catch((err) => setError(String(err)));
+            }}
+          >
+            <div className="flex gap-2">
+              <Input
+                autoFocus
+                value={draft}
+                aria-invalid={!!error}
+                aria-label={t("relayPaste")}
+                placeholder={t("relayPaste")}
+                spellCheck={false}
+                autoComplete="off"
+                onChange={(e) => {
+                  setDraft(e.target.value);
+                  setError("");
+                }}
+                onKeyDown={(e) => e.key === "Escape" && cancel()}
+                className="h-8 border-0 bg-muted text-[13px]"
+              />
+              <Button
+                type="submit"
+                size="sm"
+                variant="secondary"
+                className="h-8 shrink-0 px-3 text-[12px]"
+                disabled={!draft.trim()}
+              >
+                {t("relayAddShort")}
+              </Button>
+            </div>
+            {error && (
+              <p role="status" className="px-0.5 text-[12px] text-red-400">
+                {error}
+              </p>
+            )}
+          </form>
+        ) : relays.length < MAX_RELAYS ? (
+          <button
+            type="button"
+            onClick={() => setAdding(true)}
+            className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
+          >
+            <Row label={t("relayAdd")} sub={relays.length === 0 ? t("relaySettingsSub") : undefined}>
+              <Plus className="size-3.5 text-muted-foreground" aria-hidden="true" />
+            </Row>
+          </button>
+        ) : null}
+      </Group>
+    </section>
   );
 }
 
@@ -562,6 +744,8 @@ export function Settings({
             </Group>
           </section>
         )}
+
+        <RelaySection instance={instance} ghost={ghost} />
 
         <section className="space-y-2">
           <SectionLabel>{t("privacy")}</SectionLabel>

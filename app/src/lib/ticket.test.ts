@@ -49,7 +49,7 @@ describe("decodeTicket", () => {
 
   it("reads an open session with the optional parts absent", () => {
     const info = decodeTicket(makeTicket({ n: null, s: null, q: null }));
-    expect(info).toEqual({ sid: "abc123-9f", name: "", auth: false, peer: PEER });
+    expect(info).toEqual({ sid: "abc123-9f", name: "", auth: false, peer: PEER, relays: 0 });
     // QUIC-only hosts are fine too.
     expect(decodeTicket(makeTicket({ t: null }))).not.toBeNull();
   });
@@ -64,7 +64,7 @@ describe("decodeTicket", () => {
 
   it("keeps a garbled name cosmetic and ignores unknown parameters", () => {
     expect(decodeTicket(makeTicket({ n: "%ff%fe" }))!.name).toBe("");
-    expect(decodeTicket(`${makeTicket()}&x=1`)).not.toBeNull();
+    expect(decodeTicket(`${makeTicket()}&z=1`)).not.toBeNull();
     // IPv6 hosts (a Tailscale ULA, say) pass the loose address check.
     expect(decodeTicket(makeTicket({ a: "fd7a:115c:a1e0::1" }))).not.toBeNull();
   });
@@ -87,6 +87,34 @@ describe("decodeTicket", () => {
     expect(decodeTicket(makeTicket({ t: "70000" }))).toBeNull();
     expect(decodeTicket(makeTicket({ t: "0" }))).toBeNull();
     expect(decodeTicket(makeTicket({ q: "abc" }))).toBeNull();
+  });
+});
+
+describe("relays and the link secret", () => {
+  const RELAY = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+  const SECRET = "0123456789abcdef0123456789abcdef";
+
+  it("counts the relays a link names and accepts a well-formed secret", () => {
+    const t = `${makeTicket({ s: null })}&x=${SECRET}&r=${RELAY}~203.0.113.5~4001~4001~relay.example.org`;
+    expect(decodeTicket(t)).toMatchObject({ auth: false, relays: 1 });
+    // The same relay twice counts once; a garbled entry is skipped.
+    expect(decodeTicket(`${t}&r=${RELAY}~203.0.113.6~4001~~&r=garbage`)!.relays).toBe(1);
+  });
+
+  it("reads a link that names only relays", () => {
+    const t = `${makeTicket({ a: null, t: null, q: null })}&r=${RELAY}~~~4001~relay.example.org`;
+    expect(decodeTicket(t)).toMatchObject({ relays: 1 });
+    expect(ticketAddrs(t)).toEqual({ ips: [], tcp: 0, quic: 0 });
+  });
+
+  it("refuses what the extension refuses", () => {
+    expect(decodeTicket(`${makeTicket()}&x=zz`)).toBeNull();
+    expect(decodeTicket(`${makeTicket()}&x=${SECRET.toUpperCase()}`)).toBeNull();
+    // No direct address and no usable relay: nothing to dial.
+    const bare = makeTicket({ a: null, t: null, q: null });
+    expect(decodeTicket(`${bare}&r=${RELAY}~~~~`)).toBeNull();
+    expect(decodeTicket(`${bare}&r=${RELAY}~127.0.0.1~4001~~`)).toBeNull();
+    expect(decodeTicket(`${bare}&r=${RELAY}~~4001~~bad_name`)).toBeNull();
   });
 });
 

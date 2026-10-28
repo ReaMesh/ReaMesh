@@ -7,6 +7,11 @@
 // Format (the extension's `parse_ticket` is the authority):
 //
 //   reamesh://join/<sid>?n=<name>&s=1&p=<peer>&a=<ip>,<ip>&t=<tcp>&q=<quic>
+//     &x=<link secret>&r=<relay>~<ip>,<ip>~<tcp>~<quic>[~<dns>]
+//
+// `x` is an open session's link secret when its host has a relay (32 hex);
+// each `r` is one relay the host reserves on (no key, see lib/relay.ts). A
+// link may name only relays and no direct address.
 //
 // These checks deliberately mirror the extension's parser. Anything the app
 // accepts but the extension rejects becomes a dead end for the user: a name
@@ -24,6 +29,8 @@ export interface TicketInfo {
   /** The host's peer id: the identity the join is pinned to, and the key for
    *  the "you've joined this host before" memory. */
   peer: string;
+  /** How many relays the link names (0 = direct addresses only). */
+  relays: number;
 }
 
 /** Strip every whitespace character, not just the ends.
@@ -46,7 +53,7 @@ const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]
 // generated always satisfies both, and a hand-mangled one fails either way.
 const IPV6 = /^[0-9a-fA-F:]*:[0-9a-fA-F:.]*$/;
 
-function isIp(s: string): boolean {
+export function isIp(s: string): boolean {
   return IPV4.test(s) || (s.length <= 45 && IPV6.test(s));
 }
 
@@ -105,7 +112,7 @@ export function isDialableIp(s: string): boolean {
 }
 
 /** A port parameter: `null` when the value is not a usable port. */
-function parsePort(v: string): number | null {
+export function parsePort(v: string): number | null {
   if (!/^\d{1,5}$/.test(v)) return null;
   const n = Number(v);
   return n >= 1 && n <= 65535 ? n : null;
@@ -144,6 +151,7 @@ function parseTicket(raw: string): { info: TicketInfo; addrs: TicketAddrs } | nu
   let ips: string[] = [];
   let tcp: number | null = null;
   let quic: number | null = null;
+  const relays = new Set<string>();
   for (const pair of query.split("&")) {
     if (!pair) continue;
     const eq = pair.indexOf("=");
@@ -175,13 +183,55 @@ function parseTicket(raw: string): { info: TicketInfo; addrs: TicketAddrs } | nu
         quic = parsePort(v);
         if (quic === null) return null;
         break;
+      case "x":
+        if (!/^[0-9a-f]{32}$/.test(v)) return null;
+        break;
+      case "r": {
+        // A relay entry that doesn't parse is skipped, like the extension does.
+        const peerOf = parseTicketRelay(v);
+        if (peerOf && relays.size < MAX_RELAYS) relays.add(peerOf);
+        break;
+      }
       default:
         break; // a future version's extras are ignored, not refused
     }
   }
   // The extension pins the join to `p` (it must parse as a PeerId) and needs
   // at least one address plus one port to dial.
-  if (!/^[1-9A-HJ-NP-Za-km-z]{40,}$/.test(peer)) return null;
-  if (ips.length === 0 || (tcp === null && quic === null)) return null;
-  return { info: { sid, name, auth, peer }, addrs: { ips, tcp: tcp ?? 0, quic: quic ?? 0 } };
+  if (!PEER_ID.test(peer)) return null;
+  const direct = ips.length > 0 && (tcp !== null || quic !== null);
+  if (!direct && relays.size === 0) return null;
+  return {
+    info: { sid, name, auth, peer, relays: relays.size },
+    addrs: { ips: direct ? ips : [], tcp: direct ? (tcp ?? 0) : 0, quic: direct ? (quic ?? 0) : 0 },
+  };
+}
+
+const PEER_ID = /^[1-9A-HJ-NP-Za-km-z]{40,}$/;
+const MAX_RELAYS = 3;
+
+/** A hostname a relay may be named by (the extension's `valid_dns_name`). */
+export function isDnsName(d: string): boolean {
+  if (d.length === 0 || d.length > 253 || isIp(d)) return false;
+  return d
+    .split(".")
+    .every((l) => l.length >= 1 && l.length <= 63 && /^[A-Za-z0-9-]+$/.test(l) && !l.startsWith("-") && !l.endsWith("-"));
+}
+
+/** One `r=` entry (`<peer>~<ips>~<tcp>~<quic>[~<dns>]`): its relay peer id,
+ *  or null when the extension's `RelayAddr::from_ticket_param` would refuse it. */
+function parseTicketRelay(v: string): string | null {
+  const parts = v.split("~");
+  if (parts.length < 4 || parts.length > 5) return null;
+  const [peer, ipList, t, q, dns] = parts;
+  if (!PEER_ID.test(peer)) return null;
+  const ips = ipList.split(",").filter(isIp).filter(isDialableIp);
+  const port = (s: string) => (s === "" ? 0 : parsePort(s));
+  const tp = port(t);
+  const qp = port(q);
+  if (tp === null || qp === null) return null;
+  if (dns !== undefined && !isDnsName(dns)) return null;
+  if (ips.length === 0 && !dns) return null;
+  if (tp === 0 && qp === 0) return null;
+  return peer;
 }

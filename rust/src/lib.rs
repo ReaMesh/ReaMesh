@@ -32,6 +32,32 @@
 
 mod ctl;
 mod limits;
+mod relay;
+mod relay_proto;
+
+pub use relay::set_relays;
+
+/// The hosting run's relays as `[{peer,label,host,state,reason}]` (`state`:
+/// connecting | reserved | retrying | refused), `[]` when not hosting.
+pub fn relay_status_json() -> String {
+    relay::status().to_string()
+}
+
+/// Run the Settings relay test for `code` to completion: `(outcome, label)`
+/// (see `relay::run_test` for the outcomes). Blocks; for tests.
+#[doc(hidden)]
+pub fn relay_test_blocking(code: &str) -> (String, String) {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    rt.block_on(async {
+        match relay::parse_relay_code(code) {
+            None => ("invalid".to_string(), String::new()),
+            Some(c) => match tokio::time::timeout(Duration::from_secs(10), relay::test_relay(&c)).await {
+                Ok((o, l)) => (o.to_string(), l),
+                Err(_) => ("timeout".to_string(), String::new()),
+            },
+        }
+    })
+}
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_char};
@@ -73,7 +99,7 @@ const LOBBY_TOPIC: &str = "reamesh/v2/lobby";
 /// instead of tested. Mirrored in the app (`app/src/lib/version.ts`,
 /// `app/src-tauri/src/lib.rs`); app/src/lib/version.test.ts checks the copies
 /// agree.
-pub const PROTO: u32 = 4;
+pub const PROTO: u32 = 5;
 /// This build's version, the same number across the core, the extension and
 /// the ReaMesh app (they release together).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -327,6 +353,12 @@ enum XferRequest {
     /// session peer (not just the owner) from its project copy: this is what
     /// both the windowed initial download and mid-session media fetch ride.
     File { path: String, offset: u64, auth: String },
+    /// The host's lobby announce, asked for by a ticket joiner once it is
+    /// connected to the pinned host. The lobby runs over LAN connections only
+    /// (`relay::LanOnly`), so a guest that came in through a relay, a VPN or a
+    /// hole punch learns the session this way. Needs no proof: it says what
+    /// the LAN lobby says, minus an open session's link secret.
+    Announce,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -366,6 +398,8 @@ enum XferResponse {
         #[serde(default)]
         proof: String,
     },
+    /// Response to `Announce`: the announce JSON, as on the lobby.
+    Announce { announce: String },
     Error {
         message: String,
     },
@@ -406,6 +440,11 @@ struct SessionInfo {
     /// build that predates them). A different `proto` can't be joined.
     proto: u32,
     version: String,
+    /// An open session's link secret, from its LAN announce ("" for none). An
+    /// open session hosted with a relay derives its token from this instead
+    /// of the empty passphrase, so a stranger who reaches the host through the
+    /// relay needs the link, while LAN peers still join without typing.
+    open_secret: String,
 }
 
 #[derive(Clone, Debug)]
@@ -681,6 +720,49 @@ struct Shared {
     /// else in the folder (the user's own renders, a project they saved in
     /// there) stays private.
     servable: Mutex<HashSet<String>>,
+    /// Owner: what the invite link says besides the addresses (see
+    /// `TicketExtra`); default on clients.
+    ticket_extra: Mutex<TicketExtra>,
+    /// How each connected peer is reached right now, for the roster's
+    /// "via relay" / "direct" line.
+    links: Mutex<HashMap<PeerId, LinkState>>,
+    /// Relayed connections established so far (tests read it through
+    /// `Reamesh::relayed_connections`).
+    relayed_conns: AtomicU64,
+}
+
+/// The parts of the owner's invite link that aren't its addresses.
+#[derive(Clone, Debug, Default)]
+struct TicketExtra {
+    /// The session needs a passphrase (`s=1`).
+    auth: bool,
+    /// An open session's link secret (`x=`), "" when there is none.
+    secret: String,
+    /// The relays the host reserves on (`r=`).
+    relays: Vec<relay::RelayAddr>,
+}
+
+/// Open connections to one peer, by kind. A peer reached only through a
+/// relay circuit shows as "via relay"; one that was relayed and now has a
+/// direct connection (DCUtR) as "direct"; a peer that was never relayed says
+/// nothing (the LAN/VPN case, nothing worth pointing out).
+#[derive(Clone, Copy, Debug, Default)]
+struct LinkState {
+    direct: usize,
+    relayed: usize,
+    was_relayed: bool,
+}
+
+impl LinkState {
+    fn label(&self) -> &'static str {
+        if self.direct > 0 && self.was_relayed {
+            "direct"
+        } else if self.direct == 0 && self.relayed > 0 {
+            "relay"
+        } else {
+            ""
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1301,6 +1383,7 @@ fn prove_request(mut req: XferRequest, auth_token: &str, me: &PeerId, to: &PeerI
     let proof = xfer_proof(auth_token, PROOF_REQUEST, me, to);
     match &mut req {
         XferRequest::Manifest { auth } | XferRequest::File { auth, .. } => *auth = proof,
+        XferRequest::Announce => {}
     }
     req
 }
@@ -1555,7 +1638,21 @@ struct TicketInfo {
     /// authenticated signer is this peer is accepted, so a LAN peer announcing
     /// the same session id can't hijack a ticket join.
     peer: PeerId,
+    /// The host's direct addresses (may be empty when it named only relays).
     addrs: Vec<Multiaddr>,
+    /// Relays the host reserves on, dialed once the direct addresses haven't
+    /// answered within `RELAY_FALLBACK_AFTER`.
+    relays: Vec<relay::RelayAddr>,
+    /// An open session's link secret (`x=`), "" when the link has none. Used
+    /// as the passphrase when the user typed none.
+    secret: String,
+}
+
+impl TicketInfo {
+    /// Every circuit address that reaches the host through one of its relays.
+    fn circuit_addrs(&self) -> Vec<Multiaddr> {
+        self.relays.iter().flat_map(|r| r.circuit_addrs()).collect()
+    }
 }
 
 /// An address worth putting in a ticket: loopback and unspecified are
@@ -1624,13 +1721,13 @@ fn encode_ticket(
     ips: &[IpAddr],
     tcp: u16,
     quic: u16,
-    auth: bool,
+    extra: &TicketExtra,
 ) -> String {
-    let mut params: Vec<String> = Vec::with_capacity(6);
+    let mut params: Vec<String> = Vec::with_capacity(8);
     if !name.is_empty() {
         params.push(format!("n={}", percent_encode(name)));
     }
-    if auth {
+    if extra.auth {
         params.push("s=1".into());
     }
     params.push(format!("p={peer}"));
@@ -1642,7 +1739,18 @@ fn encode_ticket(
     if quic != 0 {
         params.push(format!("q={quic}"));
     }
+    if !extra.secret.is_empty() {
+        params.push(format!("x={}", extra.secret));
+    }
+    for r in extra.relays.iter().take(relay::MAX_RELAYS) {
+        params.push(format!("r={}", relay::ticket_param(r)));
+    }
     format!("{TICKET_PREFIX}{sid}?{}", params.join("&"))
+}
+
+/// A link secret as the host mints it: 32 lowercase hex characters.
+fn valid_link_secret(v: &str) -> bool {
+    v.len() == 32 && v.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn parse_ticket(ticket: &str) -> Option<TicketInfo> {
@@ -1665,6 +1773,8 @@ fn parse_ticket(ticket: &str) -> Option<TicketInfo> {
     let mut peer: Option<PeerId> = None;
     let mut ips: Vec<IpAddr> = Vec::new();
     let (mut tcp, mut quic) = (0u16, 0u16);
+    let mut relays: Vec<relay::RelayAddr> = Vec::new();
+    let mut secret = String::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         match k {
@@ -1681,14 +1791,33 @@ fn parse_ticket(ticket: &str) -> Option<TicketInfo> {
             }
             "t" => tcp = v.parse().ok().filter(|p| *p != 0)?,
             "q" => quic = v.parse().ok().filter(|p| *p != 0)?,
+            "x" => {
+                if !valid_link_secret(v) {
+                    return None;
+                }
+                secret = v.to_string();
+            }
+            // A relay entry that doesn't parse is skipped: the others (and
+            // the direct addresses) may still reach the host.
+            "r" if relays.len() < relay::MAX_RELAYS => {
+                if let Some(r) = relay::from_ticket_param(v)
+                    && !relays.iter().any(|o| o.peer == r.peer)
+                {
+                    relays.push(r);
+                }
+            }
             // `s` (the auth flag) is the ReaMesh app's business; anything a
             // later version adds is ignored rather than refused.
             _ => {}
         }
     }
     let peer = peer?;
-    if ips.is_empty() || (tcp == 0 && quic == 0) {
+    let direct = !ips.is_empty() && (tcp != 0 || quic != 0);
+    if !direct && relays.is_empty() {
         return None;
+    }
+    if !direct {
+        ips.clear();
     }
     let mut addrs = Vec::with_capacity(ips.len() * 2);
     for ip in ips {
@@ -1700,7 +1829,7 @@ fn parse_ticket(ticket: &str) -> Option<TicketInfo> {
             addrs.push(base.clone().with(Protocol::Udp(quic)).with(Protocol::QuicV1));
         }
     }
-    Some(TicketInfo { session_id: sid.to_string(), session_name: name, peer, addrs })
+    Some(TicketInfo { session_id: sid.to_string(), session_name: name, peer, addrs, relays, secret })
 }
 
 /// The first IP protocol component of a multiaddr, if any.
@@ -1752,6 +1881,9 @@ enum Command {
     /// `ban` also keep it out for BAN_DURATION (the table itself is updated
     /// synchronously by `Reamesh::moderate`; the task publishes the change).
     Moderate { peer: String, ban: bool },
+    /// Test hook: stop listening to the LAN lobby (a peer that isn't on the
+    /// host's network, even when the in-process test runs it on loopback).
+    LeaveLobby,
     Shutdown,
 }
 
@@ -1765,6 +1897,12 @@ struct Hosting {
     /// is required at all. The secret token itself lives in `Shared::auth_token`.
     salt: String,
     auth: bool,
+    /// An open session's link secret when the host has a relay configured
+    /// (see `SessionInfo::open_secret`), "" otherwise.
+    open_secret: String,
+    /// The relays this hosting run reserves on: the configured list as it
+    /// was when hosting started.
+    relays: Vec<relay::RelayCode>,
     /// Host-computed session meta JSON (track count + plugin list, parsed from
     /// the served .rpp by the extension) carried on the manifest so a joiner's
     /// trust dialog can say what a join loads *before* any download. "" until
@@ -1826,7 +1964,18 @@ impl Reamesh {
         let files_for_hash = files.clone();
         let session_id = new_session_id();
         let salt = random_hex(16); // fresh CSPRNG public salt, distinct from the id
-        let token = auth_token(&salt, passphrase);
+        // A session a relay can reach must have a secret: an open one gets a
+        // random link secret, used exactly like a passphrase from here on.
+        let relays = relay::configured_relays();
+        let open_secret =
+            if passphrase.is_empty() && !relays.is_empty() { random_hex(16) } else { String::new() };
+        let token =
+            auth_token(&salt, if open_secret.is_empty() { passphrase } else { &open_secret });
+        let ticket_extra = TicketExtra {
+            auth: !passphrase.is_empty(),
+            secret: open_secret.clone(),
+            relays: relays.iter().map(|r| r.addr.clone()).collect(),
+        };
         let hosting = Hosting {
             session_id: session_id.clone(),
             session_name: session_name.to_string(),
@@ -1836,6 +1985,8 @@ impl Reamesh {
             files,
             salt,
             auth: !passphrase.is_empty(),
+            open_secret,
+            relays,
             meta: String::new(),
         };
         let status = StatusState {
@@ -1864,6 +2015,7 @@ impl Reamesh {
         )?;
         *r.shared.serve_dir.lock().unwrap() = Some(dir.clone());
         *r.shared.auth_token.lock().unwrap() = token;
+        *r.shared.ticket_extra.lock().unwrap() = ticket_extra;
         *r.shared.owner_peer.lock().unwrap() = r.local_peer_id.clone();
         {
             let files = files_for_hash;
@@ -1965,6 +2117,9 @@ impl Reamesh {
             peer_locks_at: Mutex::new(None),
             banned: Mutex::new(HashSet::new()),
             servable: Mutex::new(HashSet::new()),
+            ticket_extra: Mutex::new(TicketExtra::default()),
+            links: Mutex::new(HashMap::new()),
+            relayed_conns: AtomicU64::new(0),
             force_revert: Mutex::new(Vec::new()),
             probe_result: Mutex::new(None),
             proposal_seq: AtomicU64::new(0),
@@ -2400,8 +2555,8 @@ impl Reamesh {
         if ips.is_empty() || (tcp == 0 && quic == 0) {
             return String::new();
         }
-        let auth = !self.shared.auth_token.lock().unwrap().is_empty();
-        encode_ticket(&sid, &name, &self.local_peer_id, &ips, tcp, quic, auth)
+        let extra = self.shared.ticket_extra.lock().unwrap().clone();
+        encode_ticket(&sid, &name, &self.local_peer_id, &ips, tcp, quic, &extra)
     }
 
     /// Join a session through a pasted ticket (client only): dial the ticket's
@@ -2415,10 +2570,11 @@ impl Reamesh {
         let Some(info) = parse_ticket(ticket) else {
             return false;
         };
+        let passphrase = if passphrase.is_empty() { info.secret.clone() } else { passphrase.to_string() };
         self.cmd_tx
             .send(Command::JoinTicket {
                 info,
-                passphrase: passphrase.to_string(),
+                passphrase,
                 probe_only: false,
             })
             .is_ok()
@@ -2437,10 +2593,11 @@ impl Reamesh {
         };
         *self.shared.probe_result.lock().unwrap() =
             Some((info.session_id.clone(), None, JsonValue::Null, ""));
+        let passphrase = if passphrase.is_empty() { info.secret.clone() } else { passphrase.to_string() };
         self.cmd_tx
             .send(Command::JoinTicket {
                 info,
-                passphrase: passphrase.to_string(),
+                passphrase,
                 probe_only: true,
             })
             .is_ok()
@@ -2751,12 +2908,22 @@ impl Reamesh {
         others.sort();
         others.dedup();
         let banned = self.shared.banned.lock().unwrap();
+        // How each directly connected person is reached ("relay" / "direct"
+        // after a hole punch / "" for the plain LAN or VPN case).
+        let links: HashMap<String, &'static str> = self
+            .shared
+            .links
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, l)| (p.to_string(), l.label()))
+            .collect();
         for id in others {
             if banned.contains(&id) {
                 continue;
             }
             if let Some(info) = infos.get(&id) {
-                arr.push(entry(
+                let mut e = entry(
                     &id,
                     &info.name,
                     &info.color,
@@ -2771,7 +2938,9 @@ impl Reamesh {
                     rtts.get(&id).map(|(ms, _)| ms.ceil() as u64).unwrap_or(0),
                     now.duration_since(info.last_seen).as_millis() as u64,
                     false,
-                ));
+                );
+                e["link"] = json!(links.get(&id).copied().unwrap_or(""));
+                arr.push(e);
             }
         }
         json!(arr).to_string()
@@ -2780,6 +2949,19 @@ impl Reamesh {
     /// Peer ids this peer currently treats as banned (a client: the owner's
     /// last 'B' table; the owner: its tick mirror of the global table), sorted.
     /// A test hook for the ban broadcast; the app reads `bans_json` instead.
+    /// Test hook: stop listening to the LAN lobby, so this peer only learns
+    /// sessions the way an internet guest does (through a ticket).
+    #[doc(hidden)]
+    pub fn leave_lobby(&self) {
+        let _ = self.cmd_tx.send(Command::LeaveLobby);
+    }
+
+    /// Relayed connections this peer has established (a test hook: proves a
+    /// join really went through the relay).
+    pub fn relayed_connections(&self) -> u64 {
+        self.shared.relayed_conns.load(Ordering::Relaxed)
+    }
+
     pub fn banned_peers(&self) -> Vec<String> {
         let mut v: Vec<String> = self.shared.banned.lock().unwrap().iter().cloned().collect();
         v.sort();
@@ -3663,13 +3845,45 @@ fn path_key(p: &str) -> String {
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    /// First, so a connection past the caps is refused before any other
+    /// behaviour sets up a handler for it.
+    limits: libp2p::connection_limits::Behaviour,
+    ip_limits: relay::IpLimits,
+    /// Session-topic gossip: every connection, relayed ones included.
     gossipsub: gossipsub::Behaviour,
+    /// Lobby gossip (session announces), on LAN connections only: a relayed
+    /// or internet connection never carries announces either way.
+    lobby: relay::LanOnly<gossipsub::Behaviour>,
     mdns: Toggle<mdns::tokio::Behaviour>,
     xfer: request_response::cbor::Behaviour<XferRequest, XferResponse>,
     /// Round-trip probe to every connected peer: the only latency signal the
     /// app has (gossip carries no timestamps), see `Shared::peer_rtt`.
     ping: ping::Behaviour,
+    /// Circuit relay v2 client: a host reserves a slot on its relays, a guest
+    /// dials the host through one when no direct route answers.
+    relay_client: libp2p::relay::client::Behaviour,
+    /// Hole punching over a relayed connection (DCUtR), so a direct
+    /// connection takes over where the NATs allow.
+    dcutr: libp2p::dcutr::Behaviour,
+    /// Observed addresses (what DCUtR punches towards) and the peer's listen
+    /// addresses.
+    identify: libp2p::identify::Behaviour,
+    /// The host's `/reamesh/relay-auth/1` proof before it reserves.
+    relay_auth: relay::AuthBehaviour,
 }
+
+/// Gossipsub protocol prefix for session topics. The lobby keeps the default
+/// (`/meshsub`) so builds of other versions still see each other's announces
+/// (and grey them out); sessions get their own so the lobby instance and the
+/// session instance never answer each other's streams.
+const SESSION_GOSSIP_PROTOCOL: &str = "/reamesh/session";
+/// identify's protocol version string.
+const IDENTIFY_PROTOCOL: &str = "/reamesh/id/1";
+/// Connection caps: in total, per peer id, and half-open inbound. Per IP is
+/// `relay::MAX_INBOUND_PER_IP`.
+const MAX_CONNECTIONS: u32 = 256;
+const MAX_CONNECTIONS_PER_PEER: u32 = 8;
+const MAX_PENDING_INBOUND: u32 = 64;
 
 fn session_topic(session_id: &str) -> gossipsub::IdentTopic {
     gossipsub::IdentTopic::new(format!("reamesh/v2/session/{session_id}"))
@@ -3692,11 +3906,17 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
         // whichever transport a peer's advertised address uses, falling back
         // to TCP. Same identity keypair as the TCP transport.
         .with_quic()
-        .with_behaviour(|key| {
+        // A relay code may name its relay by DNS name.
+        .with_dns()
+        .map_err(|e| anyhow::anyhow!("dns: {e}"))?
+        .with_relay_client(noise::Config::new, yamux::Config::default)
+        .map_err(|e| anyhow::anyhow!("relay client: {e}"))?
+        .with_behaviour(|key, relay_client| {
             // Item/FX-chain state chunks ride gossipsub; plugin state blobs
             // (samplers etc.) can be tens of MB.
             let gs_config = gossipsub::ConfigBuilder::default()
                 .max_transmit_size(MAX_GOSSIP_MESSAGE)
+                .protocol_id_prefix(SESSION_GOSSIP_PROTOCOL)
                 .build()
                 .map_err(std::io::Error::other)?;
             let gossipsub = gossipsub::Behaviour::new(
@@ -3704,6 +3924,18 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
                 gs_config,
             )
             .map_err(std::io::Error::other)?;
+            // Announces are a few hundred bytes.
+            let lobby_config = gossipsub::ConfigBuilder::default()
+                .max_transmit_size(64 * 1024)
+                .build()
+                .map_err(std::io::Error::other)?;
+            let lobby = relay::LanOnly::new(
+                gossipsub::Behaviour::new(
+                    gossipsub::MessageAuthenticity::Signed(key.clone()),
+                    lobby_config,
+                )
+                .map_err(std::io::Error::other)?,
+            );
             // mDNS needs a multicast socket; in sandboxed environments that
             // can fail, in which case we still run (peers must dial directly).
             let mdns = if loopback_only() {
@@ -3730,7 +3962,29 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
                     .with_interval(PING_INTERVAL)
                     .with_timeout(PING_TIMEOUT),
             );
-            Ok(Behaviour { gossipsub, mdns, xfer, ping })
+            let limits = libp2p::connection_limits::Behaviour::new(
+                libp2p::connection_limits::ConnectionLimits::default()
+                    .with_max_established(Some(MAX_CONNECTIONS))
+                    .with_max_established_per_peer(Some(MAX_CONNECTIONS_PER_PEER))
+                    .with_max_pending_incoming(Some(MAX_PENDING_INBOUND)),
+            );
+            let identify = libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
+                IDENTIFY_PROTOCOL.into(),
+                key.public(),
+            ));
+            Ok(Behaviour {
+                limits,
+                ip_limits: relay::IpLimits::default(),
+                gossipsub,
+                lobby,
+                mdns,
+                xfer,
+                ping,
+                relay_client,
+                dcutr: libp2p::dcutr::Behaviour::new(key.public().to_peer_id()),
+                identify,
+                relay_auth: relay::auth_behaviour(),
+            })
         })
         .map_err(|e| anyhow::anyhow!("behaviour: {e}"))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(3600)))
@@ -3738,7 +3992,8 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
 
     swarm
         .behaviour_mut()
-        .gossipsub
+        .lobby
+        .inner_mut()
         .subscribe(&gossipsub::IdentTopic::new(LOBBY_TOPIC))?;
     let host = if loopback_only() { "127.0.0.1" } else { "0.0.0.0" };
     swarm.listen_on(format!("/ip4/{host}/tcp/0").parse()?)?;
@@ -4300,6 +4555,10 @@ fn serve_xfer(
     }
     let presented = match req {
         XferRequest::Manifest { auth } | XferRequest::File { auth, .. } => auth.as_str(),
+        // Answered by the network task itself, which holds the announce.
+        XferRequest::Announce => {
+            return XferResponse::Error { message: "no session announced here".into() };
+        }
     };
     let expected = xfer_proof(auth_token, PROOF_REQUEST, requester, me);
     if !ct_eq(presented.as_bytes(), expected.as_bytes()) {
@@ -4383,6 +4642,7 @@ fn serve_xfer(
                 message: "not hosting".into(),
             },
         },
+        XferRequest::Announce => unreachable!("answered above"),
     }
 }
 
@@ -4591,11 +4851,26 @@ fn sync_blacklist(
     let want: HashSet<PeerId> = want.iter().filter_map(|s| s.parse().ok()).collect();
     for p in current.difference(&want) {
         swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(p);
+        swarm.behaviour_mut().lobby.inner_mut().remove_blacklisted_peer(p);
     }
     for p in want.difference(current) {
         swarm.behaviour_mut().gossipsub.blacklist_peer(p);
+        swarm.behaviour_mut().lobby.inner_mut().blacklist_peer(p);
     }
     *current = want;
+}
+
+/// A LAN peer (mDNS, a nearby hint) is an explicit peer of both gossip
+/// instances: its announces flow at once and its session messages are always
+/// forwarded to it.
+fn add_explicit_both(swarm: &mut Swarm<Behaviour>, peer: &PeerId) {
+    swarm.behaviour_mut().gossipsub.add_explicit_peer(peer);
+    swarm.behaviour_mut().lobby.inner_mut().add_explicit_peer(peer);
+}
+
+fn remove_explicit_both(swarm: &mut Swarm<Behaviour>, peer: &PeerId) {
+    swarm.behaviour_mut().gossipsub.remove_explicit_peer(peer);
+    swarm.behaviour_mut().lobby.inner_mut().remove_explicit_peer(peer);
 }
 
 /// An in-flight ticket join/check: dialing + waiting for the pinned owner's
@@ -4611,6 +4886,320 @@ struct PendingJoin {
     /// does, the host is alive and gets the full TICKET_JOIN_TIMEOUT to
     /// announce.
     connected: bool,
+    /// When the relay circuits were last dialed (None = not yet).
+    relays_dialed: Option<Instant>,
+}
+
+impl PendingJoin {
+    /// How long the host may take to accept a connection at all: a relayed
+    /// path (dial the relay, then the circuit, then noise through it) gets
+    /// more time than a direct dial.
+    fn connect_timeout(&self) -> Duration {
+        if self.info.relays.is_empty() { TICKET_CONNECT_TIMEOUT } else { TICKET_RELAY_CONNECT_TIMEOUT }
+    }
+
+    fn join_timeout(&self) -> Duration {
+        self.connect_timeout() + (TICKET_JOIN_TIMEOUT - TICKET_CONNECT_TIMEOUT)
+    }
+}
+
+/// A ticket join dials the host's direct addresses first and adds the relay
+/// circuits once those haven't connected within this long (at once when the
+/// link names none): a LAN or VPN route is faster and costs the relay nothing.
+const RELAY_FALLBACK_AFTER: Duration = Duration::from_secs(3);
+/// How often the circuits are re-dialed while the join waits.
+const RELAY_REDIAL: Duration = Duration::from_secs(8);
+/// `TICKET_CONNECT_TIMEOUT` for a link that names relays.
+const TICKET_RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Dial the host through every relay its link names. A separate dial from the
+/// direct one (which may still be waiting out an unreachable address), so it
+/// must not wait for that dial to end.
+fn dial_ticket_relays(swarm: &mut Swarm<Behaviour>, info: &TicketInfo) {
+    let addrs = info.circuit_addrs();
+    if addrs.is_empty() {
+        return;
+    }
+    swarm.behaviour_mut().gossipsub.add_explicit_peer(&info.peer);
+    for a in &addrs {
+        swarm.add_peer_address(info.peer, a.clone());
+    }
+    eprintln!("[reamesh] ticket: dialing {} through {} relay address(es)", info.peer, addrs.len());
+    if let Err(e) = swarm.dial(
+        DialOpts::peer_id(info.peer)
+            .addresses(addrs)
+            .condition(libp2p::swarm::dial_opts::PeerCondition::Disconnected)
+            .build(),
+    ) {
+        eprintln!("[reamesh] ticket relay dial: {e}");
+    }
+}
+
+/// Whether a connection runs through a relay circuit.
+fn endpoint_relayed(endpoint: &libp2p::core::ConnectedPoint) -> bool {
+    match endpoint {
+        libp2p::core::ConnectedPoint::Dialer { address, .. } => relay::is_relayed(None, address),
+        libp2p::core::ConnectedPoint::Listener { local_addr, send_back_addr } => {
+            relay::is_relayed(Some(local_addr), send_back_addr)
+        }
+    }
+}
+
+// ---------- host side: relay reservations ----------
+
+/// Where a hosting run stands with one of its relays.
+#[derive(Debug)]
+enum RelayPhase {
+    /// Waiting for `retry_at` (or never tried yet).
+    Idle,
+    Dialing { since: Instant },
+    /// Connected; the auth proof is out.
+    Authing { req: request_response::OutboundRequestId, since: Instant },
+    /// Key accepted; the reservation is out on this listener.
+    Reserving { listener: libp2p::core::transport::ListenerId, since: Instant },
+    /// The relay holds a circuit slot for us: guests can come in through it.
+    Reserved { listener: libp2p::core::transport::ListenerId },
+    /// Refused for a reason a retry can't fix (a wrong or banned key, not a
+    /// ReaMesh relay): left alone until the next hosting run.
+    Refused,
+}
+
+/// One configured relay during a hosting run. Lost reservations (the relay
+/// restarted, our network changed, the connection died) come back on their
+/// own: `RELAY_BACKOFF_MIN`, doubling to `RELAY_BACKOFF_MAX`, reset once a
+/// reservation is accepted. The peer id is pinned in the invite link, so a
+/// re-reservation keeps every link valid.
+struct RelaySlot {
+    code: relay::RelayCode,
+    phase: RelayPhase,
+    retry_at: Instant,
+    backoff: Duration,
+    /// The relay's name for our key, from its auth answer.
+    key_label: String,
+    /// Why the last attempt failed ("" = it didn't).
+    reason: &'static str,
+    /// Consecutive ping timeouts to the relay (a dead path the OS hasn't
+    /// noticed yet, e.g. after a network change).
+    ping_misses: u32,
+}
+
+const RELAY_BACKOFF_MIN: Duration = Duration::from_secs(2);
+const RELAY_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// A relay at capacity is asked again more slowly.
+const RELAY_FULL_BACKOFF: Duration = Duration::from_secs(30);
+/// Each step (dial, auth, reservation) may take this long.
+const RELAY_STEP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Ping timeouts in a row after which the relay connection is dropped (and
+/// re-established).
+const RELAY_PING_MISSES: u32 = 3;
+
+impl RelaySlot {
+    fn new(code: relay::RelayCode) -> Self {
+        Self {
+            code,
+            phase: RelayPhase::Idle,
+            retry_at: Instant::now(),
+            backoff: RELAY_BACKOFF_MIN,
+            key_label: String::new(),
+            reason: "",
+            ping_misses: 0,
+        }
+    }
+
+    fn peer(&self) -> PeerId {
+        self.code.addr.peer
+    }
+
+    /// Back to Idle after a failure, with the backoff for `reason`.
+    fn fail(&mut self, reason: &'static str) {
+        eprintln!("[reamesh] relay {}: {reason}", self.code.addr.host());
+        self.reason = reason;
+        self.ping_misses = 0;
+        if matches!(reason, "bad_key" | "banned" | "not_relay") {
+            self.phase = RelayPhase::Refused;
+            return;
+        }
+        let wait = if reason == "full" { self.backoff.max(RELAY_FULL_BACKOFF) } else { self.backoff };
+        self.retry_at = Instant::now() + wait;
+        self.backoff = (self.backoff * 2).min(RELAY_BACKOFF_MAX);
+        self.phase = RelayPhase::Idle;
+    }
+
+    fn status(&self) -> JsonValue {
+        let state = match self.phase {
+            RelayPhase::Reserved { .. } => "reserved",
+            RelayPhase::Refused => "refused",
+            RelayPhase::Idle if !self.reason.is_empty() => "retrying",
+            _ => "connecting",
+        };
+        json!({
+            "peer": self.peer().to_string(),
+            "label": if self.key_label.is_empty() { self.code.label.clone() } else { self.key_label.clone() },
+            "host": self.code.addr.host(),
+            "state": state,
+            "reason": self.reason,
+        })
+    }
+}
+
+fn publish_relay_status(slots: &[RelaySlot]) {
+    relay::set_status(JsonValue::Array(slots.iter().map(RelaySlot::status).collect()));
+}
+
+fn relay_send_auth(swarm: &mut Swarm<Behaviour>, slot: &mut RelaySlot) {
+    let me = *swarm.local_peer_id();
+    let proof = relay::auth_proof(&slot.code.key, &slot.peer(), &me).to_vec();
+    let req = swarm.behaviour_mut().relay_auth.send_request(&slot.peer(), relay::AuthRequest { proof });
+    slot.phase = RelayPhase::Authing { req, since: Instant::now() };
+}
+
+/// Drive every slot one step: start what is due, time out what hangs.
+fn relay_tick(swarm: &mut Swarm<Behaviour>, slots: &mut [RelaySlot]) {
+    let now = Instant::now();
+    for slot in slots.iter_mut() {
+        match slot.phase {
+            RelayPhase::Idle if now >= slot.retry_at => {
+                if swarm.is_connected(&slot.peer()) {
+                    relay_send_auth(swarm, slot);
+                } else {
+                    let opts = DialOpts::peer_id(slot.peer())
+                        .addresses(slot.code.addr.dial_addrs())
+                        .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                        .build();
+                    match swarm.dial(opts) {
+                        Ok(()) => slot.phase = RelayPhase::Dialing { since: now },
+                        Err(e) => {
+                            eprintln!("[reamesh] relay dial: {e}");
+                            slot.fail("unreachable");
+                        }
+                    }
+                }
+            }
+            RelayPhase::Dialing { since } if now.duration_since(since) > RELAY_STEP_TIMEOUT => {
+                slot.fail("unreachable")
+            }
+            RelayPhase::Authing { since, .. } if now.duration_since(since) > RELAY_STEP_TIMEOUT => {
+                slot.fail("timeout")
+            }
+            RelayPhase::Reserving { listener, since } if now.duration_since(since) > RELAY_STEP_TIMEOUT => {
+                swarm.remove_listener(listener);
+                slot.fail("timeout");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A (direct) connection to a relay peer came up: authenticate if we were
+/// waiting for it.
+fn relay_on_connected(swarm: &mut Swarm<Behaviour>, slots: &mut [RelaySlot], peer: &PeerId) {
+    for slot in slots.iter_mut().filter(|s| s.peer() == *peer) {
+        if matches!(slot.phase, RelayPhase::Dialing { .. }) {
+            relay_send_auth(swarm, slot);
+        }
+    }
+}
+
+/// The relay answered our proof: reserve on success.
+fn relay_on_auth(
+    swarm: &mut Swarm<Behaviour>,
+    slots: &mut [RelaySlot],
+    req: request_response::OutboundRequestId,
+    resp: Result<relay::AuthResponse, &'static str>,
+) {
+    let Some(slot) = slots
+        .iter_mut()
+        .find(|s| matches!(s.phase, RelayPhase::Authing { req: r, .. } if r == req))
+    else {
+        return;
+    };
+    match resp {
+        Ok(r) if r.ok => {
+            slot.key_label = limits::clip(r.key_label.as_deref().unwrap_or(""), 64);
+            // The reservation rides the connection we just authenticated
+            // (the relay client reuses a direct connection to the relay).
+            let base = slot.code.addr.dial_addrs().into_iter().next();
+            let Some(base) = base else { return slot.fail("unreachable") };
+            let addr = base.with(Protocol::P2p(slot.peer())).with(Protocol::P2pCircuit);
+            match swarm.listen_on(addr) {
+                Ok(listener) => slot.phase = RelayPhase::Reserving { listener, since: Instant::now() },
+                Err(e) => {
+                    eprintln!("[reamesh] relay listen: {e}");
+                    slot.fail("refused");
+                }
+            }
+        }
+        Ok(r) => slot.fail(relay::refusal_reason(&r)),
+        Err(reason) => slot.fail(reason),
+    }
+}
+
+/// The relay accepted (or renewed) our reservation.
+fn relay_on_reserved(slots: &mut [RelaySlot], relay_peer: &PeerId) {
+    for slot in slots.iter_mut().filter(|s| s.peer() == *relay_peer) {
+        if let RelayPhase::Reserving { listener, .. } | RelayPhase::Reserved { listener } = slot.phase {
+            if !matches!(slot.phase, RelayPhase::Reserved { .. }) {
+                eprintln!("[reamesh] relay {}: reserved", slot.code.addr.host());
+            }
+            slot.phase = RelayPhase::Reserved { listener };
+            slot.backoff = RELAY_BACKOFF_MIN;
+            slot.reason = "";
+        }
+    }
+}
+
+/// A relay listener ended: the reservation was refused or lost.
+fn relay_on_listener_closed(slots: &mut [RelaySlot], id: libp2p::core::transport::ListenerId) {
+    for slot in slots.iter_mut() {
+        match slot.phase {
+            RelayPhase::Reserving { listener, .. } if listener == id => slot.fail("refused"),
+            RelayPhase::Reserved { listener } if listener == id => slot.fail("lost"),
+            _ => {}
+        }
+    }
+}
+
+/// The last connection to a relay peer closed.
+fn relay_on_disconnected(swarm: &mut Swarm<Behaviour>, slots: &mut [RelaySlot], peer: &PeerId) {
+    for slot in slots.iter_mut().filter(|s| s.peer() == *peer) {
+        match slot.phase {
+            RelayPhase::Reserving { listener, .. } | RelayPhase::Reserved { listener } => {
+                swarm.remove_listener(listener);
+                slot.fail("lost");
+            }
+            RelayPhase::Authing { .. } => slot.fail("lost"),
+            _ => {}
+        }
+    }
+}
+
+/// Our network changed (an interface came or went): every relay path is
+/// suspect, so drop the relay connections and re-reserve right away.
+fn relay_on_network_change(swarm: &mut Swarm<Behaviour>, slots: &mut [RelaySlot]) {
+    for slot in slots.iter_mut() {
+        if matches!(slot.phase, RelayPhase::Refused) {
+            continue;
+        }
+        let _ = swarm.disconnect_peer_id(slot.peer());
+        if let RelayPhase::Reserving { listener, .. } | RelayPhase::Reserved { listener } = slot.phase {
+            swarm.remove_listener(listener);
+        }
+        slot.phase = RelayPhase::Idle;
+        slot.backoff = RELAY_BACKOFF_MIN;
+        slot.retry_at = Instant::now();
+    }
+}
+
+/// The set of our non-loopback interface IPs, to notice a network change.
+fn interface_ips() -> Vec<IpAddr> {
+    let mut v: Vec<IpAddr> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| !i.is_loopback())
+        .map(|i| i.ip())
+        .collect();
+    v.sort();
+    v
 }
 
 /// Most addresses one hint may name, and how soon the same address may be
@@ -4700,6 +5289,9 @@ fn dial_ticket(
     info: &TicketInfo,
     local_ips: &std::collections::HashSet<std::net::IpAddr>,
 ) {
+    if info.addrs.is_empty() {
+        return;
+    }
     swarm.behaviour_mut().gossipsub.add_explicit_peer(&info.peer);
     let mut addresses = Vec::new();
     for addr in &info.addrs {
@@ -4718,6 +5310,16 @@ fn dial_ticket(
     ) {
         // Includes the benign "already connected/dialing" conditions.
         eprintln!("[reamesh] ticket dial: {e}");
+    }
+}
+
+/// What a join derives the token from: the passphrase the user typed, or for
+/// an open session announced on the LAN with a link secret, that secret.
+fn session_passphrase<'a>(info: &'a SessionInfo, typed: &'a str) -> &'a str {
+    if typed.is_empty() && !info.auth && !info.open_secret.is_empty() {
+        &info.open_secret
+    } else {
+        typed
     }
 }
 
@@ -4763,7 +5365,7 @@ fn start_join(
     };
     // Derive (and remember) this session's access token so we
     // both present it and can serve other peers later.
-    let token = auth_token(&info.salt, passphrase);
+    let token = auth_token(&info.salt, session_passphrase(&info, passphrase));
     *shared.auth_token.lock().unwrap() = token.clone();
     *shared.owner_peer.lock().unwrap() = info.owner.clone();
     // Deliberately NOT subscribing to the session topic yet:
@@ -4836,6 +5438,144 @@ fn start_join(
     })
 }
 
+/// The host's announce as of now: `base` plus the parts that can change
+/// mid-session. The profile half is stamped on per publish so a name/color
+/// change reaches the lobby without a re-host; sizes ride along because the
+/// manifest follows the project on disk (see manifest_worker), so a
+/// precomputed pair would drift the moment the host saves or records.
+fn announce_now(base: &JsonValue, hosting: Option<&Hosting>) -> JsonValue {
+    let (name, color) = PROFILE.lock().unwrap().clone();
+    let mut v = base.clone();
+    v["owner_name"] = json!(name);
+    v["owner_color"] = json!(color);
+    if let Some(h) = hosting {
+        v["files"] = json!(h.files.len() as u64);
+        v["bytes"] = json!(h.files.iter().map(|f| f.size).sum::<u64>());
+    }
+    v
+}
+
+/// Take in one session announce (from the LAN lobby, or a ticket host's
+/// direct `Announce` answer): bound to its authenticated `signer`, validated,
+/// and folded into the session table under the first-seen-owner rule.
+fn ingest_announce(
+    shared: &Shared,
+    superseded: &mut HashMap<String, Instant>,
+    data: &[u8],
+    signer: Option<PeerId>,
+) {
+    // Any LAN peer can publish here: an announce is a few
+    // hundred bytes, so anything far larger isn't parsed
+    // at all, and every kept string is bounded.
+    if data.len() <= limits::ANNOUNCE_MAX_BYTES
+        && let Ok(v) = serde_json::from_slice::<JsonValue>(data)
+        && v.get("kind").and_then(|k| k.as_str()) == Some("announce")
+    {
+        let get = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let clipped = |k: &str, max: usize| limits::clip(&get(k), max);
+        // Bind the announcement to its authenticated signer:
+        // the claimed `owner` peer id must match the message
+        // source. Otherwise any LAN peer could announce a
+        // session naming someone else as owner, steering a
+        // joining client's manifest request (and trust) at an
+        // attacker-chosen peer.
+        let owner = get("owner");
+        let signer_is_owner = signer.is_some_and(|src| src.to_string() == owner);
+        let mut info = SessionInfo {
+            session_id: get("session_id"),
+            session_name: clipped("session_name", 128),
+            project_file: clipped("project_file", 256),
+            owner,
+            owner_name: clipped("owner_name", 64),
+            owner_color: clipped("owner_color", 16),
+            auth: v.get("auth").and_then(|x| x.as_bool()).unwrap_or(false),
+            salt: get("salt"),
+            files: v.get("files").and_then(|x| x.as_u64()).unwrap_or(0),
+            bytes: v.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0),
+            last_seen: Instant::now(),
+            contested: false,
+            proto: v
+                .get("proto")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32,
+            version: clipped("ver", 32),
+            open_secret: Some(get("open_secret"))
+                .filter(|x| valid_link_secret(x))
+                .unwrap_or_default(),
+        };
+        superseded.retain(|_, at| at.elapsed() < SESSION_STALE);
+        if signer_is_owner
+            && valid_session_id(&info.session_id)
+            && limits::valid_salt(&info.salt)
+            && !superseded.contains_key(&info.session_id)
+        {
+            let mut sessions = shared.sessions.lock().unwrap();
+            // One peer id hosts one session at a time (each
+            // REAPER instance has its own identity slot), so
+            // a new session id from a known owner means it
+            // stopped and re-hosted: drop its old card now
+            // instead of showing both until SESSION_STALE.
+            // Keyed on the authenticated signer, so a peer
+            // can only retire entries it owns itself.
+            if !sessions.contains_key(&info.session_id) {
+                let old: Vec<String> = sessions
+                    .iter()
+                    .filter(|(id, s)| s.owner == info.owner && **id != info.session_id)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in old {
+                    sessions.remove(&id);
+                    if superseded.len() < limits::MAX_SESSIONS {
+                        superseded.insert(id, Instant::now());
+                    }
+                }
+            }
+            // Bounded: a stream of distinct (signed, but
+            // freely minted) announcers can't grow the
+            // table past MAX_SESSIONS; the stalest goes.
+            limits::evict_for(
+                &mut sessions,
+                &info.session_id,
+                limits::MAX_SESSIONS,
+                |s| s.last_seen,
+            );
+            match sessions.get_mut(&info.session_id) {
+                // Pin the first-seen owner. Binding the
+                // announce to its signer (above) stops a
+                // peer naming *someone else* as owner, but
+                // not from naming *itself* under a session
+                // id it overheard: the ids are public and
+                // last-write-wins would hand the card, and
+                // with it the manifest request and the
+                // user's trust, to whoever announces last.
+                // A re-host always mints a fresh id, so a
+                // second owner on a live id is never
+                // legitimate: keep the incumbent, flag the
+                // clash, and let the lobby say so.
+                Some(existing) if existing.owner != info.owner => {
+                    existing.contested = true;
+                    existing.last_seen = Instant::now();
+                    eprintln!(
+                        "[reamesh] session {} announced by a second peer ({}); keeping the first-seen owner {}",
+                        info.session_id, info.owner, existing.owner
+                    );
+                }
+                Some(existing) => {
+                    // Same owner: refresh, but a clash once
+                    // seen stays sticky for the entry's life
+                    // so the warning can't be raced away.
+                    info.contested = existing.contested;
+                    *existing = info;
+                }
+                None => {
+                    sessions.insert(info.session_id.clone(), info);
+                }
+            }
+        }
+    }
+}
+
 async fn run_network(
     mut swarm: Swarm<Behaviour>,
     cfg: NetConfig,
@@ -4886,6 +5626,19 @@ async fn run_network(
             "ver": VERSION,
         })
     });
+    // The LAN lobby announce also carries an open session's link secret
+    // (LAN peers join it as before, without typing anything); the direct
+    // `Announce` answer never does.
+    let lobby_secret = hosting.as_ref().map(|h| h.open_secret.clone()).unwrap_or_default();
+    // Host: the configured relays this run reserves on.
+    let mut relay_slots: Vec<RelaySlot> = hosting
+        .as_ref()
+        .map(|h| h.relays.iter().cloned().map(RelaySlot::new).collect())
+        .unwrap_or_default();
+    if !relay_slots.is_empty() {
+        publish_relay_status(&relay_slots);
+    }
+    let mut last_ifaces = interface_ips();
 
     let mut download: Option<Download> = None;
     // Mid-session file fetches, keyed by project-relative path, plus the
@@ -4976,13 +5729,14 @@ async fn run_network(
                 }
                 Some(Command::ProbeAuth { session_id, passphrase }) => {
                     let info = shared.sessions.lock().unwrap().get(&session_id).cloned();
-                    match info.and_then(|i| i.owner.parse::<PeerId>().ok().map(|o| (o, i.salt, i.proto))) {
-                        Some((_, _, proto)) if proto != PROTO => {
+                    match info.and_then(|i| i.owner.parse::<PeerId>().ok().map(|o| (o, i))) {
+                        Some((_, i)) if i.proto != PROTO => {
                             *shared.probe_result.lock().unwrap() =
                                 Some((session_id, Some(false), JsonValue::Null, "version"));
                         }
-                        Some((owner, salt, _)) => {
-                            probe = Some(send_probe(&mut swarm, &owner, &salt, session_id, &passphrase));
+                        Some((owner, i)) => {
+                            let pass = session_passphrase(&i, &passphrase);
+                            probe = Some(send_probe(&mut swarm, &owner, &i.salt, session_id, pass));
                         }
                         None => {
                             // Session gone or unparseable owner -> can't verify.
@@ -5011,6 +5765,13 @@ async fn run_network(
                         info.addrs.len()
                     );
                     dial_ticket(&mut swarm, &info, &local_ips);
+                    // No direct address at all: the relays are the only way.
+                    let relays_dialed = if info.addrs.is_empty() {
+                        dial_ticket_relays(&mut swarm, &info);
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     if !probe_only {
                         // Show "connecting" (with the ticket's own name) while
                         // we wait for the host's announce to arrive over the
@@ -5025,13 +5786,20 @@ async fn run_network(
                             s.end_reason = None;
                         });
                     }
+                    // Still connected from a check a moment ago: no new
+                    // connection event will come, so ask for the announce now.
+                    let connected = swarm.is_connected(&info.peer);
+                    if connected {
+                        swarm.behaviour_mut().xfer.send_request(&info.peer, XferRequest::Announce);
+                    }
                     pending_join = Some(PendingJoin {
                         info,
                         passphrase,
                         probe_only,
                         started: Instant::now(),
                         last_dial: Instant::now(),
-                        connected: false,
+                        connected,
+                        relays_dialed,
                     });
                 }
                 Some(Command::FetchFile(rel)) => {
@@ -5152,6 +5920,9 @@ async fn run_network(
                         }
                     }
                 }
+                Some(Command::LeaveLobby) => {
+                    swarm.behaviour_mut().lobby.inner_mut().unsubscribe(&lobby);
+                }
                 Some(Command::Shutdown) | None => {
                     // Farewell, then keep driving the swarm briefly so it
                     // actually leaves the socket before the runtime is torn
@@ -5173,6 +5944,9 @@ async fn run_network(
                                 _ = swarm.select_next_some() => {}
                             }
                         }
+                    }
+                    if !relay_slots.is_empty() {
+                        relay::set_status(json!([]));
                     }
                     break;
                 }
@@ -5241,8 +6015,8 @@ async fn run_network(
                         ) {
                             download = Some(dl);
                         }
-                    } else if (!pj.connected && pj.started.elapsed() > TICKET_CONNECT_TIMEOUT)
-                        || pj.started.elapsed() > TICKET_JOIN_TIMEOUT
+                    } else if (!pj.connected && pj.started.elapsed() > pj.connect_timeout())
+                        || pj.started.elapsed() > pj.join_timeout()
                     {
                         // Two ways to give up: never reached the host at all
                         // (fast-fail: it's dead/on another network), or reached
@@ -5267,9 +6041,25 @@ async fn run_network(
                                 s.message = Some("ticket host unreachable".into());
                             });
                         }
-                    } else if pj.last_dial.elapsed() >= Duration::from_secs(3) {
-                        pj.last_dial = Instant::now();
-                        dial_ticket(&mut swarm, &pj.info, &local_ips);
+                    } else {
+                        if !pj.connected
+                            && !pj.info.relays.is_empty()
+                            && pj.started.elapsed() >= RELAY_FALLBACK_AFTER
+                            && pj.relays_dialed.is_none_or(|at| at.elapsed() >= RELAY_REDIAL)
+                        {
+                            pj.relays_dialed = Some(Instant::now());
+                            dial_ticket_relays(&mut swarm, &pj.info);
+                        }
+                        if pj.last_dial.elapsed() >= Duration::from_secs(3) {
+                            pj.last_dial = Instant::now();
+                            if swarm.is_connected(&pj.info.peer) {
+                                // Connected, but no announce yet: ask again
+                                // (the first answer may have been lost).
+                                swarm.behaviour_mut().xfer.send_request(&pj.info.peer, XferRequest::Announce);
+                            } else {
+                                dial_ticket(&mut swarm, &pj.info, &local_ips);
+                            }
+                        }
                     }
                 }
                 // Recompute session-topic peers from gossipsub's view. (Event
@@ -5374,21 +6164,29 @@ async fn run_network(
                 // profile half is stamped on per publish so a name/color change
                 // mid-session reaches the lobby without a re-host.
                 if let (Some(base), true) = (&announce_base, tick_count % 2 == 0) {
-                    let (name, color) = PROFILE.lock().unwrap().clone();
-                    let mut v = base.clone();
-                    v["owner_name"] = json!(name);
-                    v["owner_color"] = json!(color);
-                    // Sizes ride along per publish: the manifest follows the
-                    // project on disk (see manifest_worker), so a precomputed
-                    // pair would drift the moment the host saves or records.
-                    if let Some(h) = &hosting {
-                        v["files"] = json!(h.files.len() as u64);
-                        v["bytes"] = json!(h.files.iter().map(|f| f.size).sum::<u64>());
+                    let mut v = announce_now(base, hosting.as_ref());
+                    if !lobby_secret.is_empty() {
+                        v["open_secret"] = json!(lobby_secret);
                     }
                     let _ = swarm
                         .behaviour_mut()
-                        .gossipsub
+                        .lobby
+                        .inner_mut()
                         .publish(lobby.clone(), v.to_string().into_bytes());
+                }
+                // Host: keep every relay reservation up (see RelaySlot), and
+                // start over on all of them when our network changed.
+                if !relay_slots.is_empty() {
+                    if tick_count % 10 == 0 {
+                        let ifaces = interface_ips();
+                        if ifaces != last_ifaces {
+                            eprintln!("[reamesh] network changed; re-reserving on the relays");
+                            last_ifaces = ifaces;
+                            relay_on_network_change(&mut swarm, &mut relay_slots);
+                        }
+                    }
+                    relay_tick(&mut swarm, &mut relay_slots);
+                    publish_relay_status(&relay_slots);
                 }
                 // (The presence beacon has its own timer below: it needs a
                 // finer cadence than this tick while someone follows us.)
@@ -5464,6 +6262,12 @@ async fn run_network(
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     eprintln!("[reamesh] listening on {address}");
+                    // A relay reservation's circuit address: the relay's IP
+                    // and port, not ours. It reaches the ticket through
+                    // `TicketExtra::relays`, never as one of our endpoints.
+                    if address.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                        continue;
+                    }
                     for proto in address.iter() {
                         match proto {
                             Protocol::Ip4(ip) => { local_ips.insert(ip.into()); }
@@ -5475,8 +6279,24 @@ async fn run_network(
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
                     eprintln!("[reamesh] connection established with {peer_id} via {endpoint:?}");
+                    let relayed = endpoint_relayed(&endpoint);
+                    {
+                        let mut links = shared.links.lock().unwrap();
+                        let l = links.entry(peer_id).or_default();
+                        if relayed {
+                            l.relayed += 1;
+                            l.was_relayed = true;
+                        } else {
+                            l.direct += 1;
+                        }
+                    }
+                    if relayed {
+                        shared.relayed_conns.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        relay_on_connected(&mut swarm, &mut relay_slots, &peer_id);
+                    }
                     if hint_conns.remove(&connection_id) {
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                        add_explicit_both(&mut swarm, &peer_id);
                         if !hint_peers.contains(&peer_id) {
                             hint_peers.push_back(peer_id);
                         }
@@ -5499,14 +6319,19 @@ async fn run_network(
                             let Some(pos) = pos else { break };
                             let old = hint_peers.remove(pos).unwrap();
                             if !mdns_peers.contains(&old) {
-                                swarm.behaviour_mut().gossipsub.remove_explicit_peer(&old);
+                                remove_explicit_both(&mut swarm, &old);
                             }
                         }
                     }
                     // A reachable ticket host: stop the fast-fail clock and let
                     // it have the full window to send its announce.
+                    // Ask it for its announce straight away: over a relay, a
+                    // VPN or a hole punch the LAN lobby never carries it.
                     if let Some(pj) = &mut pending_join
                         && peer_id == pj.info.peer {
+                        if !pj.connected {
+                            swarm.behaviour_mut().xfer.send_request(&peer_id, XferRequest::Announce);
+                        }
                         pj.connected = true;
                     }
                 }
@@ -5514,17 +6339,83 @@ async fn run_network(
                     hint_conns.remove(&connection_id);
                     eprintln!("[reamesh] outgoing connection error (peer {peer_id:?}): {error}");
                 }
-                SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
-                    // Last connection to this peer gone: its round trip is no
-                    // longer a fact about anything.
-                    shared.peer_rtt.lock().unwrap().remove(&peer_id.to_string());
+                SwarmEvent::ConnectionClosed { peer_id, num_established, endpoint, .. } => {
+                    {
+                        let mut links = shared.links.lock().unwrap();
+                        if let Some(l) = links.get_mut(&peer_id) {
+                            if endpoint_relayed(&endpoint) {
+                                l.relayed = l.relayed.saturating_sub(1);
+                            } else {
+                                l.direct = l.direct.saturating_sub(1);
+                            }
+                        }
+                        if num_established == 0 {
+                            links.remove(&peer_id);
+                        }
+                    }
+                    if num_established == 0 {
+                        // Last connection to this peer gone: its round trip
+                        // is no longer a fact about anything.
+                        shared.peer_rtt.lock().unwrap().remove(&peer_id.to_string());
+                        relay_on_disconnected(&mut swarm, &mut relay_slots, &peer_id);
+                    }
+                }
+                SwarmEvent::ListenerClosed { listener_id, reason, .. } => {
+                    if let Err(e) = &reason {
+                        eprintln!("[reamesh] listener closed: {e}");
+                    }
+                    relay_on_listener_closed(&mut relay_slots, listener_id);
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
+                    libp2p::relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
+                )) => {
+                    relay_on_reserved(&mut relay_slots, &relay_peer_id);
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::RelayAuth(request_response::Event::Message {
+                    message: request_response::Message::Response { request_id, response },
+                    ..
+                })) => {
+                    relay_on_auth(&mut swarm, &mut relay_slots, request_id, Ok(response));
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::RelayAuth(request_response::Event::OutboundFailure {
+                    request_id, error, ..
+                })) => {
+                    let reason = match error {
+                        request_response::OutboundFailure::UnsupportedProtocols => "not_relay",
+                        request_response::OutboundFailure::Timeout => "timeout",
+                        _ => "lost",
+                    };
+                    relay_on_auth(&mut swarm, &mut relay_slots, request_id, Err(reason));
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Dcutr(libp2p::dcutr::Event { remote_peer_id, result })) => {
+                    match result {
+                        Ok(_) => eprintln!("[reamesh] hole punch to {remote_peer_id}: direct"),
+                        Err(e) => eprintln!("[reamesh] hole punch to {remote_peer_id} failed ({e}); staying on the relay"),
+                    }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { peer, result, .. })) => {
                     let sample_ms = match result {
-                        Ok(rtt) => Some(rtt.as_secs_f64() * 1000.0),
+                        Ok(rtt) => {
+                            for slot in relay_slots.iter_mut().filter(|s| s.peer() == peer) {
+                                slot.ping_misses = 0;
+                            }
+                            Some(rtt.as_secs_f64() * 1000.0)
+                        }
                         // A timed-out ping is a pessimistic sample, not a
                         // vanished peer (liveness is the topic's business).
-                        Err(ping::Failure::Timeout) => Some(PING_TIMEOUT.as_secs_f64() * 1000.0),
+                        Err(ping::Failure::Timeout) => {
+                            // A relay that stops answering is dropped and
+                            // re-reserved (a dead path after a network
+                            // change can look alive to the OS for minutes).
+                            for slot in relay_slots.iter_mut().filter(|s| s.peer() == peer) {
+                                slot.ping_misses += 1;
+                                if slot.ping_misses >= RELAY_PING_MISSES {
+                                    slot.ping_misses = 0;
+                                    let _ = swarm.disconnect_peer_id(peer);
+                                }
+                            }
+                            Some(PING_TIMEOUT.as_secs_f64() * 1000.0)
+                        }
                         // Unsupported / stream errors: nothing to learn.
                         Err(_) => None,
                     };
@@ -5544,7 +6435,7 @@ async fn run_network(
                     for (peer_id, addr) in peers {
                         eprintln!("[reamesh] mDNS discovered {peer_id} at {addr}");
                         mdns_peers.insert(peer_id);
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                        add_explicit_both(&mut swarm, &peer_id);
                         // mDNS advertises LAN-interface addresses only. When the
                         // peer is another instance on this same machine (the
                         // documented dev setup), traffic to our own LAN IP can be
@@ -5571,7 +6462,7 @@ async fn run_network(
                 SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
                     for (peer_id, _) in peers {
                         mdns_peers.remove(&peer_id);
-                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                        remove_explicit_both(&mut swarm, &peer_id);
                     }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic: t })) => {
@@ -5601,119 +6492,13 @@ async fn run_network(
                         eprintln!("[reamesh] peer {peer_id} left the session");
                     }
                 }
+                SwarmEvent::Behaviour(BehaviourEvent::Lobby(gossipsub::Event::Message { message, .. })) => {
+                    if message.topic == lobby.hash() && cfg.role == Role::Client {
+                        ingest_announce(&shared, &mut superseded, &message.data, message.source);
+                    }
+                }
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
-                    if message.topic == lobby.hash() {
-                        // Any LAN peer can publish here: an announce is a few
-                        // hundred bytes, so anything far larger isn't parsed
-                        // at all, and every kept string is bounded.
-                        if cfg.role == Role::Client
-                            && message.data.len() <= limits::ANNOUNCE_MAX_BYTES
-                            && let Ok(v) = serde_json::from_slice::<JsonValue>(&message.data)
-                            && v.get("kind").and_then(|k| k.as_str()) == Some("announce")
-                        {
-                            let get = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-                            let clipped = |k: &str, max: usize| limits::clip(&get(k), max);
-                            // Bind the announcement to its authenticated signer:
-                            // the claimed `owner` peer id must match the message
-                            // source. Otherwise any LAN peer could announce a
-                            // session naming someone else as owner, steering a
-                            // joining client's manifest request (and trust) at an
-                            // attacker-chosen peer.
-                            let owner = get("owner");
-                            let signer_is_owner = message
-                                .source
-                                .is_some_and(|src| src.to_string() == owner);
-                            let mut info = SessionInfo {
-                                session_id: get("session_id"),
-                                session_name: clipped("session_name", 128),
-                                project_file: clipped("project_file", 256),
-                                owner,
-                                owner_name: clipped("owner_name", 64),
-                                owner_color: clipped("owner_color", 16),
-                                auth: v.get("auth").and_then(|x| x.as_bool()).unwrap_or(false),
-                                salt: get("salt"),
-                                files: v.get("files").and_then(|x| x.as_u64()).unwrap_or(0),
-                                bytes: v.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0),
-                                last_seen: Instant::now(),
-                                contested: false,
-                                proto: v
-                                    .get("proto")
-                                    .and_then(|x| x.as_u64())
-                                    .unwrap_or(0)
-                                    .min(u32::MAX as u64) as u32,
-                                version: clipped("ver", 32),
-                            };
-                            superseded.retain(|_, at| at.elapsed() < SESSION_STALE);
-                            if signer_is_owner
-                                && valid_session_id(&info.session_id)
-                                && limits::valid_salt(&info.salt)
-                                && !superseded.contains_key(&info.session_id)
-                            {
-                                let mut sessions = shared.sessions.lock().unwrap();
-                                // One peer id hosts one session at a time (each
-                                // REAPER instance has its own identity slot), so
-                                // a new session id from a known owner means it
-                                // stopped and re-hosted: drop its old card now
-                                // instead of showing both until SESSION_STALE.
-                                // Keyed on the authenticated signer, so a peer
-                                // can only retire entries it owns itself.
-                                if !sessions.contains_key(&info.session_id) {
-                                    let old: Vec<String> = sessions
-                                        .iter()
-                                        .filter(|(id, s)| s.owner == info.owner && **id != info.session_id)
-                                        .map(|(id, _)| id.clone())
-                                        .collect();
-                                    for id in old {
-                                        sessions.remove(&id);
-                                        if superseded.len() < limits::MAX_SESSIONS {
-                                            superseded.insert(id, Instant::now());
-                                        }
-                                    }
-                                }
-                                // Bounded: a stream of distinct (signed, but
-                                // freely minted) announcers can't grow the
-                                // table past MAX_SESSIONS; the stalest goes.
-                                limits::evict_for(
-                                    &mut sessions,
-                                    &info.session_id,
-                                    limits::MAX_SESSIONS,
-                                    |s| s.last_seen,
-                                );
-                                match sessions.get_mut(&info.session_id) {
-                                    // Pin the first-seen owner. Binding the
-                                    // announce to its signer (above) stops a
-                                    // peer naming *someone else* as owner, but
-                                    // not from naming *itself* under a session
-                                    // id it overheard: the ids are public and
-                                    // last-write-wins would hand the card, and
-                                    // with it the manifest request and the
-                                    // user's trust, to whoever announces last.
-                                    // A re-host always mints a fresh id, so a
-                                    // second owner on a live id is never
-                                    // legitimate: keep the incumbent, flag the
-                                    // clash, and let the lobby say so.
-                                    Some(existing) if existing.owner != info.owner => {
-                                        existing.contested = true;
-                                        existing.last_seen = Instant::now();
-                                        eprintln!(
-                                            "[reamesh] session {} announced by a second peer ({}); keeping the first-seen owner {}",
-                                            info.session_id, info.owner, existing.owner
-                                        );
-                                    }
-                                    Some(existing) => {
-                                        // Same owner: refresh, but a clash once
-                                        // seen stays sticky for the entry's life
-                                        // so the warning can't be raced away.
-                                        info.contested = existing.contested;
-                                        *existing = info;
-                                    }
-                                    None => {
-                                        sessions.insert(info.session_id.clone(), info);
-                                    }
-                                }
-                            }
-                        }
-                    } else if sess_topic.as_ref().is_some_and(|st| message.topic == st.hash()) {
+                    if sess_topic.as_ref().is_some_and(|st| message.topic == st.hash()) {
                         // All session gossip is signed (MessageAuthenticity::
                         // Signed), so every legitimate message carries its
                         // authenticated author; one without a source can't be
@@ -6095,6 +6880,17 @@ async fn run_network(
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Xfer(request_response::Event::Message { peer, message, .. })) => {
                     match message {
+                        request_response::Message::Request { request: XferRequest::Announce, channel, .. } => {
+                            // A ticket joiner asking what we host (see
+                            // XferRequest::Announce). Never the link secret.
+                            let resp = match &announce_base {
+                                Some(base) if !banned_ids().contains(&peer.to_string()) => XferResponse::Announce {
+                                    announce: announce_now(base, hosting.as_ref()).to_string(),
+                                },
+                                _ => XferResponse::Error { message: "no session announced here".into() },
+                            };
+                            let _ = swarm.behaviour_mut().xfer.send_response(channel, resp);
+                        }
                         request_response::Message::Request { request, channel, .. } => {
                             let serve_dir = shared.serve_dir.lock().unwrap().clone();
                             let token = shared.auth_token.lock().unwrap().clone();
@@ -6146,6 +6942,15 @@ async fn run_network(
                                 }
                             }
                             let _ = swarm.behaviour_mut().xfer.send_response(channel, resp);
+                        }
+                        request_response::Message::Response { response: XferResponse::Announce { announce }, .. } => {
+                            // Only the pinned host of a ticket in flight; its
+                            // answer is checked like any lobby announce.
+                            if cfg.role == Role::Client
+                                && pending_join.as_ref().is_some_and(|pj| pj.info.peer == peer)
+                            {
+                                ingest_announce(&shared, &mut superseded, announce.as_bytes(), Some(peer));
+                            }
                         }
                         request_response::Message::Response { request_id, response } => {
                             if probe.as_ref().is_some_and(|p| p.req == request_id) {
@@ -6614,6 +7419,8 @@ mod transfer_safety_tests {
             files: vec![meta("Audio/a.wav", 5, "abc123")],
             salt: "salt".into(),
             auth: true,
+            open_secret: String::new(),
+            relays: Vec::new(),
             meta: String::new(),
             ever_listed: HashSet::new(),
             doc_admitted: HashSet::new(),
@@ -7845,6 +8652,8 @@ mod tests {
             files: Vec::new(),
             salt: "salt-1234".into(),
             auth: true,
+            open_secret: String::new(),
+            relays: Vec::new(),
             meta: String::new(),
             ever_listed: HashSet::new(),
             doc_admitted: HashSet::new(),
@@ -8151,7 +8960,8 @@ mod tests {
         let peer_str = "12D3KooWQYhTNQdmr3ArTeUHRYzFg94BKyTkoWBDWez9kSCVe2Xo";
         let peer: PeerId = peer_str.parse().unwrap();
         let ips = [IpAddr::from([192, 168, 1, 7]), IpAddr::from([100, 101, 102, 103])];
-        let ticket = encode_ticket("abc123-9f", "Late Night Mix & more", peer_str, &ips, 54001, 54002, true);
+        let protected = TicketExtra { auth: true, ..Default::default() };
+        let ticket = encode_ticket("abc123-9f", "Late Night Mix & more", peer_str, &ips, 54001, 54002, &protected);
         assert!(ticket.starts_with("reamesh://join/abc123-9f?"), "{ticket}");
         assert!(ticket.contains("n=Late%20Night%20Mix%20%26%20more"), "{ticket}");
         assert!(ticket.contains("&s=1&"), "{ticket}");
@@ -8171,11 +8981,11 @@ mod tests {
         assert!(parse_ticket(&ticket.replacen("reamesh", "ReaMesh", 1)).is_some());
         assert!(parse_ticket(&ticket.replacen("abc123-9f?", "abc123-9f/?", 1)).is_some());
         // Open session, TCP only, no name: the optional parts are absent.
-        let open = encode_ticket("abc", "", peer_str, &ips[..1], 54001, 0, false);
+        let open = encode_ticket("abc", "", peer_str, &ips[..1], 54001, 0, &TicketExtra::default());
         assert!(!open.contains("n=") && !open.contains("s=") && !open.contains("q="), "{open}");
         assert_eq!(parse_ticket(&open).unwrap().addrs.len(), 1);
         // An unknown parameter (a future version) is ignored, not refused.
-        assert!(parse_ticket(&format!("{ticket}&x=1")).is_some());
+        assert!(parse_ticket(&format!("{ticket}&z=1")).is_some());
         // Garbage in all its forms is rejected.
         assert!(parse_ticket("").is_none());
         assert!(parse_ticket("reamesh://join/").is_none());
@@ -8190,6 +9000,45 @@ mod tests {
         assert!(parse_ticket(&ticket.replace("&t=54001&q=54002", "")).is_none()); // no port
         assert!(parse_ticket(&ticket.replace("t=54001", "t=70000")).is_none());
         assert!(parse_ticket(&ticket.replace("t=54001", "t=0")).is_none());
+    }
+
+    #[test]
+    fn ticket_carries_relays_and_the_link_secret_but_never_a_key() {
+        let peer_str = "12D3KooWQYhTNQdmr3ArTeUHRYzFg94BKyTkoWBDWez9kSCVe2Xo";
+        let relay_peer = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+        let code = relay::parse_relay_code(&format!(
+            "reamesh://relay/{relay_peer}?a=203.0.113.5&d=relay.example.org&t=4001&q=4001&k={}",
+            "ab".repeat(32)
+        ))
+        .unwrap();
+        let extra = TicketExtra {
+            auth: false,
+            secret: "0123456789abcdef0123456789abcdef".into(),
+            relays: vec![code.addr.clone()],
+        };
+        let ips = [IpAddr::from([192, 168, 1, 7])];
+        let ticket = encode_ticket("abc", "Mix", peer_str, &ips, 54001, 54002, &extra);
+        assert!(!ticket.contains(&"ab".repeat(32)), "{ticket}");
+        assert!(ticket.contains("&x=0123456789abcdef0123456789abcdef"), "{ticket}");
+        assert!(ticket.contains(&format!("&r={relay_peer}~203.0.113.5~4001~4001~relay.example.org")), "{ticket}");
+        let info = parse_ticket(&ticket).unwrap();
+        assert_eq!(info.secret, extra.secret);
+        assert_eq!(info.relays, vec![code.addr.clone()]);
+        assert_eq!(info.addrs.len(), 2);
+        // Relay circuits: IP and DNS name, both transports.
+        let circuits = info.circuit_addrs();
+        assert_eq!(circuits.len(), 4);
+        assert!(circuits.iter().all(|a| a.to_string().ends_with("/p2p-circuit")));
+        // A link with only relays is still a link; one with neither is not.
+        let relay_only = ticket.replace("&a=192.168.1.7&t=54001&q=54002", "");
+        let info = parse_ticket(&relay_only).expect("relay-only ticket");
+        assert!(info.addrs.is_empty());
+        assert_eq!(info.relays.len(), 1);
+        let bare = relay_only.replace(&format!("&r={}", relay::ticket_param(&code.addr)), "");
+        assert!(parse_ticket(&bare).is_none(), "{bare}");
+        // A malformed secret refuses the link; a malformed relay entry is skipped.
+        assert!(parse_ticket(&ticket.replace("&x=0123456789abcdef0123456789abcdef", "&x=zz")).is_none());
+        assert_eq!(parse_ticket(&format!("{ticket}&r=garbage")).unwrap().relays.len(), 1);
     }
 
     #[test]

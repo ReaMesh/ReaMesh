@@ -20,10 +20,10 @@ import { useSlowLink } from "@/components/LinkNotice";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { DrawnCheck, SwapIcon, SwapText } from "@/components/Swap";
 import { TrackNumber } from "@/components/TrackNumber";
-import { send } from "@/lib/connection";
+import { send, useConnections } from "@/lib/connection";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
 import { t } from "@/lib/i18n";
-import { displayName, type ExtState, type Peer } from "@/lib/types";
+import { displayName, type ExtState, type Peer, type RelayStatus } from "@/lib/types";
 import { cn, focusRing, noContextMenu } from "@/lib/utils";
 
 /** What someone else is doing right now, as one line of text, most urgent
@@ -64,6 +64,11 @@ function PeerMeta({
       text = target.is_self ? t("followsYou") : t("followsName", { name: displayName(target) });
       if (target.is_self) tone = "text-found";
     }
+  }
+  // Least urgent, and only once a relay was involved.
+  if (!text && (hosting || peer.is_owner)) {
+    if (peer.link === "relay") text = t("viaRelay");
+    else if (peer.link === "direct") text = t("directLink");
   }
   if (!text) return null;
   return (
@@ -232,7 +237,13 @@ function InviteRow({ children, action }: { children: React.ReactNode; action: Re
 // LAN) join: opening it takes them straight into their app's join flow,
 // pasting it in their Lobby works too. The row names it; the link itself only
 // shows when the clipboard refuses it, so it can be copied by hand.
-function InviteCode({ ticket }: { ticket: string }) {
+function InviteCode({
+  ticket,
+  relay,
+}: {
+  ticket: string;
+  relay: ReturnType<typeof relayLine>;
+}) {
   const [copied, setCopied] = useState(false);
   const [reveal, setReveal] = useState(false);
   useEffect(() => {
@@ -269,12 +280,33 @@ function InviteCode({ ticket }: { ticket: string }) {
           className="w-full bg-transparent text-[12px] text-foreground/80 outline-none"
         />
       ) : (
-        <p className="truncate text-[13px]" title={t("inviteTicketHint")}>
-          {t("inviteCode")}
-        </p>
+        <>
+          <p className="truncate text-[13px]" title={t("inviteTicketHint")}>
+            {t("inviteCode")}
+          </p>
+          {relay && (
+            <p
+              role="status"
+              className={cn("truncate text-[12px]", relay.warn ? "text-amber-500" : "text-muted-foreground")}
+            >
+              {relay.text}
+            </p>
+          )}
+        </>
       )}
     </InviteRow>
   );
+}
+
+// How the host's relays stand, as the invite row's second line. Nothing
+// without a relay configured.
+function relayLine(status: RelayStatus[]): { text: string; warn: boolean } | null {
+  if (status.length === 0) return null;
+  const reserved = status.find((r) => r.state === "reserved");
+  if (reserved) return { text: t("relayReachable", { name: reserved.label || reserved.host }), warn: false };
+  if (status.some((r) => r.state === "connecting")) return { text: t("relayConnecting"), warn: false };
+  const keyRefused = status.some((r) => r.reason === "bad_key");
+  return { text: t(keyRefused ? "relayKeyRefused" : "relayDown"), warn: true };
 }
 
 // The password this host set, in case they forget it while a guest is trying
@@ -360,6 +392,8 @@ export function Session({
   flashPeers?: string[];
 }) {
   const hosting = state.mode === "hosting";
+  const { instances } = useConnections();
+  const relayStatus = instances.find((i) => i.port === port)?.relay?.status ?? [];
   const [confirmStop, setConfirmStop] = useState(false);
   // Guest the host is about to block (the confirm dialog's subject).
   const [banTarget, setBanTarget] = useState<Peer | null>(null);
@@ -438,7 +472,7 @@ export function Session({
             <section className="flex shrink-0 flex-col gap-2">
               <SectionLabel>{t("invite")}</SectionLabel>
               <Group>
-                {!!state.ticket && <InviteCode ticket={state.ticket} />}
+                {!!state.ticket && <InviteCode ticket={state.ticket} relay={relayLine(relayStatus)} />}
                 {!!state.ticket && !!hostPass && <Divider inset={false} />}
                 {!!hostPass && <HostPassword pass={hostPass} />}
               </Group>

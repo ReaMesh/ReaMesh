@@ -148,6 +148,13 @@ fn ctl_server_round_trip() {
         ))
         .await
         .unwrap();
+        // So are the relay commands.
+        ws.send(Message::Text(r#"{"cmd":"set_relays","codes":["not a code"]}"#.into()))
+            .await
+            .unwrap();
+        ws.send(Message::Text(r#"{"cmd":"relay_test","code":"not a code","id":"t1"}"#.into()))
+            .await
+            .unwrap();
         // A real command queues for the extension's poll.
         ws.send(Message::Text(r#"{"cmd":"browse"}"#.into()))
             .await
@@ -166,7 +173,23 @@ fn ctl_server_round_trip() {
         .expect("command never queued");
         let v: Value = serde_json::from_str(&cmd).unwrap();
         assert_eq!(v["cmd"], "browse");
-        assert!(ffi_poll().is_none(), "set_profile must not reach the queue");
+        assert!(ffi_poll().is_none(), "server-side commands must not reach the queue");
+
+        // Every client gets the relay message on connect, and again when a
+        // test finishes: the garbage code tests as "invalid".
+        let tested = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let m = ws.next().await.unwrap().unwrap();
+                let v: Value = serde_json::from_str(m.to_text().unwrap()).unwrap();
+                assert_eq!(v["type"], "relay", "unexpected frame {v}");
+                if v["test"]["id"] == "t1" && v["test"]["outcome"] == "invalid" {
+                    return v;
+                }
+            }
+        })
+        .await
+        .expect("relay test result never arrived");
+        assert_eq!(tested["status"], serde_json::json!([]));
 
         // State published by the extension reaches the app.
         let state = r#"{"type":"state","mode":"idle"}"#;
@@ -191,6 +214,13 @@ fn ctl_server_round_trip() {
             .unwrap()
             .unwrap();
         assert_eq!(replay.to_text().unwrap(), state);
+        let relay = tokio::time::timeout(Duration::from_secs(5), ws2.next())
+            .await
+            .expect("no relay replay")
+            .unwrap()
+            .unwrap();
+        let v: Value = serde_json::from_str(relay.to_text().unwrap()).unwrap();
+        assert_eq!(v["type"], "relay");
     });
 }
 
