@@ -6,6 +6,14 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Divider, Group, SectionLabel } from "@/components/Group";
@@ -403,6 +411,17 @@ export function Settings({
             : update.phase === "current"
               ? t("upToDate")
               : "";
+  const [confirmReset, setConfirmReset] = useState(false);
+  const resetIdentity = async () => {
+    setConfirmReset(false);
+    try {
+      const had = await invoke<boolean>("reset_network_identity");
+      toast.success(had ? t("identityWasReset") : t("noIdentityYet"));
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
   const [restarting, setRestarting] = useState(false);
   const restartNow = async () => {
     setRestarting(true);
@@ -756,20 +775,30 @@ export function Settings({
                 size="sm"
                 title={t("resetIdentityHint")}
                 className={cn(ghost, "text-muted-foreground hover:text-destructive")}
-                onClick={async () => {
-                  try {
-                    const had = await invoke<boolean>("reset_network_identity");
-                    toast.success(had ? t("identityWasReset") : t("noIdentityYet"));
-                  } catch (e) {
-                    toast.error(String(e));
-                  }
-                }}
+                onClick={() => setConfirmReset(true)}
               >
                 {t("resetShort")}
               </Button>
             </Row>
           </Group>
         </section>
+
+        <Dialog open={confirmReset} onOpenChange={setConfirmReset}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>{t("resetIdentityTitle")}</DialogTitle>
+              <DialogDescription>{t("resetIdentityBody")}</DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button variant="secondary" onClick={() => setConfirmReset(false)}>
+                {t("cancel")}
+              </Button>
+              <Button variant="destructive" onClick={resetIdentity}>
+                {t("resetShort")}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
         <section className="space-y-2">
           <SectionLabel>{t("help")}</SectionLabel>

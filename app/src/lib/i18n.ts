@@ -315,6 +315,9 @@ const en = {
   networkIdentity: "Network identity",
   resetIdentityHint:
     "This installation has a stable, anonymous peer ID so others can recognize you across sessions. If you reset it, ReaMesh creates a new ID the next time you join or host.",
+  resetIdentityTitle: "Reset network identity?",
+  resetIdentityBody:
+    "Others will no longer recognize you from earlier sessions. ReaMesh creates a new ID the next time you join or host.",
   identityWasReset: "Identity reset. ReaMesh will create a new one for your next session.",
   noIdentityYet: "No stored identity yet.",
 
@@ -755,6 +758,9 @@ const de: Record<MsgKey, string> = {
   networkIdentity: "Netzwerkidentität",
   resetIdentityHint:
     "Diese Installation hat eine feste, anonyme Peer-ID, an der dich andere über mehrere Sessions hinweg erkennen. Nach dem Zurücksetzen erstellt ReaMesh beim nächsten Beitritt oder Hosting eine neue ID.",
+  resetIdentityTitle: "Netzwerkidentität zurücksetzen?",
+  resetIdentityBody:
+    "Andere erkennen dich danach nicht mehr aus früheren Sessions wieder. ReaMesh erstellt beim nächsten Beitritt oder Hosting eine neue ID.",
   identityWasReset: "Identität zurückgesetzt. Für die nächste Session erstellt ReaMesh eine neue.",
   noIdentityYet: "Noch keine gespeicherte Identität.",
 
