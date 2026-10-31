@@ -2774,6 +2774,7 @@ dependencies = [
  "chacha20poly1305 0.11.0",
  "either",
  "getrandom 0.4.2",
+ "hickory-resolver",
  "if-addrs",
  "libc",
  "libp2p",
