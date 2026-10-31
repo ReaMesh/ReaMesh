@@ -7188,6 +7188,7 @@ static void cursorPump() {
         r.in = jsonBool(c, "in", false);
         r.click = jsonBool(c, "click", false);
         r.down = jsonBool(c, "down", false);
+        r.tool = jsonStr(c, "k");
         if (c.contains("drag") && c["drag"].is_object()) {
           const json& d = c["drag"];
           if (d.contains("items") && d["items"].is_array())
@@ -7213,6 +7214,17 @@ static void cursorPump() {
   static bool prevDown = false;
   const bool pressed = l.down && !prevDown;
   prevDown = l.down;
+  // What REAPER's cursor shows goes out once it has held for a moment, so
+  // brushing past an item edge doesn't make the others' cursor flicker; with
+  // the button down (a drag starting) it goes out at once.
+  static std::string toolShown, toolSeen;
+  static auto toolSince = std::chrono::steady_clock::time_point{};
+  if (l.tool != toolSeen) {
+    toolSeen = l.tool;
+    toolSince = now;
+  }
+  if (toolSeen != toolShown && (l.down || now - toolSince >= std::chrono::milliseconds(70))) toolShown = toolSeen;
+  l.tool = l.in ? toolShown : "";
   json drag;
   if (g_cursorShared) {
     drag = cursorDrag(l, pressed);
@@ -7231,7 +7243,7 @@ static void cursorPump() {
     outSince = {};
   }
   const auto since = now - lastSent;
-  const bool changed = l.in != last.in || l.down != last.down || dragKey != lastDrag ||
+  const bool changed = l.in != last.in || l.down != last.down || dragKey != lastDrag || l.tool != last.tool ||
                        (l.in && (std::fabs(l.px - last.px) >= 1 || std::fabs(l.py - last.py) >= 1 ||
                                  l.guid != last.guid || l.t != last.t));
   const bool send = l.click || (changed && since >= std::chrono::milliseconds(33)) ||
@@ -7239,6 +7251,7 @@ static void cursorPump() {
   if (!send) return;
   json m = {{"t", l.t}, {"g", l.guid}, {"fy", l.fy}, {"in", l.in}, {"click", l.click}, {"down", l.down}};
   if (!drag.is_null()) m["drag"] = drag;
+  if (!l.tool.empty()) m["k"] = l.tool;
   reamesh_send_cursor(g_handle, dumpJson(m).c_str());
   last = l;
   lastDrag = dragKey;

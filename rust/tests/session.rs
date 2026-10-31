@@ -1502,6 +1502,15 @@ fn cursor_round_trip(pass: &str) {
     assert!(owner.send_cursor(r#"{"in":true,"drag":{"items":[]}}"#));
     let r = next_cursor(&client).expect("plain cursor never arrived");
     assert!(r["drag"].is_null());
+    assert_eq!(r["k"], "");
+
+    // The glyph key travels; anything that isn't a short lowercase key is dropped.
+    assert!(owner.send_cursor(r#"{"in":true,"k":"trim_l"}"#));
+    let r = next_cursor(&client).expect("trim cursor never arrived");
+    assert_eq!(r["k"], "trim_l");
+    assert!(owner.send_cursor(r#"{"in":true,"k":"Trim<script>"}"#));
+    let r = next_cursor(&client).expect("odd cursor never arrived");
+    assert_eq!(r["k"], "");
 
     // Garbage is refused before it reaches the wire.
     assert!(!owner.send_cursor("not json"));
