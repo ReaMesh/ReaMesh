@@ -542,6 +542,16 @@ void morphAnim(CALayer* l, NSString* key, id from, id to, double dur) {
   [l addAnimation:a forKey:key];
 }
 
+// zPosition `from` for the whole morph, `to` once it ends.
+void holdZ(CALayer* l, double from, double to, double dur) {
+  CAKeyframeAnimation* a = [CAKeyframeAnimation animationWithKeyPath:@"zPosition"];
+  a.values = @[ @(from), @(to) ];
+  a.keyTimes = @[ @0, @1 ];
+  a.calculationMode = kCAAnimationDiscrete;
+  a.duration = dur;
+  [l addAnimation:a forKey:@"zPosition"];
+}
+
 // Puts the peer's morph on screen: every slot's layers to where it ends,
 // animated from where it is now.
 void showMorph(Peer& p) {
@@ -568,6 +578,11 @@ void showMorph(Peer& p) {
                 (__bridge id)fillOf(p.color, s.b).CGColor, dur);
       morphAnim(l.edge, @"opacity", @(s.opA), @(s.opB), dur);
       morphAnim(l.fill, @"opacity", @(s.opA), @(s.opB), dur);
+      if (s.layerFrom != s.layer) {
+        // The draw order holds until the morph is done (cursor_glyphs.h).
+        holdZ(l.edge, 2 * s.layerFrom, 2 * s.layer, dur);
+        holdZ(l.fill, 2 * s.layerFrom + 1, 2 * s.layer + 1, dur);
+      }
       CGPathRelease(from);
     }
     CGPathRelease(to);

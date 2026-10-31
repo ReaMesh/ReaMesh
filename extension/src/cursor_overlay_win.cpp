@@ -810,8 +810,8 @@ void drawGlyph(Node& n, const cursor_glyphs::Morph& m, const std::string& color,
     }
     pt.g = partGeometry(pts);
     if (!pt.g) return;
-    pt.layer = sl.layer;
-    layers = std::max(layers, sl.layer + 1);
+    pt.layer = m.drawLayer(sl, t);
+    layers = std::max(layers, pt.layer + 1);
     parts.push_back(pt);
   }
   ID2D1DeviceContext* dc = beginDraw(n, kGlyphLeft + kGlyphRight, kGlyphTop + kGlyphBottom, 6, kGlyphLeft, kGlyphTop);

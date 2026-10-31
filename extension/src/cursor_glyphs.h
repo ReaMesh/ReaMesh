@@ -98,7 +98,10 @@ struct Slot {
   float from[kPoints * 2] = {}, to[kPoints * 2] = {};
   Look a, b;
   double opA = 0, opB = 1;
-  int layer = 0;
+  // The glyph layer it is drawn in while the morph runs, and once it is done.
+  // The draw order switches only at the end, when every leftover is gone, so
+  // no part jumps in front of or behind another mid-way.
+  int layerFrom = 0, layer = 0;
   int kind = Solid;
   bool dying = false;
 };
@@ -110,6 +113,7 @@ class Morph {
   double start = 0, dur = 0;
 
   bool running(double now) const { return now < start + dur; }
+  int drawLayer(const Slot& s, double now) const { return running(now) ? s.layerFrom : s.layer; }
   double progress(double now) const { return dur <= 0 ? 1 : ease((now - start) / dur); }
 
   // A slot as it is at eased progress u.
@@ -124,7 +128,9 @@ class Morph {
   bool set(int next, double now, double seconds, double outline) {
     if (next < 0 || next >= kGlyphCount || next == glyph) return false;
     const double u = progress(now);
+    const bool wasRunning = running(now);
     for (Slot& s : slots) {
+      if (!wasRunning) s.layerFrom = s.layer;
       float pts[kPoints * 2];
       Look look;
       double op = 0;
@@ -137,8 +143,9 @@ class Morph {
     std::vector<int> partOf(slots.size(), -1);
     std::vector<bool> taken(g.count, false);
     // Greedy pairing, cheapest first: same family (ink with ink), close
-    // centres, similar size. A slot already on its way out pays extra, so a
-    // live part wins when both are close.
+    // centres, similar size. A part with nothing close enough grows where it
+    // is instead of flying in from elsewhere; a leftover on its way out is
+    // only taken back when it is right there.
     for (;;) {
       double best = 1e18;
       int bs = -1, bp = -1;
@@ -157,7 +164,8 @@ class Morph {
           centre(pp, &px, &py, &pa);
           const double ds = std::sqrt(std::fabs(sa)) - std::sqrt(std::fabs(pa));
           double c = (sx - px) * (sx - px) + (sy - py) * (sy - py) + 0.5 * ds * ds;
-          if (s.dying) c += 40 + 40 * (1 - s.opA);
+          if (c > (s.dying ? kReviveMax : kPairMax)) continue;
+          if (s.dying) c += 10;
           if (c < best) {
             best = c;
             bs = static_cast<int>(si);
@@ -196,7 +204,7 @@ class Morph {
       partPoints(part, s.to);
       shrunk(s.to, s.from);
       s.kind = kGlyphPartInfo[part][0];
-      s.layer = kGlyphPartInfo[part][1];
+      s.layer = s.layerFrom = kGlyphPartInfo[part][1];
       s.a = s.b = lookOf(s.kind, outline);
       s.opA = 0;
       s.opB = 1;
@@ -225,6 +233,9 @@ class Morph {
 
  private:
   int m_nextId = 1;
+  // Largest pairing cost (squared pt: centre distance plus size difference)
+  // for a live part, and for a leftover that is shrinking away.
+  static constexpr double kPairMax = 18 * 18, kReviveMax = 6 * 6;
 
   static void partPoints(int part, float* out) {
     for (int i = 0; i < kPoints * 2; ++i) out[i] = static_cast<float>(kGlyphPoints[part][i] * kUnit);
