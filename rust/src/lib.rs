@@ -197,10 +197,11 @@ const PRESENCE_FAST_INTERVAL: Duration = Duration::from_millis(100);
 /// sender's peer id), so open-topic bystanders can't inject markers.
 const TAG_MARKER: u8 = b'M';
 /// Live mouse cursor over the arrange: `'C'` + JSON
-/// `{"t","g","fy","in","click","down","drag","mac"}` (project seconds,
+/// `{"t","g","fy","in","click","down","drag","k","mac"}` (project seconds,
 /// track GUID, 0..1 within the track, false once the mouse left the arrange, a
 /// press at this spot, the button held, an item drag: see
-/// `sanitize_cursor_drag`). Sent at most ~30
+/// `sanitize_cursor_drag`, the glyph REAPER's cursor stands for: see
+/// `sanitize_cursor_tool`). Sent at most ~30
 /// times a second and only while it changes (plus a keep-alive every few
 /// seconds); receivers queue them for the in-REAPER cursor layer. MAC'd like a
 /// beacon. Additive: builds without it drop the unknown tag unread (the
@@ -946,6 +947,15 @@ fn sanitize_sel(v: Option<&JsonValue>) -> Vec<String> {
 /// `CURSOR_DRAG_MAX` item GUIDs).
 const CURSOR_MAX_BYTES: usize = 2048;
 const CURSOR_DRAG_MAX: usize = 16;
+
+/// The glyph a cursor shows (`"k"`: "trim_l", "razor", ...; "" the plain
+/// pointer): a short lowercase key, anything else is dropped. Receivers show
+/// keys they don't know as the pointer.
+fn sanitize_cursor_tool(v: Option<&JsonValue>) -> JsonValue {
+    let k = v.and_then(|x| x.as_str()).unwrap_or("");
+    let ok = k.len() <= 16 && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    json!(if ok { k } else { "" })
+}
 
 /// An item drag in progress: `{"dt": seconds moved, "dtr": tracks moved,
 /// "items": [item GUIDs]}` (null when not dragging).
@@ -2720,6 +2730,7 @@ impl Reamesh {
             "click": v.get("click").and_then(|x| x.as_bool()).unwrap_or(false),
             "down": v.get("down").and_then(|x| x.as_bool()).unwrap_or(false),
             "drag": sanitize_cursor_drag(v.get("drag")),
+            "k": sanitize_cursor_tool(v.get("k")),
         });
         self.cmd_tx.send(Command::Cursor(body)).is_ok()
     }
@@ -6666,6 +6677,7 @@ async fn run_network(
                                         "click": v.get("click").and_then(|x| x.as_bool()).unwrap_or(false),
                                         "down": v.get("down").and_then(|x| x.as_bool()).unwrap_or(false),
                                         "drag": sanitize_cursor_drag(v.get("drag")),
+                                        "k": sanitize_cursor_tool(v.get("k")),
                                     }));
                                 }
                             }

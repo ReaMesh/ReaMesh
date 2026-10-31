@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "cursor_glyphs.h"
 #include "cursor_overlay.h"
 
 namespace {
@@ -40,6 +41,7 @@ struct Style {
   double pointerNotch;   // where the notch sits on the diagonal, 0..1 of the size
   double tipRadius, wingRadius, notchRadius;  // corner rounding, pt
   double outline;        // white edge, pt
+  double morph;          // s from one glyph to the next (cursor_glyphs.h)
   double shadowOpacity;
   double shadowRadius;
   double shadowOffsetY;  // pt, downwards
@@ -92,6 +94,7 @@ constexpr Style kStyle = {
     .wingRadius = 1.8,
     .notchRadius = 2.4,
     .outline = 1.75,
+    .morph = 0.26,
     .shadowOpacity = 0.22,
     .shadowRadius = 2.5,
     .shadowOffsetY = 1,
@@ -179,7 +182,16 @@ struct Peer {
   std::map<std::string, DragItem> dragItems;
 
   CALayer* root = nil;  // positioned at the pointer tip
-  CAShapeLayer* arrow = nil;
+  // The pointer: a container (scaled about the hotspot while the button is
+  // held, dimmed when idle) with an edge and a fill layer per glyph part.
+  CALayer* glyph = nil;
+  struct PartLayers {
+    CAShapeLayer* edge = nil;
+    CAShapeLayer* fill = nil;
+  };
+  std::map<int, PartLayers> parts;  // by morph slot id
+  cursor_glyphs::Morph morph;
+  CGPoint tagOff = CGPointMake(kStyle.tagDX, kStyle.tagDY);
   bool followed = false;
   CALayer* tag = nil;   // a sibling of root, so it can trail it
   CATextLayer* tagText = nil;
@@ -288,34 +300,6 @@ bool isLight(const std::string& hex) {
 
 NSColor* inkOn(const std::string& hex) {
   return isLight(hex) ? [NSColor colorWithSRGBRed:0.1 green:0.1 blue:0.1 alpha:1] : [NSColor whiteColor];
-}
-
-CGPathRef pointerPath() {
-  // Hotspot at (0,0), y down. Four corners: the tip, two wings and the notch
-  // between them, every one rounded. The rounding pulls the drawn tip inwards,
-  // so the shape is shifted back by that amount to keep the hotspot on it.
-  static CGPathRef path = nullptr;
-  if (!path) {
-    const double z = kStyle.pointerSize;
-    const double wing = 0.37 * z;  // how far each wing leans off its axis
-    const CGPoint tip = CGPointMake(0, 0), left = CGPointMake(wing, z), right = CGPointMake(z, wing);
-    const double n = kStyle.pointerNotch * (z + wing) / 2;
-    const CGPoint notch = CGPointMake(n, n);
-    // The rounded tip sits r/sin(a/2) - r in from the corner along the
-    // diagonal (a = the angle between the two edges at the tip).
-    const double half = std::atan2(z, wing) - M_PI / 4;
-    const double inset = (kStyle.tipRadius / std::sin(half) - kStyle.tipRadius) / std::sqrt(2.0);
-    CGAffineTransform t = CGAffineTransformMakeTranslation(-inset, -inset);
-    CGMutablePathRef p = CGPathCreateMutable();
-    CGPathMoveToPoint(p, &t, (tip.x + left.x) / 2, (tip.y + left.y) / 2);
-    CGPathAddArcToPoint(p, &t, left.x, left.y, notch.x, notch.y, kStyle.wingRadius);
-    CGPathAddArcToPoint(p, &t, notch.x, notch.y, right.x, right.y, kStyle.notchRadius);
-    CGPathAddArcToPoint(p, &t, right.x, right.y, tip.x, tip.y, kStyle.wingRadius);
-    CGPathAddArcToPoint(p, &t, tip.x, tip.y, left.x, left.y, kStyle.tipRadius);
-    CGPathCloseSubpath(p);
-    path = p;
-  }
-  return path;
 }
 
 // A small rounded triangle pointing along +x, centred on (0,0).
@@ -484,16 +468,153 @@ void applyShadow(CALayer* l, CGPathRef path) {
   if (path) l.shadowPath = path;
 }
 
-CAShapeLayer* makeArrow(const std::string& color) {
-  CAShapeLayer* a = [CAShapeLayer layer];
-  a.path = pointerPath();
-  a.fillColor = parseColor(color).CGColor;
-  a.strokeColor = [NSColor whiteColor].CGColor;
-  a.lineWidth = kStyle.outline;
-  a.lineJoin = kCALineJoinRound;
-  a.contentsScale = g_scale;
-  applyShadow(a, pointerPath());
-  return a;
+// ---------- the pointer glyph ----------
+//
+// Each glyph part (cursor_glyphs.h) is two shape layers: its white edge and
+// its fill, the edges of one glyph layer below that layer's fills. A change
+// of glyph animates every part's path, colours, edge and opacity from where
+// it is now, on the same timing curve the shared morph uses, so Core
+// Animation plays it at display rate even while REAPER's main thread is busy.
+
+CGPathRef partPath(const float* pts) {
+  CGMutablePathRef p = CGPathCreateMutable();
+  CGPathMoveToPoint(p, nullptr, pts[0], pts[1]);
+  for (int i = 1; i < cursor_glyphs::kPoints; ++i) CGPathAddLineToPoint(p, nullptr, pts[2 * i], pts[2 * i + 1]);
+  CGPathCloseSubpath(p);
+  return p;
+}
+
+NSColor* fillOf(const std::string& hex, const cursor_glyphs::Look& l) {
+  NSColor* c = parseColor(hex);
+  const auto towardsWhite = [&](CGFloat v) { return v + (1 - v) * l.white; };
+  return [NSColor colorWithSRGBRed:towardsWhite(c.redComponent)
+                             green:towardsWhite(c.greenComponent)
+                              blue:towardsWhite(c.blueComponent)
+                             alpha:l.fillAlpha];
+}
+
+NSColor* edgeFillOf(const cursor_glyphs::Look& l) { return [NSColor colorWithSRGBRed:1 green:1 blue:1 alpha:l.edgeFill]; }
+
+CALayer* makeGlyphRoot() {
+  CALayer* g = [CALayer layer];
+  g.anchorPoint = CGPointZero;
+  g.bounds = CGRectZero;
+  applyShadow(g, nullptr);
+  return g;
+}
+
+Peer::PartLayers makePart(CALayer* into) {
+  Peer::PartLayers l;
+  l.edge = [CAShapeLayer layer];
+  l.edge.strokeColor = [NSColor whiteColor].CGColor;
+  l.edge.lineJoin = kCALineJoinRound;
+  l.fill = [CAShapeLayer layer];
+  l.fill.lineWidth = 0;
+  for (CAShapeLayer* x in @[ l.edge, l.fill ]) {
+    x.contentsScale = g_scale;
+    [into addSublayer:x];
+  }
+  return l;
+}
+
+// One part's layers as the slot ends.
+void setPart(const Peer::PartLayers& l, const cursor_glyphs::Slot& s, const std::string& color, CGPathRef path) {
+  l.edge.zPosition = 2 * s.layer;
+  l.fill.zPosition = 2 * s.layer + 1;
+  l.edge.path = path;
+  l.edge.lineWidth = s.b.edge;
+  l.edge.fillColor = edgeFillOf(s.b).CGColor;
+  l.fill.path = path;
+  l.fill.fillColor = fillOf(color, s.b).CGColor;
+  l.edge.opacity = l.fill.opacity = s.opB;
+}
+
+void morphAnim(CALayer* l, NSString* key, id from, id to, double dur) {
+  CABasicAnimation* a = [CABasicAnimation animationWithKeyPath:key];
+  a.fromValue = from;
+  a.toValue = to;
+  a.duration = dur;
+  a.timingFunction = [CAMediaTimingFunction functionWithControlPoints:cursor_glyphs::kEaseX1
+                                                                     :cursor_glyphs::kEaseY1
+                                                                     :cursor_glyphs::kEaseX2
+                                                                     :cursor_glyphs::kEaseY2];
+  if (@available(macOS 12.0, *)) a.preferredFrameRateRange = CAFrameRateRangeMake(60, 120, 120);
+  [l addAnimation:a forKey:key];
+}
+
+// Puts the peer's morph on screen: every slot's layers to where it ends,
+// animated from where it is now.
+void showMorph(Peer& p) {
+  const double dur = p.morph.dur;
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  for (const auto& s : p.morph.slots) {
+    auto it = p.parts.find(s.id);
+    if (it == p.parts.end()) it = p.parts.emplace(s.id, makePart(p.glyph)).first;
+    const Peer::PartLayers& l = it->second;
+    CGPathRef to = partPath(s.to);
+    setPart(l, s, p.color, to);
+    if (dur <= 0) {
+      // A jump: nothing of an earlier morph may keep playing over it.
+      [l.edge removeAllAnimations];
+      [l.fill removeAllAnimations];
+    } else {
+      CGPathRef from = partPath(s.from);
+      morphAnim(l.edge, @"path", (__bridge id)from, (__bridge id)to, dur);
+      morphAnim(l.fill, @"path", (__bridge id)from, (__bridge id)to, dur);
+      morphAnim(l.edge, @"lineWidth", @(s.a.edge), @(s.b.edge), dur);
+      morphAnim(l.edge, @"fillColor", (__bridge id)edgeFillOf(s.a).CGColor, (__bridge id)edgeFillOf(s.b).CGColor, dur);
+      morphAnim(l.fill, @"fillColor", (__bridge id)fillOf(p.color, s.a).CGColor,
+                (__bridge id)fillOf(p.color, s.b).CGColor, dur);
+      morphAnim(l.edge, @"opacity", @(s.opA), @(s.opB), dur);
+      morphAnim(l.fill, @"opacity", @(s.opA), @(s.opB), dur);
+      CGPathRelease(from);
+    }
+    CGPathRelease(to);
+  }
+  [CATransaction commit];
+}
+
+// The glyph REAPER's cursor stands for on their screen ("" the pointer).
+// Hidden cursors switch at once; a visible one morphs.
+void setGlyph(Peer& p, const std::string& key) {
+  const int g = cursor_glyphs::glyphFor(key);
+  const double dur = g_reduceMotion || !p.cursorShown ? 0 : kStyle.morph;
+  if (!p.morph.set(g, now(), dur, kStyle.outline)) return;
+  showMorph(p);
+  double x = 0, y = 0;
+  cursor_glyphs::tagOffset(g, kStyle.tagDX, kStyle.tagDY, &x, &y);
+  p.tagOff = CGPointMake(x, y);
+  p.pendingSpring = true;
+}
+
+// Removes the layers of parts that have finished shrinking away.
+void pruneParts(Peer& p, double t) {
+  const std::vector<int> gone = p.morph.prune(t);
+  if (gone.empty()) return;
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  for (int id : gone) {
+    auto it = p.parts.find(id);
+    if (it == p.parts.end()) continue;
+    [it->second.edge removeFromSuperlayer];
+    [it->second.fill removeFromSuperlayer];
+    p.parts.erase(it);
+  }
+  [CATransaction commit];
+}
+
+// A still copy of the glyph as it ends, for the crossfade ghost.
+CALayer* glyphSnapshot(const Peer& p) {
+  CALayer* g = makeGlyphRoot();
+  for (const auto& s : p.morph.slots) {
+    if (s.dying) continue;
+    const Peer::PartLayers l = makePart(g);
+    CGPathRef path = partPath(s.to);
+    setPart(l, s, p.color, path);
+    CGPathRelease(path);
+  }
+  return g;
 }
 
 void updateTag(Peer& p, double t);
@@ -512,7 +633,7 @@ void setFollowed(Peer& p, bool on) {
   p.edge.zPosition = z;
   [CATransaction commit];
   if (on && p.idle) {
-    fade(p.arrow, 1, kStyle.fadeIn);
+    fade(p.glyph, 1, kStyle.fadeIn);
     p.idle = false;
   }
   updateTag(p, now());
@@ -526,9 +647,9 @@ void buildLayers(Peer& p) {
   p.root.anchorPoint = CGPointZero;
   p.root.bounds = CGRectZero;
   p.root.opacity = 0;
-  // Scaling about the tip: the arrow is drawn around (0,0) of a zero-size layer.
-  p.arrow = makeArrow(p.color);
-  [p.root addSublayer:p.arrow];
+  // Scaling about the tip: the glyph is drawn around (0,0) of a zero-size layer.
+  p.glyph = makeGlyphRoot();
+  [p.root addSublayer:p.glyph];
 
   p.tag = [CALayer layer];
   p.tag.anchorPoint = CGPointZero;
@@ -560,6 +681,7 @@ void buildLayers(Peer& p) {
   [g_root addSublayer:p.tag];
   [g_root addSublayer:p.root];
   [CATransaction commit];
+  setGlyph(p, "");
   if (p.id == g_followId) setFollowed(p, true);
 }
 
@@ -586,7 +708,8 @@ void refreshTag(Peer& p) {
   setPill(p.tag, p.tagText, label, p.color, kStyle.tagFont, kStyle.tagHeight, kStyle.tagPadX);
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
-  p.arrow.fillColor = parseColor(p.color).CGColor;
+  for (const auto& s : p.morph.slots)
+    if (auto it = p.parts.find(s.id); it != p.parts.end()) it->second.fill.fillColor = fillOf(p.color, s.b).CGColor;
   [CATransaction commit];
 }
 
@@ -627,7 +750,7 @@ void setEdgeAngle(Peer& p, double angle) {
 void setPressed(Peer& p, bool down) {
   if (down == p.pressed) return;
   p.pressed = down;
-  scaleTo(p.arrow, down ? kStyle.pressedScale : 1.0, kStyle.pressDuration, @"press");
+  scaleTo(p.glyph, down ? kStyle.pressedScale : 1.0, kStyle.pressDuration, @"press");
 }
 
 // The cursor fades across instead of flying: a copy fades out where it was,
@@ -635,12 +758,12 @@ void setPressed(Peer& p, bool down) {
 void crossfadeTo(Peer& p, CGPoint at, CGPoint tagAt) {
   CALayer* pres = p.root.presentationLayer;
   const CGPoint from = pres ? pres.position : p.cursorModel;
-  const float op = (pres ? pres.opacity : 1) * p.arrow.opacity;
-  CAShapeLayer* ghost = makeArrow(p.color);
+  const float op = (pres ? pres.opacity : 1) * p.glyph.opacity;
+  CALayer* ghost = glyphSnapshot(p);
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
   ghost.position = from;
-  ghost.transform = p.arrow.transform;
+  ghost.transform = p.glyph.transform;
   [g_root insertSublayer:ghost below:p.root];
   [CATransaction commit];
   [CATransaction begin];
@@ -841,7 +964,7 @@ bool layoutPeer(Peer& p, const Geo& g, double t) {
   layoutDrag(p, g, net);
 
   if (pl.kind == Place::Cursor) {
-    const CGPoint tagAt = CGPointMake(pl.p.x + kStyle.tagDX, pl.p.y + kStyle.tagDY);
+    const CGPoint tagAt = CGPointMake(pl.p.x + p.tagOff.x, pl.p.y + p.tagOff.y);
     if (!p.cursorShown) {
       snapTo(p.root, pl.p);
       snapTo(p.tag, tagAt);
@@ -860,6 +983,10 @@ bool layoutPeer(Peer& p, const Geo& g, double t) {
         setPos(p.tag, tagAt);
       }
       moved = true;
+    } else if (!samePoint(tagAt, p.tagModel)) {
+      // A new glyph moved the name tag below it.
+      if (g_reduceMotion) setPos(p.tag, tagAt);
+      else springTo(p.tag, p.tagModel, tagAt, kStyle.tagStiffness);
     }
     p.cursorModel = pl.p;
     p.tagModel = tagAt;
@@ -905,7 +1032,8 @@ void checkScale() {
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
   for (auto& [id, p] : g_peers) {
-    for (CALayer* l in @[ p.arrow, p.tag, p.tagText, p.edge, p.edgeText, p.edgeArrow ]) l.contentsScale = s;
+    for (CALayer* l in @[ p.tag, p.tagText, p.edge, p.edgeText, p.edgeArrow ]) l.contentsScale = s;
+    for (auto& [id, l] : p.parts) l.edge.contentsScale = l.fill.contentsScale = s;
   }
   for (CALayer* l in @[ g_hoverTag ?: [CALayer layer], g_hoverText ?: [CALayer layer], g_followTag ?: [CALayer layer],
                         g_followText ?: [CALayer layer] ])
@@ -1364,6 +1492,7 @@ void update(const Remote& r) {
       p.predict = false;
     }
     setPressed(p, r.in && r.down);
+    setGlyph(p, r.in ? r.tool : "");
     const bool dragChanged = r.drag.items != p.drag.items || r.drag.dt != p.drag.dt || r.drag.dtr != p.drag.dtr;
     p.drag = r.drag;
     if (dragChanged) p.pendingSpring = true;
@@ -1405,11 +1534,12 @@ void tick() {
         p.pendingSpring = true;
       }
       updateTag(p, t);
+      pruneParts(p, t);
       // A cursor resting a while dims to half; the person we follow never
       // dims.
       const bool idle = p.cursorShown && !p.followed && t - p.lastMove > kStyle.idleDimAfter;
       if (idle != p.idle) {
-        fade(p.arrow, idle ? kStyle.idleOpacity : 1, idle ? kStyle.idleFade : kStyle.fadeIn);
+        fade(p.glyph, idle ? kStyle.idleOpacity : 1, idle ? kStyle.idleFade : kStyle.fadeIn);
         p.idle = idle;
       }
       ++it;
@@ -1428,6 +1558,84 @@ bool viewSize(double* w, double* h) {
 double pixelScale() { return 1; }
 
 bool mouseHeld() { return ([NSEvent pressedMouseButtons] & 1) != 0; }
+
+// ---------- what REAPER's own cursor shows ----------
+//
+// REAPER sets its cursors from the .cur files in its bundle. The cursor it
+// shows right now is matched against those files by its pixels (alpha drawn
+// at 32 x 32) and hotspot, once per cursor object: REAPER keeps its cursors,
+// so after the first sighting it is a table lookup.
+
+struct CursorRef {
+  std::string key;
+  std::vector<uint8_t> mask;
+  NSPoint hot = NSZeroPoint;  // in the 32 x 32 grid
+};
+std::vector<CursorRef> g_cursorRefs;
+bool g_cursorRefsLoaded = false;
+NSMapTable<NSCursor*, NSString*>* g_cursorKeys = nil;
+
+std::vector<uint8_t> cursorMask(NSImage* img) {
+  std::vector<uint8_t> a(32 * 32, 0);
+  if (!img) return a;
+  CGContextRef c = CGBitmapContextCreate(a.data(), 32, 32, 8, 32, nullptr, kCGImageAlphaOnly);
+  if (!c) return a;
+  NSGraphicsContext* g = [NSGraphicsContext graphicsContextWithCGContext:c flipped:NO];
+  [NSGraphicsContext saveGraphicsState];
+  NSGraphicsContext.currentContext = g;
+  [img drawInRect:NSMakeRect(0, 0, 32, 32) fromRect:NSZeroRect operation:NSCompositingOperationCopy fraction:1];
+  [NSGraphicsContext restoreGraphicsState];
+  CGContextRelease(c);
+  for (auto& v : a) v = v >= 128;
+  return a;
+}
+
+void loadCursorRefs() {
+  g_cursorRefsLoaded = true;
+  g_cursorKeys = [NSMapTable strongToStrongObjectsMapTable];
+  NSString* dir = NSBundle.mainBundle.resourcePath;
+  for (const auto& n : cursor_glyphs::kCursorNames) {
+    NSString* path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.cur", n.file]];
+    NSData* data = [NSData dataWithContentsOfFile:path];
+    NSImage* img = data ? [[NSImage alloc] initWithData:data] : nil;
+    // The hotspot is in the file's first directory entry (bytes 10..13).
+    if (!img || data.length < 22) continue;
+    const auto* b = static_cast<const uint8_t*>(data.bytes);
+    const double w = b[6] ? b[6] : 256, h = b[7] ? b[7] : 256;
+    CursorRef r;
+    r.key = n.key;
+    r.mask = cursorMask(img);
+    r.hot = NSMakePoint((b[10] | b[11] << 8) * 32 / w, (b[12] | b[13] << 8) * 32 / h);
+    g_cursorRefs.push_back(std::move(r));
+  }
+  if (g_cursorRefs.empty()) logf("no REAPER cursor files found in %s", dir.UTF8String);
+}
+
+std::string keyOfCursor(NSCursor* cur) {
+  if (!cur) return "";
+  if (!g_cursorRefsLoaded) loadCursorRefs();
+  if (NSString* k = [g_cursorKeys objectForKey:cur]) return k.UTF8String;
+  std::string key;
+  const NSSize sz = cur.image.size;
+  if (sz.width > 0 && sz.height > 0) {
+    const std::vector<uint8_t> m = cursorMask(cur.image);
+    const NSPoint hot = NSMakePoint(cur.hotSpot.x * 32 / sz.width, cur.hotSpot.y * 32 / sz.height);
+    int best = 40;  // of 1024 pixels: a rounding difference, never another cursor
+    for (const auto& r : g_cursorRefs) {
+      if (std::fabs(r.hot.x - hot.x) > 1.5 || std::fabs(r.hot.y - hot.y) > 1.5) continue;
+      int diff = 0;
+      for (size_t i = 0; i < m.size(); ++i) diff += m[i] != r.mask[i];
+      if (diff < best) {
+        best = diff;
+        key = r.key;
+      }
+    }
+  }
+  if (g_cursorKeys.count > 256) [g_cursorKeys removeAllObjects];
+  [g_cursorKeys setObject:@(key.c_str()) forKey:cur];
+  if (getenv("REAMESH_DEBUG_CURSOR")) logf("cursor %p (%.0fx%.0f) -> '%s'", (__bridge void*)cur, sz.width, sz.height, key.c_str());
+  return key;
+}
 
 bool sampleLocal(Local* out) {
   if (!g_attached) return false;
@@ -1461,6 +1669,7 @@ bool sampleLocal(Local* out) {
     out->down = out->in && down;
     out->px = vp.x;
     out->py = vp.y;
+    if (out->in) out->tool = keyOfCursor(NSCursor.currentCursor);
   }
   return true;
 }

@@ -38,14 +38,17 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "cursor_glyphs.h"
 #include "cursor_overlay.h"
 
 using Microsoft::WRL::ComPtr;
@@ -64,6 +67,7 @@ struct Style {
   double pointerNotch;
   double tipRadius, wingRadius, notchRadius;
   double outline;
+  double morph;
   double shadowOpacity;
   double shadowRadius;
   double shadowOffsetY;
@@ -99,6 +103,7 @@ constexpr Style kStyle = {
     .wingRadius = 1.8,
     .notchRadius = 2.4,
     .outline = 1.75,
+    .morph = 0.26,
     .shadowOpacity = 0.22,
     .shadowRadius = 2.5,
     .shadowOffsetY = 1,
@@ -602,55 +607,9 @@ void setScaleCentre(Node& n, double x, double y) {
 // ---------- drawing ----------
 
 ComPtr<ID2D1StrokeStyle> g_roundJoin, g_dashed;
-ComPtr<ID2D1PathGeometry> g_pointer, g_edgeArrow;
+ComPtr<ID2D1PathGeometry> g_edgeArrow;
 std::map<int, ComPtr<IDWriteTextFormat>> g_formats;  // by size * 10
 double g_capPerEm = 0.7;                              // Segoe UI Semibold cap height / em
-
-// Like CGPathAddArcToPoint: a line towards `corner`, then an arc of radius r
-// tangent to both edges, ending on the edge towards `next`.
-void arcTo(ID2D1GeometrySink* s, D2D1_POINT_2F& cur, D2D1_POINT_2F corner, D2D1_POINT_2F next, double r) {
-  const double ax = cur.x - corner.x, ay = cur.y - corner.y, bx = next.x - corner.x, by = next.y - corner.y;
-  const double la = std::hypot(ax, ay), lb = std::hypot(bx, by);
-  if (la < 1e-9 || lb < 1e-9) return;
-  const double ang = std::acos(std::clamp((ax * bx + ay * by) / (la * lb), -1.0, 1.0));
-  const double d = r / std::tan(ang / 2);
-  const D2D1_POINT_2F t1 = D2D1::Point2F(static_cast<float>(corner.x + ax / la * d), static_cast<float>(corner.y + ay / la * d));
-  const D2D1_POINT_2F t2 = D2D1::Point2F(static_cast<float>(corner.x + bx / lb * d), static_cast<float>(corner.y + by / lb * d));
-  s->AddLine(t1);
-  // y points down, so a positive cross product turns clockwise on screen.
-  const double cross = (corner.x - cur.x) * (next.y - corner.y) - (corner.y - cur.y) * (next.x - corner.x);
-  s->AddArc(D2D1::ArcSegment(t2, D2D1::SizeF(static_cast<float>(r), static_cast<float>(r)), 0,
-                             cross > 0 ? D2D1_SWEEP_DIRECTION_CLOCKWISE : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-                             D2D1_ARC_SIZE_SMALL));
-  cur = t2;
-}
-
-// Hotspot at (0,0), y down. Four corners: the tip, two wings and the notch
-// between them, every one rounded. The rounding pulls the drawn tip inwards,
-// so the shape is shifted back by that amount to keep the hotspot on it.
-ID2D1PathGeometry* pointerGeometry() {
-  if (g_pointer || !g_d2dFactory) return g_pointer.Get();
-  const double z = kStyle.pointerSize;
-  const double wing = 0.37 * z;
-  const double half = std::atan2(z, wing) - kPi / 4;
-  const double inset = (kStyle.tipRadius / std::sin(half) - kStyle.tipRadius) / std::sqrt(2.0);
-  auto P = [inset](double x, double y) { return D2D1::Point2F(static_cast<float>(x - inset), static_cast<float>(y - inset)); };
-  const double nn = kStyle.pointerNotch * (z + wing) / 2;
-  const D2D1_POINT_2F tip = P(0, 0), left = P(wing, z), right = P(z, wing), notch = P(nn, nn);
-  ComPtr<ID2D1PathGeometry> g;
-  ComPtr<ID2D1GeometrySink> s;
-  if (FAILED(g_d2dFactory->CreatePathGeometry(&g)) || FAILED(g->Open(&s))) return nullptr;
-  D2D1_POINT_2F cur = D2D1::Point2F((tip.x + left.x) / 2, (tip.y + left.y) / 2);
-  s->BeginFigure(cur, D2D1_FIGURE_BEGIN_FILLED);
-  arcTo(s.Get(), cur, left, notch, kStyle.wingRadius);
-  arcTo(s.Get(), cur, notch, right, kStyle.notchRadius);
-  arcTo(s.Get(), cur, right, tip, kStyle.wingRadius);
-  arcTo(s.Get(), cur, tip, left, kStyle.tipRadius);
-  s->EndFigure(D2D1_FIGURE_END_CLOSED);
-  if (FAILED(s->Close())) return nullptr;
-  g_pointer = g;
-  return g_pointer.Get();
-}
 
 // A small triangle pointing along +x, centred on (0,0).
 ID2D1PathGeometry* edgeArrowGeometry() {
@@ -807,15 +766,80 @@ std::string scaleKey() {
   return b;
 }
 
-void drawArrow(Node& n, const std::string& color) {
-  const std::string look = "arrow" + color + scaleKey();
+// The pointer glyph (cursor_glyphs.h) as its morph stands at time t: per
+// glyph layer the white edges of its parts, then their fills, over one soft
+// shadow. While a morph runs the layer's timer draws it again every frame;
+// DirectComposition can't animate a shape itself.
+ComPtr<ID2D1PathGeometry> partGeometry(const float* pts) {
+  ComPtr<ID2D1PathGeometry> g;
+  ComPtr<ID2D1GeometrySink> s;
+  if (!g_d2dFactory || FAILED(g_d2dFactory->CreatePathGeometry(&g)) || FAILED(g->Open(&s))) return nullptr;
+  s->BeginFigure(D2D1::Point2F(pts[0], pts[1]), D2D1_FIGURE_BEGIN_FILLED);
+  for (int i = 1; i < cursor_glyphs::kPoints; ++i) s->AddLine(D2D1::Point2F(pts[2 * i], pts[2 * i + 1]));
+  s->EndFigure(D2D1_FIGURE_END_CLOSED);
+  if (FAILED(s->Close())) return nullptr;
+  return g;
+}
+
+// Room around the hotspot every glyph fits in, DIP.
+constexpr double kGlyphLeft = 16, kGlyphTop = 16, kGlyphRight = 24, kGlyphBottom = 24;
+
+void drawGlyph(Node& n, const cursor_glyphs::Morph& m, const std::string& color, double t) {
+  const bool running = m.running(t);
+  char key[64];
+  snprintf(key, sizeof key, "glyph%d|%s|%.4f", m.glyph, color.c_str(), running ? t : -1.0);
+  const std::string look = key + scaleKey();
   if (n.look == look) return;
-  ID2D1Geometry* g = pointerGeometry();
-  ID2D1DeviceContext* dc = g ? beginDraw(n, kStyle.pointerSize, kStyle.pointerSize, 6) : nullptr;
+  const double u = m.progress(t);
+  struct Part {
+    ComPtr<ID2D1PathGeometry> g;
+    cursor_glyphs::Look look;
+    double op;
+    int layer;
+  };
+  std::vector<Part> parts;
+  int layers = 0;
+  for (const auto& sl : m.slots) {
+    float pts[cursor_glyphs::kPoints * 2];
+    Part pt;
+    cursor_glyphs::Morph::current(sl, u, pts, &pt.look, &pt.op);
+    if (pt.op <= 0.002) continue;
+    for (int i = 0; i < cursor_glyphs::kPoints * 2; i += 2) {
+      pts[i] += static_cast<float>(kGlyphLeft);
+      pts[i + 1] += static_cast<float>(kGlyphTop);
+    }
+    pt.g = partGeometry(pts);
+    if (!pt.g) return;
+    pt.layer = sl.layer;
+    layers = std::max(layers, sl.layer + 1);
+    parts.push_back(pt);
+  }
+  ID2D1DeviceContext* dc = beginDraw(n, kGlyphLeft + kGlyphRight, kGlyphTop + kGlyphBottom, 6, kGlyphLeft, kGlyphTop);
   if (!dc) return;
-  drawShadow(dc, g, kStyle.shadowOpacity);
-  dc->FillGeometry(g, brush(dc, rgba(parseColor(color))).Get());
-  dc->DrawGeometry(g, brush(dc, D2D1::ColorF(1, 1, 1, 1)).Get(), static_cast<float>(kStyle.outline), roundJoin());
+  std::vector<ID2D1Geometry*> all;
+  for (const Part& pt : parts)
+    if (pt.look.white < 0.5) all.push_back(pt.g.Get());
+  ComPtr<ID2D1GeometryGroup> group;
+  if (!all.empty() && SUCCEEDED(g_d2dFactory->CreateGeometryGroup(D2D1_FILL_MODE_WINDING, all.data(),
+                                                                  static_cast<UINT32>(all.size()), &group)))
+    drawShadow(dc, group.Get(), kStyle.shadowOpacity);
+  const Rgb c = parseColor(color);
+  for (int layer = 0; layer < layers; ++layer) {
+    for (const Part& pt : parts) {
+      if (pt.layer != layer) continue;
+      if (pt.look.edgeFill > 0) dc->FillGeometry(pt.g.Get(), brush(dc, D2D1::ColorF(1, 1, 1, static_cast<float>(pt.look.edgeFill * pt.op))).Get());
+      if (pt.look.edge > 0.01)
+        dc->DrawGeometry(pt.g.Get(), brush(dc, D2D1::ColorF(1, 1, 1, static_cast<float>(pt.op))).Get(),
+                         static_cast<float>(pt.look.edge), roundJoin());
+    }
+    for (const Part& pt : parts) {
+      if (pt.layer != layer) continue;
+      const double w = pt.look.white;
+      const Rgb f{static_cast<float>(c.r + (1 - c.r) * w), static_cast<float>(c.g + (1 - c.g) * w),
+                  static_cast<float>(c.b + (1 - c.b) * w)};
+      dc->FillGeometry(pt.g.Get(), brush(dc, rgba(f, pt.look.fillAlpha * pt.op)).Get());
+    }
+  }
   endDraw(n, dc);
   n.look = look;
 }
@@ -947,7 +971,9 @@ struct Peer {
   std::map<std::string, DragItem> dragItems;
 
   Node root;   // positioned at the pointer tip
-  Node arrow;  // child of root
+  Node arrow;  // child of root: the glyph, scaled about the hotspot while pressed
+  cursor_glyphs::Morph morph;
+  double tagOffX = kStyle.tagDX, tagOffY = kStyle.tagDY;  // below the glyph, DIP
   bool followed = false;
   Node tag;    // a sibling of root, so it can trail it
   Node edge;
@@ -1072,7 +1098,8 @@ void buildLayers(Peer& p) {
   setOpacityNow(p.edge, 0);
   setOpacityNow(p.tag, 0);
   setOpacityNow(p.root, 0);
-  drawArrow(p.arrow, p.color);
+  p.morph.set(0, now(), 0, kStyle.outline);
+  drawGlyph(p.arrow, p.morph, p.color, now());
   // Built above every other cursor, which the followed one has to stay on.
   if (p.id == g_followId) setFollowed(p, true);
   else raiseFollowed();
@@ -1093,7 +1120,7 @@ void dropLayers(Peer& p) {
 
 void refreshTag(Peer& p) {
   drawPill(p.tag, displayName(p), p.color, kStyle.tagFont, kStyle.tagHeight, kStyle.tagPadX);
-  drawArrow(p.arrow, p.color);
+  drawGlyph(p.arrow, p.morph, p.color, now());
 }
 
 void refreshEdge(Peer& p, Side side) {
@@ -1162,6 +1189,27 @@ void ripple(Peer& p) {
   dropLater(r, t + kStyle.rippleDuration + 0.05);
 }
 
+// The glyph REAPER's cursor stands for on their screen ("" the pointer).
+// Hidden cursors switch at once; a visible one morphs, drawn per frame by
+// the layer's timer.
+void setGlyph(Peer& p, const std::string& key) {
+  const int g = cursor_glyphs::glyphFor(key);
+  const double t = now();
+  if (!p.morph.set(g, t, g_reduceMotion || !p.cursorShown ? 0 : kStyle.morph, kStyle.outline)) return;
+  drawGlyph(p.arrow, p.morph, p.color, t);
+  cursor_glyphs::tagOffset(g, kStyle.tagDX, kStyle.tagDY, &p.tagOffX, &p.tagOffY);
+  p.pendingSpring = true;
+}
+
+// Every running morph one frame on; finished ones drop their leftovers.
+void stepMorphs(double t) {
+  for (auto& [id, p] : g_peers) {
+    // A moment past the end draws the final shape (then it is a cached look).
+    if (t < p.morph.start + p.morph.dur + 0.1) drawGlyph(p.arrow, p.morph, p.color, t);
+    p.morph.prune(t);
+  }
+}
+
 // The button is held (or let go): the pointer shrinks a little about its tip.
 void setPressed(Peer& p, bool down) {
   if (down == p.pressed) return;
@@ -1175,7 +1223,7 @@ void crossfadeTo(Peer& p, Pt at, Pt tagAt) {
   const double t = now();
   Node ghost = makeNode(g_rootV.Get(), Z::Below, p.root.v.Get());
   if (ghost) {
-    drawArrow(ghost, p.color);
+    drawGlyph(ghost, p.morph, p.color, p.morph.start + p.morph.dur + 1);
     setPos(ghost, shownAt(p.root, t));
     ghost.sx = ghost.sy = Curve::constant(p.arrow.sx.value(t) * p.root.sx.value(t));
     bindScale(ghost, t);
@@ -1333,7 +1381,7 @@ void layoutPeer(Peer& p, const Geo& g, double t) {
   layoutDrag(p, g, net);
 
   if (pl.kind == Place::Cursor) {
-    const Pt tagAt{pl.p.x + std::round(S(kStyle.tagDX)), pl.p.y + std::round(S(kStyle.tagDY))};
+    const Pt tagAt{pl.p.x + std::round(S(p.tagOffX)), pl.p.y + std::round(S(p.tagOffY))};
     if (!p.cursorShown) {
       snapTo(p.root, pl.p);
       snapTo(p.tag, tagAt);
@@ -1350,6 +1398,10 @@ void layoutPeer(Peer& p, const Geo& g, double t) {
         setPos(p.root, pl.p);
         setPos(p.tag, tagAt);
       }
+    } else if (!samePoint(tagAt, p.tagModel)) {
+      // A new glyph moved the name tag below it.
+      if (g_reduceMotion) setPos(p.tag, tagAt);
+      else springTo(p.tag, p.tagModel, tagAt, kStyle.tagStiffness);
     }
     p.cursorModel = pl.p;
     p.tagModel = tagAt;
@@ -1481,6 +1533,7 @@ void onTimer() {
   if (!g_attached) return;  // the pump may have ended the session
   const double t = now();
   sweepDoomed(t);
+  stepMorphs(t);
   if (!g_peers.empty() || !g_marks.empty()) {
     // Updates stopped: the pointer came to rest, so take the prediction back.
     for (auto& [id, p] : g_peers)
@@ -1869,6 +1922,7 @@ void update(const Remote& r) {
     p.predict = false;
   }
   setPressed(p, r.in && r.down);
+  setGlyph(p, r.in ? r.tool : "");
   const bool dragChanged = r.drag.items != p.drag.items || r.drag.dt != p.drag.dt || r.drag.dtr != p.drag.dtr;
   p.drag = r.drag;
   if (dragChanged) p.pendingSpring = true;
@@ -1949,6 +2003,121 @@ bool mouseHeld() {
   return (GetAsyncKeyState(GetSystemMetrics(SM_SWAPBUTTON) ? VK_RBUTTON : VK_LBUTTON) & 0x8000) != 0;
 }
 
+// ---------- what REAPER's own cursor shows ----------
+//
+// REAPER's cursors are resources of reaper.exe, loaded once and reused, so
+// the one it shows is found by its handle. Which resource stands for which
+// glyph is told by its pixels: a hash over the 32 x 32 mask and the hotspot,
+// as REAPER's cursor files (the same images, named) give it. A handle that
+// isn't one of those resources is hashed the same way the first time it
+// shows up.
+
+// FNV-1a over the opaque-pixel bits (row by row, MSB first) and the hotspot.
+struct CursorHash {
+  uint64_t hash;
+  const char* file;
+};
+constexpr CursorHash kCursorHashes[] = {
+    {0x45653487a87ceff5ull, "size-left"},
+    {0x046b34356ce8fa05ull, "border_left"},
+    {0x2d7fb55bd125cb69ull, "size-border"},
+    {0xbf4312a6e281471dull, "size-right"},
+    {0xff82ae56ec42c8fdull, "border_right"},
+    {0xb5d9ed37c8ca66f0ull, "curve_fadein"},
+    {0xa3ef47902fdb70fdull, "curve_fadeout"},
+    {0x9fd559a687d88397ull, "adjustfade2"},
+    {0xa492d359378fef36ull, "fade_width"},
+    {0x6a96669799a3e114ull, "curve_fadeinout_l_r"},
+    {0x50649fe03924cc07ull, "xfade_move"},
+    {0xeb68486e9fad92bcull, "arrowslip"},
+    {0xdf8da63ba0416d18ull, "razor"},
+    {0x05055733f86addadull, "razor_move"},
+    {0xd31a51bf080ace16ull, "razor_copy"},
+};
+
+std::map<HCURSOR, std::string> g_cursorKeys;
+bool g_cursorKeysLoaded = false;
+
+// A bitmap's pixels as 32-bit BGRA, top row first.
+bool bitmapPixels(HBITMAP bm, int w, int h, std::vector<uint32_t>* out) {
+  BITMAPINFO bi{};
+  bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+  bi.bmiHeader.biWidth = w;
+  bi.bmiHeader.biHeight = -h;
+  bi.bmiHeader.biPlanes = 1;
+  bi.bmiHeader.biBitCount = 32;
+  bi.bmiHeader.biCompression = BI_RGB;
+  out->assign(static_cast<size_t>(w) * h, 0);
+  HDC dc = GetDC(nullptr);
+  const int lines = dc ? GetDIBits(dc, bm, 0, h, out->data(), &bi, DIB_RGB_COLORS) : 0;
+  if (dc) ReleaseDC(nullptr, dc);
+  return lines == h;
+}
+
+// The cursor's glyph key from its pixels; "" when it isn't one of ours.
+std::string keyFromPixels(HCURSOR c) {
+  ICONINFO ii{};
+  if (!GetIconInfo(c, &ii)) return "";
+  std::string key;
+  BITMAP bm{};
+  if (ii.hbmMask && GetObjectW(ii.hbmMask, sizeof bm, &bm)) {
+    const bool mono = !ii.hbmColor;  // monochrome: AND above XOR in one bitmap
+    const int w = bm.bmWidth, h = mono ? bm.bmHeight / 2 : bm.bmHeight;
+    std::vector<uint32_t> mask, color;
+    if (w == 32 && h == 32 && bitmapPixels(ii.hbmMask, w, mono ? 2 * h : h, &mask) &&
+        (mono || bitmapPixels(ii.hbmColor, w, h, &color))) {
+      uint8_t bits[32 * 4] = {};
+      for (int y = 0; y < 32; ++y)
+        for (int x = 0; x < 32; ++x) {
+          const bool andBit = (mask[y * 32 + x] & 0xffffff) != 0;
+          const bool xorBit = ((mono ? mask[(y + 32) * 32 + x] : color[y * 32 + x]) & 0xffffff) != 0;
+          if (!andBit || xorBit) bits[y * 4 + x / 8] |= static_cast<uint8_t>(0x80 >> (x % 8));
+        }
+      uint64_t hash = 0xcbf29ce484222325ull;
+      const auto feed = [&hash](uint8_t b) { hash = (hash ^ b) * 0x100000001b3ull; };
+      for (uint8_t b : bits) feed(b);
+      feed(static_cast<uint8_t>(ii.xHotspot));
+      feed(static_cast<uint8_t>(ii.yHotspot));
+      for (const auto& ch : kCursorHashes)
+        if (ch.hash == hash)
+          for (const auto& n : cursor_glyphs::kCursorNames)
+            if (!strcmp(n.file, ch.file)) key = n.key;
+    }
+  }
+  if (ii.hbmMask) DeleteObject(ii.hbmMask);
+  if (ii.hbmColor) DeleteObject(ii.hbmColor);
+  return key;
+}
+
+BOOL CALLBACK cursorResource(HMODULE m, LPCWSTR, LPWSTR name, LONG_PTR) {
+  // The shared handle REAPER gets from LoadCursor, and a 32 x 32 copy to read.
+  HCURSOR shown = LoadCursorW(m, name);
+  HCURSOR exact = static_cast<HCURSOR>(LoadImageW(m, name, IMAGE_CURSOR, 32, 32, 0));
+  if (shown && exact) {
+    const std::string key = keyFromPixels(exact);
+    if (!key.empty()) g_cursorKeys[shown] = key;
+  }
+  if (exact) DestroyCursor(exact);
+  return TRUE;
+}
+
+std::string currentCursorKey() {
+  if (!g_cursorKeysLoaded) {
+    g_cursorKeysLoaded = true;
+    EnumResourceNamesW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(12) /* RT_GROUP_CURSOR */, cursorResource, 0);
+    trace("%zu REAPER cursors matched", g_cursorKeys.size());
+  }
+  CURSORINFO ci{};
+  ci.cbSize = sizeof ci;
+  if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return "";
+  auto it = g_cursorKeys.find(ci.hCursor);
+  if (it == g_cursorKeys.end()) {
+    if (g_cursorKeys.size() > 512) g_cursorKeys.clear();
+    it = g_cursorKeys.emplace(ci.hCursor, keyFromPixels(ci.hCursor)).first;
+  }
+  return it->second;
+}
+
 bool sampleLocal(Local* out) {
   if (!g_attached) return false;
   *out = Local{};
@@ -1990,6 +2159,7 @@ bool sampleLocal(Local* out) {
   out->down = out->in && down;
   out->px = at.x;
   out->py = at.y;
+  if (out->in) out->tool = currentCursorKey();
   return true;
 }
 

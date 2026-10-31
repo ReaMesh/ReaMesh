@@ -83,6 +83,7 @@ struct Remote {
   bool click = false;  // a mouse-down at this spot
   bool down = false;   // the button is held (dragging)
   Drag drag;           // while dragging items
+  std::string tool;    // the glyph REAPER's cursor stands for ("" the pointer, see cursor_glyphs.h)
 };
 void update(const Remote& r);
 
@@ -112,6 +113,7 @@ struct Local {
   bool click = false;
   bool down = false;
   double px = 0, py = 0;  // arrange pixels, for change detection only
+  std::string tool;       // what REAPER's cursor shows right now ("" the plain pointer)
 };
 // Samples the local pointer; false when there is nothing to sample (no layer).
 bool sampleLocal(Local* out);
