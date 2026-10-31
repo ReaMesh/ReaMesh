@@ -171,11 +171,12 @@ struct TestBehaviour {
 }
 
 fn test_swarm() -> anyhow::Result<libp2p::Swarm<TestBehaviour>> {
+    let (dns_cfg, dns_opts) = crate::dns_config();
     Ok(libp2p::SwarmBuilder::with_existing_identity(crate::identity_keypair())
         .with_tokio()
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
         .with_quic()
-        .with_dns()?
+        .with_dns_config(dns_cfg, dns_opts)
         .with_behaviour(|_| TestBehaviour { auth: auth_behaviour() })
         .map_err(|e| anyhow::anyhow!("behaviour: {e}"))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(5)))

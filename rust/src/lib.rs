@@ -1245,6 +1245,38 @@ fn identity_keypair() -> libp2p::identity::Keypair {
     }
 }
 
+/// Resolver config for `/dns/` relay addresses. hickory's system reader
+/// refuses the whole config over one entry it can't parse (macOS lists an
+/// iPhone hotspot's link-local server as `fe80::…%en0`), and DNS is only
+/// needed for relay codes that name a host, so that must never fail a swarm
+/// start. Fallback: the parsable `nameserver` lines of `/etc/resolv.conf`
+/// (absent on Windows), else a public resolver. Logged once per process.
+pub(crate) fn dns_config() -> (libp2p::dns::ResolverConfig, libp2p::dns::ResolverOpts) {
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts, QUAD9};
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+
+    let err = match hickory_resolver::system_conf::read_system_conf() {
+        Ok(conf) => return conf,
+        Err(e) => e.to_string(),
+    };
+    let servers: Vec<NameServerConfig> = std::fs::read_to_string("/etc/resolv.conf")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("nameserver"))
+        .filter_map(|ip| ip.trim().parse::<IpAddr>().ok())
+        .map(NameServerConfig::udp_and_tcp)
+        .collect();
+    let (cfg, via) = if servers.is_empty() {
+        (ResolverConfig::udp_and_tcp(&QUAD9), "a public resolver")
+    } else {
+        (ResolverConfig::from_parts(None, vec![], servers), "the parsable resolv.conf servers")
+    };
+    LOGGED.call_once(|| {
+        eprintln!("[reamesh] system DNS config unreadable ({err}); using {via}");
+    });
+    (cfg, ResolverOpts::default())
+}
+
 /// Load the keypair stored at `path`, or mint + persist a fresh one there.
 /// Kept free of the `IDENTITY_PATH` global so it is unit-testable without
 /// contaminating the in-process network tests (which must each get their own
@@ -3903,6 +3935,7 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
     // The per-install persisted keypair when the extension registered one
     // (lasting identity: remembered hosts, tickets that survive a restart), a
     // fresh ephemeral one otherwise (tests spin many peers per process).
+    let (dns_cfg, dns_opts) = dns_config();
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity_keypair())
         .with_tokio()
         .with_tcp(
@@ -3917,8 +3950,7 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
         // to TCP. Same identity keypair as the TCP transport.
         .with_quic()
         // A relay code may name its relay by DNS name.
-        .with_dns()
-        .map_err(|e| anyhow::anyhow!("dns: {e}"))?
+        .with_dns_config(dns_cfg, dns_opts)
         .with_relay_client(noise::Config::new, yamux::Config::default)
         .map_err(|e| anyhow::anyhow!("relay client: {e}"))?
         .with_behaviour(|key, relay_client| {

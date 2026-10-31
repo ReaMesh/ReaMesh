@@ -40,6 +40,10 @@ if-addrs = "0.15"
 # The lobby gossip wrapper hands relayed connections a do-nothing handler
 # (`relay::LanOnly`). Already in the tree through libp2p.
 either = "1"
+# Reading the OS resolver config ourselves, so one unparsable nameserver (a
+# zone-scoped `fe80::…%en0` on iPhone hotspots) can't fail every swarm start
+# (`dns_config`). Same version libp2p's `dns` feature already pulls in.
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["system-config"] }
 # The relay code and auth exchange, shared with the relay server (`relay/`).
 reamesh-relay-proto = { path = "../relay-proto" }
 
