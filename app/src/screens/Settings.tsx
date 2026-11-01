@@ -539,7 +539,8 @@ export function Settings({
           <SectionLabel>{t("updates")}</SectionLabel>
           <Group>
             <Row
-              label={`${version ? `ReaMesh ${version}` : "ReaMesh"} ${channelLabel(channel.channel)}`}
+              // The channel is the switch two rows down; said once, there.
+              label={version ? `ReaMesh ${version}` : "ReaMesh"}
               sub={
                 updateSub && (
                   <span className={cn(update.phase === "failed" && "text-amber-500")}>
@@ -879,11 +880,11 @@ export function Settings({
                 </span>
               </Row>
               <Divider inset={false} />
-              <Row label={t("aboutBuild")}>
+              {/* One fact per side: the kind of build names the row, its date
+                  is the value. */}
+              <Row label={build ? t(build.release ? "releaseBuild" : "devBuild") : t("aboutBuild")}>
                 <span className="shrink-0 text-[12px] text-muted-foreground tabular-nums">
-                  {build && [t(build.release ? "releaseBuild" : "devBuild"), buildDate]
-                    .filter(Boolean)
-                    .join(" · ")}
+                  {buildDate}
                 </span>
               </Row>
               <Divider inset={false} />
@@ -904,7 +905,8 @@ export function Settings({
             <div className="space-y-1 px-1 text-[11px] leading-snug text-muted-foreground">
               <p>{t("aboutTagline")}</p>
               <p>{t("cockosNotice")}</p>
-              <p>© 2026 tiszu · GPL-3.0</p>
+              <p>© 2026 tiszu</p>
+              <p>GPL-3.0</p>
             </div>
           </section>
         )}

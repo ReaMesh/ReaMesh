@@ -147,8 +147,10 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
                         )}
                       >
                         <p className="truncate text-[13px]">{p.name}</p>
-                        <p className="truncate text-[12px] text-muted-foreground tabular-nums">
-                          {[formatBytes(p.bytes), date(p.modified)].filter(Boolean).join(" · ")}
+                        {/* Size and date side by side, each its own fact. */}
+                        <p className="flex gap-3 truncate text-[12px] text-muted-foreground tabular-nums">
+                          <span>{formatBytes(p.bytes)}</span>
+                          {date(p.modified) && <span className="truncate">{date(p.modified)}</span>}
                         </p>
                       </button>
                       {used ? (

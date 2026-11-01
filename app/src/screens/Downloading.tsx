@@ -160,7 +160,8 @@ function Faces({ shown, rest }: { shown: Peer[]; rest: number }) {
   // Gliding from one face to the next; a fresh tag just takes its size.
   const [moved, setMoved] = useState(false);
 
-  const label = (p: Peer) => (p.is_owner ? `${displayName(p)} · ${t("sessionHost")}` : displayName(p));
+  // The host's face wears the crown, so the tag only needs the name.
+  const label = (p: Peer) => displayName(p);
   const current = at != null ? shown[at] : undefined;
   const text = current ? label(current) : "";
   const face = at != null ? faces.current[at] : null;
