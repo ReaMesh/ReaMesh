@@ -28,6 +28,9 @@ import { isWindows } from "@/lib/platform";
 import { localizeLogEntry } from "@/lib/log";
 import { pluginStatus, useInstalledPlugins } from "@/lib/plugins";
 import { isInviteLink } from "@/lib/ticket";
+import { isRelayCode } from "@/lib/relay";
+import { offerRelayLink } from "@/lib/relayLink";
+import { RelayLinkDialog } from "@/components/RelayLinkDialog";
 import { displayName, type ExtState, type LogEntry, type Mode } from "@/lib/types";
 import { cn, focusRing } from "@/lib/utils";
 import { listenForRestart, revealWindow, takeResume, trackScreen } from "@/lib/resume";
@@ -353,6 +356,9 @@ export default function App() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     onOpenUrl((urls) => {
+      // A relay code asks right where it is, whatever the screen.
+      const relay = urls.find(isRelayCode);
+      if (relay) offerRelayLink(relay);
       const link = urls.find(isInviteLink);
       if (!link) return;
       offerInvite(link);
@@ -682,6 +688,7 @@ export default function App() {
           {screen.node}
         </motion.main>
       </AnimatePresence>
+      <RelayLinkDialog hosting={state?.mode === "hosting"} />
       <Toaster />
     </div>
   );
