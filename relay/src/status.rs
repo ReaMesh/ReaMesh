@@ -37,7 +37,31 @@ pub struct Status {
     /// Own public IPs as hosts saw them.
     pub observed_ips: Vec<IpAddr>,
     pub listening: Vec<String>,
+    /// Bytes sent per second over the last few seconds.
+    #[serde(default)]
+    pub rate: u64,
+    /// Connections that came in over each transport since the start.
+    #[serde(default)]
+    pub inbound_tcp: Inbound,
+    #[serde(default)]
+    pub inbound_quic: Inbound,
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Inbound {
+    pub count: u64,
+    /// Unix seconds of the newest one.
+    pub last: u64,
+}
+
+/// After this many connections over TCP and none over QUIC, UDP is most
+/// likely blocked: ReaMesh dials both at once and QUIC, with fewer round
+/// trips, usually wins. The other way round means nothing, so TCP is never
+/// suspected.
+pub const QUIC_SUSPECT_AFTER: u64 = 5;
+
+/// Rates below this are the relay's own small protocols, not traffic.
+const RATE_SHOWN_FROM: u64 = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostStatus {
@@ -84,7 +108,7 @@ impl Status {
             String::new()
         };
         let mut out = format!(
-            "{dot}{}  {} {up}   {} {}   {} {}\n\n",
+            "{dot}{} {} {up}   {} {}   {} {}\n\n",
             s.strong("running"),
             s.dim("for"),
             s.dim("mode"),
@@ -92,10 +116,11 @@ impl Status {
             s.dim("version"),
             self.version,
         );
-        out += &s.field(
-            "traffic",
-            &format!("{} this month\n", term::bytes(self.sent)),
-        );
+        let mut traffic = format!("{} this month", term::bytes(self.sent));
+        if self.rate >= RATE_SHOWN_FROM {
+            traffic += &format!(", now {}/s", term::bytes(self.rate));
+        }
+        out += &s.field("traffic", &format!("{traffic}\n"));
         if self.budget == 0 {
             out += &s.field("budget", "none\n");
         } else {
@@ -105,21 +130,40 @@ impl Status {
                 p => format!("{:.0}", p.min(100.0).floor()),
             };
             let mut line = format!("{pct} % of {}", term::bytes(self.budget));
+            let mut warn = false;
             if self.budget_exhausted {
                 line += &format!(
                     ", coordination only until {}",
                     term::next_month_start(&self.month)
                 );
+            } else {
+                match self.projection(now) {
+                    Some(Projection::UsedUp(at)) => {
+                        line += &format!(", used up around {} at this pace", term::utc_day(at));
+                        warn = true;
+                    }
+                    Some(Projection::Total(total, last)) => {
+                        line +=
+                            &format!(", about {} by {}", term::bytes(total), term::utc_day(last));
+                    }
+                    None => {}
+                }
             }
+            let line = if warn { s.amber(&line) } else { line };
             let line = if s.rich {
                 let bar = term::bar(used, 20);
-                let bar = if used >= 0.8 { s.amber(&bar) } else { bar };
+                let bar = if used >= 0.8 || warn {
+                    s.amber(&bar)
+                } else {
+                    bar
+                };
                 format!("{bar}  {line}")
             } else {
                 line
             };
             out += &s.field("budget", &format!("{line}\n"));
         }
+        out += &s.field("inbound", &format!("{}\n", self.inbound_line(now, s)));
         out.push('\n');
         if self.hosts.is_empty() {
             out += &s.dim("No hosts connected.\n");
@@ -153,6 +197,57 @@ impl Status {
     }
 }
 
+enum Projection {
+    /// The budget runs out at this Unix time.
+    UsedUp(u64),
+    /// The month ends with this much sent; its last second.
+    Total(u64, u64),
+}
+
+impl Status {
+    /// Where this month ends up at the pace so far, once a day of it has
+    /// passed (before that, one evening's session would set the pace).
+    fn projection(&self, now: u64) -> Option<Projection> {
+        let (start, end) = term::month_bounds(&self.month)?;
+        let elapsed = now
+            .checked_sub(start)
+            .filter(|e| *e >= 86_400 && now < end)?;
+        if self.sent == 0 {
+            return None;
+        }
+        let total = u128::from(self.sent) * u128::from(end - start) / u128::from(elapsed);
+        if self.budget > 0 && total > u128::from(self.budget) {
+            let at = u128::from(start)
+                + u128::from(self.budget) * u128::from(elapsed) / u128::from(self.sent);
+            return Some(Projection::UsedUp(u64::try_from(at).ok()?));
+        }
+        Some(Projection::Total(u64::try_from(total).ok()?, end - 1))
+    }
+
+    /// "TCP 12 s ago   QUIC none yet", QUIC in amber once only TCP gets in.
+    fn inbound_line(&self, now: u64, s: Style) -> String {
+        let when = |i: Inbound| {
+            if i.count == 0 {
+                "none yet".to_owned()
+            } else {
+                let ago = Duration::from_secs(now.saturating_sub(i.last));
+                format!("{} ago", term::duration(ago))
+            }
+        };
+        let quic = format!("QUIC {}", when(self.inbound_quic));
+        let quic = if self.quic_suspect() {
+            s.amber(&quic)
+        } else {
+            quic
+        };
+        format!("TCP {}   {quic}", when(self.inbound_tcp))
+    }
+
+    pub fn quic_suspect(&self) -> bool {
+        self.inbound_tcp.count >= QUIC_SUSPECT_AFTER && self.inbound_quic.count == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,9 +262,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plain_status_names_hosts_by_key() {
-        let st = Status {
+    fn status() -> Status {
+        Status {
             running: true,
             pid: 1,
             updated: 9000,
@@ -183,6 +277,64 @@ mod tests {
             sent: 5_000_000_000,
             received: 0,
             budget: 500_000_000_000,
+            hosts: Vec::new(),
+            circuits: 0,
+            peers: 0,
+            observed_ips: Vec::new(),
+            listening: Vec::new(),
+            rate: 0,
+            inbound_tcp: Inbound::default(),
+            inbound_quic: Inbound::default(),
+        }
+    }
+
+    #[test]
+    fn budget_line_projects_the_month() {
+        // Ten days into November 2026.
+        let start = 1_793_491_200;
+        let now = start + 10 * 86_400;
+        let mut st = status();
+        st.month = "2026-11".into();
+        st.sent = 100_000_000_000;
+        st.rate = 1_400_000;
+        let out = st.render(now, Style::plain());
+        assert!(out.contains("traffic   100 GB this month, now 1.4 MB/s\n"));
+        assert!(out.contains("budget    20 % of 500 GB, about 300 GB by Nov 30\n"));
+        st.sent = 200_000_000_000;
+        let out = st.render(now, Style::plain());
+        assert!(out.contains("40 % of 500 GB, used up around Nov 26 at this pace\n"));
+        // Too early in the month to tell.
+        let out = st.render(start + 3600, Style::plain());
+        assert!(out.contains("budget    40 % of 500 GB\n"));
+    }
+
+    #[test]
+    fn inbound_line_suspects_only_quic() {
+        let mut st = status();
+        st.inbound_tcp = Inbound {
+            count: 2,
+            last: 8988,
+        };
+        let out = st.render(9000, Style::plain());
+        assert!(out.contains("inbound   TCP 12 s ago   QUIC none yet\n"));
+        assert!(!st.quic_suspect());
+        st.inbound_tcp.count = QUIC_SUSPECT_AFTER;
+        assert!(st.quic_suspect());
+        st.inbound_quic = Inbound {
+            count: 1,
+            last: 8000,
+        };
+        assert!(!st.quic_suspect());
+        let tcp_only = Status {
+            inbound_tcp: Inbound::default(),
+            ..st.clone()
+        };
+        assert!(!tcp_only.quic_suspect());
+    }
+
+    #[test]
+    fn plain_status_names_hosts_by_key() {
+        let st = Status {
             hosts: vec![
                 host("band", "12D3KooWaaaaaa", 1),
                 host("band", "12D3KooWbbbbbb", 0),
@@ -190,11 +342,10 @@ mod tests {
             ],
             circuits: 3,
             peers: 6,
-            observed_ips: Vec::new(),
-            listening: Vec::new(),
+            ..status()
         };
         let out = st.render(9000, Style::plain());
-        assert!(out.starts_with("running  for 2 h 13 min   mode full   version 0.1.0\n"));
+        assert!(out.starts_with("running for 2 h 13 min   mode full   version 0.1.0\n"));
         assert!(out.contains("budget    1 % of 500 GB\n"));
         assert!(out.contains("band ...aaaaaa   ec24d153   2 h 13 min   1 guest\n"));
         assert!(out.contains("lena             ec24d153   2 h 13 min   2 guests\n"));

@@ -44,7 +44,8 @@ use tracing::{debug, error, info, warn};
 use crate::addrs;
 use crate::auth::AuthState;
 use crate::config::{self, Config, Mode};
-use crate::status::{HostStatus, Status};
+use crate::seen::Seen;
+use crate::status::{self, HostStatus, Inbound, Status};
 use crate::term::{self, Style, problem};
 use crate::traffic::{Counters, CountingMuxer, Ledger};
 use reamesh_relay_proto::{self as proto, AuthRequest, AuthResponse, RelayAddr, RelayCode};
@@ -62,6 +63,8 @@ const MAX_OBSERVED: usize = 4;
 /// The same `limit` line at most this often, so a guest retrying against a
 /// full host doesn't flood the log.
 const LIMIT_LOG_EVERY: Duration = Duration::from_secs(60);
+/// Room for a banner value in 80 columns, after the R and the label.
+const BANNER_VALUE_WIDTH: usize = 52;
 
 pub struct Options {
     pub data_dir: PathBuf,
@@ -102,8 +105,8 @@ struct Behaviour {
 #[derive(Debug, Default)]
 struct Gate {
     auth: AuthState,
-    /// Active circuits: (source, destination, source IP).
-    circuits: Vec<(PeerId, PeerId, Option<IpAddr>)>,
+    /// Active circuits: (source, destination, source IP, opened).
+    circuits: Vec<(PeerId, PeerId, Option<IpAddr>, Instant)>,
     max_circuits: usize,
     max_circuits_per_ip: usize,
     max_circuits_per_host: usize,
@@ -216,12 +219,15 @@ impl RelayHandle {
 /// Tokio runtime.
 pub fn spawn(opts: Options) -> anyhow::Result<RelayHandle> {
     config::init(&opts.data_dir)?;
+    // Before anything binds: a second relay on the same dir would fight the
+    // first one over status.json and the ports.
+    let lock = config::lock_data_dir(&opts.data_dir)?;
     let key = config::load_identity(&opts.data_dir)?;
     let cfg = Config::load(&opts.data_dir)?;
     let peer_id = key.public().to_peer_id();
     let (listen_tx, listen) = watch::channel(Vec::new());
     let (shutdown, shutdown_rx) = watch::channel(false);
-    let task = tokio::spawn(run(opts, key, cfg, listen_tx, shutdown_rx));
+    let task = tokio::spawn(run(opts, lock, key, cfg, listen_tx, shutdown_rx));
     Ok(RelayHandle {
         peer_id,
         listen,
@@ -260,10 +266,26 @@ struct Relay {
     refused: HashSet<(PeerId, PeerId)>,
     /// Swarms built so far; only the first one's failure to listen is fatal.
     builds: u32,
+    /// Direct connections that came in, per transport, since the start.
+    inbound_tcp: Inbound,
+    inbound_quic: Inbound,
+    /// The QUIC-looks-blocked warning went out (once per run).
+    quic_warned: bool,
+    /// Bytes sent since the last status write, for the rate.
+    rate_bytes: u64,
+    rate_since: Instant,
+    seen: Seen,
+    /// For the line when it stops: hosts that reserved, circuits opened,
+    /// bytes sent.
+    hosts_seen: HashSet<PeerId>,
+    circuits_opened: u64,
+    sent_total: u64,
+    _lock: std::fs::File,
 }
 
 async fn run(
     opts: Options,
+    lock: std::fs::File,
     key: Keypair,
     cfg: Config,
     listen_tx: watch::Sender<Vec<Multiaddr>>,
@@ -291,6 +313,16 @@ async fn run(
         limit_logged: HashMap::new(),
         refused: HashSet::new(),
         builds: 0,
+        inbound_tcp: Inbound::default(),
+        inbound_quic: Inbound::default(),
+        quic_warned: false,
+        rate_bytes: 0,
+        rate_since: Instant::now(),
+        seen: Seen::load(&opts.data_dir),
+        hosts_seen: HashSet::new(),
+        circuits_opened: 0,
+        sent_total: 0,
+        _lock: lock,
         opts,
     };
     #[cfg(unix)]
@@ -340,7 +372,7 @@ async fn run(
     }
     relay.save_ledger();
     relay.write_status(false, &[]);
-    info!("stopped");
+    info!("{}", relay.stop_summary());
     Ok(())
 }
 
@@ -491,7 +523,7 @@ impl Relay {
                     Err(e) => {
                         debug!("cannot listen on {ip}: {e}");
                         kinds[i] = kinds[i].or(failure_kind(&e));
-                        first_error[i].get_or_insert_with(|| e.to_string());
+                        first_error[i].get_or_insert_with(|| describe(&e));
                     }
                 }
             }
@@ -524,11 +556,15 @@ impl Relay {
                     ),
                 ),
                 _ => problem(
+                    match first_error[i].as_deref() {
+                        Some("") => format!("Cannot listen on {what} {port}{quic}."),
+                        Some(e) => format!("Cannot listen on {what} {port}{quic}: {e}."),
+                        None => format!("Cannot listen on {what} {port}{quic}: no listen_addrs."),
+                    },
                     format!(
-                        "Cannot listen on {what} {port}{quic}: {}.",
-                        first_error[i].as_deref().unwrap_or("no listen_addrs")
+                        "Another program may use the port, or listen_addrs in {}\nnames an address this machine doesn't have.",
+                        term::path(&config)
                     ),
-                    format!("Check listen_addrs in {}.", term::path(&config)),
                 ),
             });
         }
@@ -634,12 +670,64 @@ impl Relay {
             info!("new month, traffic counter reset");
         }
         self.ledger.add(sent, received);
+        self.rate_bytes = self.rate_bytes.saturating_add(sent);
+        self.sent_total = self.sent_total.saturating_add(sent);
+    }
+
+    /// "stopped after 3 h 12 min: 4 hosts, 11 relayed connections, 1.2 GB
+    /// sent", leaving out what didn't happen.
+    fn stop_summary(&self) -> String {
+        let up = SystemTime::now()
+            .duration_since(self.started)
+            .unwrap_or_default();
+        let mut parts = Vec::new();
+        match self.hosts_seen.len() {
+            0 => {}
+            1 => parts.push("1 host".to_owned()),
+            n => parts.push(format!("{n} hosts")),
+        }
+        if self.circuits_opened > 0 {
+            parts.push(connections(self.circuits_opened as usize));
+        }
+        if self.sent_total > 0 {
+            parts.push(format!("{} sent", term::bytes(self.sent_total)));
+        }
+        let mut line = format!("stopped after {}", term::duration(up));
+        if !parts.is_empty() {
+            line += &format!(": {}", parts.join(", "));
+        }
+        line
+    }
+
+    /// A direct connection came in: count it per transport, and warn once
+    /// when every one so far took TCP.
+    fn note_inbound(&mut self, addr: &Multiaddr) {
+        let quic = addr.iter().any(|p| matches!(p, Protocol::QuicV1));
+        let entry = if quic {
+            &mut self.inbound_quic
+        } else {
+            &mut self.inbound_tcp
+        };
+        entry.count += 1;
+        entry.last = unix_now();
+        if !self.quic_warned
+            && self.inbound_tcp.count >= status::QUIC_SUSPECT_AFTER
+            && self.inbound_quic.count == 0
+        {
+            self.quic_warned = true;
+            let (_, q) = self.ports();
+            warn!(
+                kind = "firewall",
+                "{} connections came in over TCP and none over QUIC: check that UDP {q} is open",
+                self.inbound_tcp.count
+            );
+        }
     }
 
     fn announce_mode_change(&self, old: Mode) {
         let new = self.params().mode;
         if new == old {
-            info!("limits changed, everyone reconnects once");
+            info!("everyone reconnects once to apply it");
         } else if new == Mode::Coordination && self.cfg.mode == Mode::Full {
             warn!(
                 kind = "budget",
@@ -670,6 +758,7 @@ impl Relay {
         }
         let before = self.params();
         let old_labels: HashSet<String> = self.cfg.keys.iter().map(|k| k.label.clone()).collect();
+        let settings = config_changes(&self.cfg, &cfg);
         self.cfg = cfg;
         let labels: HashSet<String> = self.cfg.keys.iter().map(|k| k.label.clone()).collect();
         let (revoked, lost) = {
@@ -692,15 +781,22 @@ impl Relay {
             self.reserved_since.remove(peer);
             let _ = swarm.disconnect_peer_id(*peer);
         }
-        info!(
-            keys = labels.len(),
-            hosts_revoked = revoked.len(),
-            "config reloaded"
-        );
         let mut added: Vec<&String> = labels.difference(&old_labels).collect();
         let mut removed: Vec<&String> = old_labels.difference(&labels).collect();
         added.sort();
         removed.sort();
+        // Each change gets its own line; "config reloaded" only says that
+        // something changed where nothing more specific can.
+        if added.is_empty() && removed.is_empty() && settings.is_empty() && lost.is_empty() {
+            info!(
+                keys = labels.len(),
+                hosts_revoked = revoked.len(),
+                "config reloaded"
+            );
+        }
+        for line in &settings {
+            info!("{line}");
+        }
         for label in added {
             info!(key = label.as_str(), "key {label} added");
         }
@@ -772,6 +868,9 @@ impl Relay {
                     num_established.get() as usize,
                     Instant::now(),
                 );
+                if endpoint.is_listener() {
+                    self.note_inbound(addr);
+                }
                 if log_addrs {
                     info!("connection from {addr}");
                 }
@@ -886,6 +985,10 @@ impl Relay {
                 renewed,
             } => {
                 gate.auth.reserved.insert(src_peer_id);
+                if let Some(label) = gate.auth.label(&src_peer_id) {
+                    self.seen.touch(label, unix_now());
+                }
+                self.hosts_seen.insert(src_peer_id);
                 if !renewed {
                     self.reserved_since.insert(src_peer_id, SystemTime::now());
                     let name = host_name(&gate.auth, &src_peer_id);
@@ -926,7 +1029,9 @@ impl Relay {
                     return;
                 }
                 let ip = self.peers.get(&src_peer_id).and_then(|e| e.1);
-                gate.circuits.push((src_peer_id, dst_peer_id, ip));
+                gate.circuits
+                    .push((src_peer_id, dst_peer_id, ip, Instant::now()));
+                self.circuits_opened += 1;
                 info!(
                     key = gate.auth.label(&dst_peer_id).unwrap_or_default(),
                     "guest joined {name} via relay"
@@ -945,11 +1050,14 @@ impl Relay {
                     .iter()
                     .position(|c| c.0 == src_peer_id && c.1 == dst_peer_id)
                 {
-                    gate.circuits.swap_remove(i);
+                    // A few seconds usually means the two went direct; hours,
+                    // that the relay carried the session.
+                    let opened = gate.circuits.swap_remove(i).3;
                     let name = host_name(&gate.auth, &dst_peer_id);
                     info!(
                         key = gate.auth.label(&dst_peer_id).unwrap_or_default(),
-                        "relayed connection to {name} ended"
+                        "relayed connection to {name} ended after {}",
+                        term::duration(opened.elapsed())
                     );
                 }
             }
@@ -1070,6 +1178,14 @@ impl Relay {
         } else {
             String::new()
         };
+        // Beside the R a long path would wrap and pull the block apart; logs
+        // keep it whole.
+        let data = term::path(&self.opts.data_dir);
+        let data = if s.rich {
+            term::fit(s, &data, BANNER_VALUE_WIDTH)
+        } else {
+            data
+        };
         let lines = [
             s.strong(&format!("ReaMesh Relay {}", env!("CARGO_PKG_VERSION"))),
             String::new(),
@@ -1081,7 +1197,7 @@ impl Relay {
             ),
             s.field("port", &format!("{port}{families}")),
             s.field("address", &address),
-            s.field("data", &term::path(&self.opts.data_dir)),
+            s.field("data", &data),
         ];
         let mut out = term::with_mark(s, &lines);
         out.push('\n');
@@ -1105,14 +1221,32 @@ impl Relay {
         anstream::print!("{out}");
     }
 
-    fn save_ledger(&self) {
+    fn save_ledger(&mut self) {
         if let Err(e) = self.ledger.save() {
             error!("cannot save the traffic counter: {e}");
         }
+        let labels: Vec<String> = self.cfg.keys.iter().map(|k| k.label.clone()).collect();
+        if let Err(e) = self.seen.save(labels.iter().map(String::as_str)) {
+            error!("cannot save seen.json: {e}");
+        }
     }
 
-    fn write_status(&self, running: bool, listen: &[Multiaddr]) {
-        let gate = self.gate.lock().unwrap();
+    fn write_status(&mut self, running: bool, listen: &[Multiaddr]) {
+        let elapsed = self.rate_since.elapsed().as_secs_f64();
+        let rate = if running && elapsed > 0.5 {
+            (self.rate_bytes as f64 / elapsed) as u64
+        } else {
+            0
+        };
+        self.rate_bytes = 0;
+        self.rate_since = Instant::now();
+        let gate = self.gate.clone();
+        let gate = gate.lock().unwrap();
+        // Hosts online now count as seen now, so a host that stays for days
+        // doesn't read as gone in `key list`.
+        for (_, label) in gate.auth.hosts() {
+            self.seen.touch(&label, unix_now());
+        }
         let unix = |t: SystemTime| {
             t.duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs())
@@ -1151,6 +1285,9 @@ impl Relay {
             peers: self.peers.len(),
             observed_ips: self.observed.clone(),
             listening: listen.iter().map(|a| a.to_string()).collect(),
+            rate,
+            inbound_tcp: self.inbound_tcp,
+            inbound_quic: self.inbound_quic,
         };
         drop(gate);
         if let Err(e) = status.write(&self.opts.data_dir) {
@@ -1165,6 +1302,118 @@ fn connections(n: usize) -> String {
     } else {
         format!("{n} relayed connections")
     }
+}
+
+/// The settings that differ, one line each, in config.toml's own names:
+/// "max_hosts 32 → 48". Keys are logged on their own.
+fn config_changes(old: &Config, new: &Config) -> Vec<String> {
+    fn ips(v: &[IpAddr]) -> String {
+        if v.is_empty() {
+            "none".to_owned()
+        } else {
+            v.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+    let mut out = Vec::new();
+    let arrow = Style::stderr().sym("→", "->");
+    let mut diff = |name: &str, a: String, b: String| {
+        if a != b {
+            out.push(format!("{name} {a} {arrow} {b}"));
+        }
+    };
+    diff(
+        "tcp_port",
+        old.tcp_port.to_string(),
+        new.tcp_port.to_string(),
+    );
+    diff(
+        "quic_port",
+        old.quic_port.to_string(),
+        new.quic_port.to_string(),
+    );
+    diff(
+        "listen_addrs",
+        ips(&old.listen_addrs),
+        ips(&new.listen_addrs),
+    );
+    diff(
+        "public_addrs",
+        ips(&old.public_addrs),
+        ips(&new.public_addrs),
+    );
+    let dns = |d: &Option<String>| d.clone().unwrap_or_else(|| "none".to_owned());
+    diff("dns_name", dns(&old.dns_name), dns(&new.dns_name));
+    diff(
+        "mode",
+        mode_name(old.mode).into(),
+        mode_name(new.mode).into(),
+    );
+    diff(
+        "log_addresses",
+        old.log_addresses.to_string(),
+        new.log_addresses.to_string(),
+    );
+    let (a, b) = (&old.limits, &new.limits);
+    diff(
+        "max_hosts",
+        a.max_hosts.to_string(),
+        b.max_hosts.to_string(),
+    );
+    diff(
+        "max_circuits",
+        a.max_circuits.to_string(),
+        b.max_circuits.to_string(),
+    );
+    diff(
+        "max_circuits_per_host",
+        a.max_circuits_per_host.to_string(),
+        b.max_circuits_per_host.to_string(),
+    );
+    diff(
+        "max_circuits_per_ip",
+        a.max_circuits_per_ip.to_string(),
+        b.max_circuits_per_ip.to_string(),
+    );
+    diff(
+        "circuit_max_minutes",
+        a.circuit_max_minutes.to_string(),
+        b.circuit_max_minutes.to_string(),
+    );
+    diff(
+        "circuit_max_mb",
+        a.circuit_max_mb.to_string(),
+        b.circuit_max_mb.to_string(),
+    );
+    diff(
+        "monthly_budget_gb",
+        a.monthly_budget_gb.to_string(),
+        b.monthly_budget_gb.to_string(),
+    );
+    let banned: HashSet<&String> = new.banned_peers.iter().collect();
+    let was: HashSet<&String> = old.banned_peers.iter().collect();
+    for (n, what) in [
+        (banned.difference(&was).count(), "banned"),
+        (was.difference(&banned).count(), "unbanned"),
+    ] {
+        match n {
+            0 => {}
+            1 => out.push(format!("1 peer {what}")),
+            n => out.push(format!("{n} peers {what}")),
+        }
+    }
+    for k in &new.keys {
+        if old
+            .keys
+            .iter()
+            .any(|o| o.label == k.label && o.key != k.key)
+        {
+            out.push(format!("key {} replaced", k.label));
+        }
+    }
+    out
 }
 
 fn mode_name(mode: Mode) -> &'static str {
@@ -1199,6 +1448,22 @@ fn has_tcp_and_quic(listen: &[Multiaddr]) -> bool {
             .any(|a| a.iter().any(|p| matches!(p, Protocol::QuicV1)))
 }
 
+/// Every non-empty message along the error chain: some transports wrap the
+/// OS error in a layer that prints nothing.
+fn describe(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        let msg = err.to_string();
+        let msg = msg.trim();
+        if !msg.is_empty() && !parts.iter().any(|p| p.contains(msg)) {
+            parts.push(msg.to_owned());
+        }
+        cur = err.source();
+    }
+    parts.join(": ")
+}
+
 /// Why binding failed, as far as the error chain tells; the message as a
 /// fallback, since transports don't all keep the `io::ErrorKind`.
 fn failure_kind(e: &(dyn std::error::Error + 'static)) -> Option<std::io::ErrorKind> {
@@ -1215,8 +1480,9 @@ fn failure_kind(e: &(dyn std::error::Error + 'static)) -> Option<std::io::ErrorK
         }
         cur = err.source();
     }
-    let text = e.to_string().to_lowercase();
-    if text.contains("in use") {
+    let text = describe(e).to_lowercase();
+    // Windows says "Only one usage of each socket address … (os error 10048)".
+    if text.contains("in use") || text.contains("only one usage") {
         Some(AddrInUse)
     } else if text.contains("permission denied") || text.contains("access is denied") {
         Some(PermissionDenied)

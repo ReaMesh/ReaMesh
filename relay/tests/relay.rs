@@ -307,9 +307,20 @@ async fn reservation_needs_auth_and_guests_reach_only_hosts() {
     assert_eq!(status.hosts[0].label, "default");
     assert_eq!(status.hosts[0].peer_id, host_id.to_string());
     assert!(status.sent > 0 && status.received > 0);
+    // Every peer here came in over TCP.
+    assert!(status.inbound_tcp.count >= 2 && status.inbound_tcp.last > 0);
+    assert_eq!(status.inbound_quic.count, 0);
+
+    // While it runs, the data dir is taken.
+    let second = server::spawn(Options::new(dir.path()));
+    assert!(second.is_err_and(|e| e.to_string().contains("already runs")));
 
     relay.stop().await.unwrap();
     assert!(!Status::read(dir.path()).unwrap().running);
+    // The host's key was seen, and the dir is free again.
+    let seen = reamesh_relay::seen::Seen::load(dir.path());
+    assert!(seen.last.contains_key("default"));
+    start(dir.path()).stop().await.unwrap();
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@
 //! console calls on an old Windows console.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anstream::ColorChoice;
@@ -106,6 +106,16 @@ impl Style {
     /// `label` padded to the column the values start in, in grey.
     pub fn field(self, label: &str, value: &str) -> String {
         format!("{}{value}", self.dim(&format!("{label:<10}")))
+    }
+
+    /// `text` as a terminal hyperlink to `url` (OSC 8). Terminals without
+    /// them show just the text, so selecting it copies the same characters.
+    pub fn link(self, url: &str, text: &str) -> String {
+        if self.rich {
+            format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+        } else {
+            text.to_owned()
+        }
     }
 }
 
@@ -227,25 +237,127 @@ pub fn next_month_start(month: &str) -> String {
     format!("{} 1", NAMES[m % 12])
 }
 
-/// The local time of day, for log lines.
-pub fn clock() -> String {
-    jiff::Zoned::now().strftime("%H:%M:%S").to_string()
-}
-
 /// `p` with the home directory as `~`, which keeps paths short enough to
 /// read at a glance.
 pub fn path(p: &Path) -> String {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    match home.as_deref().and_then(|h| p.strip_prefix(h).ok()) {
-        Some(rest) if !rest.as_os_str().is_empty() => format!("~/{}", rest.display()),
+    let shown = match home_dir().as_deref().and_then(|h| p.strip_prefix(h).ok()) {
+        Some(rest) if !rest.as_os_str().is_empty() => {
+            Path::new("~").join(rest).display().to_string()
+        }
         _ => p.display().to_string(),
+    };
+    // Windows reads / and \ alike, and a dir passed from a Unix-style shell
+    // arrives with /: show one kind.
+    if cfg!(windows) {
+        shown.replace('/', "\\")
+    } else {
+        shown
     }
 }
 
+fn home_dir() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var)
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `text` cut to `max` characters by dropping its middle, which keeps both
+/// the start and the file name of a long path.
+pub fn fit(s: Style, text: &str, max: usize) -> String {
+    let n = text.chars().count();
+    let dots = s.sym("…", "...");
+    let room = max.saturating_sub(dots.chars().count());
+    if n <= max || room < 4 {
+        return text.to_owned();
+    }
+    let head = room / 2;
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(n - (room - head)).collect();
+    format!("{start}{dots}{end}")
+}
+
+/// "Nov 24": the UTC day of a Unix time, as budgets count months in UTC.
+pub fn utc_day(unix: u64) -> String {
+    jiff::Timestamp::from_second(unix as i64)
+        .map(|t| {
+            t.to_zoned(jiff::tz::TimeZone::UTC)
+                .strftime("%b %-d")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// Start and end (Unix seconds, UTC) of `month` ("2026-10").
+pub fn month_bounds(month: &str) -> Option<(u64, u64)> {
+    use jiff::ToSpan;
+    let first: jiff::civil::Date = format!("{month}-01").parse().ok()?;
+    let at = |d: jiff::civil::Date| {
+        d.to_zoned(jiff::tz::TimeZone::UTC)
+            .ok()
+            .and_then(|z| u64::try_from(z.timestamp().as_second()).ok())
+    };
+    Some((at(first)?, at(first.checked_add(1.month()).ok()?)?))
+}
+
+/// When something local happened: "23:39" today, "Oct 30" before.
+pub fn local_since(unix: u64) -> String {
+    let tz = jiff::tz::TimeZone::system();
+    let Ok(t) = jiff::Timestamp::from_second(unix as i64) else {
+        return String::new();
+    };
+    let then = t.to_zoned(tz.clone());
+    if then.date() == jiff::Timestamp::now().to_zoned(tz).date() {
+        then.strftime("%H:%M").to_string()
+    } else {
+        then.strftime("%b %-d").to_string()
+    }
+}
+
+/// Puts `text` on the clipboard of the terminal this runs in (OSC 52),
+/// which also reaches the desktop over SSH. False where it can't even be
+/// tried (not a terminal, escapes off); whether the terminal allowed it,
+/// nothing tells.
+pub fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::{IsTerminal, Write};
+    let mut out = std::io::stdout();
+    // The classic Windows console would print the escape; Windows Terminal
+    // understands it.
+    let windows_ok = !cfg!(windows) || std::env::var_os("WT_SESSION").is_some();
+    if !Style::stdout().rich || !out.is_terminal() || !windows_ok {
+        return false;
+    }
+    // tmux takes it itself and passes it on with `set-clipboard on`.
+    let seq = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    out.write_all(seq.as_bytes())
+        .and_then(|()| out.flush())
+        .is_ok()
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() {
+                ABC[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
 /// A relay code alone on its line, nothing around it, so a triple click
-/// copies exactly the code.
+/// copies exactly the code. It is a link too: clicked on the desktop it
+/// opens ReaMesh, which offers to add the relay.
 pub fn code_block(s: Style, intro: &str, code: &str) -> String {
-    format!("{intro}\n\n{}\n\n", s.strong(code))
+    format!("{intro}\n\n{}\n\n", s.strong(&s.link(code, code)))
 }
 
 /// Where a code goes, and who should have it.
@@ -291,11 +403,14 @@ pub fn problem(what: impl Into<String>, hint: impl Into<String>) -> anyhow::Erro
 }
 
 pub mod log {
-    //! The log line format: `HH:MM:SS  message`, the time in grey. Only
-    //! `limit` and `budget` events (a `kind` field) carry a tag, in amber,
-    //! and errors a red ✗.
+    //! The log line format: `HH:MM:SS  message`, the time in grey, and a
+    //! line with the date whenever the day changes under a running relay.
+    //! The journal stamps every line itself, so there the time is left out.
+    //! Only `limit`, `budget` and `firewall` events (a `kind` field) carry a
+    //! tag, in amber, and errors a red ✗.
 
     use std::fmt;
+    use std::sync::Mutex;
 
     use tracing::field::{Field, Visit};
     use tracing::{Event, Level, Subscriber};
@@ -306,7 +421,43 @@ pub mod log {
     use super::Style;
 
     pub struct Plain {
-        pub style: Style,
+        style: Style,
+        clock: bool,
+        /// The day of the last line, for the date line.
+        day: Mutex<Option<jiff::civil::Date>>,
+    }
+
+    impl Plain {
+        pub fn new(style: Style) -> Self {
+            Self {
+                style,
+                clock: !to_journal(),
+                day: Mutex::new(None),
+            }
+        }
+    }
+
+    /// Whether stderr is connected to the systemd journal: `JOURNAL_STREAM`
+    /// names its device and inode, and children inherit the variable, so it
+    /// is compared with stderr itself.
+    fn to_journal() -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let Some(v) = std::env::var_os("JOURNAL_STREAM") else {
+                return false;
+            };
+            let v = v.to_string_lossy();
+            let Some((dev, ino)) = v.split_once(':') else {
+                return false;
+            };
+            match std::fs::metadata("/dev/stderr") {
+                Ok(m) => dev.parse() == Ok(m.dev()) && ino.parse() == Ok(m.ino()),
+                Err(_) => true,
+            }
+        }
+        #[cfg(not(unix))]
+        false
     }
 
     #[derive(Default)]
@@ -347,7 +498,17 @@ pub mod log {
             let s = self.style;
             let mut f = Fields::default();
             event.record(&mut f);
-            write!(w, "{}  ", s.dim(&super::clock()))?;
+            if self.clock {
+                let now = jiff::Zoned::now();
+                let mut day = self.day.lock().unwrap_or_else(|e| e.into_inner());
+                if day.is_some_and(|d| d != now.date()) {
+                    let rule = s.sym("──", "--");
+                    let date = now.strftime("%A, %B %-d");
+                    writeln!(w, "{}", s.dim(&format!("{rule} {date} {rule}")))?;
+                }
+                *day = Some(now.date());
+                write!(w, "{}  ", s.dim(&now.strftime("%H:%M:%S").to_string()))?;
+            }
             if *event.metadata().level() == Level::ERROR {
                 write!(
                     w,
@@ -397,6 +558,46 @@ mod tests {
         assert_eq!(bar(1.0, 4), "████");
         assert_eq!(next_month_start("2026-10"), "Nov 1");
         assert_eq!(next_month_start("2026-12"), "Jan 1");
+    }
+
+    #[test]
+    fn long_text_loses_its_middle() {
+        let s = Style::plain();
+        assert_eq!(fit(s, "/srv/relay", 20), "/srv/relay");
+        assert_eq!(
+            fit(s, "/home/lena/very/long/path/config.toml", 20),
+            "/home/le...nfig.toml"
+        );
+        assert_eq!(
+            fit(s, "/home/lena/very/long/path/config.toml", 20).len(),
+            20
+        );
+        let rich = Style { rich: true };
+        assert_eq!(fit(rich, "abcdefghijklmnop", 9), "abcd…mnop");
+    }
+
+    #[test]
+    fn clipboard_payload_is_base64() {
+        assert_eq!(base64(b"M"), "TQ==");
+        assert_eq!(base64(b"Ma"), "TWE=");
+        assert_eq!(base64(b"Man"), "TWFu");
+        assert_eq!(base64(b"reamesh://relay/x"), "cmVhbWVzaDovL3JlbGF5L3g=");
+    }
+
+    #[test]
+    fn months_and_days_in_utc() {
+        assert_eq!(
+            month_bounds("2026-11"),
+            Some((1_793_491_200, 1_796_083_200))
+        );
+        assert_eq!(utc_day(1_796_083_199), "Nov 30");
+        assert_eq!(month_bounds("bogus"), None);
+    }
+
+    #[test]
+    fn plain_link_is_just_the_text() {
+        assert_eq!(Style::plain().link("reamesh://relay/x", "code"), "code");
+        assert!(Style { rich: true }.link("u", "t").contains("\x1b]8;;u"));
     }
 
     #[test]

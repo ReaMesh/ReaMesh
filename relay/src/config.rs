@@ -1,6 +1,7 @@
 //! The data dir: `identity.key`, `config.toml` (ports, limits, access keys),
-//! `traffic.json` (this month's counter) and `status.json` (live state for
-//! `reamesh-relay status`).
+//! `traffic.json` (this month's counter), `status.json` (live state for
+//! `reamesh-relay status`), `seen.json` (when each key was last used) and
+//! `relay.lock` (held while a relay runs on the dir).
 
 use std::collections::HashSet;
 use std::fs;
@@ -19,6 +20,8 @@ pub const CONFIG_FILE: &str = "config.toml";
 pub const IDENTITY_FILE: &str = "identity.key";
 pub const TRAFFIC_FILE: &str = "traffic.json";
 pub const STATUS_FILE: &str = "status.json";
+pub const SEEN_FILE: &str = "seen.json";
+pub const LOCK_FILE: &str = "relay.lock";
 
 pub const DEFAULT_PORT: u16 = 4001;
 
@@ -241,6 +244,33 @@ pub fn io_problem(verb: &str, path: &Path, e: &std::io::Error) -> anyhow::Error 
             format!("Cannot {verb} {}: {e}.", crate::term::path(path)),
             "",
         ),
+    }
+}
+
+/// Claims the data dir for a running relay. The lock lives as long as the
+/// returned file, and the OS lets go of it when the process ends, crashed
+/// or not, so a restart right after a crash is never refused.
+pub fn lock_data_dir(dir: &Path) -> anyhow::Result<fs::File> {
+    let path = dir.join(LOCK_FILE);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| io_problem("open", &path, &e))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => {
+            let since = crate::status::Status::read(dir)
+                .filter(|s| s.running)
+                .map(|s| format!(" (since {})", crate::term::local_since(s.started)))
+                .unwrap_or_default();
+            Err(problem(
+                format!("A relay already runs with this data dir{since}."),
+                "See it with: reamesh-relay status\nA second relay needs its own data dir (--data) and ports.",
+            ))
+        }
+        Err(fs::TryLockError::Error(e)) => Err(io_problem("lock", &path, &e)),
     }
 }
 

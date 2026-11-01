@@ -135,11 +135,21 @@ data inside the encrypted connections: real traffic is a few percent higher.
 ```
 reamesh-relay [run]           run the relay (creates the data dir on first start)
 reamesh-relay status          whether it runs, this month's traffic, the hosts online
+reamesh-relay status --watch  the same, kept on screen and updated every 2 seconds
 reamesh-relay code [name]     print the relay code for a key (every key without a name)
 reamesh-relay key add <name>  create a key and print its relay code
-reamesh-relay key list        names, fingerprints and dates
+reamesh-relay key list        names, fingerprints, dates and when each key was last used
 reamesh-relay key remove <name>  delete a key; its hosts lose access within a few seconds
 ```
+
+`code <name> --copy` and `key add <name> --copy` also put the code on your
+clipboard, over SSH too, in terminals that allow it (OSC 52: Windows
+Terminal, iTerm2, kitty, WezTerm, and tmux with `set-clipboard on`). In
+terminals with links (OSC 8), a click on a printed code opens ReaMesh, which
+asks before it adds the relay.
+
+Only one relay runs per data dir: a second start on the same dir stops with a
+message instead of fighting the first over the ports.
 
 All take `--data <dir>` (or `REAMESH_RELAY_DATA`). `run` also takes
 `--log-format json` for log collectors. To type less, add
@@ -165,25 +175,40 @@ through this relay, so keep it within your circle.
 21:28:38  ready
 21:28:44  host band connected
 21:28:46  guest joined band via relay
-21:29:02  relayed connection to band ended
+21:28:49  relayed connection to band ended after 3 s
 ```
+
+A relayed connection that ends after a few seconds usually means host and
+guest went direct; one that lasts hours is a session the relay carried. A
+config change logs what changed (`max_hosts 32 → 48`, `key lena added`), and
+Ctrl+C ends with a summary (`stopped after 3 h 12 min: 4 hosts, 11 relayed
+connections, 1.2 GB sent`). When the day changes under a running relay, a
+line with the date goes into the log; under systemd the journal stamps lines
+itself, so there the relay leaves its own time out.
 
 `status` while it runs:
 
 ```
-● running  for 2 h 14 min   mode full   version 0.1.0
+● running for 2 h 14 min   mode full   version 0.1.0
 
-traffic   3.2 GB this month
-budget    █░░░░░░░░░░░░░░░░░░░  1 % of 500 GB
+traffic   32 GB this month, now 1.4 MB/s
+budget    █░░░░░░░░░░░░░░░░░░░  6 % of 500 GB, about 96 GB by Nov 30
+inbound   TCP 12 s ago   QUIC 40 s ago
 
 HOST   KEY        ONLINE      RELAYED
 band   ec24d153   1 h 2 min   1 guest
 lena   96f676b3   12 min      none
 ```
 
+The budget line looks ahead once a day of the month has passed, and turns
+amber when the month's pace would use the budget up (`used up around Nov 21
+at this pace`). `inbound` says when a connection last came in over each
+transport: ReaMesh dials both at once and QUIC usually wins, so when only TCP
+ever gets through, UDP is most likely closed in a firewall.
+
 Warnings worth acting on are tagged: `limit` when a host, a guest address or
 the relay as a whole is at its limit, `budget` when the month's budget is used
-up. In `docker logs`, journald or any other non-terminal (and with `NO_COLOR`
+up, `firewall` when several connections came in over TCP and none over QUIC. In `docker logs`, journald or any other non-terminal (and with `NO_COLOR`
 set) the output is the same text without colour or symbols.
 
 ## Privacy
@@ -192,7 +217,7 @@ The relay logs events by key name and counts, not who connected from where;
 set `log_addresses = true` to log client IPs. Relayed sessions stay end-to-end
 encrypted between host and guests; the relay sees only that bytes pass.
 `status.json` in the data dir lists the hosts currently connected (key label
-and ID).
+and ID), `seen.json` when each key was last used.
 
 ## License and the logo
 
