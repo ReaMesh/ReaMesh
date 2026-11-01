@@ -27,13 +27,6 @@ export interface Peer {
   /** Smoothed ping round trip to this peer in ms (0 / absent = not measured,
    *  and always 0 on the self entry). Drives the "slow connection" notice. */
   rtt?: number;
-  /** What this peer holds an editing lock on right now: a track (its name,
-   *  "" when unnamed, plus its local 1-based number) or a project-level field
-   *  (tempo, markers, ...). Absent when they hold nothing, on the self entry,
-   *  and from an older extension. */
-  editing?:
-    | { kind: "track"; name: string; n?: number }
-    | { kind: "project"; field: string };
   /** How this person is connected: "relay" through a relay circuit, "direct"
    *  once a relayed connection was upgraded to a direct one; "" / absent for
    *  the plain LAN or VPN case. */
