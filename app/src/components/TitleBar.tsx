@@ -1,5 +1,4 @@
-import { useEffect, useState } from "react";
-import { Copy, Minus, Settings, Square, X } from "lucide-react";
+import { Minus, Settings, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Lockup } from "@/components/RMark";
 import { UpdateIndicator } from "@/components/UpdateIndicator";
@@ -18,9 +17,10 @@ import { cn, focusRing } from "@/lib/utils";
 //
 // On Windows the window is undecorated (tauri.windows.conf.json), so this strip
 // IS the title bar: app name at the left, instance tabs, the Settings gear,
-// and our own minimize / maximize / close buttons at the right, the layout
-// Windows Terminal, Spotify and the Windows Settings app use. Double-click on
-// the strip toggles maximize (Tauri's drag-region script handles that).
+// and our own minimize / close buttons at the right, the layout Windows
+// Terminal, Spotify and the Windows Settings app use. There is no maximize:
+// the window is a narrow companion beside REAPER, capped in width
+// (tauri.windows.conf.json), and every row is laid out for that.
 export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
   const { instances, activePort } = useConnections();
 
@@ -117,31 +117,6 @@ function Wordmark() {
 // the native ones; close turns Windows' signature red on hover. Every window
 // call is wrapped so the plain-browser dev harness (no Tauri) stays usable.
 function WindowControls() {
-  const [maximized, setMaximized] = useState(false);
-
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    try {
-      const win = getCurrentWindow();
-      const sync = () => win.isMaximized().then(setMaximized).catch(() => {});
-      sync();
-      win
-        .onResized(sync)
-        .then((fn) => {
-          if (cancelled) fn();
-          else unlisten = fn;
-        })
-        .catch(() => {});
-    } catch {
-      // Not running inside Tauri.
-    }
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, []);
-
   const call = (fn: (w: ReturnType<typeof getCurrentWindow>) => Promise<void>) => () => {
     try {
       fn(getCurrentWindow()).catch(() => {});
@@ -164,19 +139,6 @@ function WindowControls() {
         className={cn(base, "hover:bg-secondary hover:text-foreground")}
       >
         <Minus className="size-4" aria-hidden="true" />
-      </button>
-      <button
-        type="button"
-        onClick={call((w) => w.toggleMaximize())}
-        aria-label={maximized ? t("restoreWindow") : t("maximizeWindow")}
-        title={maximized ? t("restoreWindow") : t("maximizeWindow")}
-        className={cn(base, "hover:bg-secondary hover:text-foreground")}
-      >
-        {maximized ? (
-          <Copy className="size-3.5 -scale-x-100" aria-hidden="true" />
-        ) : (
-          <Square className="size-3.5" aria-hidden="true" />
-        )}
       </button>
       <button
         type="button"

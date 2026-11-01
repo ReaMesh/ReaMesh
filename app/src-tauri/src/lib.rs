@@ -1884,14 +1884,19 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         // Main window only (the HUD keeps its own position logic), and never
-        // its visibility: the webview decides when to show it.
+        // its visibility: the webview decides when to show it. On Windows the
+        // main window can't be maximized (tauri.windows.conf.json), so a state
+        // saved maximized by an older build must not bring it back.
         .plugin(
             tauri_plugin_window_state::Builder::new()
                 .with_denylist(&["overlay"])
-                .with_state_flags(
-                    tauri_plugin_window_state::StateFlags::all()
-                        - tauri_plugin_window_state::StateFlags::VISIBLE,
-                )
+                .with_state_flags({
+                    use tauri_plugin_window_state::StateFlags;
+                    let flags = StateFlags::all() - StateFlags::VISIBLE;
+                    #[cfg(windows)]
+                    let flags = flags - StateFlags::MAXIMIZED;
+                    flags
+                })
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
