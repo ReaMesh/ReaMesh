@@ -40,6 +40,7 @@ import { getProfile, useProfile } from "@/lib/profile";
 import { nearbyBlocked, setNearby, useNearby } from "@/lib/nearby";
 import { decodeTicket, normalizeTicket } from "@/lib/ticket";
 import { initials, type ExtState, type SessionAd } from "@/lib/types";
+import { checkForUpdate, restartToUpdate, useUpdate } from "@/lib/updater";
 import { protoSkew } from "@/lib/version";
 import { cn, focusRing } from "@/lib/utils";
 
@@ -369,7 +370,7 @@ function NameCard() {
 /** The host's self-reported face. A contested session gets a neutral one: two
  *  devices claim it, so neither name deserves the trust a face implies. So
  *  does a host that never said its name. */
-function HostAvatar({ session }: { session: SessionAd }) {
+function HostAvatar({ session, dimmed }: { session: SessionAd; dimmed?: boolean }) {
   const known = !session.contested && !!session.owner_name;
   return (
     <div
@@ -377,6 +378,7 @@ function HostAvatar({ session }: { session: SessionAd }) {
       className={cn(
         "flex size-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold",
         !known && "bg-[#2a2a31] text-muted-foreground",
+        dimmed && "opacity-45",
       )}
       style={
         known
@@ -386,6 +388,25 @@ function HostAvatar({ session }: { session: SessionAd }) {
     >
       {known ? initials(session.owner_name ?? "") : "?"}
     </div>
+  );
+}
+
+/** A host on a newer build is the one case in the session list where this
+ *  user can do something: fetch the update, then restart into it. Nothing
+ *  when this channel has nothing newer. */
+function UpdateButton() {
+  const update = useUpdate();
+  if (update.phase === "current") return null;
+  const ready = update.phase === "ready" && update.can_restart;
+  return (
+    <PendingButton
+      size="sm"
+      variant="secondary"
+      className="h-7 min-w-[76px] shrink-0 px-3 text-[12px]"
+      busy={update.phase === "checking" || update.phase === "downloading"}
+      label={ready ? t("restartNow") : t("updateShort")}
+      onClick={() => (ready ? restartToUpdate().catch(() => {}) : checkForUpdate())}
+    />
   );
 }
 
@@ -404,6 +425,9 @@ function SessionCard({
   port: number | null;
 }) {
   const [pass, setPass] = useState("");
+  // A protected session looks like an open one until Join is pressed; then
+  // its password field unfolds in place and the button moves beside it.
+  const [open, setOpen] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [error, setError] = useState<CheckError>("");
   // Prevent a second join command while the first one starts downloading.
@@ -461,22 +485,33 @@ function SessionCard({
     send({ cmd: "check", session_id: session.session_id, passphrase: pass }, port ?? undefined);
   };
   const busy = checking || joining;
+  const showField = session.auth && open;
+  // Fold the field away again when it is left empty, unless a check runs or
+  // a refusal is still on show.
+  const foldIfEmpty = (e: React.FocusEvent<HTMLDivElement>) => {
+    if (pass || busy || error) return;
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+    setOpen(false);
+  };
 
   // Both join buttons look the same; the one beside a password field is as
-  // tall as the field.
+  // tall as the field. It is one button that moves: in the head while the
+  // field is folded, beside the field once it opens.
   const joinButton = (besideField: boolean) => (
-    <PendingButton
-      size="sm"
-      variant="secondary"
-      className={cn(
-        "shrink-0 px-3",
-        besideField ? "h-8 min-w-[84px] text-[13px]" : "h-7 min-w-[76px] text-[12px]",
-      )}
-      disabled={(session.auth && !pass) || busy || skew !== "same"}
-      busy={busy}
-      label={t("join")}
-      onClick={beginJoin}
-    />
+    <motion.div layoutId={`join-${session.session_id}`} transition={FOLD} className="shrink-0">
+      <PendingButton
+        size="sm"
+        variant="secondary"
+        className={cn(
+          "px-3",
+          besideField ? "h-8 min-w-[84px] text-[13px]" : "h-7 min-w-[76px] text-[12px]",
+        )}
+        disabled={(besideField && !pass) || busy}
+        busy={busy}
+        label={t("join")}
+        onClick={session.auth && !besideField ? () => setOpen(true) : beginJoin}
+      />
+    </motion.div>
   );
 
   return (
@@ -498,11 +533,13 @@ function SessionCard({
           transition={{ duration: 0.9, ease: "easeOut", delay: 0.15 }}
         />
       )}
-      <HostAvatar session={session} />
+      {/* Another build can't be joined: the face and name step back, the
+          line under them says who has to update. */}
+      <HostAvatar session={session} dimmed={skew !== "same"} />
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex min-h-8 items-center gap-3">
           <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-1.5">
+            <div className={cn("flex items-center gap-1.5", skew !== "same" && "opacity-45")}>
               <span className="truncate text-[13px] font-semibold" title={session.session_name}>
                 {session.session_name}
               </span>
@@ -515,7 +552,7 @@ function SessionCard({
                 {t("sessionContested")}
               </p>
             ) : skew !== "same" ? (
-              <p className="truncate text-[12px] text-amber-500">
+              <p className="truncate text-[12px] text-muted-foreground">
                 {t(skew === "newer" ? "hostNewerVersion" : "hostOlderVersion")}
               </p>
             ) : (
@@ -524,30 +561,46 @@ function SessionCard({
               </p>
             )}
           </div>
-          {!session.auth && joinButton(false)}
+          {skew === "newer" ? <UpdateButton /> : skew === "same" && !showField && joinButton(false)}
         </div>
         {/* Always mounted so a failed probe on an open session still gets its
             "no answer" line and the shake. */}
-        <div ref={shakeScope} className={cn(session.auth && "mt-2")}>
-          {session.auth && (
-            <div className="flex gap-2">
-              <PasswordInput
-                value={pass}
-                aria-label={t("passwordFor", { name: session.session_name })}
-                placeholder={t("password")}
-                className={cn(
-                  "h-8 border-0 bg-muted text-[13px]",
-                  error && "ring-1 ring-red-500/70",
-                )}
-                onChange={(e) => {
-                  setPass(e.target.value);
-                  setError("");
-                }}
-                onKeyDown={(e) => e.key === "Enter" && pass && beginJoin()}
-              />
-              {joinButton(true)}
-            </div>
-          )}
+        <div ref={shakeScope} onBlur={foldIfEmpty}>
+          <AnimatePresence initial={false}>
+            {showField && (
+              <motion.div
+                key="field"
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: "auto", opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={FOLD}
+                // A pixel of room on the sides keeps the focus ring unclipped.
+                className="-mx-px overflow-hidden px-px"
+              >
+                <div className="flex gap-2 pt-2 pb-px">
+                  <PasswordInput
+                    value={pass}
+                    autoFocus
+                    aria-label={t("passwordFor", { name: session.session_name })}
+                    placeholder={t("password")}
+                    className={cn(
+                      "h-8 border-0 bg-muted text-[13px]",
+                      error && "ring-1 ring-red-500/70",
+                    )}
+                    onChange={(e) => {
+                      setPass(e.target.value);
+                      setError("");
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && pass) beginJoin();
+                      if (e.key === "Escape" && !pass && !busy) setOpen(false);
+                    }}
+                  />
+                  {joinButton(true)}
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
           <ErrorFold gap={session.auth ? "pt-1.5" : "pt-2"}>
             {error && <ErrorLine>{checkErrorText(error)}</ErrorLine>}
           </ErrorFold>
