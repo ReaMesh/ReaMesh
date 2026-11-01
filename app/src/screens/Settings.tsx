@@ -127,8 +127,17 @@ function relayOutcomeText(outcome: string): string {
 }
 
 // The relays this install hosts through. A test answers on the `relay`
-// message, so it is matched to its row by request id.
-function RelaySection({ instance, ghost }: { instance: Instance | null; ghost: string }) {
+// message, so it is matched to its row by request id. The section is
+// "Network": rows about how others reach this device follow as children.
+function RelaySection({
+  instance,
+  ghost,
+  children,
+}: {
+  instance: Instance | null;
+  ghost: string;
+  children?: React.ReactNode;
+}) {
   const relays = useRelays();
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
@@ -178,7 +187,7 @@ function RelaySection({ instance, ghost }: { instance: Instance | null; ghost: s
 
   return (
     <section className="space-y-2">
-      <SectionLabel>{t("relaySettings")}</SectionLabel>
+      <SectionLabel>{t("network")}</SectionLabel>
       <Group>
         {relays.map((r, i) => {
           const result = results[r.peer];
@@ -272,6 +281,12 @@ function RelaySection({ instance, ghost }: { instance: Instance | null; ghost: s
             </Row>
           </button>
         ) : null}
+        {children && (
+          <>
+            <Divider inset={false} />
+            {children}
+          </>
+        )}
       </Group>
     </section>
   );
@@ -680,12 +695,8 @@ export function Settings({
                 </Button>
               )}
             </Row>
-          </Group>
-        </section>
-
-        <section className="space-y-2">
-          <SectionLabel>{t("storage")}</SectionLabel>
-          <Group>
+            {/* The project copies joins left on this disk: REAPER opens them. */}
+            <Divider inset={false} />
             <button
               type="button"
               onClick={onOpenJoined}
@@ -764,24 +775,19 @@ export function Settings({
           </section>
         )}
 
-        <RelaySection instance={instance} ghost={ghost} />
-
-        <section className="space-y-2">
-          <SectionLabel>{t("privacy")}</SectionLabel>
-          <Group>
-            <Row label={t("networkIdentity")}>
-              <Button
-                variant="ghost"
-                size="sm"
-                title={t("resetIdentityHint")}
-                className={cn(ghost, "text-muted-foreground hover:text-destructive")}
-                onClick={() => setConfirmReset(true)}
-              >
-                {t("resetShort")}
-              </Button>
-            </Row>
-          </Group>
-        </section>
+        <RelaySection instance={instance} ghost={ghost}>
+          <Row label={t("networkIdentity")}>
+            <Button
+              variant="ghost"
+              size="sm"
+              title={t("resetIdentityHint")}
+              className={cn(ghost, "text-muted-foreground hover:text-destructive")}
+              onClick={() => setConfirmReset(true)}
+            >
+              {t("resetShort")}
+            </Button>
+          </Row>
+        </RelaySection>
 
         <Dialog open={confirmReset} onOpenChange={setConfirmReset}>
           <DialogContent>
