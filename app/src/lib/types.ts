@@ -173,6 +173,16 @@ export interface ExtState {
   /** Items currently shown as empty placeholders because their media hasn't
    *  arrived yet (progressive join). */
   placeholders?: number;
+  /** Outside a progressive join: items waiting for a file a peer just added,
+   *  and the bytes of the files on their way (0 until a first piece has said how
+   *  big a file is). */
+  waiting_media?: number;
+  fetch_done?: number;
+  fetch_total?: number;
+  /** Items that gave up waiting for their file and are not in the project here.
+   *  `file` names the first file missing. Retried with `retry_media`; null when
+   *  nothing is missing. */
+  missing_media?: { count: number; file: string } | null;
   /** Devices this host has blocked (process-global in the extension, so the
    *  list outlives a stop-hosting / re-host cycle). Absent from an older
    *  extension. */

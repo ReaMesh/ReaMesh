@@ -17,7 +17,7 @@ import { DrawnCheck, SwapIcon } from "@/components/Swap";
 import { TrackLabel } from "@/components/TrackLabel";
 import { t, useLang } from "@/lib/i18n";
 import { localizeLogEntry, reconnectingText } from "@/lib/log";
-import { displayName, type ExtState, type Peer, type PingEntry } from "@/lib/types";
+import { displayName, type Peer, type PingEntry } from "@/lib/types";
 import { useOverlaySettings } from "@/lib/overlaySettings";
 import { cn, noContextMenu } from "@/lib/utils";
 import { useOverlayState } from "./useOverlayState";
@@ -230,18 +230,17 @@ function PingRow({
   );
 }
 
-/** Background media-transfer progress while the project is open: a word, the
- *  percentage, and a bar. The row goes once all files are here and editing
- *  unlocks. */
-function LoadingStrip({ state }: { state: ExtState }) {
-  const done = state.done_bytes || 0;
-  const total = state.total_bytes || 0;
-  const pct = total > 0 ? Math.min(100, Math.floor((done / total) * 100)) : 0;
+/** Media on its way while the project is open: a word, the percentage once the
+ *  sizes are known, and a bar. The row goes once the files are here. */
+function LoadingStrip({ pct }: { pct: number | null }) {
+  const shown = pct == null ? null : Math.floor(pct);
   return (
     <div className="flex flex-col gap-1.5 border-t border-white/10 px-2.5 pt-[7px] pb-[9px]">
       <div className="flex items-baseline justify-between gap-2">
         <span className="text-[11px] font-medium">{t("loadingMedia")}</span>
-        <span className="text-[11px] tabular-nums text-muted-foreground">{pct} %</span>
+        {shown != null && (
+          <span className="text-[11px] tabular-nums text-muted-foreground">{shown} %</span>
+        )}
       </div>
       <div
         className="h-[3px] overflow-hidden rounded-full bg-secondary"
@@ -249,12 +248,12 @@ function LoadingStrip({ state }: { state: ExtState }) {
         aria-label={t("loadingMedia")}
         aria-valuemin={0}
         aria-valuemax={100}
-        aria-valuenow={pct}
+        aria-valuenow={shown ?? undefined}
       >
         <motion.div
           className="h-full rounded-full bg-found"
           initial={false}
-          animate={{ width: `${pct}%` }}
+          animate={{ width: `${shown ?? 0}%` }}
           transition={{ type: "spring", stiffness: 120, damping: 26 }}
         />
       </div>
@@ -355,10 +354,12 @@ export function Overlay({ port }: { port: number | null }) {
   const reveal = (peer: Peer) => send({ cmd: "reveal_peer", peer_id: peer.id });
   // Progressive join: media still arriving behind the open project.
   const loading = !!state && state.mode === "client" && !!state.loading;
-  const loadPct =
-    loading && (state.total_bytes || 0) > 0
-      ? Math.min(100, ((state.done_bytes || 0) / (state.total_bytes || 1)) * 100)
-      : 0;
+  // The same strip for a file someone just added, host or guest.
+  const mediaOnItsWay = loading || (state?.waiting_media ?? 0) > 0;
+  const loadDone = (loading ? state?.done_bytes : state?.fetch_done) || 0;
+  const loadTotal = (loading ? state?.total_bytes : state?.fetch_total) || 0;
+  const loadPct = loadTotal > 0 ? Math.min(100, (loadDone / loadTotal) * 100) : null;
+  const missing = state?.missing_media;
 
   // Window drag by hand instead of `data-tauri-drag-region`: Tauri's injected
   // drag script also maximizes the window on a double-click, and on macOS tao
@@ -511,7 +512,7 @@ export function Overlay({ port }: { port: number | null }) {
               {/* Collapsed, the strip below is hidden: a hairline along the header's
                   bottom edge keeps the download visible without taking any room. */}
               <AnimatePresence initial={false}>
-                {collapsed && loading && (
+                {collapsed && mediaOnItsWay && (
                   <motion.div
                     key="hairline"
                     aria-hidden
@@ -523,7 +524,7 @@ export function Overlay({ port }: { port: number | null }) {
                     <motion.div
                       className="h-full bg-found"
                       initial={false}
-                      animate={{ width: `${loadPct}%` }}
+                      animate={{ width: `${loadPct ?? 0}%` }}
                       transition={{ type: "spring", stiffness: 120, damping: 26 }}
                     />
                   </motion.div>
@@ -618,6 +619,38 @@ export function Overlay({ port }: { port: number | null }) {
                 </motion.div>
               )}
             </AnimatePresence>
+            {/* Outside the body too: this one waits for an answer. */}
+            <AnimatePresence initial={false}>
+              {missing && (
+                <motion.div
+                  key="missing"
+                  role="status"
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: "auto", opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  transition={FOLD}
+                  className="overflow-hidden"
+                >
+                  <div className="flex items-center gap-2 border-t border-white/10 py-[7px] pr-1.5 pl-2.5">
+                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                      <p className="truncate text-[11px] font-medium text-amber-500">
+                        {t("mediaMissing", { count: missing.count })}
+                      </p>
+                      <p className="truncate text-[11px] text-muted-foreground" title={missing.file}>
+                        {missing.file}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => send({ cmd: "retry_media" })}
+                      className="h-6 shrink-0 rounded px-1.5 text-[11.5px] font-semibold text-foreground transition-colors outline-none hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                    >
+                      {t("mediaRetry")}
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
             <AnimatePresence initial={false}>
               {!collapsed && (
                 <motion.div
@@ -629,7 +662,7 @@ export function Overlay({ port }: { port: number | null }) {
                   style={{ overflow: "hidden" }}
                 >
                   <AnimatePresence initial={false}>
-                    {loading && state && (
+                    {mediaOnItsWay && (
                       <motion.div
                         key="loading"
                         initial={{ height: 0, opacity: 0 }}
@@ -638,7 +671,7 @@ export function Overlay({ port }: { port: number | null }) {
                         transition={FOLD}
                         className="overflow-hidden"
                       >
-                        <LoadingStrip state={state} />
+                        <LoadingStrip pct={loadPct} />
                       </motion.div>
                     )}
                   </AnimatePresence>

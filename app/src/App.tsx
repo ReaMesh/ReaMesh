@@ -303,8 +303,9 @@ function usePluginToasts(state: ExtState | undefined, port: number | undefined) 
     };
     for (const e of newEntries) {
       // Progressive join: a snapped-back edit while loading, and the moment
-      // editing unlocks. The extension rate-limits the former.
-      if (e.code === "loading_readonly" || e.code === "media_ready") {
+      // editing unlocks. The extension rate-limits the former. An item's media
+      // not arriving is in the HUD as well, which may be off.
+      if (e.code === "loading_readonly" || e.code === "media_ready" || e.code === "media_timeout") {
         toast(localizeLogEntry(e));
         continue;
       }

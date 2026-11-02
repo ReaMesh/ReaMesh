@@ -480,7 +480,13 @@ struct StatusState {
 }
 
 impl StatusState {
-    fn to_json(&self, reverts: usize, reverted: Vec<JsonValue>, probe: JsonValue) -> String {
+    fn to_json(
+        &self,
+        reverts: usize,
+        reverted: Vec<JsonValue>,
+        probe: JsonValue,
+        fetch: (u64, u64),
+    ) -> String {
         json!({
             "state": self.state,
             "progress": self.progress,
@@ -490,6 +496,10 @@ impl StatusState {
             "files_total": self.files_total,
             "current_file": self.current_file,
             "background": self.background,
+            // Mid-session fetches, which the counters above don't cover (see
+            // FetchProgress): bytes so far and bytes expected, 0 when idle.
+            "fetch_done": fetch.0,
+            "fetch_total": fetch.1,
             "project_path": self.project_path,
             "dir": self.dir,
             "session_id": self.session_id,
@@ -624,6 +634,8 @@ struct Shared {
     /// project dir on the owner, the downloaded copy on clients (set once the
     /// initial transfer completes).
     serve_dir: Mutex<Option<PathBuf>>,
+    /// What the mid-session fetches add up to, for the status.
+    fetch_progress: Mutex<FetchProgress>,
     /// Peer ids currently subscribed to the session topic (fetch candidates;
     /// its length is the peer count).
     session_peers: Mutex<Vec<PeerId>>,
@@ -2147,6 +2159,7 @@ impl Reamesh {
             sessions: Mutex::new(HashMap::new()),
             status: Mutex::new(status),
             serve_dir: Mutex::new(None),
+            fetch_progress: Mutex::new(FetchProgress::default()),
             session_peers: Mutex::new(Vec::new()),
             auth_token: Mutex::new(String::new()),
             peers_info: Mutex::new(HashMap::new()),
@@ -2826,11 +2839,15 @@ impl Reamesh {
             }
             None => JsonValue::Null,
         };
+        let fetch = {
+            let p = self.shared.fetch_progress.lock().unwrap();
+            (p.done, p.total)
+        };
         self.shared
             .status
             .lock()
             .unwrap()
-            .to_json(reverts, reverted, probe)
+            .to_json(reverts, reverted, probe, fetch)
     }
 
     /// Full current doc state in changeset shape. For tests and debugging.
@@ -4284,6 +4301,28 @@ impl Fetch {
 type FetchMap = HashMap<String, Fetch>;
 type FetchReqs = HashMap<request_response::OutboundRequestId, String>;
 
+/// Bytes across the mid-session fetches, for the status. A batch lasts until
+/// nothing is left to fetch: a finished file stays counted until then, so the
+/// figures don't drop every time one lands. A file counts for nothing until its
+/// first piece has said how big it is.
+#[derive(Default)]
+struct FetchProgress {
+    /// Bytes of the files this batch already finished.
+    finished: u64,
+    done: u64,
+    total: u64,
+}
+
+fn publish_fetch_progress(shared: &Shared, fetches: &FetchMap) {
+    let mut p = shared.fetch_progress.lock().unwrap();
+    if fetches.is_empty() {
+        *p = FetchProgress::default();
+        return;
+    }
+    p.done = p.finished + fetches.values().map(|f| f.written).sum::<u64>();
+    p.total = p.finished + fetches.values().map(|f| f.size.unwrap_or(0)).sum::<u64>();
+}
+
 /// Passphrase pre-check, matched by request id. A manifest confirms access;
 /// errors distinguish rejection, a ban, and an unreachable host.
 struct Probe {
@@ -4510,6 +4549,7 @@ fn handle_fetch_response(
     match write() {
         Ok(true) => {
             eprintln!("[reamesh] fetched {} ({size} bytes)", fetch.rel);
+            shared.fetch_progress.lock().unwrap().finished += size;
             // Ours now: other members may fetch it from this copy too.
             shared.servable.lock().unwrap().insert(path_key(&fetch.rel));
             fetches.remove(rel);
@@ -6333,6 +6373,7 @@ async fn run_network(
                 if fetch_reqs.len() > 1024 {
                     fetch_reqs.retain(|_, rel| fetches.contains_key(rel));
                 }
+                publish_fetch_progress(&shared, &fetches);
                 // Client: keep the download's request window full, fold in any
                 // newly-arrived peers (swarming), and recover from stalls.
                 download_tick(&mut swarm, &shared, &mut download);
@@ -7114,6 +7155,7 @@ async fn run_network(
                                 handle_download_piece(&mut swarm, &shared, &mut download, &verify_tx, request_id, Some((peer, response)));
                             } else if let Some(rel) = fetch_reqs.remove(&request_id) {
                                 handle_fetch_response(&mut swarm, &shared, &mut fetches, &mut fetch_reqs, &rel, request_id, Some((peer, response)));
+                                publish_fetch_progress(&shared, &fetches);
                             }
                         }
                     }
@@ -7135,6 +7177,7 @@ async fn run_network(
                         handle_download_piece(&mut swarm, &shared, &mut download, &verify_tx, request_id, None);
                     } else if let Some(rel) = fetch_reqs.remove(&request_id) {
                         handle_fetch_response(&mut swarm, &shared, &mut fetches, &mut fetch_reqs, &rel, request_id, None);
+                        publish_fetch_progress(&shared, &fetches);
                     }
                 }
                 _ => {}

@@ -1116,6 +1116,91 @@ int main() {
     assert(!o2["items"].contains("{I2}"));                  // subproject dropped
   }
 
+  // Parked items: giving up, what the app is told, the retry, the late file.
+  {
+    assert(pathBaseName("Audio/Take 7.wav") == "Take 7.wav");
+    assert(pathBaseName("Audio\\sub\\b.wav") == "b.wav");
+    assert(pathBaseName("c.wav") == "c.wav");
+    assert(missingMediaState({}).is_null());
+
+    const fs::path dir = fs::temp_directory_path() / "reamesh_chunk_test_media";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir / "Audio");
+    g_sessionProjectPath = fsUtf8(dir / "Song.rpp");
+    const auto touch = [&](const char* rel) { std::ofstream(dir / rel) << "x"; };
+    const auto ago = [](int s) { return std::chrono::steady_clock::now() - std::chrono::seconds(s); };
+
+    g_deferredItems.push_back({"{NEW}", json::object(), {"Audio/new.wav"}, ago(0)});
+    g_deferredItems.push_back({"{SLOW}", json::object(), {"Audio/slow.wav"}, ago(5)});
+    g_deferredItems.push_back(
+        {"{GONE}", json::object(), {"Audio/a.wav", "Audio/b.wav"}, ago(91)});
+
+    // The file that just left doesn't count yet; a join's progress isn't this.
+    assert(waitingMediaCount(std::chrono::steady_clock::now()) == 2);
+    g_mediaLoading = true;
+    assert(waitingMediaCount(std::chrono::steady_clock::now()) == 0);
+    g_mediaLoading = false;
+
+    // A queued download holds the clock.
+    g_downloadBackground = true;
+    assert(collectReadyItems().empty());
+    assert(g_deferredItems.size() == 3 && g_failedItems.empty());
+    g_downloadBackground = false;
+    for (DeferredItem& d : g_deferredItems)
+      if (d.guid == "{GONE}") d.since = ago(91);
+
+    // Out of time: kept, reported once, no longer waiting.
+    const size_t logged = g_log.size();
+    assert(collectReadyItems().empty());
+    assert(g_deferredItems.size() == 2 && g_failedItems.size() == 1);
+    assert(g_log.size() == logged + 1 && g_log.back()["code"] == "media_timeout");
+    assert(g_log.back()["params"]["file"] == "Audio/a.wav");
+    json report = missingMediaState(g_failedItems);
+    assert(report["count"] == 1 && report["file"] == "a.wav");
+
+    // The retry puts it back, counted at once (the other two only just re-queued).
+    retryMissingMedia();
+    assert(g_failedItems.empty() && g_deferredItems.size() == 3);
+    assert(waitingMediaCount(std::chrono::steady_clock::now()) == 1);
+    assert(collectReadyItems().empty());
+    assert(g_failedItems.empty());
+
+    // Failed again. One of its two files lands: still missing, now named by the other.
+    for (DeferredItem& d : g_deferredItems) d.since = ago(91);
+    g_lastFailedCheck = {};
+    assert(collectReadyItems().empty());
+    assert(g_deferredItems.empty() && g_failedItems.size() == 3);
+    touch("Audio/a.wav");
+    g_lastFailedCheck = {};
+    assert(collectReadyItems().empty());
+    auto gone = std::find_if(g_failedItems.begin(), g_failedItems.end(),
+                             [](const DeferredItem& d) { return d.guid == "{GONE}"; });
+    assert(gone != g_failedItems.end() && gone->missing == std::vector<std::string>{"Audio/b.wav"});
+
+    // All of them there: ready to apply. At most one look a second, though.
+    touch("Audio/b.wav");
+    assert(collectReadyItems().empty());
+    g_lastFailedCheck = {};
+    std::vector<DeferredItem> ready = collectReadyItems();
+    assert(ready.size() == 1 && ready[0].guid == "{GONE}");
+    assert(g_failedItems.size() == 2);
+
+    // A pure move of a parked item rides along; anything else is not for here.
+    g_failedItems[0].fields = {{"present", true}, {"track", "{T1}"}, {"chunk", "<ITEM\n>\n"}};
+    const std::string parkedGuid = g_failedItems[0].guid;
+    assert(mergeIntoParkedItem(parkedGuid, {{"track", "{T2}"}}));
+    assert(g_failedItems[0].fields["track"] == "{T2}");
+    assert(g_failedItems[0].fields["chunk"] == "<ITEM\n>\n");
+    assert(!mergeIntoParkedItem(parkedGuid, {{"chunk", "<ITEM\n  x\n>\n"}}));
+    assert(!mergeIntoParkedItem(parkedGuid, {{"present", false}}));
+    assert(!mergeIntoParkedItem("{ELSEWHERE}", {{"track", "{T2}"}}));
+
+    g_failedItems.clear();
+    g_sessionProjectPath.clear();
+    fs::remove_all(dir, ec);
+  }
+
   printf("chunk_test: all assertions passed\n");
   return 0;
 }

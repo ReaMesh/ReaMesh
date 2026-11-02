@@ -378,7 +378,8 @@ struct Snapshot {
 };
 
 // An incoming item whose media files have not arrived yet. Re-checked every
-// tick; the fields are applied once every file exists.
+// tick; the fields are applied once every file exists. Past MEDIA_GIVE_UP it
+// moves to g_failedItems and waits for the user, or for the file to turn up.
 struct DeferredItem {
   std::string guid;
   json fields;
@@ -465,6 +466,15 @@ static bool g_cursorShared = true;
 // like a log entry ({code, params, text}); JSON null when there is none.
 static json g_lastError;
 static std::vector<DeferredItem> g_deferredItems;
+// Parked items whose media never came. Not in the project here: the HUD says so
+// and offers a retry, and they still apply if their files turn up.
+static std::vector<DeferredItem> g_failedItems;
+static std::chrono::steady_clock::time_point g_lastFailedCheck{};
+static constexpr std::chrono::seconds MEDIA_GIVE_UP{90};
+// How long a parked item stays out of the app's count: a small file from the LAN
+// is here before the HUD's strip has finished folding in, and each one would
+// shove the roster about.
+static constexpr std::chrono::seconds MEDIA_WAIT_QUIET{1};
 // Track GUID -> receives waiting for their source track to show up.
 static std::map<std::string, DeferredRecv> g_deferredRecv;
 // ---- progressive join ----
@@ -4463,6 +4473,21 @@ static void throttledLog(const char* code, json params, const std::string& text,
   logEvent(code, std::move(params), text);
 }
 
+// A change with no chunk (a pure move to another track) to an item still parked
+// must not replace the parked copy: the chunk is what it is waiting to apply, and
+// the item would come up empty. The change rides along instead.
+static bool mergeIntoParkedItem(const std::string& guid, const json& fields) {
+  if (fields.contains("chunk") || !jsonBool(fields, "present", true)) return false;
+  bool merged = false;
+  for (std::vector<DeferredItem>* list : {&g_deferredItems, &g_failedItems})
+    for (DeferredItem& d : *list)
+      if (d.guid == guid) {
+        d.fields.update(fields);
+        merged = true;
+      }
+  return merged;
+}
+
 static void applyChangeset(const json& changeset) {
   // One lazily-loaded lock table + roster for the whole changeset (see
   // LockHolders); resolving a holder per entity was an FFI call and a full
@@ -4576,9 +4601,12 @@ static void applyChangeset(const json& changeset) {
                        collectPlugins(fields["chunk"].get<std::string>()));
       }
 
+      if (mergeIntoParkedItem(guid, fields)) continue;
       // A tombstone or retarget to available media supersedes a parked copy;
       // otherwise old fields could reappear when the media arrives.
-      std::erase_if(g_deferredItems, [&](const DeferredItem& d) { return d.guid == guid; });
+      const auto parked = [&](const DeferredItem& d) { return d.guid == guid; };
+      std::erase_if(g_deferredItems, parked);
+      std::erase_if(g_failedItems, parked);
       std::vector<std::string> missing = missingMediaIn(fields);
       if (!missing.empty()) {
         // Media hasn't arrived yet: fetch it from the peers and apply the
@@ -4797,34 +4825,92 @@ static void revertWhileLoading(const json& changeset, const Snapshot& base) {
   g_applyingRemote = false;
 }
 
-// Retry items that were waiting for media files to arrive from the peers.
-static void processDeferredItems() {
-  if (g_deferredItems.empty()) return;
+// Sort the parked items by what became of their files, and hand back the ones
+// that can be applied now.
+static std::vector<DeferredItem> collectReadyItems() {
+  std::vector<DeferredItem> ready;
+  if (g_deferredItems.empty() && g_failedItems.empty()) return ready;
   const fs::path projDir = projectDir();
   const auto now = std::chrono::steady_clock::now();
-  std::vector<DeferredItem> ready;
-
-  std::erase_if(g_deferredItems, [&](DeferredItem& d) {
+  const auto allHere = [&](DeferredItem& d) {
     std::error_code ec;
     std::erase_if(d.missing,
                   [&](const std::string& rel) { return fs::exists(projDir / fsPath(rel), ec); });
-    if (d.missing.empty()) {
+    return d.missing.empty();
+  };
+
+  std::string gaveUpOn;
+  std::erase_if(g_deferredItems, [&](DeferredItem& d) {
+    if (allHere(d)) {
       ready.push_back(std::move(d));
       return true;
     }
     // While the progressive join's background download is still streaming,
     // the file is simply queued: the give-up clock only starts once it ends.
     if (g_downloadBackground) d.since = now;
-    if (now - d.since > std::chrono::seconds(90)) {
-      logEvent("media_timeout", {{"file", d.missing.front()}},
-               "gave up waiting for media: " + d.missing.front());
+    if (now - d.since > MEDIA_GIVE_UP) {
+      if (gaveUpOn.empty()) gaveUpOn = d.missing.front();
+      g_failedItems.push_back(std::move(d));
       return true;
     }
     // Keep nudging the fetch; it is idempotent while the file is missing.
     for (const std::string& rel : d.missing) reamesh_fetch_file(g_handle, rel.c_str());
     return false;
   });
+  // The app toasts this, and a whole batch can give up at once.
+  if (!gaveUpOn.empty())
+    throttledLog("media_timeout", {{"file", gaveUpOn}}, "gave up waiting for media: " + gaveUpOn,
+                 std::chrono::seconds(10));
 
+  // No more fetches for these until the user asks (retryMissingMedia), but the
+  // file can still turn up: another item fetched it, or someone copied it in.
+  if (!g_failedItems.empty() && now - g_lastFailedCheck >= std::chrono::seconds(1)) {
+    g_lastFailedCheck = now;
+    std::erase_if(g_failedItems, [&](DeferredItem& d) {
+      if (!allHere(d)) return false;
+      ready.push_back(std::move(d));
+      return true;
+    });
+  }
+  return ready;
+}
+
+// The user asked for the missing items again: back to waiting, on a fresh clock.
+// Backdated by the quiet period so the HUD's strip answers the click at once.
+static void retryMissingMedia() {
+  const auto now = std::chrono::steady_clock::now();
+  for (DeferredItem& d : g_failedItems) {
+    d.since = now - MEDIA_WAIT_QUIET;
+    for (const std::string& rel : d.missing) reamesh_fetch_file(g_handle, rel.c_str());
+    g_deferredItems.push_back(std::move(d));
+  }
+  g_failedItems.clear();
+}
+
+// Parked items for the app's count: a progressive join's are its own progress
+// strip, and see MEDIA_WAIT_QUIET.
+static size_t waitingMediaCount(std::chrono::steady_clock::time_point now) {
+  if (g_mediaLoading) return 0;
+  return static_cast<size_t>(
+      std::count_if(g_deferredItems.begin(), g_deferredItems.end(),
+                    [&](const DeferredItem& d) { return now - d.since >= MEDIA_WAIT_QUIET; }));
+}
+
+static std::string pathBaseName(const std::string& path) {
+  const size_t slash = path.find_last_of("/\\");
+  return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+// {count, file} for the app, file = the first missing path's name; null if none.
+static json missingMediaState(const std::vector<DeferredItem>& failed) {
+  if (failed.empty()) return json();
+  const auto& first = failed.front().missing;
+  return json{{"count", failed.size()}, {"file", first.empty() ? "" : pathBaseName(first.front())}};
+}
+
+// Apply the items whose media files have arrived from the peers.
+static void processDeferredItems() {
+  std::vector<DeferredItem> ready = collectReadyItems();
   if (ready.empty()) return;
   flushLocalEdits();
   g_applyingRemote = true;
@@ -5689,6 +5775,7 @@ static void leaveSession(const char* code, json params, const std::string& text)
   g_sessionProjectPath.clear();
   g_snapshot = Snapshot{};
   g_deferredItems.clear();
+  g_failedItems.clear();
   g_deferredRecv.clear();
   g_placeholders.clear();
   g_foreignSources.clear();
@@ -6143,6 +6230,8 @@ static void ctlDispatch(const json& cmd) {
     // to continue: open the held-back download now.
     if (!g_pendingOpenPath.empty() && g_mode == Mode::Downloading)
       openDownloadedProject(g_pendingOpenPath);
+  } else if (c == "retry_media") {
+    retryMissingMedia();
   } else if (c == "share_marker") {
     sharePing(jsonStr(cmd, "name"));
   } else if (c == "jump_to") {
@@ -6398,6 +6487,16 @@ static void ctlPublishState() {
   // meanwhile; the byte/file counters above keep moving.
   state["loading"] = g_mediaLoading;
   state["placeholders"] = g_placeholders.size();
+  // Outside a progressive join: items waiting for a file a peer just added, the
+  // bytes on their way, and the items that gave up ({count, file} or null).
+  state["waiting_media"] = waitingMediaCount(std::chrono::steady_clock::now());
+  state["fetch_done"] = (st.contains("fetch_done") && st["fetch_done"].is_number())
+                            ? st["fetch_done"].get<uint64_t>()
+                            : 0;
+  state["fetch_total"] = (st.contains("fetch_total") && st["fetch_total"].is_number())
+                             ? st["fetch_total"].get<uint64_t>()
+                             : 0;
+  state["missing_media"] = missingMediaState(g_failedItems);
   state["sessions"] = handleJson(reamesh_sessions, json::array());
   state["peers"] = std::move(peers);
 

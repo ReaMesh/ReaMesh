@@ -923,6 +923,57 @@ fn mid_session_media_fetch() {
     let _ = fs::remove_dir_all(staging);
 }
 
+/// While a fetch runs, the status counts its bytes; once nothing is left to
+/// fetch, the counters are back at zero.
+#[test]
+fn mid_session_fetch_reports_bytes() {
+    let project = temp_dir("proj-fetch-bytes");
+    let staging = temp_dir("staging-fetch-bytes");
+    make_project(&project);
+    let (owner, client) = establish("fetch-bytes-test", &project, &staging);
+    let client_dir = {
+        let status: Value = serde_json::from_str(&client.status_json()).unwrap();
+        PathBuf::from(status["project_path"].as_str().unwrap())
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    };
+    let counters = || {
+        let v: Value = serde_json::from_str(&client.status_json()).unwrap();
+        (v["fetch_done"].as_u64().unwrap(), v["fetch_total"].as_u64().unwrap())
+    };
+    assert_eq!(counters(), (0, 0));
+
+    // Several pieces, so there are moments in between to see.
+    let size = 6 * 4 * 1024 * 1024 + 12345;
+    let long: Vec<u8> = (0..size).map(|i| (i % 239) as u8).collect();
+    fs::write(project.join("Audio/long.wav"), &long).unwrap();
+    owner.push_local(
+        r#"{"items":{"{LONG}":{"present":true,"track":"{T1}","chunk":"<ITEM\n  <SOURCE WAVE\n    FILE \"Audio/long.wav\"\n  >\n>\n"}}}"#,
+    );
+
+    let mut seen = (0, 0);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !client_dir.join("Audio/long.wav").exists() && Instant::now() < deadline {
+        client.fetch_file("Audio/long.wav");
+        let (done, total) = counters();
+        assert!(done <= total, "{done} of {total}");
+        if done > 0 {
+            seen = (done, total);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(client_dir.join("Audio/long.wav").exists(), "fetch never completed");
+    assert!(seen.0 > 0, "the status never showed the fetch's bytes");
+    assert_eq!(seen.1, size as u64, "the status had the wrong total");
+    assert!(wait_until(Duration::from_secs(5), || counters() == (0, 0)), "counters stuck");
+
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+}
+
 /// Progressive join: with enough media outstanding, the client reports `ready`
 /// (with `background: true`) once the project file and the small files are on
 /// disk, while the media keeps streaming; the flag drops when everything has

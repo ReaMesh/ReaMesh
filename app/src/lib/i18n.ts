@@ -288,6 +288,9 @@ const en = {
   logNofxSkippedOne: "Skipped 1 incoming change that would load effects or other code.",
   logTickError: "Something went wrong while syncing. ReaMesh recovered and keeps going.",
   loadingMedia: "Loading media",
+  mediaMissing: "{count} items missing",
+  mediaMissingOne: "1 item missing",
+  mediaRetry: "Fetch again",
 
   // Download
   downloadStalled: "The download isn't moving. The host may be offline.",
@@ -736,6 +739,9 @@ const de: Record<MsgKey, string> = {
   logNofxSkippedOne: "1 empfangene Änderung hätte Effekte oder anderen Code geladen und wurde übersprungen.",
   logTickError: "Beim Synchronisieren ist ein Fehler aufgetreten. ReaMesh hat sich davon erholt und läuft weiter.",
   loadingMedia: "Medien werden geladen",
+  mediaMissing: "{count} Items fehlen",
+  mediaMissingOne: "1 Item fehlt",
+  mediaRetry: "Erneut holen",
 
   downloadStalled: "Der Download kommt nicht voran. Der Host ist möglicherweise offline.",
   downloadProgress: "Download-Fortschritt",
