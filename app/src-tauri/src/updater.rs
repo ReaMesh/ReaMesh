@@ -176,7 +176,8 @@ impl Channel {
         }
     }
 
-    /// How the app names it, the same in every language.
+    /// How the macOS About window names it, the same in every language.
+    #[cfg(target_os = "macos")]
     pub fn label(self) -> &'static str {
         match self {
             Channel::Beta => "Beta",
