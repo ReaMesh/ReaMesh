@@ -590,6 +590,25 @@ export function Overlay({ port }: { port: number | null }) {
         </button>
       </div>
 
+      {/* Outside the body: an edit snaps back just the same with the HUD collapsed. */}
+      <AnimatePresence initial={false}>
+        {lockNotice && (
+          <motion.div
+            key="lock"
+            role="status"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ type: "spring", stiffness: 400, damping: 38 }}
+            className="overflow-hidden"
+          >
+            <div className="flex items-start gap-2 border-t border-white/10 px-2.5 py-2">
+              {lockNotice.by && <PeerAvatar peer={lockNotice.by} size="xs" />}
+              <p className="min-w-0 flex-1 text-[11.5px] leading-snug">{lockNotice.text}</p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       <AnimatePresence initial={false}>
         {!collapsed && (
           <motion.div
@@ -634,24 +653,6 @@ export function Overlay({ port }: { port: number | null }) {
                         </motion.div>
                       ))}
                     </AnimatePresence>
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
-            <AnimatePresence initial={false}>
-              {lockNotice && (
-                <motion.div
-                  key="lock"
-                  role="status"
-                  initial={{ height: 0, opacity: 0 }}
-                  animate={{ height: "auto", opacity: 1 }}
-                  exit={{ height: 0, opacity: 0 }}
-                  transition={{ type: "spring", stiffness: 400, damping: 38 }}
-                  className="overflow-hidden"
-                >
-                  <div className="flex items-start gap-2 border-t border-white/10 px-2.5 py-2">
-                    {lockNotice.by && <PeerAvatar peer={lockNotice.by} size="xs" />}
-                    <p className="min-w-0 flex-1 text-[11.5px] leading-snug">{lockNotice.text}</p>
                   </div>
                 </motion.div>
               )}
