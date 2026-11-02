@@ -14,7 +14,7 @@ import { Hint, HintProvider } from "@/components/Hint";
 import { HostCrown } from "@/components/HostCrown";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { DrawnCheck, SwapIcon } from "@/components/Swap";
-import { TrackNumber } from "@/components/TrackNumber";
+import { TrackLabel } from "@/components/TrackLabel";
 import { t, useLang } from "@/lib/i18n";
 import { localizeLogEntry, reconnectingText } from "@/lib/log";
 import { displayName, type ExtState, type Peer, type PingEntry } from "@/lib/types";
@@ -137,7 +137,7 @@ function PeerRow({
           {followsYou ? (
             <span className="text-[11px] text-found">{t("followsYou")}</span>
           ) : (
-            <TrackNumber track={peer.track} small />
+            <TrackLabel track={peer.track} name={peer.track_name} small />
           )}
         </span>
         {/* Without a pointer that hovers the eye stays hidden, so it takes no taps either. */}

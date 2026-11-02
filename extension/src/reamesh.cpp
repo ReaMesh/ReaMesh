@@ -6224,10 +6224,10 @@ static void ctlDispatch(const json& cmd) {
 static void ctlPublishState() {
   json state;
   // Each peer's beacon carries the GUID of the track they're focused on;
-  // resolve it against THIS instance's tracks so the roster shows a
-  // locally-correct 1-based track number. The GUID is the shared identity;
-  // the index is per-project, so the resolution must happen here, never on the
-  // wire. The raw GUID is dropped from what the app sees.
+  // resolve it against THIS instance's tracks so the roster shows that track's
+  // name, or a locally-correct 1-based number when it has none. The GUID is the
+  // shared identity; the index is per-project, so the resolution must happen
+  // here, never on the wire. The raw GUID is dropped from what the app sees.
   json peers = handleJson(reamesh_peers, json::array());
   if (peers.is_array()) {
     for (auto& p : peers) {
@@ -6250,7 +6250,10 @@ static void ctlPublishState() {
       if (guid.empty()) continue;
       if (MediaTrack* tr = findTrackByGuid(guid)) {
         int n = static_cast<int>(GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"));
-        if (n > 0) p["track"] = n;
+        if (n > 0) {
+          p["track"] = n;
+          p["track_name"] = trackStringAttr(tr, "P_NAME");  // "" when unnamed
+        }
       }
     }
   }

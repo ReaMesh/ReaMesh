@@ -17,6 +17,8 @@ export interface Peer {
    *  locally from their broadcast track GUID. Absent/0 when they're not on a
    *  track (or an older extension that doesn't report focus). */
   track?: number | null;
+  /** That track's name; "" when it has none, so the roster says "Track 7". */
+  track_name?: string;
   /** Peer id this peer is following ("" / absent = nobody). On the self entry
    *  it is this user's own follow target; on others it powers the "following
    *  you" indicator. */

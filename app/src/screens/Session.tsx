@@ -19,7 +19,7 @@ import { ListSlot } from "@/components/ListSlot";
 import { useSlowLink } from "@/components/LinkNotice";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { DrawnCheck, SwapIcon, SwapText } from "@/components/Swap";
-import { TrackNumber } from "@/components/TrackNumber";
+import { TrackLabel } from "@/components/TrackLabel";
 import { send, useConnections } from "@/lib/connection";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
 import { t } from "@/lib/i18n";
@@ -154,7 +154,7 @@ function PeerRow({
         onClick={(e) => e.stopPropagation()}
         onKeyDown={(e) => e.stopPropagation()}
       >
-        <TrackNumber track={peer.track} />
+        <TrackLabel track={peer.track} name={peer.track_name} />
         {peer.is_self ? (
           <span aria-hidden="true" className="w-7 shrink-0" />
         ) : (

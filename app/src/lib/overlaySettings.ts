@@ -12,7 +12,7 @@ export interface OverlaySettings {
    *  toggles below say (the tint is drawn by REAPER and stays separate). Stored
    *  inverted as bit 16 ("hidden"), so every existing install keeps it on. */
   hud: boolean;
-  /** The participant roster (avatars + names + track numbers). */
+  /** The participant roster (avatars + names + tracks). */
   roster: boolean;
   /**
    * The dark-grey tint painted on media items another peer is editing (their
