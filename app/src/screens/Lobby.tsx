@@ -1045,25 +1045,51 @@ function VpnHint() {
   );
 }
 
-/** Asked once, until the user decides either way; afterwards it is a switch in
- *  Settings. Not on by default: turning it on is what asks macOS for the
- *  Bluetooth permission, which should follow a click, not appear at launch. */
-function NearbyAsk() {
+/** How long the session list stays empty before the Bluetooth search is offered. */
+const NEARBY_ASK_AFTER = 10_000;
+
+/** Offered once the list has stayed empty for a while, where it explains
+ *  itself, until the user decides; afterwards it is a switch in Settings. Not
+ *  on by default: turning it on is what asks macOS for the Bluetooth
+ *  permission, which should follow a click, not appear at launch. */
+function NearbySearch({ empty }: { empty: boolean }) {
   const n = useNearby();
-  if (!n.supported || n.enabled !== null || nearbyBlocked(n)) return null;
+  const [waited, setWaited] = useState(false);
+  useEffect(() => {
+    if (!empty) {
+      setWaited(false);
+      return;
+    }
+    const id = setTimeout(() => setWaited(true), NEARBY_ASK_AFTER);
+    return () => clearTimeout(id);
+  }, [empty]);
+  const show = waited && n.supported && n.enabled === null && !nearbyBlocked(n);
   return (
-    <div className="flex shrink-0 items-center gap-2.5 rounded-xl bg-card py-2 pr-2 pl-3">
-      <Bluetooth className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-      <span className="min-w-0 flex-1 text-[12px] text-foreground/80" title={t("nearbyHostHint")}>
-        {t("nearbySettingsLabel")}
-      </span>
-      <Button variant="ghost" size="xs" onClick={() => setNearby(false)}>
-        {t("nearbyNotNow")}
-      </Button>
-      <Button variant="secondary" size="xs" onClick={() => setNearby(true)}>
-        {t("nearbyTurnOn")}
-      </Button>
-    </div>
+    <AnimatePresence initial={false}>
+      {show && (
+        <motion.div
+          key="nearby"
+          initial={{ height: 0, opacity: 0 }}
+          animate={{ height: "auto", opacity: 1 }}
+          exit={{ height: 0, opacity: 0 }}
+          transition={FOLD}
+          className="overflow-hidden pb-0.5"
+        >
+          <button
+            type="button"
+            title={t("nearbyHostHint")}
+            onClick={() => setNearby(true)}
+            className={cn(
+              "mt-2 inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground",
+              focusRing,
+            )}
+          >
+            <Bluetooth className="size-3 shrink-0" aria-hidden="true" />
+            {t("nearbySearchToo")}
+          </button>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 
@@ -1096,8 +1122,6 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
       <FirewallBlocked />
 
       <NameCard />
-
-      <NearbyAsk />
 
       <section className="flex min-h-0 flex-1 flex-col gap-2">
         <SectionLabel>{t("sessionsOnNetwork")}</SectionLabel>
@@ -1134,6 +1158,7 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
                 <div className="px-6 py-6 text-center">
                   <p className="text-[13px] text-muted-foreground">{t("noSessionsYet")}</p>
                   <VpnHint />
+                  <NearbySearch empty={count === 0} />
                 </div>
               </motion.div>
             )}
