@@ -10,6 +10,7 @@ import {
   X,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -30,7 +31,7 @@ import { ListSlot } from "@/components/ListSlot";
 import { TrustDialog } from "@/components/TrustDialog";
 import { SwapText } from "@/components/Swap";
 import { FOUND_COLOR, inkFor } from "@/lib/colors";
-import { send } from "@/lib/connection";
+import { send, useActiveInstance } from "@/lib/connection";
 import { stageHostPass } from "@/lib/hostPass";
 import { takeInvite, useInviteSeq } from "@/lib/invite";
 import { recordHostJoin } from "@/lib/knownHosts";
@@ -897,17 +898,22 @@ function HostCard({
   project,
   error,
   warning,
+  aborted,
   port,
 }: {
   project: string;
   error: ExtState["error"];
   /** Warning that pauses hosting until the user confirms or cancels. */
   warning: ExtState["host_warning"];
+  /** Counts hosts that ended at a cancelled Save As. */
+  aborted: ExtState["host_aborted"];
   port: number | null;
 }) {
   const [pass, setPass] = useState("");
+  const instance = useActiveInstance();
+  const reaperBusy = !!instance?.busy;
   // Pending until the mode flips to hosting (which unmounts the Lobby) or the
-  // host attempt fails (a new error arrives, e.g. "save the project first").
+  // host attempt fails (a new error arrives, or the Save As was cancelled).
   // Saving a large project before hosting takes a moment; without this the
   // button looks dead and invites double-clicks.
   const [pending, setPending] = useState(false);
@@ -921,15 +927,24 @@ function HostCard({
   useEffect(() => {
     if (pending && errKey) setPending(false);
   }, [errKey, pending]);
-  // Stop the spinner while the user decides about a host warning.
+  useEffect(() => setPending(false), [aborted]);
+  // Stop the spinner while the user decides about a host warning. After a Save
+  // As this window is behind REAPER, and the question is asked here.
   useEffect(() => {
-    if (pending && warning) setPending(false);
+    if (!pending || !warning) return;
+    setPending(false);
+    try {
+      getCurrentWindow().setFocus().catch(() => {});
+    } catch {
+      // Plain-browser development has no Tauri window API.
+    }
   }, [warning, pending]);
+  // Safety net. Not while REAPER is blocked: a Save As takes as long as it takes.
   useEffect(() => {
-    if (!pending) return;
-    const id = setTimeout(() => setPending(false), 10000); // safety net
+    if (!pending || reaperBusy) return;
+    const id = setTimeout(() => setPending(false), 10000);
     return () => clearTimeout(id);
-  }, [pending]);
+  }, [pending, reaperBusy]);
 
   const host = (confirm: boolean) => {
     if (pending || tooShort) return;
@@ -940,6 +955,9 @@ function HostCard({
     // Stage the passphrase locally; commit it only after hosting starts.
     stageHostPass(port, pass);
     send(confirm ? { cmd: "host", passphrase: pass, confirm: true } : { cmd: "host", passphrase: pass }, port);
+    // An untitled project gets REAPER's Save As first, which must not open
+    // behind this window.
+    if (!project) invoke("focus_reaper", { pid: instance?.pid ?? 0 }).catch(() => {});
   };
   const dismissWarning = () => send({ cmd: "host_dismiss" }, port ?? undefined);
   const w = warning ?? null;
@@ -957,7 +975,7 @@ function HostCard({
           className="h-7 min-w-[68px] px-3 text-[12px]"
           disabled={pending || tooShort}
           busy={pending}
-          label={t("hostAction")}
+          label={project ? t("hostAction") : t("saveAndHost")}
           onClick={() => host(false)}
         />
       </div>
@@ -1177,6 +1195,7 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
           project={state.project}
           error={state.error}
           warning={state.host_warning}
+          aborted={state.host_aborted}
           port={port}
         />
       </section>

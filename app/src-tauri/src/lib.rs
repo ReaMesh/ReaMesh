@@ -20,7 +20,7 @@ mod updater;
 /// `PROTO` (rust/src/lib.rs; app/src/lib/version.test.ts checks the copies
 /// agree). An update is restarted into mid-session only when its manifest
 /// names the same number.
-pub(crate) const PROTO: u32 = 5;
+pub(crate) const PROTO: u32 = 6;
 
 #[cfg(target_os = "macos")]
 const PLUGIN_NAME: &str = "reaper_reamesh.dylib";

@@ -520,6 +520,9 @@ static bool g_noFx = false;
 // copy this much external media into the project folder (and/or the project
 // lives in a cloud-synced folder). The app confirms before the host proceeds.
 static json g_hostWarning;
+// Times a host ended at a cancelled Save As. Published so the app can stop its
+// spinner: the user answered the dialog, so there is no error to report.
+static long g_hostAborted = 0;
 // Post-download plugin verification ({extras:[...],listed} or null): the
 // received .rpp loads plugins the host's manifest meta didn't list. The open
 // is held until the app confirms (open_confirm) or the user leaves.
@@ -5850,7 +5853,7 @@ static void reconnectTick() {
 // confirm dialog.
 static json hostPrecheck() {
   const std::string path = currentProjectPath();
-  if (path.empty()) return json();  // unsaved: onHost's save-first flow handles it
+  if (path.empty()) return json();  // nothing saved, so no folder to look at
   const fs::path projDir = fsPath(path).parent_path();
 
   // External media that hosting would copy in (dedup by source path).
@@ -5900,19 +5903,28 @@ static json hostPrecheck() {
               {"free_known", !ec}, {"cloud", cloud},   {"enough", enough}};
 }
 
+// Hosting shares the project file, so an untitled project has to get one first:
+// REAPER's Save As, which blocks here until it closes. The timer stands still
+// meanwhile, the same guard as around Main_openProject, since a tick in the
+// middle could dispatch a second host on top of the dialog. False = cancelled.
+static bool ensureProjectSaved() {
+  if (!currentProjectPath().empty()) return true;
+  g_applyingRemote = true;
+  Main_SaveProject(nullptr, true);
+  g_applyingRemote = false;
+  if (!currentProjectPath().empty()) return true;
+  ++g_hostAborted;
+  return false;
+}
+
 static void onHost(const std::string& passphrase) {
   if (g_mode == Mode::Hosting) return;
+  // Before leaving the Lobby: a cancelled Save As changes nothing.
+  if (!ensureProjectSaved()) return;
   if (g_mode != Mode::Idle) leaveSession("left", json::object(), "left previous session");
   g_noFx = false;  // hosting is always a full, read-write session
 
-  std::string path = currentProjectPath();
-  if (path.empty()) {
-    // Unsaved project: trigger Save As so there is a project file to share.
-    g_lastError =
-        logEvent("save_first", json::object(), "save the project first, then host again");
-    Main_SaveProject(nullptr, true);
-    return;
-  }
+  const std::string path = currentProjectPath();
   Main_SaveProject(nullptr, false);  // share what's on screen, not a stale file
 
   size_t slash = path.find_last_of("/\\");
@@ -6102,6 +6114,8 @@ static void ctlDispatch(const json& cmd) {
     startBrowse();
   } else if (c == "host") {
     g_hostWarning = json();
+    // First: the pre-check below has no folder to look at before the save.
+    if (!ensureProjectSaved()) return;
     if (!cmdBool("confirm")) {
       // First pass: if hosting would copy external media in (or the project
       // lives in a cloud-synced folder), surface the numbers and wait for the
@@ -6370,6 +6384,7 @@ static void ctlPublishState() {
   // Pre-host media-copy warning ({files,bytes,free,cloud,enough} or null):
   // the app confirms before re-sending host with confirm:true.
   state["host_warning"] = g_hostWarning;
+  state["host_aborted"] = g_hostAborted;
   // Post-download plugin verification ({extras,listed} or null): the app
   // confirms (open_confirm) or leaves; the open is held meanwhile.
   state["verify"] = g_pendingVerify;

@@ -155,6 +155,9 @@ export interface ExtState {
     cloud: boolean;
     enough: boolean;
   } | null;
+  /** How many hosts ended at a cancelled Save As (an untitled project gets one
+   *  first). Goes up instead of an error: the user answered the dialog. */
+  host_aborted?: number;
   /** Post-download verification: the received project loads plugins the host
    *  didn't list (`listed` false = the host reported no list at all). The open
    *  is held until `open_confirm` or `leave`. */

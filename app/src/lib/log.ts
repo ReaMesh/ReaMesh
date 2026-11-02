@@ -21,7 +21,6 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   project_changed: "logProjectChanged",
   host_ended: "hostEndedSession",
   host_lost: "hostLost",
-  save_first: "logSaveFirst",
   host_failed: "logHostFailed",
   browse_failed: "logBrowseFailed",
   waiting_media: "logWaitingMedia",
