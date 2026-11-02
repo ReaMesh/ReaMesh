@@ -23,6 +23,7 @@ import { TrackNumber } from "@/components/TrackNumber";
 import { send, useConnections } from "@/lib/connection";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
 import { t } from "@/lib/i18n";
+import { ticketAddrs, ticketReach } from "@/lib/ticket";
 import { displayName, type ExtState, type Peer, type RelayStatus } from "@/lib/types";
 import { cn, focusRing, noContextMenu } from "@/lib/utils";
 
@@ -237,13 +238,7 @@ function InviteRow({ children, action }: { children: React.ReactNode; action: Re
 // LAN) join: opening it takes them straight into their app's join flow,
 // pasting it in their Lobby works too. The row names it; the link itself only
 // shows when the clipboard refuses it, so it can be copied by hand.
-function InviteCode({
-  ticket,
-  relay,
-}: {
-  ticket: string;
-  relay: ReturnType<typeof relayLine>;
-}) {
+function InviteCode({ ticket, line }: { ticket: string; line: InviteLine | null }) {
   const [copied, setCopied] = useState(false);
   const [reveal, setReveal] = useState(false);
   useEffect(() => {
@@ -284,12 +279,12 @@ function InviteCode({
           <p className="truncate text-[13px]" title={t("inviteTicketHint")}>
             {t("inviteCode")}
           </p>
-          {relay && (
+          {line && (
             <p
               role="status"
-              className={cn("truncate text-[12px]", relay.warn ? "text-amber-500" : "text-muted-foreground")}
+              className={cn("truncate text-[12px]", line.warn ? "text-amber-500" : "text-muted-foreground")}
             >
-              {relay.text}
+              {line.text}
             </p>
           )}
         </>
@@ -298,15 +293,30 @@ function InviteCode({
   );
 }
 
-// How the host's relays stand, as the invite row's second line. Nothing
-// without a relay configured.
-function relayLine(status: RelayStatus[]): { text: string; warn: boolean } | null {
+/** The invite row's second line. */
+type InviteLine = { text: string; warn: boolean };
+
+// How the host's relays stand. Nothing without a relay configured.
+function relayLine(status: RelayStatus[]): InviteLine | null {
   if (status.length === 0) return null;
   const reserved = status.find((r) => r.state === "reserved");
   if (reserved) return { text: t("relayReachable", { name: reserved.label || reserved.host }), warn: false };
   if (status.some((r) => r.state === "connecting")) return { text: t("relayConnecting"), warn: false };
   const keyRefused = status.some((r) => r.reason === "bad_key");
   return { text: t(keyRefused ? "relayKeyRefused" : "relayDown"), warn: true };
+}
+
+const REACH_TEXT = {
+  lan: "reachLan",
+  lan_tailscale: "reachLanTailscale",
+  tailscale: "reachTailscale",
+  public: "reachPublic",
+} as const;
+
+// Without a relay, the code reaches as far as the addresses in it.
+function reachLine(ticket: string): InviteLine | null {
+  const ips = ticketAddrs(ticket)?.ips ?? [];
+  return ips.length > 0 ? { text: t(REACH_TEXT[ticketReach(ips)]), warn: false } : null;
 }
 
 // The password this host set, in case they forget it while a guest is trying
@@ -472,7 +482,7 @@ export function Session({
             <section className="flex shrink-0 flex-col gap-2">
               <SectionLabel>{t("invite")}</SectionLabel>
               <Group>
-                {!!state.ticket && <InviteCode ticket={state.ticket} relay={relayLine(relayStatus)} />}
+                {!!state.ticket && <InviteCode ticket={state.ticket} line={relayLine(relayStatus) ?? reachLine(state.ticket)} />}
                 {!!state.ticket && !!hostPass && <Divider inset={false} />}
                 {!!hostPass && <HostPassword pass={hostPass} />}
               </Group>

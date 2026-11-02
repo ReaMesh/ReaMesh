@@ -93,6 +93,12 @@ function ipv4Dialable(o: number[]): boolean {
   return true;
 }
 
+/** The IPv4 octets of an IPv4-mapped address (::ffff:a.b.c.d), else null. */
+function mappedIpv4(g: number[]): number[] | null {
+  if (!g.slice(0, 5).every((x) => x === 0) || g[5] !== 0xffff) return null;
+  return [g[6] >> 8, g[6] & 0xff, g[7] >> 8, g[7] & 0xff];
+}
+
 /** Whether a ticket address can name a host: loopback, unspecified,
  *  link-local, multicast and broadcast never do. Mirrors the extension's
  *  `dialable_ip`, which drops the same addresses from a ticket. */
@@ -100,10 +106,9 @@ export function isDialableIp(s: string): boolean {
   if (IPV4.test(s)) return ipv4Dialable(s.split(".").map(Number));
   const g = ipv6Groups(s);
   if (!g) return false;
-  // IPv4-mapped (::ffff:a.b.c.d) follows the IPv4 rules.
-  if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) {
-    return ipv4Dialable([g[6] >> 8, g[6] & 0xff, g[7] >> 8, g[7] & 0xff]);
-  }
+  // IPv4-mapped follows the IPv4 rules.
+  const mapped = mappedIpv4(g);
+  if (mapped) return ipv4Dialable(mapped);
   if (g.every((x) => x === 0)) return false; // ::
   if (g.slice(0, 7).every((x) => x === 0) && g[7] === 1) return false; // ::1
   if ((g[0] & 0xffc0) === 0xfe80) return false; // link-local
@@ -124,6 +129,43 @@ export interface TicketAddrs {
   /** 0 when the link names no such port. */
   tcp: number;
   quic: number;
+}
+
+/** Who an invite link's addresses can reach. */
+export type TicketReach = "lan" | "lan_tailscale" | "tailscale" | "public";
+
+function ipReach(ip: string): "lan" | "tailscale" | "public" {
+  const g = IPV4.test(ip) ? null : ipv6Groups(ip);
+  const o = g ? mappedIpv4(g) : IPV4.test(ip) ? ip.split(".").map(Number) : null;
+  // Home routers firewall inbound IPv6, so even a global address promises
+  // nothing beyond the local network.
+  if (!o) return "lan";
+  const [a, b, c] = o;
+  if (a === 100 && b >= 64 && b <= 127) return "tailscale"; // 100.64.0.0/10
+  const local =
+    a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    // Never routed on the internet: this network, loopback, link-local, the
+    // documentation and benchmark ranges, multicast and reserved.
+    a === 0 ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 192 && b === 0 && (c === 0 || c === 2)) ||
+    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+    (a === 203 && b === 0 && c === 113) ||
+    a >= 224;
+  return local ? "lan" : "public";
+}
+
+/** How far a host's addresses carry an invite: a public IPv4 address reaches
+ *  the internet, 100.64.0.0/10 other Tailscale devices, the rest (RFC 1918, ULA
+ *  and global IPv6) the local network. */
+export function ticketReach(ips: string[]): TicketReach {
+  const kinds = new Set(ips.map(ipReach));
+  if (kinds.has("public")) return "public";
+  if (!kinds.has("tailscale")) return "lan";
+  return kinds.has("lan") ? "lan_tailscale" : "tailscale";
 }
 
 export function decodeTicket(raw: string): TicketInfo | null {

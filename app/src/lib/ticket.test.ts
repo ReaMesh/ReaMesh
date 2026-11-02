@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeTicket, isDialableIp, isInviteLink, normalizeTicket, ticketAddrs } from "./ticket";
+import { decodeTicket, isDialableIp, isInviteLink, normalizeTicket, ticketAddrs, ticketReach } from "./ticket";
 
 const PEER = "12D3KooWQYhTNQdmr3ArTeUHRYzFg94BKyTkoWBDWez9kSCVe2Xo";
 
@@ -131,6 +131,49 @@ describe("ticketAddrs", () => {
       quic: 0,
     });
     expect(ticketAddrs(makeTicket({ a: null }))).toBeNull();
+  });
+});
+
+describe("ticketReach", () => {
+  it("reads a link's own addresses", () => {
+    expect(ticketReach(ticketAddrs(makeTicket())!.ips)).toBe("lan_tailscale");
+    expect(ticketReach(ticketAddrs(makeTicket({ a: "192.168.1.7" }))!.ips)).toBe("lan");
+  });
+
+  it("keeps private addresses and all IPv6 on the local network", () => {
+    for (const ip of [
+      "192.168.1.7",
+      "10.0.0.2",
+      "172.16.0.1",
+      "172.31.255.254",
+      "fd00::5",
+      "2001:db8::5",
+      "2a02:8108::1",
+      "::ffff:192.168.1.7",
+    ]) {
+      expect(ticketReach([ip]), ip).toBe("lan");
+    }
+  });
+
+  it("recognises Tailscale's range, alone and beside a LAN address", () => {
+    for (const ip of ["100.64.0.0", "100.101.102.103", "100.127.255.255", "::ffff:100.64.0.1"]) {
+      expect(ticketReach([ip]), ip).toBe("tailscale");
+      expect(ticketReach(["192.168.1.7", ip]), ip).toBe("lan_tailscale");
+    }
+    expect(ticketReach(["100.64.0.1", "fd00::5"])).toBe("lan_tailscale");
+  });
+
+  it("counts a public IPv4 address as the internet, whatever else is there", () => {
+    for (const ip of ["81.2.69.160", "100.63.255.255", "100.128.0.0", "172.15.0.1", "172.32.0.1", "::ffff:8.8.8.8"]) {
+      expect(ticketReach([ip]), ip).toBe("public");
+    }
+    expect(ticketReach(["192.168.1.7", "100.101.102.103", "81.2.69.160"])).toBe("public");
+  });
+
+  it("doesn't take ranges the internet never routes for public", () => {
+    for (const ip of ["192.0.2.1", "198.18.0.1", "198.19.255.1", "198.51.100.7", "203.0.113.5", "240.0.0.1", "0.1.2.3"]) {
+      expect(ticketReach([ip]), ip).toBe("lan");
+    }
   });
 });
 
