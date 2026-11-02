@@ -407,8 +407,8 @@ export function Settings({
         ? t("updateAvailable")
         : loadedOld
           ? t("extRestartToLoad", { version })
-          : status.preinstalled || version
-            ? t("versionLabel", { version: status.preinstalled || version })
+          : status.preinstalled && status.preinstalled !== version
+            ? t("versionLabel", { version: status.preinstalled })
             : t("installed");
   const extWarn = !!status?.installed && (!status.upToDate || loadedOld);
 
