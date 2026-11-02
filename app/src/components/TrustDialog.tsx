@@ -176,12 +176,14 @@ export function TrustDialog({
         <DialogFacts>
           {(hostName || hostId) && (
             <DialogFact label={t("trustHostLabel")}>
-              {hostName && <span className="truncate">{hostName}</span>}
-              {hostId && (
-                <span className="shrink-0 font-normal text-muted-foreground">
-                  {seen > 0 ? t("hostSeenTimes", { count: seen }) : t("hostSeenNever")}
-                </span>
-              )}
+              <span className="flex min-w-0 flex-col items-end">
+                {hostName && <span className="max-w-full truncate">{hostName}</span>}
+                {hostId && (
+                  <span className="font-normal text-muted-foreground">
+                    {seen > 0 ? t("hostSeenTimes", { count: seen }) : t("hostSeenNever")}
+                  </span>
+                )}
+              </span>
             </DialogFact>
           )}
           {totalBytes > 0 && (

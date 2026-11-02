@@ -38,6 +38,6 @@ export function recordHostJoin(peerId: string): void {
       localStorage.setItem(KEY, JSON.stringify(map));
     }
   } catch {
-    // localStorage unavailable: the dialog just stays on "first time".
+    // localStorage unavailable: the dialog just stays on "never joined".
   }
 }
