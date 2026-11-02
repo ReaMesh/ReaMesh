@@ -557,8 +557,13 @@ function SessionCard({
                 {t(skew === "newer" ? "hostNewerVersion" : "hostOlderVersion")}
               </p>
             ) : (
-              <p className="truncate text-[12px] text-muted-foreground" title={session.project_file}>
-                {session.owner_name || session.project_file}
+              <p className="flex gap-3 text-[12px] tabular-nums text-muted-foreground">
+                <span className="truncate" title={session.project_file}>
+                  {session.owner_name || session.project_file}
+                </span>
+                {(session.bytes ?? 0) > 0 && (
+                  <span className="shrink-0">{formatBytes(session.bytes ?? 0)}</span>
+                )}
               </p>
             )}
           </div>
