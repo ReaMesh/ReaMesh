@@ -31,35 +31,28 @@ const MIN_MAX_HEIGHT = 160;
 const FOLD = { type: "spring", stiffness: 400, damping: 38 } as const;
 
 // One person per row: face, name (plus "you" and the host's crown), and at
-// most one thing on the right: that they follow you, or else their track. A
-// peer whose REAPER stopped responding is dimmed; the tooltip says why.
+// most one thing on the right: that they follow you, or else their track. Under
+// the pointer that gives way to an eye that follows them. A peer whose REAPER
+// stopped responding is dimmed; the tooltip says why.
 function PeerRow({
   peer,
   onReveal,
-  pickMode = false,
-  onPick,
+  onFollow,
   followsYou = false,
 }: {
   peer: Peer;
   onReveal?: (peer: Peer) => void;
-  /** Follow-mode picking: clicking any other person starts following them. */
-  pickMode?: boolean;
-  onPick?: (peer: Peer) => void;
+  /** Left out for the person you already follow. */
+  onFollow?: (peer: Peer) => void;
   /** This peer's transport mirrors yours. */
   followsYou?: boolean;
 }) {
-  // Other peers can be followed in pick mode or revealed when they are on a track.
-  const pickable = pickMode && !peer.is_self && !!onPick;
-  const clickable =
-    pickable || (!!onReveal && !peer.is_self && peer.track != null && peer.track > 0);
+  // Other peers can be revealed when they are on a track.
+  const clickable = !!onReveal && !peer.is_self && peer.track != null && peer.track > 0;
+  const followable = !!onFollow && !peer.is_self;
   // Flash the row to acknowledge the change happening in REAPER.
   const [flashScope, animateFlash] = useAnimate();
-  const activate = () => {
-    if (pickable) {
-      onPick!(peer);
-    } else {
-      onReveal!(peer);
-    }
+  const flash = () => {
     if (!flashScope.current) return;
     const tint = /^#[0-9a-fA-F]{6}$/.test(peer.color)
       ? [`${peer.color}4d`, `${peer.color}00`]
@@ -70,69 +63,103 @@ function PeerRow({
       { duration: 0.5, ease: "easeOut" },
     );
   };
+  const activate = () => {
+    onReveal!(peer);
+    flash();
+  };
   const frozen = !!peer.frozen && !peer.is_self;
+  const followLabel = t("followPerson", { name: displayName(peer) });
   return (
-    <Hint
-      label={
-        pickable
-          ? t("followPerson", { name: displayName(peer) })
-          : frozen
+    <motion.div
+      layout
+      initial={{ opacity: 0, x: -8 }}
+      // Online, but their REAPER has stopped responding: the row dims. Set
+      // here rather than as a class, which Motion's inline opacity would beat.
+      animate={{ opacity: frozen ? 0.45 : 1, x: 0 }}
+      exit={{ opacity: 0, x: 8 }}
+      transition={{ type: "spring", stiffness: 350, damping: 28 }}
+      onClick={clickable ? activate : undefined}
+      onKeyDown={
+        clickable
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                activate();
+              }
+            }
+          : undefined
+      }
+      role={clickable ? "button" : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      className={cn(
+        "group/row relative flex items-center gap-2 rounded-md px-1.5 py-1",
+        clickable && "cursor-pointer transition-colors hover:bg-white/5",
+      )}
+    >
+      {!peer.is_self && (
+        <span
+          ref={flashScope}
+          aria-hidden
+          className="pointer-events-none absolute inset-0 rounded-md"
+        />
+      )}
+      {/* Not on the whole row: the eye has a tooltip of its own. */}
+      <Hint
+        label={
+          frozen
             ? t("reaperNotRespondingPeer")
             : clickable
               ? t("revealPeerTrack", { name: displayName(peer) })
               : undefined
-      }
-    >
-      <motion.div
-        layout
-        initial={{ opacity: 0, x: -8 }}
-        // Online, but their REAPER has stopped responding: the row dims. Set
-        // here rather than as a class, which Motion's inline opacity would beat.
-        animate={{ opacity: frozen ? 0.45 : 1, x: 0 }}
-        exit={{ opacity: 0, x: 8 }}
-        transition={{ type: "spring", stiffness: 350, damping: 28 }}
-        onClick={clickable ? activate : undefined}
-        onKeyDown={
-          clickable
-            ? (e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  activate();
-                }
-              }
-            : undefined
         }
-        role={clickable ? "button" : undefined}
-        tabIndex={clickable ? 0 : undefined}
-        className={cn(
-          "relative flex items-center gap-2 rounded-md px-1.5 py-1",
-          clickable && "cursor-pointer transition-colors hover:bg-white/5",
-          pickable && "ring-1 ring-inset ring-white/15",
-        )}
       >
-        {clickable && (
-          <span
-            ref={flashScope}
-            aria-hidden
-            className="pointer-events-none absolute inset-0 rounded-md"
-          />
-        )}
-        <PeerAvatar peer={peer} size="xs" />
-        <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
-          <span className="truncate text-[12px] font-medium">{displayName(peer)}</span>
-          {peer.is_self && (
-            <span className="shrink-0 text-[11px] text-muted-foreground">{t("youBadge")}</span>
-          )}
-          {peer.is_owner && <HostCrown />}
-          {frozen && <span className="sr-only">{t("reaperNotRespondingPeer")}</span>}
+        <span className="flex min-w-0 flex-1 items-center gap-2">
+          <PeerAvatar peer={peer} size="xs" />
+          <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
+            <span className="truncate text-[12px] font-medium">{displayName(peer)}</span>
+            {peer.is_self && (
+              <span className="shrink-0 text-[11px] text-muted-foreground">{t("youBadge")}</span>
+            )}
+            {peer.is_owner && <HostCrown />}
+            {frozen && <span className="sr-only">{t("reaperNotRespondingPeer")}</span>}
+          </span>
         </span>
-        {followsYou ? (
-          <span className="shrink-0 text-[11px] text-found">{t("followsYou")}</span>
-        ) : (
-          <TrackNumber track={peer.track} small />
+      </Hint>
+      {/* min-w-5: on a row with nothing to its right the eye must not cover the name. */}
+      <span className={cn("relative flex shrink-0 items-center justify-end", followable && "min-w-5")}>
+        <span
+          className={cn(
+            "flex transition-opacity duration-150",
+            followable &&
+              "group-hover/row:opacity-0 group-has-[button:focus-visible]/row:opacity-0",
+          )}
+        >
+          {followsYou ? (
+            <span className="text-[11px] text-found">{t("followsYou")}</span>
+          ) : (
+            <TrackNumber track={peer.track} small />
+          )}
+        </span>
+        {/* Without a pointer that hovers the eye stays hidden, so it takes no taps either. */}
+        {followable && (
+          <Hint label={followLabel}>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onFollow!(peer);
+                flash();
+              }}
+              onKeyDown={(e) => e.stopPropagation()}
+              aria-label={followLabel}
+              className="pointer-events-none absolute top-1/2 -right-1 grid size-6 -translate-y-1/2 cursor-pointer place-items-center rounded-md text-foreground/80 opacity-0 transition-[opacity,background-color] duration-150 outline-none group-hover/row:pointer-events-auto group-hover/row:opacity-100 hover:bg-white/10 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+            >
+              <Eye className="size-3.5" aria-hidden="true" />
+            </button>
+          </Hint>
         )}
-      </motion.div>
-    </Hint>
+      </span>
+    </motion.div>
   );
 }
 
@@ -434,12 +461,6 @@ export function Overlay({ port }: { port: number | null }) {
   const followTarget = followingId ? peers.find((p) => p.id === followingId) : undefined;
   const [markerOpen, setMarkerOpen] = useState(false);
   const [markerName, setMarkerName] = useState("");
-  const [pickMode, setPickMode] = useState(false);
-  // Follow target gone (left / went stale): the extension already stopped
-  // following; make sure pick mode isn't stuck either.
-  useEffect(() => {
-    if (followingId) setPickMode(false);
-  }, [followingId]);
 
   // Temporarily let the HUD take focus while the ping field is open, then
   // return focus to REAPER. Focus the field only after the native call finishes.
@@ -484,21 +505,9 @@ export function Overlay({ port }: { port: number | null }) {
     send({ cmd: "share_marker", name });
     closeMarker();
   };
-  const pickFollow = (peer: Peer) => {
-    setPickMode(false);
-    send({ cmd: "follow", peer_id: peer.id });
-  };
+  // Pointing at someone else while following switches to them.
+  const follow = (peer: Peer) => send({ cmd: "follow", peer_id: peer.id });
   const stopFollowing = () => send({ cmd: "follow", peer_id: "" });
-  // The two tools share one fold below the bar, so only one is ever open.
-  // ("marker" is the ping tool; the ctl command keeps its older name.)
-  const openMarker = () => {
-    setPickMode(false);
-    setMarkerOpen((v) => !v);
-  };
-  const openPick = () => {
-    closeMarker();
-    setPickMode((v) => !v);
-  };
 
   return (
     // The card is the tooltip boundary: the OS window hugs it exactly, so a
@@ -715,8 +724,7 @@ export function Overlay({ port }: { port: number | null }) {
                               key={p.id}
                               peer={p}
                               onReveal={reveal}
-                              pickMode={pickMode}
-                              onPick={pickFollow}
+                              onFollow={p.id === followingId ? undefined : follow}
                               followsYou={!p.is_self && !!self && p.follow === self.id}
                             />
                           ))}
@@ -725,7 +733,6 @@ export function Overlay({ port }: { port: number | null }) {
                     </div>
                   )}
 
-                  {/* Pings and follow mode share this expandable area. */}
                   <div className="border-t border-white/10 px-1.5 py-1">
                     {followTarget ? (
                       // Following someone: say whom, and end it with one click.
@@ -742,28 +749,19 @@ export function Overlay({ port }: { port: number | null }) {
                         </button>
                       </div>
                     ) : (
-                      <div className="flex h-7 items-center gap-1">
-                        {(
-                          [
-                            { key: "marker", label: t("markerTool"), hint: t("shareMarkerTitle"), icon: Flag, on: markerOpen, click: openMarker },
-                            { key: "follow", label: t("followAction"), hint: t("followMode"), icon: Eye, on: pickMode, click: openPick },
-                          ] as const
-                        ).map((tool) => (
-                          <Hint key={tool.key} label={tool.hint}>
-                            <button
-                              type="button"
-                              onClick={tool.click}
-                              aria-expanded={tool.on}
-                              className={`flex h-7 flex-1 items-center justify-center gap-1.5 rounded-md text-[11.5px] font-medium transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
-                                tool.on ? "bg-white/10 text-foreground" : "text-foreground/65"
-                              }`}
-                            >
-                              <tool.icon className="size-3.5 shrink-0" aria-hidden="true" />
-                              {tool.label}
-                            </button>
-                          </Hint>
-                        ))}
-                      </div>
+                      <Hint label={t("shareMarkerTitle")}>
+                        <button
+                          type="button"
+                          onClick={() => setMarkerOpen((v) => !v)}
+                          aria-expanded={markerOpen}
+                          className={`flex h-7 w-full items-center justify-center gap-1.5 rounded-md text-[11.5px] font-medium transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
+                            markerOpen ? "bg-white/10 text-foreground" : "text-foreground/65"
+                          }`}
+                        >
+                          <Flag className="size-3.5 shrink-0" aria-hidden="true" />
+                          {t("markerTool")}
+                        </button>
+                      </Hint>
                     )}
                     <AnimatePresence initial={false} mode="wait">
                       {markerOpen ? (
@@ -801,19 +799,6 @@ export function Overlay({ port }: { port: number | null }) {
                               {t("share")}
                             </button>
                           </div>
-                        </motion.div>
-                      ) : pickMode && !followTarget ? (
-                        <motion.div
-                          key="pick"
-                          initial={{ height: 0, opacity: 0 }}
-                          animate={{ height: "auto", opacity: 1 }}
-                          exit={{ height: 0, opacity: 0 }}
-                          transition={FOLD}
-                          className="overflow-hidden"
-                        >
-                          <p className="px-1.5 pt-1 pb-0.5 text-[11px] leading-snug text-muted-foreground">
-                            {t("pickPersonToFollow")}
-                          </p>
                         </motion.div>
                       ) : null}
                     </AnimatePresence>
