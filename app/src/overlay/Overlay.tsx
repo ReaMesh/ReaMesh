@@ -8,12 +8,12 @@
 
 import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { AnimatePresence, motion, useAnimate } from "motion/react";
-import { BookmarkPlus, Check, ChevronUp, Eye, Flag } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
+import { BookmarkPlus, ChevronUp, Eye, Flag } from "lucide-react";
 import { currentMonitor, getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { Hint, HintProvider } from "@/components/Hint";
 import { HostCrown } from "@/components/HostCrown";
 import { PeerAvatar } from "@/components/PeerAvatar";
+import { DrawnCheck, SwapIcon } from "@/components/Swap";
 import { TrackNumber } from "@/components/TrackNumber";
 import { t, useLang } from "@/lib/i18n";
 import { localizeLogEntry, reconnectingText } from "@/lib/log";
@@ -170,6 +170,8 @@ const PING_SHOW_MS = 8000;
 const PING_MAX = 3;
 /// After the pointer leaves a held ping, it stays at least this much longer.
 const PING_LINGER_MS = 2000;
+/// How long the Ping button shows its check.
+const PINGED_MS = 1500;
 
 type ShownPing = PingEntry & { key: string; until: number; kept?: boolean };
 
@@ -214,11 +216,13 @@ function PingRow({
             aria-label={ping.kept ? t("pingKept") : t("pingKeep")}
             className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:text-found disabled:hover:bg-transparent"
           >
-            {ping.kept ? (
-              <Check className="size-3.5" aria-hidden="true" />
-            ) : (
-              <BookmarkPlus className="size-3.5" aria-hidden="true" />
-            )}
+            <SwapIcon value={ping.kept ? "check" : "keep"} from={ping.kept ? 0.85 : 0.25} className="size-3.5">
+              {ping.kept ? (
+                <DrawnCheck className="size-3.5" />
+              ) : (
+                <BookmarkPlus className="size-3.5" aria-hidden="true" />
+              )}
+            </SwapIcon>
           </button>
         </Hint>
       )}
@@ -459,51 +463,19 @@ export function Overlay({ port }: { port: number | null }) {
   const self = peers.find((p) => p.is_self);
   const followingId = self?.follow || "";
   const followTarget = followingId ? peers.find((p) => p.id === followingId) : undefined;
-  const [markerOpen, setMarkerOpen] = useState(false);
-  const [markerName, setMarkerName] = useState("");
-
-  // Temporarily let the HUD take focus while the ping field is open, then
-  // return focus to REAPER. Focus the field only after the native call finishes.
-  const markerInput = useRef<HTMLInputElement>(null);
-  const markerWasOpen = useRef(false);
+  // One click pings the edit cursor under the sender's own name (the ctl command
+  // keeps its older name). The check holds for a moment and clicks are ignored
+  // meanwhile, so a double click is still one ping.
+  const [pinged, setPinged] = useState(false);
   useEffect(() => {
-    // Do not hand focus to REAPER just because the HUD mounted.
-    if (!markerOpen && !markerWasOpen.current) return;
-    markerWasOpen.current = markerOpen;
-    let alive = true;
-    invoke("set_overlay_interactive", { on: markerOpen })
-      .then(() => {
-        if (alive && markerOpen) markerInput.current?.focus();
-      })
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, [markerOpen]);
-  useEffect(
-    () => () => {
-      invoke("set_overlay_interactive", { on: false }).catch(() => {});
-    },
-    [],
-  );
-
-  const closeMarker = () => {
-    setMarkerOpen(false);
-    setMarkerName("");
-  };
-
-  // Close the ping field on blur so later HUD clicks cannot steal focus.
-  useEffect(() => {
-    if (!markerOpen) return;
-    const onBlur = () => closeMarker();
-    window.addEventListener("blur", onBlur);
-    return () => window.removeEventListener("blur", onBlur);
-  }, [markerOpen]); // eslint-disable-line react-hooks/exhaustive-deps
-  const shareMarker = () => {
-    const name = markerName.trim();
-    if (!name) return;
-    send({ cmd: "share_marker", name });
-    closeMarker();
+    if (!pinged) return;
+    const id = setTimeout(() => setPinged(false), PINGED_MS);
+    return () => clearTimeout(id);
+  }, [pinged]);
+  const sendPing = () => {
+    if (pinged || !self) return;
+    send({ cmd: "share_marker", name: displayName(self) });
+    setPinged(true);
   };
   // Pointing at someone else while following switches to them.
   const follow = (peer: Peer) => send({ cmd: "follow", peer_id: peer.id });
@@ -657,44 +629,6 @@ export function Overlay({ port }: { port: number | null }) {
                   style={{ overflow: "hidden" }}
                 >
                   <AnimatePresence initial={false}>
-                    {shownPings.length > 0 && (
-                      <motion.div
-                        key="pings"
-                        role="status"
-                        initial={{ height: 0, opacity: 0 }}
-                        animate={{ height: "auto", opacity: 1 }}
-                        exit={{ height: 0, opacity: 0 }}
-                        transition={FOLD}
-                        className="overflow-hidden"
-                        onMouseEnter={() => (pingHover.current = true)}
-                        onMouseLeave={releasePings}
-                      >
-                        <div className="border-t border-white/10 py-0.5">
-                          <AnimatePresence initial={false}>
-                            {shownPings.map((p) => (
-                              <motion.div
-                                key={p.key}
-                                initial={{ height: 0, opacity: 0 }}
-                                animate={{ height: "auto", opacity: 1 }}
-                                exit={{ height: 0, opacity: 0 }}
-                                transition={FOLD}
-                                className="overflow-hidden"
-                              >
-                                <PingRow
-                                  ping={p}
-                                  sender={pingSender(p)}
-                                  canKeep={canKeep}
-                                  onJump={() => jumpToPing(p)}
-                                  onKeep={() => keepPing(p)}
-                                />
-                              </motion.div>
-                            ))}
-                          </AnimatePresence>
-                        </div>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                  <AnimatePresence initial={false}>
                     {loading && state && (
                       <motion.div
                         key="loading"
@@ -752,57 +686,60 @@ export function Overlay({ port }: { port: number | null }) {
                       <Hint label={t("shareMarkerTitle")}>
                         <button
                           type="button"
-                          onClick={() => setMarkerOpen((v) => !v)}
-                          aria-expanded={markerOpen}
-                          className={`flex h-7 w-full items-center justify-center gap-1.5 rounded-md text-[11.5px] font-medium transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
-                            markerOpen ? "bg-white/10 text-foreground" : "text-foreground/65"
-                          }`}
+                          onClick={sendPing}
+                          className="flex h-7 w-full items-center justify-center gap-1.5 rounded-md text-[11.5px] font-medium text-foreground/65 transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                         >
-                          <Flag className="size-3.5 shrink-0" aria-hidden="true" />
+                          <SwapIcon value={pinged ? "check" : "flag"} from={pinged ? 0.85 : 0.25} className="size-3.5">
+                            {pinged ? (
+                              <DrawnCheck className="size-3.5 text-found" />
+                            ) : (
+                              <Flag className="size-3.5" aria-hidden="true" />
+                            )}
+                          </SwapIcon>
                           {t("markerTool")}
                         </button>
                       </Hint>
                     )}
-                    <AnimatePresence initial={false} mode="wait">
-                      {markerOpen ? (
-                        <motion.div
-                          key="marker"
-                          initial={{ height: 0, opacity: 0 }}
-                          animate={{ height: "auto", opacity: 1 }}
-                          exit={{ height: 0, opacity: 0 }}
-                          transition={FOLD}
-                          className="overflow-hidden"
-                        >
-                          {/* px-px so the focus ring (drawn inside, see ring-inset)
-                              still has a hair of room and never clips against the
-                              card's rounded edge. */}
-                          <div className="flex items-center gap-1 px-px pt-1 pb-0.5">
-                            <input
-                              ref={markerInput}
-                              value={markerName}
-                              onChange={(e) => setMarkerName(e.target.value)}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter") shareMarker();
-                                if (e.key === "Escape") closeMarker();
-                              }}
-                              maxLength={80}
-                              aria-label={t("markerNamePlaceholder")}
-                              placeholder={t("markerNamePlaceholder")}
-                              className="h-6 min-w-0 flex-1 rounded-md bg-white/5 px-1.5 text-[11px] outline-none placeholder:text-muted-foreground focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-foreground/40"
-                            />
-                            <button
-                              type="button"
-                              onClick={shareMarker}
-                              disabled={!markerName.trim()}
-                              className="h-6 shrink-0 rounded-md px-2 text-[11px] font-medium text-foreground transition-colors outline-none hover:bg-white/10 disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                            >
-                              {t("share")}
-                            </button>
-                          </div>
-                        </motion.div>
-                      ) : null}
-                    </AnimatePresence>
                   </div>
+                  {/* Below the footer, so a new one never moves anything under the pointer. */}
+                  <AnimatePresence initial={false}>
+                    {shownPings.length > 0 && (
+                      <motion.div
+                        key="pings"
+                        role="status"
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: "auto", opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={FOLD}
+                        className="overflow-hidden"
+                        onMouseEnter={() => (pingHover.current = true)}
+                        onMouseLeave={releasePings}
+                      >
+                        <div className="border-t border-white/10 py-0.5">
+                          <AnimatePresence initial={false}>
+                            {shownPings.map((p) => (
+                              <motion.div
+                                key={p.key}
+                                initial={{ height: 0, opacity: 0 }}
+                                animate={{ height: "auto", opacity: 1 }}
+                                exit={{ height: 0, opacity: 0 }}
+                                transition={FOLD}
+                                className="overflow-hidden"
+                              >
+                                <PingRow
+                                  ping={p}
+                                  sender={pingSender(p)}
+                                  canKeep={canKeep}
+                                  onJump={() => jumpToPing(p)}
+                                  onKeep={() => keepPing(p)}
+                                />
+                              </motion.div>
+                            ))}
+                          </AnimatePresence>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
                 </motion.div>
               )}
             </AnimatePresence>

@@ -308,35 +308,6 @@ pub fn attach(hwnd: isize, scale: f64, reaper_pid: u32) {
     std::thread::spawn(follow_loop);
 }
 
-/// Allow keyboard focus while the marker-name field is open. Restore
-/// WS_EX_NOACTIVATE and return focus to REAPER when it closes.
-/// The foreground check includes the overlay, keeping it visible while typing.
-pub fn set_interactive(on: bool) {
-    let raw = OVERLAY.load(Ordering::SeqCst);
-    if raw == 0 {
-        return;
-    }
-    let overlay = HWND(raw as *mut _);
-    if !unsafe { IsWindow(Some(overlay)) }.as_bool() {
-        return;
-    }
-    unsafe {
-        let ex = GetWindowLongPtrW(overlay, GWL_EXSTYLE);
-        let noactivate = WS_EX_NOACTIVATE.0 as isize;
-        let next = if on { ex & !noactivate } else { ex | noactivate };
-        if next != ex {
-            SetWindowLongPtrW(overlay, GWL_EXSTYLE, next);
-        }
-        if on {
-            // The click that opened the field is recent input to this process,
-            // which is what earns the right to set the foreground window.
-            let _ = SetForegroundWindow(overlay);
-        } else if let Some(reaper) = find_reaper_window() {
-            let _ = SetForegroundWindow(reaper);
-        }
-    }
-}
-
 /// Stop following. The window itself is closed by the caller.
 pub fn detach() {
     RUNNING.store(false, Ordering::SeqCst);
