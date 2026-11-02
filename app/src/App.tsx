@@ -154,6 +154,54 @@ function usePresenceToasts(state: ExtState | undefined, port: number | undefined
   return flash;
 }
 
+/** How long the HUD stays up to say why the session ended. */
+const HUD_END_NOTICE_MS = 6000;
+
+/** Give the overlay the active instance's port and process; a port change must
+ *  rebuild the HUD even when both instances are already in sessions. A session
+ *  that ends without the user leaving keeps the HUD a little longer, for the
+ *  line it shows then: while the extension reconnects, or HUD_END_NOTICE_MS for
+ *  an error. The error is cleared on the next frame, so the timer lives in a ref
+ *  that later frames can't cancel. Everything else closes it on the spot:
+ *  your own leave, the overlay switched off in Settings, REAPER gone. */
+function useSessionHud(
+  state: ExtState | undefined,
+  inSession: boolean,
+  port: number | undefined,
+  pid: number | undefined,
+) {
+  const hud = useOverlaySettings().hud;
+  const alive = !!state;
+  const reconnecting = !!state?.reconnecting;
+  const failed = !!state?.error;
+  // The instance the HUD is up for, and the pending close.
+  const upFor = useRef<number | null>(null);
+  const closing = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    const cancelClose = () => {
+      clearTimeout(closing.current);
+      closing.current = undefined;
+    };
+    const close = () => {
+      cancelClose();
+      upFor.current = null;
+      closeOverlay();
+    };
+    if (!hud || port == null) {
+      close();
+    } else if (inSession) {
+      cancelClose();
+      upFor.current = port;
+      openOverlay(port, pid ?? null);
+    } else if (!alive || upFor.current !== port) {
+      close();
+    } else if (closing.current === undefined && !reconnecting) {
+      if (failed) closing.current = window.setTimeout(close, HUD_END_NOTICE_MS);
+      else close();
+    }
+  }, [hud, inSession, port, pid, alive, reconnecting, failed]);
+}
+
 /** Deduplicate control-server errors per REAPER instance. The server replays
  *  its latest state after reconnects, so clearing the key while disconnected
  *  would show dismissed errors again. */
@@ -488,16 +536,8 @@ export default function App() {
   // Bluetooth as a discovery fallback: scan in the Lobby, advertise while hosting.
   useNearbySync(mode, state?.ticket, port);
 
-  // Give the overlay the active instance's port and process. A port change must
-  // rebuild the HUD even when both instances are already in sessions.
   const inSession = mode === "hosting" || mode === "client";
-  // Switching the overlay off in Settings closes it on the spot.
-  const pid = instance?.pid;
-  const hud = useOverlaySettings().hud;
-  useEffect(() => {
-    if (hud && inSession && port != null) openOverlay(port, pid ?? null);
-    else closeOverlay();
-  }, [hud, inSession, port, pid]);
+  useSessionHud(state, inSession, port, instance?.pid);
 
   // REAPER loads plugins only at startup: after an install it needs a restart
   // only if it was already running then (the app installs at launch, so a

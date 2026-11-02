@@ -66,6 +66,12 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   banned: "bannedByHost",
 };
 
+/** "Reconnecting to …", named from the newest `reconnecting` entry of the log. */
+export function reconnectingText(log: LogEntry[]): string {
+  const name = [...log].reverse().find((e) => e.code === "reconnecting")?.params?.name;
+  return name ? t("reconnectingTo", { name: String(name) }) : t("reconnectingBanner");
+}
+
 export function localizeLogEntry(entry: LogEntry | string): string {
   if (typeof entry === "string") return entry; // older extension: raw text
   // A few codes pick a different string depending on whether the extension

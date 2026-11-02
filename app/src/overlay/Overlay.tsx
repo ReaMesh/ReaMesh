@@ -16,7 +16,7 @@ import { HostCrown } from "@/components/HostCrown";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { TrackNumber } from "@/components/TrackNumber";
 import { t, useLang } from "@/lib/i18n";
-import { localizeLogEntry } from "@/lib/log";
+import { localizeLogEntry, reconnectingText } from "@/lib/log";
 import { displayName, type ExtState, type Peer, type PingEntry } from "@/lib/types";
 import { useOverlaySettings } from "@/lib/overlaySettings";
 import { cn, noContextMenu } from "@/lib/utils";
@@ -28,6 +28,7 @@ const WIDTH = 232;
 const MAX_HEIGHT_FRACTION = 0.5;
 /// Floor for the clamp, so a tiny/odd monitor report can't collapse the HUD.
 const MIN_MAX_HEIGHT = 160;
+const FOLD = { type: "spring", stiffness: 400, damping: 38 } as const;
 
 // One person per row: face, name (plus "you" and the host's crown), and at
 // most one thing on the right: that they follow you, or else their track. A
@@ -303,6 +304,22 @@ export function Overlay({ port }: { port: number | null }) {
     };
   }, []);
 
+  // Why the session is over, latched from the first frame that says so: the
+  // error is gone from the next one, as soon as the app is back to browsing.
+  // Set while rendering, so the fold starts from the roster, not an empty one.
+  const [ended, setEnded] = useState<string | null>(null);
+  if (state) {
+    const next =
+      state.mode === "hosting" || state.mode === "client"
+        ? null
+        : state.reconnecting
+          ? reconnectingText(state.log)
+          : state.error
+            ? localizeLogEntry(state.error)
+            : ended;
+    if (next !== ended) setEnded(next);
+  }
+
   const peers = state?.peers ?? [];
   const reveal = (peer: Peer) => send({ cmd: "reveal_peer", peer_id: peer.id });
   // Progressive join: media still arriving behind the open project.
@@ -495,300 +512,331 @@ export function Overlay({ port }: { port: number | null }) {
       className="overflow-hidden rounded-xl border border-white/10 bg-background text-foreground opacity-90 transition-opacity duration-200 hover:opacity-100"
       onContextMenu={noContextMenu}
     >
-      <div
-        onMouseDown={dragWindow}
-        className="relative flex h-9 items-center gap-2 px-2.5"
-      >
-        {/* Collapsed, the strip below is hidden: a hairline along the header's
-            bottom edge keeps the download visible without taking any room. */}
-        <AnimatePresence initial={false}>
-          {collapsed && loading && (
-            <motion.div
-              key="hairline"
-              aria-hidden
-              className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-white/10"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-            >
-              <motion.div
-                className="h-full bg-found"
-                initial={false}
-                animate={{ width: `${loadPct}%` }}
-                transition={{ type: "spring", stiffness: 120, damping: 26 }}
-              />
-            </motion.div>
-          )}
-        </AnimatePresence>
-        <div onMouseDown={dragWindow} className="flex min-w-0 flex-1 items-center">
-          <AnimatePresence initial={false} mode="popLayout">
-            {collapsed && settings.roster && peers.length > 0 ? (
-              <motion.div
-                key="stack"
-                initial={{ opacity: 0, scale: 0.85, x: -4 }}
-                animate={{ opacity: 1, scale: 1, x: 0 }}
-                exit={{ opacity: 0, scale: 0.85, x: -4 }}
-                transition={{ type: "spring", stiffness: 420, damping: 30 }}
-                className="pointer-events-none"
-              >
-                <AvatarStack peers={peers} />
-              </motion.div>
-            ) : (
-              // Which session this is; who is in it is the list below.
-              <motion.div
-                key="title"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="pointer-events-none flex min-w-0 flex-1 items-center"
-              >
-                <span className="min-w-0 truncate text-[12px] font-semibold">
-                  {state?.session || t("sessionFallback")}
-                </span>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
-        {/* Collapsed: a ping doesn't unfold the HUD; a flag in the sender's
-            colour says one is waiting, and a click opens it. */}
-        <AnimatePresence initial={false}>
-          {collapsed && latestPing && (
-            <motion.div
-              key="ping-flag"
-              initial={{ opacity: 0, scale: 0.6 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.6 }}
-              transition={{ type: "spring", stiffness: 420, damping: 30 }}
-            >
-              <Hint label={t("pingFrom", { name: displayName(pingSender(latestPing)) })}>
-                <button
-                  type="button"
-                  onClick={() => setCollapsed(false)}
-                  aria-label={t("pingFrom", { name: displayName(pingSender(latestPing)) })}
-                  className="grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-ring"
-                  style={{ color: pingSender(latestPing).color }}
-                >
-                  <Flag className="size-3.5" aria-hidden="true" />
-                </button>
-              </Hint>
-            </motion.div>
-          )}
-        </AnimatePresence>
-        <button
-          type="button"
-          onClick={() => setCollapsed((c) => !c)}
-          aria-label={collapsed ? t("expand") : t("collapse")}
-          className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <motion.span
-            animate={{ rotate: collapsed ? 180 : 0 }}
-            transition={{ type: "spring", stiffness: 400, damping: 30 }}
-            className="grid place-items-center"
-          >
-            <ChevronUp className="size-4" aria-hidden="true" />
-          </motion.span>
-        </button>
-      </div>
-
-      {/* Outside the body: an edit snaps back just the same with the HUD collapsed. */}
+      {/* The session is over or reconnecting: only the line that says so stays. */}
       <AnimatePresence initial={false}>
-        {lockNotice && (
+        {!ended && (
           <motion.div
-            key="lock"
-            role="status"
+            key="hud"
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: "auto", opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
-            transition={{ type: "spring", stiffness: 400, damping: 38 }}
-            className="overflow-hidden"
-          >
-            <div className="flex items-start gap-2 border-t border-white/10 px-2.5 py-2">
-              {lockNotice.by && <PeerAvatar peer={lockNotice.by} size="xs" />}
-              <p className="min-w-0 flex-1 text-[11.5px] leading-snug">{lockNotice.text}</p>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-      <AnimatePresence initial={false}>
-        {!collapsed && (
-          <motion.div
-            key="body"
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ type: "spring", stiffness: 400, damping: 38 }}
+            transition={FOLD}
             style={{ overflow: "hidden" }}
           >
+            <div
+              onMouseDown={dragWindow}
+              className="relative flex h-9 items-center gap-2 px-2.5"
+            >
+              {/* Collapsed, the strip below is hidden: a hairline along the header's
+                  bottom edge keeps the download visible without taking any room. */}
+              <AnimatePresence initial={false}>
+                {collapsed && loading && (
+                  <motion.div
+                    key="hairline"
+                    aria-hidden
+                    className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-white/10"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                  >
+                    <motion.div
+                      className="h-full bg-found"
+                      initial={false}
+                      animate={{ width: `${loadPct}%` }}
+                      transition={{ type: "spring", stiffness: 120, damping: 26 }}
+                    />
+                  </motion.div>
+                )}
+              </AnimatePresence>
+              <div onMouseDown={dragWindow} className="flex min-w-0 flex-1 items-center">
+                <AnimatePresence initial={false} mode="popLayout">
+                  {collapsed && settings.roster && peers.length > 0 ? (
+                    <motion.div
+                      key="stack"
+                      initial={{ opacity: 0, scale: 0.85, x: -4 }}
+                      animate={{ opacity: 1, scale: 1, x: 0 }}
+                      exit={{ opacity: 0, scale: 0.85, x: -4 }}
+                      transition={{ type: "spring", stiffness: 420, damping: 30 }}
+                      className="pointer-events-none"
+                    >
+                      <AvatarStack peers={peers} />
+                    </motion.div>
+                  ) : (
+                    // Which session this is; who is in it is the list below.
+                    <motion.div
+                      key="title"
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="pointer-events-none flex min-w-0 flex-1 items-center"
+                    >
+                      <span className="min-w-0 truncate text-[12px] font-semibold">
+                        {state?.session || t("sessionFallback")}
+                      </span>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+              {/* Collapsed: a ping doesn't unfold the HUD; a flag in the sender's
+                  colour says one is waiting, and a click opens it. */}
+              <AnimatePresence initial={false}>
+                {collapsed && latestPing && (
+                  <motion.div
+                    key="ping-flag"
+                    initial={{ opacity: 0, scale: 0.6 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.6 }}
+                    transition={{ type: "spring", stiffness: 420, damping: 30 }}
+                  >
+                    <Hint label={t("pingFrom", { name: displayName(pingSender(latestPing)) })}>
+                      <button
+                        type="button"
+                        onClick={() => setCollapsed(false)}
+                        aria-label={t("pingFrom", { name: displayName(pingSender(latestPing)) })}
+                        className="grid size-6 shrink-0 place-items-center rounded-md transition-colors outline-none hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-ring"
+                        style={{ color: pingSender(latestPing).color }}
+                      >
+                        <Flag className="size-3.5" aria-hidden="true" />
+                      </button>
+                    </Hint>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+              <button
+                type="button"
+                onClick={() => setCollapsed((c) => !c)}
+                aria-label={collapsed ? t("expand") : t("collapse")}
+                className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <motion.span
+                  animate={{ rotate: collapsed ? 180 : 0 }}
+                  transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                  className="grid place-items-center"
+                >
+                  <ChevronUp className="size-4" aria-hidden="true" />
+                </motion.span>
+              </button>
+            </div>
+
+            {/* Outside the body: an edit snaps back just the same with the HUD collapsed. */}
             <AnimatePresence initial={false}>
-              {shownPings.length > 0 && (
+              {lockNotice && (
                 <motion.div
-                  key="pings"
+                  key="lock"
                   role="status"
                   initial={{ height: 0, opacity: 0 }}
                   animate={{ height: "auto", opacity: 1 }}
                   exit={{ height: 0, opacity: 0 }}
-                  transition={{ type: "spring", stiffness: 400, damping: 38 }}
+                  transition={FOLD}
                   className="overflow-hidden"
-                  onMouseEnter={() => (pingHover.current = true)}
-                  onMouseLeave={releasePings}
                 >
-                  <div className="border-t border-white/10 py-0.5">
-                    <AnimatePresence initial={false}>
-                      {shownPings.map((p) => (
-                        <motion.div
-                          key={p.key}
-                          initial={{ height: 0, opacity: 0 }}
-                          animate={{ height: "auto", opacity: 1 }}
-                          exit={{ height: 0, opacity: 0 }}
-                          transition={{ type: "spring", stiffness: 400, damping: 38 }}
-                          className="overflow-hidden"
-                        >
-                          <PingRow
-                            ping={p}
-                            sender={pingSender(p)}
-                            canKeep={canKeep}
-                            onJump={() => jumpToPing(p)}
-                            onKeep={() => keepPing(p)}
-                          />
-                        </motion.div>
-                      ))}
-                    </AnimatePresence>
+                  <div className="flex items-start gap-2 border-t border-white/10 px-2.5 py-2">
+                    {lockNotice.by && <PeerAvatar peer={lockNotice.by} size="xs" />}
+                    <p className="min-w-0 flex-1 text-[11.5px] leading-snug">{lockNotice.text}</p>
                   </div>
                 </motion.div>
               )}
             </AnimatePresence>
             <AnimatePresence initial={false}>
-              {loading && state && (
+              {!collapsed && (
                 <motion.div
-                  key="loading"
+                  key="body"
                   initial={{ height: 0, opacity: 0 }}
                   animate={{ height: "auto", opacity: 1 }}
                   exit={{ height: 0, opacity: 0 }}
-                  transition={{ type: "spring", stiffness: 400, damping: 38 }}
-                  className="overflow-hidden"
+                  transition={FOLD}
+                  style={{ overflow: "hidden" }}
                 >
-                  <LoadingStrip state={state} />
+                  <AnimatePresence initial={false}>
+                    {shownPings.length > 0 && (
+                      <motion.div
+                        key="pings"
+                        role="status"
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: "auto", opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={FOLD}
+                        className="overflow-hidden"
+                        onMouseEnter={() => (pingHover.current = true)}
+                        onMouseLeave={releasePings}
+                      >
+                        <div className="border-t border-white/10 py-0.5">
+                          <AnimatePresence initial={false}>
+                            {shownPings.map((p) => (
+                              <motion.div
+                                key={p.key}
+                                initial={{ height: 0, opacity: 0 }}
+                                animate={{ height: "auto", opacity: 1 }}
+                                exit={{ height: 0, opacity: 0 }}
+                                transition={FOLD}
+                                className="overflow-hidden"
+                              >
+                                <PingRow
+                                  ping={p}
+                                  sender={pingSender(p)}
+                                  canKeep={canKeep}
+                                  onJump={() => jumpToPing(p)}
+                                  onKeep={() => keepPing(p)}
+                                />
+                              </motion.div>
+                            ))}
+                          </AnimatePresence>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                  <AnimatePresence initial={false}>
+                    {loading && state && (
+                      <motion.div
+                        key="loading"
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: "auto", opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={FOLD}
+                        className="overflow-hidden"
+                      >
+                        <LoadingStrip state={state} />
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                  {settings.roster && (
+                    <div
+                      className="scroll-slim overflow-y-auto border-t border-white/10 px-1.5 py-1.5"
+                      style={{ maxHeight: maxBodyHeight }}
+                    >
+                      {peers.length === 0 ? (
+                        <p className="px-1.5 py-1 text-[12px] text-muted-foreground">
+                          {t("connecting")}
+                        </p>
+                      ) : (
+                        <AnimatePresence initial={false} mode="popLayout">
+                          {peers.map((p) => (
+                            <PeerRow
+                              key={p.id}
+                              peer={p}
+                              onReveal={reveal}
+                              pickMode={pickMode}
+                              onPick={pickFollow}
+                              followsYou={!p.is_self && !!self && p.follow === self.id}
+                            />
+                          ))}
+                        </AnimatePresence>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Pings and follow mode share this expandable area. */}
+                  <div className="border-t border-white/10 px-1.5 py-1">
+                    {followTarget ? (
+                      // Following someone: say whom, and end it with one click.
+                      <div className="flex h-7 items-center gap-2 pl-1 text-found">
+                        <span className="min-w-0 flex-1 truncate text-[11.5px] font-medium">
+                          {t("followingName", { name: displayName(followTarget) })}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={stopFollowing}
+                          className="h-6 shrink-0 rounded px-1.5 text-[11.5px] font-semibold transition-colors outline-none hover:bg-found/15 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                        >
+                          {t("endFollow")}
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex h-7 items-center gap-1">
+                        {(
+                          [
+                            { key: "marker", label: t("markerTool"), hint: t("shareMarkerTitle"), icon: Flag, on: markerOpen, click: openMarker },
+                            { key: "follow", label: t("followAction"), hint: t("followMode"), icon: Eye, on: pickMode, click: openPick },
+                          ] as const
+                        ).map((tool) => (
+                          <Hint key={tool.key} label={tool.hint}>
+                            <button
+                              type="button"
+                              onClick={tool.click}
+                              aria-expanded={tool.on}
+                              className={`flex h-7 flex-1 items-center justify-center gap-1.5 rounded-md text-[11.5px] font-medium transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
+                                tool.on ? "bg-white/10 text-foreground" : "text-foreground/65"
+                              }`}
+                            >
+                              <tool.icon className="size-3.5 shrink-0" aria-hidden="true" />
+                              {tool.label}
+                            </button>
+                          </Hint>
+                        ))}
+                      </div>
+                    )}
+                    <AnimatePresence initial={false} mode="wait">
+                      {markerOpen ? (
+                        <motion.div
+                          key="marker"
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: "auto", opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          transition={FOLD}
+                          className="overflow-hidden"
+                        >
+                          {/* px-px so the focus ring (drawn inside, see ring-inset)
+                              still has a hair of room and never clips against the
+                              card's rounded edge. */}
+                          <div className="flex items-center gap-1 px-px pt-1 pb-0.5">
+                            <input
+                              ref={markerInput}
+                              value={markerName}
+                              onChange={(e) => setMarkerName(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") shareMarker();
+                                if (e.key === "Escape") closeMarker();
+                              }}
+                              maxLength={80}
+                              aria-label={t("markerNamePlaceholder")}
+                              placeholder={t("markerNamePlaceholder")}
+                              className="h-6 min-w-0 flex-1 rounded-md bg-white/5 px-1.5 text-[11px] outline-none placeholder:text-muted-foreground focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-foreground/40"
+                            />
+                            <button
+                              type="button"
+                              onClick={shareMarker}
+                              disabled={!markerName.trim()}
+                              className="h-6 shrink-0 rounded-md px-2 text-[11px] font-medium text-foreground transition-colors outline-none hover:bg-white/10 disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                            >
+                              {t("share")}
+                            </button>
+                          </div>
+                        </motion.div>
+                      ) : pickMode && !followTarget ? (
+                        <motion.div
+                          key="pick"
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: "auto", opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          transition={FOLD}
+                          className="overflow-hidden"
+                        >
+                          <p className="px-1.5 pt-1 pb-0.5 text-[11px] leading-snug text-muted-foreground">
+                            {t("pickPersonToFollow")}
+                          </p>
+                        </motion.div>
+                      ) : null}
+                    </AnimatePresence>
+                  </div>
                 </motion.div>
               )}
             </AnimatePresence>
-            {settings.roster && (
-              <div
-                className="scroll-slim overflow-y-auto border-t border-white/10 px-1.5 py-1.5"
-                style={{ maxHeight: maxBodyHeight }}
-              >
-                {peers.length === 0 ? (
-                  <p className="px-1.5 py-1 text-[12px] text-muted-foreground">
-                    {t("connecting")}
-                  </p>
-                ) : (
-                  <AnimatePresence initial={false} mode="popLayout">
-                    {peers.map((p) => (
-                      <PeerRow
-                        key={p.id}
-                        peer={p}
-                        onReveal={reveal}
-                        pickMode={pickMode}
-                        onPick={pickFollow}
-                        followsYou={!p.is_self && !!self && p.follow === self.id}
-                      />
-                    ))}
-                  </AnimatePresence>
-                )}
-              </div>
-            )}
-
-            {/* Pings and follow mode share this expandable area. */}
-            <div className="border-t border-white/10 px-1.5 py-1">
-              {followTarget ? (
-                // Following someone: say whom, and end it with one click.
-                <div className="flex h-7 items-center gap-2 pl-1 text-found">
-                  <span className="min-w-0 flex-1 truncate text-[11.5px] font-medium">
-                    {t("followingName", { name: displayName(followTarget) })}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={stopFollowing}
-                    className="h-6 shrink-0 rounded px-1.5 text-[11.5px] font-semibold transition-colors outline-none hover:bg-found/15 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                  >
-                    {t("endFollow")}
-                  </button>
-                </div>
-              ) : (
-                <div className="flex h-7 items-center gap-1">
-                  {(
-                    [
-                      { key: "marker", label: t("markerTool"), hint: t("shareMarkerTitle"), icon: Flag, on: markerOpen, click: openMarker },
-                      { key: "follow", label: t("followAction"), hint: t("followMode"), icon: Eye, on: pickMode, click: openPick },
-                    ] as const
-                  ).map((tool) => (
-                    <Hint key={tool.key} label={tool.hint}>
-                      <button
-                        type="button"
-                        onClick={tool.click}
-                        aria-expanded={tool.on}
-                        className={`flex h-7 flex-1 items-center justify-center gap-1.5 rounded-md text-[11.5px] font-medium transition-colors outline-none hover:bg-white/5 hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
-                          tool.on ? "bg-white/10 text-foreground" : "text-foreground/65"
-                        }`}
-                      >
-                        <tool.icon className="size-3.5 shrink-0" aria-hidden="true" />
-                        {tool.label}
-                      </button>
-                    </Hint>
-                  ))}
-                </div>
-              )}
-              <AnimatePresence initial={false} mode="wait">
-                {markerOpen ? (
-                  <motion.div
-                    key="marker"
-                    initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: "auto", opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    transition={{ type: "spring", stiffness: 400, damping: 38 }}
-                    className="overflow-hidden"
-                  >
-                    {/* px-px so the focus ring (drawn inside, see ring-inset)
-                        still has a hair of room and never clips against the
-                        card's rounded edge. */}
-                    <div className="flex items-center gap-1 px-px pt-1 pb-0.5">
-                      <input
-                        ref={markerInput}
-                        value={markerName}
-                        onChange={(e) => setMarkerName(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") shareMarker();
-                          if (e.key === "Escape") closeMarker();
-                        }}
-                        maxLength={80}
-                        aria-label={t("markerNamePlaceholder")}
-                        placeholder={t("markerNamePlaceholder")}
-                        className="h-6 min-w-0 flex-1 rounded-md bg-white/5 px-1.5 text-[11px] outline-none placeholder:text-muted-foreground focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-foreground/40"
-                      />
-                      <button
-                        type="button"
-                        onClick={shareMarker}
-                        disabled={!markerName.trim()}
-                        className="h-6 shrink-0 rounded-md px-2 text-[11px] font-medium text-foreground transition-colors outline-none hover:bg-white/10 disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                      >
-                        {t("share")}
-                      </button>
-                    </div>
-                  </motion.div>
-                ) : pickMode && !followTarget ? (
-                  <motion.div
-                    key="pick"
-                    initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: "auto", opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    transition={{ type: "spring", stiffness: 400, damping: 38 }}
-                    className="overflow-hidden"
-                  >
-                    <p className="px-1.5 pt-1 pb-0.5 text-[11px] leading-snug text-muted-foreground">
-                      {t("pickPersonToFollow")}
-                    </p>
-                  </motion.div>
-                ) : null}
-              </AnimatePresence>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      <AnimatePresence initial={false}>
+        {ended && (
+          <motion.div
+            key="ended"
+            role="status"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={FOLD}
+            className="overflow-hidden"
+          >
+            <div onMouseDown={dragWindow} className="px-2.5 py-2 text-[11.5px] leading-snug">
+              {ended}
             </div>
           </motion.div>
         )}

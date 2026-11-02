@@ -36,6 +36,7 @@ import { takeInvite, useInviteSeq } from "@/lib/invite";
 import { recordHostJoin } from "@/lib/knownHosts";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
+import { reconnectingText } from "@/lib/log";
 import { getProfile, useProfile } from "@/lib/profile";
 import { nearbyBlocked, setNearby, useNearby } from "@/lib/nearby";
 import { decodeTicket, normalizeTicket } from "@/lib/ticket";
@@ -1064,7 +1065,6 @@ function NearbyAsk() {
 /** The extension lost the host without a farewell and is watching the lobby
  *  to rejoin the same session on its own: one quiet row, nothing to do. */
 function ReconnectRow({ log }: { log: ExtState["log"] }) {
-  const name = [...log].reverse().find((e) => e.code === "reconnecting")?.params?.name;
   return (
     <div role="status" className="flex shrink-0 items-center gap-2.5 rounded-xl bg-card px-3 py-2.5">
       <LoaderCircle
@@ -1072,7 +1072,7 @@ function ReconnectRow({ log }: { log: ExtState["log"] }) {
         aria-hidden="true"
       />
       <span className="min-w-0 truncate text-[12px] text-foreground/65">
-        {name ? t("reconnectingTo", { name: String(name) }) : t("reconnectingBanner")}
+        {reconnectingText(log)}
       </span>
     </div>
   );
