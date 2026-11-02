@@ -3810,6 +3810,14 @@ fn staging_dir_name(session_name: &str, session_id: &str, owner: &PeerId) -> Str
     format!("{}-{}", sanitize_dir_name(session_name), &tag.as_str()[..16])
 }
 
+/// The folder a join of this session downloads into.
+fn staging_dir_for(staging_root: Option<&Path>, session_name: &str, session_id: &str, owner: &PeerId) -> PathBuf {
+    staging_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(staging_dir_name(session_name, session_id, owner))
+}
+
 fn sanitize_dir_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -4171,6 +4179,35 @@ fn available_space(_dir: &Path) -> Option<u64> {
 /// `DISK_RESERVE` free. Unknown free space counts as enough.
 fn space_for(dir: &Path, needed: u64) -> bool {
     available_space(dir).is_none_or(|free| needed.saturating_add(DISK_RESERVE) <= free)
+}
+
+/// `available_space` for a folder that may not exist yet: its nearest existing
+/// ancestor is on the disk it would be created on.
+fn available_space_near(dir: &Path) -> Option<u64> {
+    dir.ancestors().find(|p| p.is_dir()).and_then(available_space)
+}
+
+/// What a join into `dir` would still have to write, as the join preview tells
+/// it: the manifest's usable files (the same ones `download_build` plans) minus
+/// those already there at the same size. Sizes only: this runs on the network
+/// loop, so nothing is hashed, and a same-size file that turns out stale is
+/// left to the check the download itself makes.
+fn bytes_needed(dir: &Path, files: &[FileMeta]) -> u64 {
+    let existing = dir.is_dir();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut needed = 0u64;
+    for meta in files {
+        let Some(rel) = safe_relative_path(&meta.path) else { continue };
+        if !seen.insert(path_key(&meta.path)) {
+            continue;
+        }
+        let present = existing
+            && fs::metadata(dir.join(&rel)).is_ok_and(|m| m.is_file() && m.len() == meta.size);
+        if !present {
+            needed = needed.saturating_add(meta.size);
+        }
+    }
+    needed
 }
 
 /// The status message a join fails with when the project won't fit on the
@@ -5417,8 +5454,7 @@ fn start_join(
     // wrong-passphrase joiner flashes up as a ghost peer on
     // everyone's roster until its download fails. The
     // subscribe happens when the manifest arrives.
-    let staging = staging_dir.map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir);
-    let dir = staging.join(staging_dir_name(&info.session_name, session_id, &owner));
+    let dir = staging_dir_for(staging_dir, &info.session_name, session_id, &owner);
     shared.servable.lock().unwrap().clear();
     let sid = session_id.to_string();
     let name = info.session_name.clone();
@@ -7009,15 +7045,30 @@ async fn run_network(
                                     XferResponse::Manifest { files, project_file, meta, .. } => {
                                         let parsed_meta = serde_json::from_str::<JsonValue>(meta)
                                             .unwrap_or(JsonValue::Null);
-                                        (
-                                            true,
-                                            json!({
-                                                "files": files.len() as u64,
-                                                "bytes": files.iter().map(|f| f.size).sum::<u64>(),
-                                                "project_file": project_file,
-                                                "meta": parsed_meta,
-                                            }),
-                                        )
+                                        // Will it fit? Asked of this session's own
+                                        // staging folder, so a rejoin counts only
+                                        // what is still missing.
+                                        let name = shared
+                                            .sessions
+                                            .lock()
+                                            .unwrap()
+                                            .get(&p.session_id)
+                                            .map(|i| i.session_name.clone())
+                                            .unwrap_or_default();
+                                        let dir = staging_dir_for(cfg.staging_dir.as_deref(), &name, &p.session_id, &p.owner);
+                                        let needed = bytes_needed(&dir, files);
+                                        let mut preview = json!({
+                                            "files": files.len() as u64,
+                                            "bytes": files.iter().map(|f| f.size).sum::<u64>(),
+                                            "project_file": project_file,
+                                            "meta": parsed_meta,
+                                            "needed": needed,
+                                        });
+                                        if let Some(free) = available_space_near(&dir) {
+                                            preview["free"] = json!(free);
+                                            preview["enough"] = json!(needed.saturating_add(DISK_RESERVE) <= free);
+                                        }
+                                        (true, preview)
                                     }
                                     _ => (false, JsonValue::Null),
                                 };
@@ -7386,6 +7437,38 @@ mod transfer_safety_tests {
 
     fn meta(path: &str, size: u64, hash: &str) -> FileMeta {
         FileMeta { path: path.into(), size, hash: hash.into() }
+    }
+
+    #[test]
+    fn join_preview_counts_what_is_still_missing() {
+        let root = std::env::temp_dir().join(format!("reamesh-needed-{}", std::process::id()));
+        let dir = root.join("Song-0123456789abcdef");
+        let files = vec![
+            meta("Song.rpp", 10, "h"),
+            meta("audio/kick.wav", 100, "h"),
+            meta("audio/snare.wav", 1000, "h"),
+            meta("Audio/KICK.wav", 100, "h"),
+            meta("../escape.wav", 5000, "h"),
+        ];
+
+        // Nothing there yet: everything usable counts, once each.
+        assert_eq!(bytes_needed(&dir, &files), 1110);
+        assert!(available_space(&dir).is_none() && available_space_near(&dir).is_some());
+
+        // A rejoin: the same size counts as there, another size doesn't, and
+        // the name outside the folder is never looked at.
+        fs::create_dir_all(dir.join("audio")).unwrap();
+        fs::write(dir.join("Song.rpp"), [0u8; 10]).unwrap();
+        fs::write(dir.join("audio/kick.wav"), [0u8; 99]).unwrap();
+        fs::write(root.join("escape.wav"), [0u8; 5000]).unwrap();
+        assert_eq!(bytes_needed(&dir, &files), 1100);
+        fs::write(dir.join("audio/kick.wav"), [0u8; 100]).unwrap();
+        assert_eq!(bytes_needed(&dir, &files), 1000);
+
+        // A hostile manifest can't wrap the sum.
+        let huge = vec![meta("a.wav", u64::MAX, ""), meta("b.wav", u64::MAX, "")];
+        assert_eq!(bytes_needed(&dir, &huge), u64::MAX);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

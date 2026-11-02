@@ -42,6 +42,12 @@ export interface SessionPreview {
   /** `reaper` is the host's REAPER version ("7.42"; absent from an older
    *  host): the trust dialog warns when it differs from the local one. */
   meta?: { v?: number; tracks?: number; plugins?: string[]; reaper?: string } | null;
+  /** Bytes a join would still write: what isn't already in this session's copy. */
+  needed?: number;
+  /** Bytes free on that disk; absent when it can't be told, like `enough`. */
+  free?: number;
+  /** `needed` fits in `free` with the download's reserve left over. */
+  enough?: boolean;
 }
 
 export interface SessionAd {

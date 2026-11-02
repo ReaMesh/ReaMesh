@@ -1055,6 +1055,15 @@ fn passphrase_precheck_reports_right_and_wrong() {
         client.status_json()
     );
 
+    // The preview says what a join would still have to write, and whether it
+    // fits; nothing is in this session's staging folder yet.
+    let s: Value = serde_json::from_str(&client.status_json()).unwrap();
+    let preview = &s["probe"]["preview"];
+    assert!(preview["bytes"].as_u64().unwrap() > 0, "{preview}");
+    assert_eq!(preview["needed"], preview["bytes"], "{preview}");
+    assert!(preview["free"].as_u64().unwrap() > 0, "{preview}");
+    assert_eq!(preview["enough"], true, "{preview}");
+
     drop(client);
     drop(owner);
     let _ = fs::remove_dir_all(project);

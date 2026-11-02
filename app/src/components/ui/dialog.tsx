@@ -66,8 +66,10 @@ function DialogContent({
           // shadow: the dimmed backdrop already sets the dialog apart.
           // grid-cols-1 (= minmax(0, 1fr)) keeps one long nowrap row, like a
           // plugin name, from widening the column past the dialog's edge.
-          // The rise in and out lives in index.css (`dialog-panel`).
-          "dialog-panel fixed top-[50%] left-[50%] z-50 grid grid-cols-1 w-[calc(100%-2rem)] max-w-[372px] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-2xl border bg-popover p-5 outline-none",
+          // The rise in and out lives in index.css (`dialog-panel`). Never
+          // taller than the window: a long dialog scrolls instead of losing
+          // its title and buttons past the edges.
+          "dialog-panel scroll-slim fixed top-[50%] left-[50%] z-50 grid max-h-[calc(100%-3.75rem)] grid-cols-1 w-[calc(100%-2rem)] max-w-[372px] translate-x-[-50%] translate-y-[-50%] gap-4 overflow-y-auto rounded-2xl border bg-popover p-5 outline-none",
           className
         )}
         // Open with focus on the dialog itself, not on its first button: a

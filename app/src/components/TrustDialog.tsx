@@ -28,10 +28,11 @@ const STATUS_ORDER: Record<PluginStatus, number> = { missing: 0, unknown: 1, hav
 
 /** A plugin list: name, then vendor, one plugin per row. Tall enough for
  *  eight rows; a longer list scrolls with the ninth row half in view, so the
- *  cut never hides that there is more. */
-export function PluginBox({ children }: { children: React.ReactNode }) {
+ *  cut never hides that there is more. `relative` keeps the rows' screen-reader
+ *  text inside the scroller, where it can't stretch the dialog around it. */
+export function PluginBox({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
-    <div className="scroll-slim max-h-[216px] overflow-y-auto rounded-xl bg-white/[0.04] p-1.5">
+    <div className={cn("scroll-slim relative max-h-[216px] overflow-y-auto rounded-xl bg-white/[0.04] p-1.5", className)}>
       {children}
     </div>
   );
@@ -92,8 +93,8 @@ function PluginList({ plugins }: { plugins: string[] }) {
       : t("pluginsAllInstalled", { total: rows.length });
 
   return (
-    <div className="space-y-1.5">
-      <div className="flex items-center justify-between gap-2">
+    <div className="flex min-h-0 flex-col gap-1.5">
+      <div className="flex shrink-0 items-center justify-between gap-2">
         <p
           className={cn(
             "text-[12px] font-medium",
@@ -117,7 +118,8 @@ function PluginList({ plugins }: { plugins: string[] }) {
           </button>
         )}
       </div>
-      <PluginBox>
+      {/* The one part of the dialog that gives way in a short window. */}
+      <PluginBox className="min-h-0 flex-1">
         {rows.map((r) => (
           <PluginRow key={r.raw} raw={r.raw} status={r.status} />
         ))}
@@ -163,17 +165,22 @@ export function TrustDialog({
   const localReaper = useActiveInstance()?.state?.reaper;
   const mismatch = !!hostReaper && !!localReaper && hostReaper !== localReaper;
 
+  // The download would refuse to start for lack of room, so say it here.
+  const noRoom = preview?.enough === false;
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>{t("trustTitle", { name })}</DialogTitle>
+      {/* The list takes what the rest leaves: in the smallest window the
+          tighter gap puts its lower edge through a row, so it reads as more. */}
+      <DialogContent className="flex flex-col gap-3.5 overflow-hidden">
+        <DialogHeader className="shrink-0">
+          <DialogTitle className="line-clamp-2 wrap-anywhere">{t("trustTitle", { name })}</DialogTitle>
           <DialogDescription>{t("trustBody")}</DialogDescription>
         </DialogHeader>
 
         {/* Only what could change the decision: who hosts it, how big it is,
-            and a REAPER version that doesn't match. */}
-        <DialogFacts>
+            whether it fits, and a REAPER version that doesn't match. */}
+        <DialogFacts className="shrink-0">
           {(hostName || hostId) && (
             <DialogFact label={t("trustHostLabel")}>
               <span className="flex min-w-0 flex-col items-end">
@@ -189,6 +196,12 @@ export function TrustDialog({
           {totalBytes > 0 && (
             <DialogFact label={t("trustSizeLabel")}>
               <span className="tabular-nums">{formatBytes(totalBytes)}</span>
+            </DialogFact>
+          )}
+          {noRoom && (
+            <DialogFact label={t("hostFreeLabel")}>
+              <span className="tabular-nums">{formatBytes(preview.free ?? 0)}</span>
+              <span className="font-normal text-red-400">{t("hostFreeShort")}</span>
             </DialogFact>
           )}
           {mismatch && (
@@ -215,7 +228,7 @@ export function TrustDialog({
         <div
           role="radiogroup"
           aria-label={t("joinModeLabel")}
-          className="flex gap-1 rounded-[10px] bg-white/[0.04] p-1"
+          className="flex shrink-0 gap-1 rounded-[10px] bg-white/[0.04] p-1"
         >
           {[false, true].map((v) => (
             <button
@@ -245,11 +258,13 @@ export function TrustDialog({
           ))}
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="shrink-0">
           <Button variant="secondary" onClick={() => onOpenChange(false)}>
             {t("cancel")}
           </Button>
-          <Button onClick={() => onJoin(nofx)}>{t("joinAnyway")}</Button>
+          <Button disabled={noRoom} onClick={() => onJoin(nofx)}>
+            {t("joinAnyway")}
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
