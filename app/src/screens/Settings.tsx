@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ArrowLeft, ChevronRight, Copy, ExternalLink, Plus } from "lucide-react";
-import { motion } from "motion/react";
+import { AnimatePresence, motion } from "motion/react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -230,57 +230,85 @@ function RelaySection({
           );
         })}
         {relays.length > 0 && (adding || relays.length < MAX_RELAYS) && <Divider inset={false} />}
-        {adding ? (
-          <form
-            className="space-y-2 p-3"
-            onSubmit={(e) => {
-              e.preventDefault();
-              submit().catch((err) => setError(String(err)));
-            }}
-          >
-            <div className="flex gap-2">
-              <Input
-                autoFocus
-                value={draft}
-                aria-invalid={!!error}
-                aria-label={t("relayPaste")}
-                placeholder={t("relayPaste")}
-                spellCheck={false}
-                autoComplete="off"
-                onChange={(e) => {
-                  setDraft(e.target.value);
-                  setError("");
-                }}
-                onKeyDown={(e) => e.key === "Escape" && cancel()}
-                className="h-8 border-0 bg-muted text-[13px]"
-              />
-              <Button
-                type="submit"
-                size="sm"
-                variant="secondary"
-                className="h-8 shrink-0 px-3 text-[12px]"
-                disabled={!draft.trim()}
-              >
-                {t("relayAddShort")}
-              </Button>
-            </div>
-            {error && (
-              <p role="status" className="px-0.5 text-[12px] text-red-400">
-                {error}
-              </p>
-            )}
-          </form>
-        ) : relays.length < MAX_RELAYS ? (
-          <button
-            type="button"
-            onClick={() => setAdding(true)}
-            className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
-          >
-            <Row label={t("relayAdd")} sub={relays.length === 0 ? t("relaySettingsSub") : undefined}>
-              <Plus className="size-3.5 text-muted-foreground" aria-hidden="true" />
-            </Row>
-          </button>
-        ) : null}
+        {(adding || relays.length < MAX_RELAYS) && (
+          <div className="flex flex-col">
+            <button
+              type="button"
+              aria-expanded={adding}
+              onClick={() => (adding ? cancel() : setAdding(true))}
+              // Open, the row heads the field below: only the close mark reacts.
+              className={cn(
+                "group text-left transition-colors",
+                !adding && "hover:bg-white/[0.03]",
+                focusRing,
+              )}
+            >
+              <Row label={t("relayAdd")} sub={relays.length === 0 ? t("relaySettingsSub") : undefined}>
+                <Plus
+                  className={cn(
+                    "size-3.5 text-muted-foreground transition-[transform,color]",
+                    adding && "rotate-45 group-hover:text-foreground",
+                  )}
+                  aria-hidden="true"
+                />
+              </Row>
+            </button>
+            <AnimatePresence initial={false}>
+              {adding && (
+                <motion.div
+                  key="relay-form"
+                  // Height only: fading would put the half-transparent Add
+                  // button on its own layer, and its text jumps when that ends.
+                  initial={{ height: 0 }}
+                  animate={{ height: "auto" }}
+                  exit={{ height: 0 }}
+                  transition={PILL}
+                  className="overflow-hidden"
+                >
+                  <form
+                    className="space-y-2 px-3 pt-1 pb-3"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      submit().catch((err) => setError(String(err)));
+                    }}
+                  >
+                    <div className="flex gap-2">
+                      <Input
+                        autoFocus
+                        value={draft}
+                        aria-invalid={!!error}
+                        aria-label={t("relayPaste")}
+                        placeholder={t("relayPaste")}
+                        spellCheck={false}
+                        autoComplete="off"
+                        onChange={(e) => {
+                          setDraft(e.target.value);
+                          setError("");
+                        }}
+                        onKeyDown={(e) => e.key === "Escape" && cancel()}
+                        className="h-8 border-0 bg-muted text-[13px]"
+                      />
+                      <Button
+                        type="submit"
+                        size="sm"
+                        variant="secondary"
+                        className="h-8 shrink-0 px-3 text-[12px]"
+                        disabled={!draft.trim()}
+                      >
+                        {t("relayAddShort")}
+                      </Button>
+                    </div>
+                    {error && (
+                      <p role="status" className="px-0.5 text-[12px] text-red-400">
+                        {error}
+                      </p>
+                    )}
+                  </form>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+        )}
         {children && (
           <>
             <Divider inset={false} />
@@ -291,6 +319,9 @@ function RelaySection({
     </section>
   );
 }
+
+// Where Settings stood when it opened a sub-screen: Back returns there.
+let returnScroll = 0;
 
 // App settings. On Windows a full-screen screen of the main window, reached
 // from the title-bar gear or Ctrl+, (with `onBack`); on macOS the content of the
@@ -476,9 +507,37 @@ export function Settings({
   };
   const ghost = "h-7 shrink-0 px-2.5 text-[12px]";
 
+  const scroller = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    const top = returnScroll;
+    if (!el || !top) return;
+    el.scrollTop = top;
+    // Rows fill in as their status arrives: hold the spot until they have.
+    const hold = new ResizeObserver(() => {
+      el.scrollTop = top;
+    });
+    if (el.firstElementChild) hold.observe(el.firstElementChild);
+    const settled = setTimeout(() => {
+      returnScroll = 0;
+      hold.disconnect();
+    }, 500);
+    return () => {
+      clearTimeout(settled);
+      hold.disconnect();
+    };
+  }, []);
+  const leaveFor = (next: () => void) => () => {
+    returnScroll = scroller.current?.scrollTop ?? 0;
+    next();
+  };
+
   return (
     // Style WebView2's scrollbar on Windows; keep the native macOS overlay.
-    <div className={cn("flex flex-1 flex-col overflow-y-auto", isWindows && "scroll-slim")}>
+    <div
+      ref={scroller}
+      className={cn("flex flex-1 flex-col overflow-y-auto", isWindows && "scroll-slim")}
+    >
       <div className="w-full space-y-[18px] px-4 pt-1 pb-5">
         {onBack && (
           <div className="relative flex h-8 items-center">
@@ -700,7 +759,7 @@ export function Settings({
             <Divider inset={false} />
             <button
               type="button"
-              onClick={onOpenJoined}
+              onClick={leaveFor(onOpenJoined)}
               className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
             >
               <Row label={t("joinedProjects")}>
@@ -841,7 +900,7 @@ export function Settings({
             <Divider inset={false} />
             <button
               type="button"
-              onClick={onOpenCredits}
+              onClick={leaveFor(onOpenCredits)}
               className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
             >
               <Row label={t("credits")}>
