@@ -401,6 +401,7 @@ struct DeferredRecv {
 enum class Mode { Idle, Hosting, Browsing, Downloading, ClientActive };
 
 static reaper_plugin_info_t* g_rec = nullptr;
+static bool g_unloading = false;  // REAPER is unloading the extension
 static ReameshHandle* g_handle = nullptr;
 static Mode g_mode = Mode::Idle;
 static std::string g_sessionProjectPath;  // path the session is bound to
@@ -5763,6 +5764,52 @@ static void noteHostReaperMismatch() {
                ". Some edits may not sync cleanly");
 }
 
+// Whether the project on screen is this guest's downloaded copy and fit to go to
+// disk. Never while REAPER unloads us (the user may just have answered "don't
+// save"), a no-FX join (that is a stripped sibling), or with placeholders about
+// (their sources are empty stand-ins and would overwrite the real paths). The
+// path check covers a project switch the tick hasn't seen yet, and an empty path
+// would make REAPER ask for a file name.
+static bool sessionCopySavable(Mode mode, bool unloading, bool noFx, bool placeholders,
+                               bool loading, const std::string& current,
+                               const std::string& session) {
+  return mode == Mode::ClientActive && !unloading && !noFx && !placeholders && !loading &&
+         !current.empty() && current == session;
+}
+
+// Whether REAPER can save over this file without asking. A file it can't write
+// makes Main_SaveProject open its Save As dialog (read-only) or an error box
+// (held by another program), and it writes a sibling first, hence the room for
+// two.
+static bool fileRewritable(const std::string& path) {
+  std::error_code ec;
+  const fs::path file = fsPath(path);
+  const auto size = fs::file_size(file, ec);
+  if (ec) return false;
+  const fs::space_info sp = fs::space(file.parent_path(), ec);
+  if (!ec && (uint64_t)sp.available < (uint64_t)size * 2 + (16ull << 20)) return false;
+  return std::ofstream(file, std::ios::binary | std::ios::app).is_open();
+}
+
+// Bring the guest's copy on disk up to what the session ended with, so a later
+// "save as" of that folder takes the session's state along.
+static void saveSessionCopy() {
+  const std::string path = currentProjectPath();
+  if (!sessionCopySavable(g_mode, g_unloading, g_noFx, !g_placeholders.empty(), g_mediaLoading,
+                          path, g_sessionProjectPath))
+    return;
+  if (!fileRewritable(path)) {
+    logEvent("copy_not_saved", json::object(),
+             "couldn't update your copy of the project: the file is read-only or in use");
+    return;
+  }
+  // The timer stands still in case REAPER shows anything after all (the disk
+  // filling up in this very moment): a tick would run on a half-left session.
+  g_applyingRemote = true;
+  Main_SaveProject(nullptr, false);
+  g_applyingRemote = false;
+}
+
 // Tear the session down. `code`/`params`/`text` describe why as a structured
 // log event (also flagged to the app as the error); empty text = silent.
 static void leaveSession(const char* code, json params, const std::string& text) {
@@ -5771,6 +5818,7 @@ static void leaveSession(const char* code, json params, const std::string& text)
   // (and a later save can't persist the tint). Runs while still in-session so
   // the suppress + re-baseline is correct; it's a no-op when nothing is tinted.
   restoreAllItemTints();
+  saveSessionCopy();  // after the tints: the real colors go to disk
   if (g_handle) {
     reamesh_shutdown(g_handle);
     g_handle = nullptr;
@@ -7771,6 +7819,7 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
       g_rec->Register("-custom_action", &g_caHost);
       g_rec->Register("-custom_action", &g_caLeave);
     }
+    g_unloading = true;  // REAPER is on its way out: leave its project alone
     leaveSession("", json::object(), "");
     g_rec = nullptr;
     return 0;

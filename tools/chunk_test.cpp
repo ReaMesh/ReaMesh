@@ -1207,6 +1207,47 @@ int main() {
     fs::remove_all(dir, ec);
   }
 
+  // ---- A guest's copy goes to disk at session end only when it is fit to ----
+  {
+    const std::string song = "/x/Song.rpp";
+    const auto savable = [&](Mode mode, bool unloading, bool noFx, bool placeholders, bool loading,
+                             const std::string& current, const std::string& session) {
+      return sessionCopySavable(mode, unloading, noFx, placeholders, loading, current, session);
+    };
+    assert(savable(Mode::ClientActive, false, false, false, false, song, song));
+    // Only a guest in a running session.
+    assert(!savable(Mode::Hosting, false, false, false, false, song, song));
+    assert(!savable(Mode::Downloading, false, false, false, false, song, song));
+    assert(!savable(Mode::Browsing, false, false, false, false, song, song));
+    // REAPER unloading us, a stripped copy, empty stand-ins for media.
+    assert(!savable(Mode::ClientActive, true, false, false, false, song, song));
+    assert(!savable(Mode::ClientActive, false, true, false, false, song, song));
+    assert(!savable(Mode::ClientActive, false, false, true, false, song, song));
+    assert(!savable(Mode::ClientActive, false, false, false, true, song, song));
+    // The user switched projects; an untitled one would get a Save As dialog.
+    assert(!savable(Mode::ClientActive, false, false, false, false, "/x/Other.rpp", song));
+    assert(!savable(Mode::ClientActive, false, false, false, false, "", song));
+    assert(!savable(Mode::ClientActive, false, false, false, false, "", ""));
+
+    std::error_code ec;
+    const fs::path dir = fs::temp_directory_path(ec) / "reamesh_chunk_test_rewritable";
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const fs::path file = dir / "Song.rpp";
+    assert(!fileRewritable(fsUtf8(file)));  // nothing there
+    std::ofstream(file, std::ios::binary) << "<REAPER_PROJECT\n>\n";
+    const auto size = fs::file_size(file, ec);
+    assert(fileRewritable(fsUtf8(file)));
+    assert(fs::file_size(file, ec) == size);  // asking leaves it as it was
+    // Read-only is what makes REAPER open its Save As dialog.
+    fs::permissions(file,
+                    fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write,
+                    fs::perm_options::remove, ec);
+    assert(!ec && !fileRewritable(fsUtf8(file)));
+    fs::permissions(file, fs::perms::owner_write, fs::perm_options::add, ec);
+    fs::remove_all(dir, ec);
+  }
+
   printf("chunk_test: all assertions passed\n");
   return 0;
 }

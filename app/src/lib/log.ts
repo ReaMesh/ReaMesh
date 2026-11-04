@@ -29,6 +29,7 @@ const CODE_KEYS: Partial<Record<string, MsgKey>> = {
   media_copied: "logMediaCopied",
   media_copy_failed: "logMediaCopyFailed",
   media_timeout: "logMediaTimeout",
+  copy_not_saved: "logCopyNotSaved",
   reconnecting: "logReconnecting",
   reconnect_failed: "reconnectFailed",
   bad_ticket: "logBadTicket",
