@@ -120,6 +120,8 @@ export interface ExtState {
    *  project, and the folder a join downloads into. Absent from older
    *  extensions. */
   in_use?: string[];
+  /** The folder of this guest's downloaded copy; "" outside a join. */
+  session_dir?: string;
   /** Last session-ending event; null when there is none. */
   error: LogEntry | null;
   log: LogEntry[];

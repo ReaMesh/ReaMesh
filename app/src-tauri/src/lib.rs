@@ -13,6 +13,7 @@ use tauri::{AppHandle, Manager};
 
 #[cfg(target_os = "windows")]
 mod overlay_panel_win;
+mod copies;
 mod nearby;
 mod updater;
 
@@ -1210,7 +1211,7 @@ fn do_reset_identity(app: &AppHandle) -> Result<bool, String> {
 //
 // Every join downloads the host's project into a folder of its own under
 // `<REAPER resource>/ReaMesh/<session name>-<hex tag>` (the extension's
-// staging root). The extension sweeps copies nothing has touched for three
+// staging root). The extension sweeps copies nothing has touched for seven
 // days; this lists what is there so a big one can go to the Trash right away.
 
 /// Entries one listing walks at most, so a pathological folder can't hang it.
@@ -1324,40 +1325,55 @@ async fn joined_projects(app: AppHandle) -> Result<Vec<JoinedProject>, String> {
     .map_err(|e| e.to_string())
 }
 
-/// Move one downloaded copy (a folder name from `joined_projects`) to the
-/// Trash / Recycle Bin, so a mistaken click can still be put back.
-#[tauri::command]
-async fn trash_joined_project(app: AppHandle, dir: String) -> Result<(), String> {
-    let root = staging_root(&app)?;
-    // A bare folder name, never a path: nothing outside the staging root.
+/// A folder name from `joined_projects` as a path inside the staging root. A bare
+/// name, never a path: nothing outside the staging root.
+fn joined_folder(root: &Path, dir: &str) -> Result<PathBuf, String> {
     if dir.is_empty()
         || dir.starts_with('.')
         || dir.contains(['/', '\\'])
-        || Path::new(&dir).components().count() != 1
+        || Path::new(dir).components().count() != 1
     {
         return Err("invalid project folder".into());
     }
-    let path = root.join(&dir);
+    let path = root.join(dir);
     let meta = path.symlink_metadata().map_err(|e| e.to_string())?;
     if !meta.is_dir() {
         return Err("invalid project folder".into());
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        let ctx = {
-            #[allow(unused_mut)]
-            let mut ctx = trash::TrashContext::default();
-            // Finder's method asks for permission to control Finder.
-            #[cfg(target_os = "macos")]
-            {
-                use trash::macos::{DeleteMethod, TrashContextExtMacos};
-                ctx.set_delete_method(DeleteMethod::NsFileManager);
-            }
-            ctx
-        };
-        ctx.delete(&path).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    Ok(path)
+}
+
+/// To the Trash / Recycle Bin, so it can still be put back.
+fn move_to_trash(path: &Path) -> Result<(), String> {
+    #[allow(unused_mut)]
+    let mut ctx = trash::TrashContext::default();
+    // Finder's method asks for permission to control Finder.
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+    }
+    ctx.delete(path).map_err(|e| e.to_string())
+}
+
+/// Move one downloaded copy to the Trash, so a mistaken click can still be put
+/// back.
+#[tauri::command]
+async fn trash_joined_project(app: AppHandle, dir: String) -> Result<(), String> {
+    let path = joined_folder(&staging_root(&app)?, &dir)?;
+    tauri::async_runtime::spawn_blocking(move || move_to_trash(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Copy one downloaded copy to `dest/<session name>` in the background (see
+/// copies.rs). Returns once it runs; `copy-finished` says how it ended.
+#[tauri::command]
+async fn save_joined_copy(app: AppHandle, dir: String, dest: String) -> Result<(), String> {
+    let root = staging_root(&app)?;
+    let source = joined_folder(&root, &dir)?;
+    let name = joined_name(&dir);
+    copies::start(app, dir, name, source, PathBuf::from(dest), root)
 }
 
 #[tauri::command]
@@ -1912,6 +1928,7 @@ pub fn run() {
             reset_network_identity,
             joined_projects,
             trash_joined_project,
+            save_joined_copy,
             open_bluetooth_settings,
             build_info,
             nearby::nearby_state,
@@ -2131,6 +2148,18 @@ mod native_overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_joined_folder_is_a_bare_name_inside_the_root() {
+        let root = std::env::temp_dir().join(format!("reamesh-joined-{}", std::process::id()));
+        fs::create_dir_all(root.join("Song-0f3a")).unwrap();
+        fs::write(root.join("a-file"), b"x").unwrap();
+        assert_eq!(joined_folder(&root, "Song-0f3a").unwrap(), root.join("Song-0f3a"));
+        for bad in ["", ".", "..", ".hidden", "../x", "a/b", r"a\b", r"C:\x", "/x", "a-file", "missing"] {
+            assert!(joined_folder(&root, bad).is_err(), "{bad}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn au_cache_keys_become_rpp_display_names() {

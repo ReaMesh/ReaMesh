@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ArrowLeft, Trash2 } from "lucide-react";
+import { ArrowLeft, FolderDown, LoaderCircle, Trash2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -17,11 +17,13 @@ import { useConnections } from "@/lib/connection";
 import { formatBytes } from "@/lib/format";
 import { resolveLang, t, useLang } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
+import { copyPercent, saveCopyAs, useRunningCopy } from "@/lib/savedCopies";
 import { cn, focusRing } from "@/lib/utils";
 
 // The downloaded copies of joined sessions (one folder each under REAPER's
 // resource dir), with their size, so a big one can go to the Trash before the
-// extension's own three-day sweep gets to it. Reached from Settings.
+// extension's own seven-day sweep gets to it, or be saved somewhere for good.
+// Reached from Settings.
 
 export interface JoinedProject {
   dir: string;
@@ -52,6 +54,7 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
   const [target, setTarget] = useState<JoinedProject | null>(null);
   const [busy, setBusy] = useState(false);
   const { instances } = useConnections();
+  const running = useRunningCopy();
 
   const load = useCallback(() => {
     listJoinedProjects().then(setList, (e) => {
@@ -80,6 +83,18 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
         sessionDirName(state.session) === p.name
       );
     });
+  };
+
+  // A copy in a running session (or a join on its way there) keeps changing:
+  // it can be saved once the session is over.
+  const inSession = (p: JoinedProject) => {
+    const dir = normPath(p.path);
+    return instances.some(
+      ({ state }) =>
+        (state?.mode === "client" || state?.mode === "downloading") &&
+        !!state.session_dir &&
+        normPath(state.session_dir) === dir,
+    );
   };
 
   const trash = async () => {
@@ -133,6 +148,7 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
             ) : (
               list.map((p, i) => {
                 const used = inUse(p);
+                const copying = running?.dir === p.dir ? running : null;
                 return (
                   <div key={p.dir} className="flex flex-col">
                     {i > 0 && <Divider inset={false} />}
@@ -153,6 +169,29 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
                           {date(p.modified) && <span className="truncate">{date(p.modified)}</span>}
                         </p>
                       </button>
+                      {copying ? (
+                        <span
+                          role="status"
+                          className="flex shrink-0 items-center gap-1.5 px-1.5 text-[12px] text-muted-foreground tabular-nums"
+                        >
+                          <LoaderCircle className="size-3.5 motion-safe:animate-spin" aria-hidden="true" />
+                          {copyPercent(copying)}%
+                        </span>
+                      ) : (
+                        !inSession(p) && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            title={t("saveCopyAs")}
+                            aria-label={`${t("saveCopyAs")}: ${p.name}`}
+                            disabled={!!running}
+                            className="size-8 shrink-0 p-0 text-muted-foreground hover:text-foreground"
+                            onClick={() => void saveCopyAs(p.dir)}
+                          >
+                            <FolderDown className="size-4" aria-hidden="true" />
+                          </Button>
+                        )
+                      )}
                       {used ? (
                         <span className="shrink-0 px-1.5 text-[12px] text-muted-foreground">
                           {t("joinedInUse")}
@@ -163,6 +202,7 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
                           size="sm"
                           title={trashLabel}
                           aria-label={`${trashLabel}: ${p.name}`}
+                          disabled={!!copying}
                           className="size-8 shrink-0 p-0 text-muted-foreground hover:text-destructive"
                           onClick={() => setTarget(p)}
                         >

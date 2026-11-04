@@ -25,6 +25,11 @@ const Toaster = ({ ...props }: ToasterProps) => {
           // Flat like the rest of the app: the border sets it apart.
           boxShadow: "none",
         },
+        // A toast's action is a side door, not the screen's main button.
+        actionButtonStyle: {
+          background: "var(--secondary)",
+          color: "var(--secondary-foreground)",
+        },
       }}
       {...props}
     />

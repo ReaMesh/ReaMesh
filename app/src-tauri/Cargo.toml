@@ -55,6 +55,10 @@ if-addrs = "0.15"
 # Recycle Bin instead of deleting it outright.
 trash = { version = "5", default-features = false, features = ["coinit_apartmentthreaded"] }
 
+# Free space on the disk a saved copy goes to (src/copies.rs); Windows asks kernel32.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # The presence overlay's native behaviour on Windows (src/overlay_panel_win.rs):
 # a non-activating topmost window that follows REAPER's and hides when REAPER
 # is not in front. macOS does the same job in Objective-C (src/overlay_panel.m),

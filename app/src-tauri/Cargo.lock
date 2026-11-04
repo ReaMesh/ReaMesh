@@ -53,6 +53,7 @@ version = "1.1.0"
 dependencies = [
  "cc",
  "if-addrs",
+ "libc",
  "semver",
  "serde",
  "serde_json",

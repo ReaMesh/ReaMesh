@@ -6464,11 +6464,15 @@ static void ctlPublishState() {
     }
     if ((g_mode == Mode::Hosting || g_mode == Mode::ClientActive) && !g_sessionProjectPath.empty())
       inUse.push_back(g_sessionProjectPath);
+    // The folder of this guest's copy: what the app can offer to save when the
+    // session is over, and what it must not while the session is running.
+    std::string sessionDir;
     if (g_mode == Mode::Downloading || g_mode == Mode::ClientActive) {
-      const std::string dir = jsonStr(st, "dir");
-      if (!dir.empty()) inUse.push_back(dir);
+      sessionDir = jsonStr(st, "dir");
+      if (!sessionDir.empty()) inUse.push_back(sessionDir);
     }
     state["in_use"] = std::move(inUse);
+    state["session_dir"] = sessionDir;
   }
   // This REAPER's version, for the app's host-version mismatch warning.
   state["reaper"] = g_reaperVersion;
