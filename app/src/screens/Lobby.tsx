@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -33,19 +34,20 @@ import { SwapText } from "@/components/Swap";
 import { FOUND_COLOR, inkFor } from "@/lib/colors";
 import { send, useActiveInstance } from "@/lib/connection";
 import { stageHostPass } from "@/lib/hostPass";
-import { takeInvite, useInviteSeq } from "@/lib/invite";
+import { offerInvite, takeInvite, useInviteSeq } from "@/lib/invite";
 import { recordHostJoin } from "@/lib/knownHosts";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
 import { localizeLogEntry, reconnectingText } from "@/lib/log";
-import { setLastSession, useLastSession, type LastSession } from "@/lib/lastSession";
-import { copyDirName, copyPercent, saveCopyAs, useRunningCopy } from "@/lib/savedCopies";
+import { isCopyRefusal, setLastSession, useLastSession, type LastSession } from "@/lib/lastSession";
+import { copyDirName, copyPercent, folderName, saveCopyAs, useRunningCopy, useSavedAs } from "@/lib/savedCopies";
 import { getProfile, useProfile } from "@/lib/profile";
 import { nearbyBlocked, setNearby, useNearby } from "@/lib/nearby";
 import { decodeTicket, normalizeTicket } from "@/lib/ticket";
 import { initials, type ExtState, type LogEntry, type SessionAd } from "@/lib/types";
 import { checkForUpdate, restartToUpdate, useUpdate } from "@/lib/updater";
 import { protoSkew } from "@/lib/version";
+import { isWindows } from "@/lib/platform";
 import { cn, focusRing } from "@/lib/utils";
 
 /// Shortest passphrase accepted by the host form. This is only a minimum for
@@ -146,13 +148,18 @@ function usePassphraseCheck(
 /// response. Successful joins leave the lobby before this deadline.
 const JOIN_TIMEOUT_MS = 10_000;
 
-function useJoinPending(): [boolean, React.Dispatch<React.SetStateAction<boolean>>] {
+function useJoinPending(error: ExtState["error"]): [boolean, React.Dispatch<React.SetStateAction<boolean>>] {
   const [joining, setJoining] = useState(false);
   useEffect(() => {
     if (!joining) return;
     const id = setTimeout(() => setJoining(false), JOIN_TIMEOUT_MS);
     return () => clearTimeout(id);
   }, [joining]);
+  // A join refused on the spot stays in the Lobby, with the reason in a toast.
+  const errKey = error ? JSON.stringify(error) : "";
+  useEffect(() => {
+    if (errKey) setJoining(false);
+  }, [errKey]);
   return [joining, setJoining];
 }
 
@@ -414,14 +421,20 @@ function UpdateButton() {
   );
 }
 
+// The Lobby's "last session" block can ask a session's card to start the normal
+// way in: the password if it needs one, then the trust dialog.
+const joinAsks = new Map<string, () => void>();
+
 function SessionCard({
   session,
   probe,
+  error: extError,
   lobbyMountedAt,
   port,
 }: {
   session: SessionAd;
   probe?: ExtState["probe"];
+  error: ExtState["error"];
   lobbyMountedAt: number;
   /** The instance this card was rendered for. Every command names it
    *  explicitly, so a command can never land on a different REAPER because the
@@ -435,7 +448,7 @@ function SessionCard({
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [error, setError] = useState<CheckError>("");
   // Prevent a second join command while the first one starts downloading.
-  const [joining, setJoining] = useJoinPending();
+  const [joining, setJoining] = useJoinPending(extError);
   const { scope: shakeScope, shake } = useShake();
   // A session discovered while the lobby was already up gets a one-shot
   // found-blue wash so the eye catches it. Cards present when the lobby
@@ -444,7 +457,7 @@ function SessionCard({
   // Another build can't be joined: say which side needs the update instead.
   const skew = protoSkew(session.proto);
 
-  const join = (nofx: boolean) => {
+  const join = (nofx: boolean, into: { dest?: string; overwrite?: boolean }) => {
     if (joining) return;
     setJoining(true);
     setConfirmOpen(false);
@@ -457,6 +470,7 @@ function SessionCard({
         session_name: session.session_name,
         passphrase: pass,
         nofx,
+        ...into,
       },
       port ?? undefined,
     );
@@ -488,6 +502,16 @@ function SessionCard({
     begin();
     send({ cmd: "check", session_id: session.session_id, passphrase: pass }, port ?? undefined);
   };
+  const ask = useRef(() => {});
+  ask.current = () => (session.auth && !pass ? setOpen(true) : beginJoin());
+  useEffect(() => {
+    const id = session.session_id;
+    const start = () => ask.current();
+    joinAsks.set(id, start);
+    return () => {
+      if (joinAsks.get(id) === start) joinAsks.delete(id);
+    };
+  }, [session.session_id]);
   const busy = checking || joining;
   const showField = session.auth && open;
   // Fold the field away again when it is left empty, unless a check runs or
@@ -641,10 +665,12 @@ function SessionCard({
 function InviteCard({
   sessions,
   probe,
+  error: extError,
   port,
 }: {
   sessions: SessionAd[];
   probe?: ExtState["probe"];
+  error: ExtState["error"];
   port: number | null;
 }) {
   const [open, setOpen] = useState(false);
@@ -652,7 +678,7 @@ function InviteCard({
   const [pass, setPass] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [error, setError] = useState<CheckError>("");
-  const [joining, setJoining] = useJoinPending();
+  const [joining, setJoining] = useJoinPending(extError);
   const { scope: shakeScope, shake } = useShake();
   const ticket = decodeTicket(raw);
   const code = normalizeTicket(raw);
@@ -665,13 +691,13 @@ function InviteCard({
     ? sessions.find((s) => s.session_id === ticket.sid && s.owner === ticket.peer)?.owner_name
     : undefined;
 
-  const join = (nofx: boolean) => {
+  const join = (nofx: boolean, into: { dest?: string; overwrite?: boolean }) => {
     if (!ticket || joining) return;
     setJoining(true);
     setConfirmOpen(false);
     recordHostJoin(ticket.peer);
     send(
-      { cmd: "join", ticket: code, session_name: name, passphrase: pass, nofx },
+      { cmd: "join", ticket: code, session_name: name, passphrase: pass, nofx, ...into },
       port ?? undefined,
     );
   };
@@ -1149,15 +1175,34 @@ function lastSessionReason(reason: LogEntry): string {
 function LastSessionBlock({
   last,
   canReconnect,
+  lastJoin,
+  sessions,
   port,
 }: {
   last: LastSession;
   canReconnect: boolean;
+  lastJoin: ExtState["last_join"];
+  sessions: SessionAd[];
   port: number | null;
 }) {
   const away = { height: 0, marginTop: -18, opacity: 0, filter: "blur(4px)" };
   const running = useRunningCopy();
   const copyDir = last.dir ? copyDirName(last.dir) : "";
+  // A folder of the user's stays where it is, and "save as" of a temporary copy
+  // leaves one behind.
+  const saved = useSavedAs(copyDir);
+  const linkedDir = last.linked ? last.dir : saved;
+  // The folder itself is what's in the way: from here on the dialog has to ask.
+  // Through the session's own card, or for a host beyond this network through
+  // the invite card, with the code that led here.
+  const joinAgain =
+    isCopyRefusal(last.reason) && lastJoin
+      ? sessions.some((s) => s.session_id === lastJoin.session_id)
+        ? () => joinAsks.get(lastJoin.session_id)?.()
+        : lastJoin.ticket
+          ? () => offerInvite(lastJoin.ticket)
+          : null
+      : null;
   return (
     <motion.section
       key="last"
@@ -1205,6 +1250,16 @@ function LastSessionBlock({
                 {t("reconnectAction")}
               </Button>
             )}
+            {joinAgain && (
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-7 shrink-0 px-3 text-[12px]"
+                onClick={joinAgain}
+              >
+                {t("join")}
+              </Button>
+            )}
           </div>
           {copyDir && (
             <>
@@ -1212,26 +1267,42 @@ function LastSessionBlock({
               <div className="flex min-h-[52px] items-center gap-3 py-2 pr-2 pl-3">
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-[13px]">{t("yourCopy")}</p>
-                  <p className="truncate text-[12px] text-muted-foreground">{t("yourCopyKept")}</p>
+                  <p
+                    className="truncate text-[12px] text-muted-foreground"
+                    title={linkedDir ?? undefined}
+                  >
+                    {linkedDir ? folderName(linkedDir) : t("yourCopyKept")}
+                  </p>
                 </div>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={!!running}
-                  className="h-7 shrink-0 px-2.5 text-[12px] text-foreground/80"
-                  onClick={() => void saveCopyAs(copyDir)}
-                >
-                  <SwapText value={running?.dir === copyDir ? "copying" : "idle"}>
-                    {running?.dir === copyDir ? (
-                      <span className="inline-flex items-center gap-1.5 tabular-nums">
-                        <LoaderCircle className="size-3.5 motion-safe:animate-spin" aria-hidden="true" />
-                        {copyPercent(running)}%
-                      </span>
-                    ) : (
-                      t("saveCopyAs")
-                    )}
-                  </SwapText>
-                </Button>
+                {linkedDir ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 shrink-0 px-2.5 text-[12px] text-foreground/80"
+                    onClick={() => revealItemInDir(linkedDir).catch(() => {})}
+                  >
+                    {t(isWindows ? "showInExplorer" : "showInFinder")}
+                  </Button>
+                ) : (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={!!running}
+                    className="h-7 shrink-0 px-2.5 text-[12px] text-foreground/80"
+                    onClick={() => void saveCopyAs(copyDir)}
+                  >
+                    <SwapText value={running?.dir === copyDir ? "copying" : "idle"}>
+                      {running?.dir === copyDir ? (
+                        <span className="inline-flex items-center gap-1.5 tabular-nums">
+                          <LoaderCircle className="size-3.5 motion-safe:animate-spin" aria-hidden="true" />
+                          {copyPercent(running)}%
+                        </span>
+                      ) : (
+                        t("saveCopyAs")
+                      )}
+                    </SwapText>
+                  </Button>
+                )}
               </div>
             </>
           )}
@@ -1258,7 +1329,13 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
 
       <AnimatePresence initial={false}>
         {last && !state.reconnecting && (
-          <LastSessionBlock last={last} canReconnect={!!state.can_reconnect} port={port} />
+          <LastSessionBlock
+            last={last}
+            canReconnect={!!state.can_reconnect}
+            lastJoin={state.last_join}
+            sessions={state.sessions}
+            port={port}
+          />
         )}
       </AnimatePresence>
 
@@ -1276,6 +1353,7 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
                   <SessionCard
                     session={s}
                     probe={state.probe}
+                    error={state.error}
                     lobbyMountedAt={mountedAt}
                     port={port}
                   />
@@ -1304,7 +1382,7 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
           </AnimatePresence>
         </Group>
         {/* A session you can't see here is still a session. */}
-        <InviteCard sessions={state.sessions} probe={state.probe} port={port} />
+        <InviteCard sessions={state.sessions} probe={state.probe} error={state.error} port={port} />
       </section>
 
       {/* Blocks outlive the session they were made in: keep them revocable. */}

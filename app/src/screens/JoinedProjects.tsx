@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ArrowLeft, FolderDown, LoaderCircle, Trash2 } from "lucide-react";
+import { ArrowLeft, FolderDown, LoaderCircle, Trash2, Unlink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -17,13 +17,22 @@ import { useConnections } from "@/lib/connection";
 import { formatBytes } from "@/lib/format";
 import { resolveLang, t, useLang } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
-import { copyPercent, saveCopyAs, useRunningCopy } from "@/lib/savedCopies";
+import {
+  copyPercent,
+  refreshLinkedCopies,
+  saveCopyAs,
+  unlinkCopy,
+  useLinkedCopies,
+  useRunningCopy,
+} from "@/lib/savedCopies";
 import { cn, focusRing } from "@/lib/utils";
 
 // The downloaded copies of joined sessions (one folder each under REAPER's
 // resource dir), with their size, so a big one can go to the Trash before the
 // extension's own seven-day sweep gets to it, or be saved somewhere for good.
-// Reached from Settings.
+// A saved one is listed above them: it is linked to its project from then on, and
+// being the user's own folder it can be unlinked but never trashed. Reached from
+// Settings.
 
 export interface JoinedProject {
   dir: string;
@@ -55,6 +64,10 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
   const [busy, setBusy] = useState(false);
   const { instances } = useConnections();
   const running = useRunningCopy();
+  const linked = useLinkedCopies();
+  useEffect(() => {
+    void refreshLinkedCopies();
+  }, []);
 
   const load = useCallback(() => {
     listJoinedProjects().then(setList, (e) => {
@@ -135,6 +148,43 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
             {t("joinedProjects")}
           </h1>
         </div>
+
+        {linked && linked.length > 0 && (
+          <section className="space-y-2">
+            <SectionLabel>{t("savedCopies")}</SectionLabel>
+            <Group>
+              {linked.map((copy, i) => (
+                <div key={copy.path} className="flex flex-col">
+                  {i > 0 && <Divider inset={false} />}
+                  <div className="flex min-h-11 items-center gap-2 pr-2">
+                    <button
+                      type="button"
+                      title={t(isWindows ? "showInExplorer" : "showInFinder")}
+                      onClick={() => revealItemInDir(copy.path).catch(() => {})}
+                      className={cn(
+                        "min-w-0 flex-1 px-3 py-2 text-left transition-colors hover:bg-white/[0.03]",
+                        focusRing,
+                      )}
+                    >
+                      <p className="truncate text-[13px]">{copy.name}</p>
+                      <p className="truncate text-[12px] text-muted-foreground">{copy.path}</p>
+                    </button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      title={t("unlink")}
+                      aria-label={`${t("unlink")}: ${copy.name}`}
+                      className="size-8 shrink-0 p-0 text-muted-foreground hover:text-foreground"
+                      onClick={() => unlinkCopy(copy.path).catch((e) => toast.error(String(e)))}
+                    >
+                      <Unlink className="size-4" aria-hidden="true" />
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </Group>
+          </section>
+        )}
 
         <section className="space-y-2">
           <SectionLabel aside={list && list.length > 0 ? formatBytes(total) : undefined}>

@@ -6,7 +6,8 @@
 //
 // A copy that fails goes to the Trash. Where that isn't possible it stays where
 // it is under its incomplete name, and the error says so. So does a whole copy
-// that can't get its name. Nothing is deleted.
+// that can't get its name. Nothing is deleted. A finished copy brings the folder's
+// `.reamesh-link.json` along, which is what links it (see links.rs).
 
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
@@ -268,10 +269,12 @@ struct CopyFinished {
     error: Option<String>,
     trashed: bool,
     kept: Option<String>,
+    /// The new folder is a linked copy of the project from now on.
+    linked: bool,
 }
 
 fn finished(dir: String, result: Result<PathBuf, Failed>) -> CopyFinished {
-    let mut out = CopyFinished { dir, path: None, error: None, trashed: false, kept: None };
+    let mut out = CopyFinished { dir, path: None, error: None, trashed: false, kept: None, linked: false };
     match result {
         Ok(path) => out.path = Some(path.to_string_lossy().into_owned()),
         Err(Failed { why, partial }) => {
@@ -319,7 +322,11 @@ pub(crate) fn start(
                     },
                 },
             );
-            let _ = app.emit("copy-finished", finished(dir.clone(), result));
+            // A whole copy that knows what it is a copy of is linked from here on.
+            let linked = result.as_ref().is_ok_and(|path| crate::links::remember(&app, path));
+            let mut end = finished(dir.clone(), result);
+            end.linked = linked;
+            let _ = app.emit("copy-finished", end);
         })
         .map(|_| ())
         .map_err(|e| e.to_string())

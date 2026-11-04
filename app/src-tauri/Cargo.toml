@@ -51,6 +51,9 @@ sys-locale = "0.3"
 # Network interfaces for the Lobby's "a VPN is active" line (vpn_active).
 # Same version libp2p's mDNS already pulls into the extension's core.
 if-addrs = "0.15"
+# The hash a linked copy compares its project file by (src/links.rs): the same
+# hex the extension's core writes.
+blake3 = "1.5"
 # Settings → Joined projects moves a downloaded session copy to the Trash /
 # Recycle Bin instead of deleting it outright.
 trash = { version = "5", default-features = false, features = ["coinit_apartmentthreaded"] }

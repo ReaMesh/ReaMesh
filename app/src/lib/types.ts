@@ -43,7 +43,9 @@ export interface SessionPreview {
   project_file?: string;
   /** `reaper` is the host's REAPER version ("7.42"; absent from an older
    *  host): the trust dialog warns when it differs from the local one. */
-  meta?: { v?: number; tracks?: number; plugins?: string[]; reaper?: string } | null;
+  meta?: { v?: number; tracks?: number; plugins?: string[]; reaper?: string; project?: string } | null;
+  /** blake3 of the host's project file; "" while it is still hashing. */
+  project_hash?: string;
   /** Bytes a join would still write: what isn't already in this session's copy. */
   needed?: number;
   /** Bytes free on that disk; absent when it can't be told, like `enough`. */
@@ -122,6 +124,8 @@ export interface ExtState {
   in_use?: string[];
   /** The folder of this guest's downloaded copy; "" outside a join. */
   session_dir?: string;
+  /** That folder is a linked copy of the user's, not a temporary one. */
+  session_linked?: boolean;
   /** Last session-ending event; null when there is none. */
   error: LogEntry | null;
   log: LogEntry[];
@@ -132,6 +136,8 @@ export interface ExtState {
   reconnecting?: boolean;
   /** A session lost its host and can be rejoined from the Lobby (`reconnect`). */
   can_reconnect?: boolean;
+  /** What it takes to find that session again by the normal way in. */
+  last_join?: { session_id: string; ticket: string } | null;
   /** Invite code for the hosted session ("" while the host's addresses are
    *  still being learned, and always "" when not hosting). Someone outside
    *  mDNS reach (VPN, strict LAN) pastes it in their Lobby to join. */

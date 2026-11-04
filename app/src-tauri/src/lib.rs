@@ -14,6 +14,7 @@ use tauri::{AppHandle, Manager};
 #[cfg(target_os = "windows")]
 mod overlay_panel_win;
 mod copies;
+mod links;
 mod nearby;
 mod updater;
 
@@ -1929,6 +1930,9 @@ pub fn run() {
             joined_projects,
             trash_joined_project,
             save_joined_copy,
+            links::linked_projects,
+            links::unlink_project,
+            links::link_state,
             open_bluetooth_settings,
             build_info,
             nearby::nearby_state,
