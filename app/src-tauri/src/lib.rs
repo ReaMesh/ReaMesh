@@ -255,8 +255,8 @@ fn write_private(p: &Path, body: &str) -> std::io::Result<()> {
 // switched off altogether (inverted so existing installs keep it on); the
 // webview just stops opening the window. Bits 32 and 64 are set when other
 // people's cursors are hidden in REAPER and when ours is not shared (inverted
-// the same way).
-const OVERLAY_ALL: u8 = 0b111_0111;
+// the same way). Bit 128 is set when the rosters show only track numbers.
+const OVERLAY_ALL: u8 = 0b1111_0111;
 const OVERLAY_REMEMBER_POS: u8 = 0b100;
 /// Fresh install: HUD shown, every toggle on.
 const OVERLAY_DEFAULT: u8 = 0b111;

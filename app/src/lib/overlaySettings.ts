@@ -30,6 +30,9 @@ export interface OverlaySettings {
   cursors: boolean;
   /** Send our own cursor to the others. Stored inverted as bit 64. */
   shareCursor: boolean;
+  /** Rosters say "Track 7" even for a named track. Covers the Session screen as
+   *  well as the HUD. Bit 128, off by default. */
+  trackNumbersOnly: boolean;
 }
 
 const KEY = "reamesh.overlay";
@@ -41,6 +44,7 @@ const DEFAULTS: OverlaySettings = {
   rememberPos: true,
   cursors: true,
   shareCursor: true,
+  trackNumbersOnly: false,
 };
 
 // Bit layout: must match the Rust `OVERLAY_ALL` mask. Bit 8 (time-selection)
@@ -51,6 +55,7 @@ const BITS: Partial<Record<Key, number>> = {
   roster: 1,
   tint: 2,
   rememberPos: 4,
+  trackNumbersOnly: 128,
 };
 const INVERTED: Partial<Record<Key, number>> = {
   hud: 16,

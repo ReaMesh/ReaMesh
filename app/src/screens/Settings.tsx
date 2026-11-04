@@ -69,10 +69,12 @@ const PILL = { type: "spring", stiffness: 400, damping: 38 } as const;
 type BuildInfo = { commit: string; buildTime: number; release: boolean };
 
 // `hud` rows only mean something while the HUD is shown and grey out without it.
-// Marks and cursors are drawn inside REAPER, so they stay independent.
+// Marks and cursors are drawn inside REAPER and tracks also show in the Session
+// roster, so they stay independent.
 const OVERLAY_TOGGLES: { key: keyof OverlaySettings; label: () => string; hud?: true }[] = [
   { key: "hud", label: () => t("olShow") },
   { key: "roster", label: () => t("olRoster"), hud: true },
+  { key: "trackNumbersOnly", label: () => t("olTrackNumbersOnly") },
   { key: "rememberPos", label: () => t("olRememberPos"), hud: true },
   { key: "tint", label: () => t("olItemTint") },
   { key: "cursors", label: () => t("olCursors") },
