@@ -26,6 +26,7 @@ import { loadReaperPath, refreshStatus, useExtensionStale, useReaperStatus } fro
 import { t, useLang } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
 import { localizeLogEntry } from "@/lib/log";
+import { getLastSession, lastSessionAfter, setLastSession } from "@/lib/lastSession";
 import { pluginStatus, useInstalledPlugins } from "@/lib/plugins";
 import { isInviteLink } from "@/lib/ticket";
 import { isRelayCode } from "@/lib/relay";
@@ -202,10 +203,37 @@ function useSessionHud(
   }, [hud, inSession, port, pid, alive, reconnecting, failed]);
 }
 
+/** Feed the Lobby's "last session" block from the state frames. The first frame
+ *  out of a session is the only one with the reason, the next already has it
+ *  cleared. Returns the error the block took over, for `useErrorToasts`. */
+function useLastSessionFeed(state: ExtState | undefined, port: number | undefined) {
+  const before = useRef<{ port: number; state: ExtState } | null>(null);
+  const shown = useRef("");
+  useEffect(() => {
+    // REAPER gone: nothing to compare with when it comes back.
+    if (port == null || !state) {
+      before.current = null;
+      return;
+    }
+    const prev = before.current?.port === port ? before.current.state : null;
+    const block = getLastSession(port);
+    const next = lastSessionAfter(prev, state, block);
+    if (next !== block) setLastSession(port, next);
+    if (state.error && next?.reason === state.error) shown.current = JSON.stringify(state.error);
+    before.current = { port, state };
+  }, [state, port]);
+  return shown;
+}
+
 /** Deduplicate control-server errors per REAPER instance. The server replays
  *  its latest state after reconnects, so clearing the key while disconnected
- *  would show dismissed errors again. */
-function useErrorToasts(state: ExtState | undefined, port: number | undefined) {
+ *  would show dismissed errors again. Why a session ended is on the Lobby's
+ *  block instead, whenever there is one to show it. */
+function useErrorToasts(
+  state: ExtState | undefined,
+  port: number | undefined,
+  shownElsewhere: { current: string },
+) {
   const last = useRef<Map<number, string>>(new Map());
   useEffect(() => {
     if (port == null) return;
@@ -213,9 +241,11 @@ function useErrorToasts(state: ExtState | undefined, port: number | undefined) {
     // A missing state frame does not mean the error was cleared.
     if (!state) return;
     const key = err ? JSON.stringify(err) : "";
-    if (err && key !== last.current.get(port)) toast.error(localizeLogEntry(err));
+    if (err && key !== last.current.get(port) && key !== shownElsewhere.current) {
+      toast.error(localizeLogEntry(err));
+    }
     last.current.set(port, key);
-  }, [state, state?.error, port]);
+  }, [state, state?.error, port, shownElsewhere]);
 }
 
 /** Explain when a remote editing lock reverts a local change. Debounce the
@@ -384,7 +414,9 @@ export default function App() {
   // and none of this state carries across.
   const activePort = instance?.port;
   const flashPeers = usePresenceToasts(state, activePort);
-  useErrorToasts(state, activePort);
+  // Before the toasts: an error the block takes over gets none.
+  const onLastSession = useLastSessionFeed(state, activePort);
+  useErrorToasts(state, activePort, onLastSession);
   useOverrideToasts(state, activePort);
   usePluginToasts(state, activePort);
 

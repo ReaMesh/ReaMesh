@@ -37,11 +37,13 @@ import { takeInvite, useInviteSeq } from "@/lib/invite";
 import { recordHostJoin } from "@/lib/knownHosts";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
-import { reconnectingText } from "@/lib/log";
+import { localizeLogEntry, reconnectingText } from "@/lib/log";
+import { setLastSession, useLastSession, type LastSession } from "@/lib/lastSession";
+import { copyDirName, copyPercent, saveCopyAs, useRunningCopy } from "@/lib/savedCopies";
 import { getProfile, useProfile } from "@/lib/profile";
 import { nearbyBlocked, setNearby, useNearby } from "@/lib/nearby";
 import { decodeTicket, normalizeTicket } from "@/lib/ticket";
-import { initials, type ExtState, type SessionAd } from "@/lib/types";
+import { initials, type ExtState, type LogEntry, type SessionAd } from "@/lib/types";
 import { checkForUpdate, restartToUpdate, useUpdate } from "@/lib/updater";
 import { protoSkew } from "@/lib/version";
 import { cn, focusRing } from "@/lib/utils";
@@ -1112,8 +1114,8 @@ function NearbySearch({ empty }: { empty: boolean }) {
 }
 
 /** The extension lost the host without a farewell and is watching the lobby
- *  to rejoin the same session on its own: one quiet row, nothing to do. */
-function ReconnectRow({ log }: { log: ExtState["log"] }) {
+ *  to rejoin the same session on its own: one quiet row, and a way to stop it. */
+function ReconnectRow({ log, port }: { log: ExtState["log"]; port: number | null }) {
   return (
     <div role="status" className="flex shrink-0 items-center gap-2.5 rounded-xl bg-card px-3 py-2.5">
       <LoaderCircle
@@ -1123,7 +1125,119 @@ function ReconnectRow({ log }: { log: ExtState["log"] }) {
       <span className="min-w-0 truncate text-[12px] text-foreground/65">
         {reconnectingText(log)}
       </span>
+      <Button
+        variant="ghost"
+        size="xs"
+        className="-my-1 ml-auto shrink-0 text-foreground/80"
+        onClick={() => send({ cmd: "reconnect_cancel" }, port ?? undefined)}
+      >
+        {t("cancel")}
+      </Button>
     </div>
+  );
+}
+
+/** Why the session ended, in the block under the session's name. */
+function lastSessionReason(reason: LogEntry): string {
+  // The name is right above it: the block needs no second one.
+  const text = reason.code === "reconnect_failed" ? t("lastSessionRetryFailed") : localizeLogEntry(reason);
+  return text.replace(/\.$/, "");
+}
+
+/** The session that just ended: why, the way back, and the copy it left. Stays
+ *  until it is closed or something new starts. */
+function LastSessionBlock({
+  last,
+  canReconnect,
+  port,
+}: {
+  last: LastSession;
+  canReconnect: boolean;
+  port: number | null;
+}) {
+  const away = { height: 0, marginTop: -18, opacity: 0, filter: "blur(4px)" };
+  const running = useRunningCopy();
+  const copyDir = last.dir ? copyDirName(last.dir) : "";
+  return (
+    <motion.section
+      key="last"
+      initial={away}
+      animate={{ height: "auto", marginTop: 0, opacity: 1, filter: "blur(0px)" }}
+      exit={away}
+      transition={FOLD}
+      className="shrink-0 overflow-hidden"
+    >
+      <div className="flex flex-col gap-2">
+        <SectionLabel
+          aside={
+            <button
+              type="button"
+              aria-label={t("close")}
+              onClick={() => port != null && setLastSession(port, null)}
+              className={cn(
+                "-my-0.5 grid size-5 place-items-center rounded text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground",
+                focusRing,
+              )}
+            >
+              <X className="size-3.5" aria-hidden="true" />
+            </button>
+          }
+        >
+          {t("lastSession")}
+        </SectionLabel>
+        <Group>
+          <div className="flex min-h-[52px] items-center gap-3 py-2 pr-2 pl-3">
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-[13px] font-semibold">{last.name}</p>
+              {last.reason ? (
+                <p className="text-[12px] text-amber-500">{lastSessionReason(last.reason)}</p>
+              ) : (
+                <p className="text-[12px] text-muted-foreground">{t("lastSessionLeft")}</p>
+              )}
+            </div>
+            {canReconnect && (
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-7 shrink-0 px-3 text-[12px]"
+                onClick={() => send({ cmd: "reconnect" }, port ?? undefined)}
+              >
+                {t("reconnectAction")}
+              </Button>
+            )}
+          </div>
+          {copyDir && (
+            <>
+              <Divider inset={false} />
+              <div className="flex min-h-[52px] items-center gap-3 py-2 pr-2 pl-3">
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-[13px]">{t("yourCopy")}</p>
+                  <p className="truncate text-[12px] text-muted-foreground">{t("yourCopyKept")}</p>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={!!running}
+                  className="h-7 shrink-0 px-2.5 text-[12px] text-foreground/80"
+                  onClick={() => void saveCopyAs(copyDir)}
+                >
+                  <SwapText value={running?.dir === copyDir ? "copying" : "idle"}>
+                    {running?.dir === copyDir ? (
+                      <span className="inline-flex items-center gap-1.5 tabular-nums">
+                        <LoaderCircle className="size-3.5 motion-safe:animate-spin" aria-hidden="true" />
+                        {copyPercent(running)}%
+                      </span>
+                    ) : (
+                      t("saveCopyAs")
+                    )}
+                  </SwapText>
+                </Button>
+              </div>
+            </>
+          )}
+        </Group>
+      </div>
+    </motion.section>
   );
 }
 
@@ -1131,15 +1245,22 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
   // Sessions discovered after this timestamp get a one-time highlight.
   const mountedAt = useRef(Date.now()).current;
   const count = state.sessions.length;
+  const last = useLastSession(port);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-[18px] px-4 pt-1.5 pb-4">
-      {state.reconnecting && <ReconnectRow log={state.log} />}
+      {state.reconnecting && <ReconnectRow log={state.log} port={port} />}
 
       {/* Show a repair path for an active Windows Firewall block rule. */}
       <FirewallBlocked />
 
       <NameCard />
+
+      <AnimatePresence initial={false}>
+        {last && !state.reconnecting && (
+          <LastSessionBlock last={last} canReconnect={!!state.can_reconnect} port={port} />
+        )}
+      </AnimatePresence>
 
       <section className="flex min-h-0 flex-1 flex-col gap-2">
         <SectionLabel>{t("sessionsOnNetwork")}</SectionLabel>

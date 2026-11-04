@@ -610,10 +610,10 @@ static double jsonNum(const json& j, const char* key, double dflt);
 static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback);
 static void openDownloadedProject(std::string path);
 
-// In-flight automatic rejoin after the host vanished without a farewell
-// (network blip / crash). While set, the Browsing tick watches the lobby for
-// the same session id and rejoins with the remembered passphrase.
-struct Reconnect {
+// A session this client lost the connection to: what going back takes. Stays
+// after a failed or cancelled auto-rejoin for the Lobby's reconnect button, until
+// the user hosts, joins or leaves something else.
+struct LastSession {
   std::string sessionId;
   std::string sessionName;
   std::string passphrase;
@@ -621,6 +621,13 @@ struct Reconnect {
   // sessions). A ticket host is usually NOT on this LAN, so waiting for its
   // lobby announce would wait forever: the rejoin re-dials the ticket instead.
   std::string ticket;
+};
+static std::optional<LastSession> g_lastSession;
+
+// In-flight automatic rejoin after the host vanished without a farewell
+// (network blip / crash). While set, the Browsing tick watches the lobby for
+// the same session id and rejoins with the remembered passphrase.
+struct Reconnect : LastSession {
   std::chrono::steady_clock::time_point deadline;
 };
 static std::optional<Reconnect> g_reconnect;
@@ -5913,26 +5920,34 @@ static bool joinSession(const std::string& sid, const std::string& ticket,
   return true;
 }
 
+// Watch for that session again for a bounded window (Browsing only).
+static void startReconnect(const LastSession& session) {
+  Reconnect rc;
+  static_cast<LastSession&>(rc) = session;
+  rc.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+  logEvent("reconnecting", {{"name", rc.sessionName}},
+           "connection to the host lost. Reconnecting to \"" + rc.sessionName + "\"");
+  g_reconnect = std::move(rc);
+}
+
 // Recover from a host crash or network interruption. If the host returns, the
 // session id remains valid and the staged download avoids duplicate transfers.
 // Keep watching the lobby and reuse the passphrase for a bounded retry window.
 static void beginReconnect(const json& st) {
-  Reconnect rc;
-  rc.sessionId = jsonStr(st, "session_id");
-  rc.sessionName = jsonStr(st, "session_name");
-  if (rc.sessionName.empty()) rc.sessionName = "session";
-  rc.passphrase = g_joinPassphrase;
-  rc.ticket = g_joinTicket;
-  rc.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+  LastSession session;
+  session.sessionId = jsonStr(st, "session_id");
+  session.sessionName = jsonStr(st, "session_name");
+  if (session.sessionName.empty()) session.sessionName = "session";
+  session.passphrase = g_joinPassphrase;
+  session.ticket = g_joinTicket;
   leaveSession("", json::object(), "");  // silent: this is not (yet) an error
-  if (rc.sessionId.empty() || !startBrowse()) {
+  if (!session.sessionId.empty()) g_lastSession = session;
+  if (session.sessionId.empty() || !startBrowse()) {
     g_lastError =
         logEvent("host_lost", json::object(), "lost the connection to the host");
     return;
   }
-  logEvent("reconnecting", {{"name", rc.sessionName}},
-           "connection to the host lost. Reconnecting to \"" + rc.sessionName + "\"");
-  g_reconnect = std::move(rc);
+  startReconnect(session);
 }
 
 // The session ended under us (status "ended"). A vanished host triggers an
@@ -5941,6 +5956,7 @@ static void beginReconnect(const json& st) {
 // the host asked us to go (a kicked user can still rejoin by hand).
 static void onSessionEnded(const json& st) {
   const std::string why = jsonStr(st, "end_reason");
+  if (why != "host_lost") g_lastSession.reset();  // a rejoin in progress ends here too
   if (why == "host_lost") beginReconnect(st);
   else if (why == "kicked")
     leaveSession("kicked", json::object(), "the host removed you from the session");
@@ -6060,6 +6076,8 @@ static void onHost(const std::string& passphrase) {
   if (g_mode == Mode::Hosting) return;
   // Before leaving the Lobby: a cancelled Save As changes nothing.
   if (!ensureProjectSaved()) return;
+  g_reconnect.reset();
+  g_lastSession.reset();
   if (g_mode != Mode::Idle) leaveSession("left", json::object(), "left previous session");
   g_noFx = false;  // hosting is always a full, read-write session
 
@@ -6105,6 +6123,7 @@ static void onHost(const std::string& passphrase) {
 
 static void onLeave() {
   g_reconnect.reset();  // a manual leave also cancels a pending auto-rejoin
+  g_lastSession.reset();
   if (g_mode == Mode::Idle) return;
   leaveSession("left", json::object(), "left the session");
   g_lastError = json();  // user-initiated, nothing to flag in the app
@@ -6275,8 +6294,22 @@ static void ctlDispatch(const json& cmd) {
     // Adopted only once the join is under way: a join refused because one is
     // already in progress must not flip the flag of the session it refused for.
     if (joinSession(jsonStr(cmd, "session_id"), jsonStr(cmd, "ticket"),
-                    name.empty() ? "session" : name, jsonStr(cmd, "passphrase")))
+                    name.empty() ? "session" : name, jsonStr(cmd, "passphrase"))) {
       g_noFx = cmdBool("nofx");
+      g_lastSession.reset();
+    }
+  } else if (c == "reconnect_cancel") {
+    // Stop retrying, stay in the Lobby; the session can still be retried by hand.
+    if (g_reconnect) {
+      g_reconnect.reset();
+      g_lastError = logEvent("host_lost", json::object(), "lost the connection to the host");
+    }
+  } else if (c == "reconnect") {
+    if (g_lastSession && !g_reconnect && (g_mode == Mode::Idle || g_mode == Mode::Browsing) &&
+        startBrowse()) {
+      g_lastError = json();
+      startReconnect(*g_lastSession);
+    }
   } else if (c == "open_confirm") {
     // The user read the "loads plugins that weren't listed" warning and chose
     // to continue: open the held-back download now.
@@ -6482,6 +6515,7 @@ static void ctlPublishState() {
   // Recent pings, for the HUD notice (see sharePing).
   state["pings"] = pingsJson();
   state["reconnecting"] = static_cast<bool>(g_reconnect);
+  state["can_reconnect"] = g_lastSession.has_value() && !g_reconnect;
   // Passphrase pre-check result ({session_id, ok|null} or null), passed through
   // so the Lobby can show "wrong password" inline without a session transition.
   state["probe"] = (st.contains("probe")) ? st["probe"] : json();
@@ -6769,6 +6803,7 @@ static void openDownloadedProject(std::string path) {
   // blocks. Queue the missing ones now; the build runs in the background.
   Main_OnCommand(40047, 0);  // Peaks: Build any missing peaks
   g_mode = Mode::ClientActive;
+  g_lastSession.reset();  // back in, a rejoin included
   // Don't propose anything until the owner's authoritative state has applied
   // and re-baselined us; and don't narrate that settle (the whole project
   // arriving as one changeset) as a flurry of "a track was added" events.
