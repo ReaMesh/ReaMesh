@@ -6400,6 +6400,24 @@ async fn run_network(
                     // Leaving mid-download: no temp files left behind, least of
                     // all in a folder of the user's.
                     download_cleanup(&mut download);
+                    // Close the connections instead of leaving them to time out
+                    // (QUIC has no FIN): gossipsub tells a peer its subscriptions
+                    // on the first connection only, so a peer still counting an
+                    // old one wouldn't tell the next swarm of this identity, and
+                    // a session hosted again right away stays out of its Lobby.
+                    let peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
+                    if !peers.is_empty() {
+                        for peer in peers {
+                            let _ = swarm.disconnect_peer_id(peer);
+                        }
+                        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+                        loop {
+                            tokio::select! {
+                                _ = tokio::time::sleep_until(deadline) => break,
+                                _ = swarm.select_next_some() => {}
+                            }
+                        }
+                    }
                     break;
                 }
             },
