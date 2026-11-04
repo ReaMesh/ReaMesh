@@ -722,6 +722,12 @@ int main() {
     const std::string win = absolutizeChunkFiles(wire, "C:\\Users\\Ben\\Song");
     assert(win.find("FILE \"C:\\Users\\Ben\\Song\\Audio\\Kick.wav\"") != std::string::npos);
     assert(relativizeChunkFiles(win, {"C:\\Users\\Ben\\Song"}) == wire);
+    // A joined copy's folder holds both kinds. What follows it is a backslash
+    // all the same: only then does REAPER save the path relative.
+    const std::string copy = "C:\\Users\\Ben\\REAPER/ReaMesh\\Song-0f3a";
+    const std::string mixed = absolutizeChunkFiles(wire, copy);
+    assert(mixed.find("FILE \"C:\\Users\\Ben\\REAPER/ReaMesh\\Song-0f3a\\Audio\\Kick.wav\"") != std::string::npos);
+    assert(relativizeChunkFiles(mixed, {copy}) == wire);
     // No saved project: untouched.
     assert(absolutizeChunkFiles(wire, "") == wire);
   }

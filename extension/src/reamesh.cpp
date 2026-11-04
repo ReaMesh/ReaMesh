@@ -1179,10 +1179,14 @@ static std::string relativizeChunkFiles(const std::string& chunk,
 // exactly what this names. Recapture maps the absolute path back to the same
 // relative text, so the round trip stays byte-stable. Paths that climb out
 // ("..") or are already absolute stay as they are; so does everything when
-// `dir` is empty (no saved project).
+// `dir` is empty (no saved project). On Windows the rest of the path takes
+// backslashes even where the folder holds both kinds, as a joined copy's does
+// (the resource path plus "/ReaMesh"): REAPER writes a path relative into the
+// .rpp only when a backslash follows the project folder, and with an absolute one
+// a copy of that folder would keep reading the old folder's media.
 static std::string absolutizeChunkFiles(const std::string& chunk, std::string dir) {
   if (dir.empty() || isRelativePath(dir)) return chunk;
-  const bool backslash = dir.find('\\') != std::string::npos && dir.find('/') == std::string::npos;
+  const bool backslash = dir[0] == '\\' || (dir.size() >= 2 && dir[1] == ':');
   const char sep = backslash ? '\\' : '/';
   while (dir.size() > 1 && (dir.back() == '/' || dir.back() == '\\')) dir.pop_back();
   std::string out;
