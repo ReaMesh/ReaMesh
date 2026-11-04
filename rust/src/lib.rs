@@ -634,6 +634,16 @@ struct Shared {
     /// project dir on the owner, the downloaded copy on clients (set once the
     /// initial transfer completes).
     serve_dir: Mutex<Option<PathBuf>>,
+    /// The folder the next join goes into instead of the staging folder, if
+    /// any: a linked copy of the project. `start_join` takes it, once.
+    join_dest: Mutex<Option<JoinDest>>,
+    /// This session's copy is a folder of the user's (see `JoinDest`): it may
+    /// hold other things of theirs, so it serves less (see `may_serve`).
+    dest_join: AtomicBool,
+    /// Media this user put on the timeline themselves during a join into a
+    /// linked folder, as `path_key`s: all that folder serves beyond the session's
+    /// own files.
+    own_media: Mutex<HashSet<String>>,
     /// What the mid-session fetches add up to, for the status.
     fetch_progress: Mutex<FetchProgress>,
     /// Peer ids currently subscribed to the session topic (fetch candidates;
@@ -2013,8 +2023,13 @@ impl Reamesh {
         // thread below; a client that requests the manifest before that
         // finishes simply downloads without resume-dedup/verify (empty hashes
         // are legal throughout the transfer path).
-        let files = referenced_files(build_manifest(&dir)?, &dir, project_file, "");
+        let mut files = referenced_files(build_manifest(&dir)?, &dir, project_file, "");
         let files_for_hash = files.clone();
+        // The one hash a joiner's first look needs (does its linked copy match?)
+        // shouldn't have to wait for the media: it's a small file, just saved.
+        if let Some(f) = files.iter_mut().find(|f| f.path == project_file) {
+            f.hash = blake3_file(&dir.join(project_file)).unwrap_or_default();
+        }
         let session_id = new_session_id();
         let salt = random_hex(16); // fresh CSPRNG public salt, distinct from the id
         // A session a relay can reach must have a secret: an open one gets a
@@ -2159,6 +2174,9 @@ impl Reamesh {
             sessions: Mutex::new(HashMap::new()),
             status: Mutex::new(status),
             serve_dir: Mutex::new(None),
+            join_dest: Mutex::new(None),
+            dest_join: AtomicBool::new(false),
+            own_media: Mutex::new(HashSet::new()),
             fetch_progress: Mutex::new(FetchProgress::default()),
             session_peers: Mutex::new(Vec::new()),
             auth_token: Mutex::new(String::new()),
@@ -2325,6 +2343,9 @@ impl Reamesh {
                 reject_unsafe_media_paths(&mut parsed, "local");
                 if !SECTIONS.iter().any(|s| parsed.get(s).is_some()) {
                     return;
+                }
+                if self.shared.dest_join.load(Ordering::Relaxed) {
+                    note_own_media(&self.shared, &ds.doc, &parsed);
                 }
                 for section in SECTIONS {
                     let Some(entities) = parsed.get(section).and_then(|t| t.as_object()) else {
@@ -2564,6 +2585,35 @@ impl Reamesh {
             })
             .collect();
         json!(arr).to_string()
+    }
+
+    /// Have the next join go into `dest`, a linked copy of the project, instead
+    /// of a staging folder (empty = staging, as usual). See `check_dest` for what
+    /// the core asks of that folder and `commit_dest` for how it changes.
+    pub fn set_join_dest(&self, dest: &str, overwrite: bool) {
+        *self.shared.join_dest.lock().unwrap() =
+            (!dest.is_empty()).then(|| JoinDest { dir: PathBuf::from(dest), overwrite });
+    }
+
+    /// The session is over and the copy on disk holds what it ended with: the
+    /// folder's link now names that state as the one it last agreed on, so a
+    /// later change in the file can be told from the session's.
+    pub fn note_local_project(&self) {
+        if self.role != Role::Client {
+            return;
+        }
+        let Some(dir) = self.shared.serve_dir.lock().unwrap().clone() else { return };
+        let Some(mut link) = read_link(&dir) else { return };
+        let Some(rel) = safe_relative_path(&link.project_file) else { return };
+        match blake3_file(&dir.join(rel)) {
+            Ok(hash) => {
+                link.hash = hash;
+                if let Err(e) = write_link(&dir, &link) {
+                    eprintln!("[reamesh] couldn't update {LINK_FILE}: {e}");
+                }
+            }
+            Err(e) => eprintln!("[reamesh] couldn't read {}: {e}", link.project_file),
+        }
     }
 
     /// Join an announced session (client only): subscribe to its topic and
@@ -3547,6 +3597,11 @@ fn chunk_media_keys(chunk: &str, out: &mut HashSet<String>) {
 /// search `referenced_files` does for the manifest: a file this check admits
 /// is one some session member deliberately put on the timeline.
 fn doc_references(doc: &Doc, path: &str) -> bool {
+    doc_media_keys(doc).contains(&path_key(path))
+}
+
+/// The `path_key` of every file a live item in the doc names.
+fn doc_media_keys(doc: &Doc) -> HashSet<String> {
     let root = doc.get_or_insert_map(ITEMS_ROOT);
     let txn = doc.transact();
     let mut keys = HashSet::new();
@@ -3559,7 +3614,25 @@ fn doc_references(doc: &Doc, path: &str) -> bool {
             chunk_media_keys(&chunk, &mut keys);
         }
     }
-    keys.contains(&path_key(path))
+    keys
+}
+
+/// Remember the media an outgoing changeset brings into the session. What the doc
+/// already names is left out: that came from someone else, and moving an item
+/// around must not open up a file of the user's that an item merely named.
+fn note_own_media(shared: &Shared, doc: &Doc, changeset: &JsonValue) {
+    let Some(items) = changeset.get(ITEMS_ROOT).and_then(|v| v.as_object()) else { return };
+    let mut named = HashSet::new();
+    for fields in items.values() {
+        if let Some(chunk) = fields.get("chunk").and_then(|v| v.as_str()) {
+            chunk_media_keys(chunk, &mut named);
+        }
+    }
+    if named.is_empty() {
+        return;
+    }
+    let known = doc_media_keys(doc);
+    shared.own_media.lock().unwrap().extend(named.into_iter().filter(|k| !known.contains(k)));
 }
 
 /// `doc_references`, plus the item chunks this peer has proposed and not yet
@@ -3809,6 +3882,242 @@ fn prune_staging(root: &Path, keep: &[PathBuf]) {
             let _ = fs::remove_dir_all(&path);
         }
     }
+}
+
+/// What every joined copy keeps about itself, beside the project: which hosted
+/// project it is a copy of, and the state of the project file it last agreed on
+/// with that host. A dotfile, so it is outside every manifest and never served.
+/// "Save as" takes it along, which is what links the saved folder.
+const LINK_FILE: &str = ".reamesh-link.json";
+/// Where a join into a linked folder keeps what it replaced, as
+/// `<unix seconds>/<project-relative path>`. Also outside every manifest. Nothing
+/// ever empties it.
+const BACKUP_DIR: &str = ".reamesh-backup";
+/// The status messages of a refused join into a linked folder; the extension maps
+/// each to a stable code. They have to stay clear of the words its later checks
+/// look for.
+const LOCAL_CHANGED_MESSAGE: &str = "your copy of the project has changed";
+const LINK_MISSING_MESSAGE: &str = "linked folder not found";
+const LINK_FOREIGN_MESSAGE: &str = "linked folder holds something else";
+const LINK_BUSY_MESSAGE: &str = "a file of your copy is in use";
+/// How long a join into a linked folder waits for the host's hashes: without one
+/// it can't tell an unchanged file from a changed one and would replace them all.
+const DEST_HASH_WAIT: Duration = Duration::from_secs(15);
+/// A file another program has open now may well be free in a moment (a virus
+/// scanner, usually).
+const MOVE_ATTEMPTS: u32 = 4;
+const MOVE_PAUSE: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CopyLink {
+    /// The project's lasting id (`meta.project`). A link matches only together
+    /// with `owner`, the transport-authenticated peer id: anyone can copy an id.
+    project: String,
+    owner: String,
+    project_file: String,
+    name: String,
+    /// blake3 of the project file as of the last agreement with the session.
+    hash: String,
+}
+
+fn read_link(dir: &Path) -> Option<CopyLink> {
+    serde_json::from_slice(&fs::read(dir.join(LINK_FILE)).ok()?).ok()
+}
+
+/// Whole or not at all: a half-written link would read as a foreign folder.
+fn write_link(dir: &Path, link: &CopyLink) -> std::io::Result<()> {
+    let tmp = dir.join(format!("{LINK_FILE}.tmp"));
+    fs::write(&tmp, serde_json::to_vec_pretty(link).map_err(std::io::Error::other)?)?;
+    fs::rename(&tmp, dir.join(LINK_FILE))
+}
+
+/// The lasting project id in a manifest's meta blob, if it holds a proper one.
+fn project_id_of(meta: &str) -> Option<String> {
+    let v: JsonValue = serde_json::from_str(meta).ok()?;
+    let id = v.get("project")?.as_str()?;
+    (id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))).then(|| id.to_string())
+}
+
+/// A folder the user chose for this project, for one join.
+struct JoinDest {
+    dir: PathBuf,
+    overwrite: bool,
+}
+
+/// What a running download knows about the linked folder it goes into.
+struct DestJoin {
+    overwrite: bool,
+    /// The link's `hash` when the join started.
+    base: String,
+}
+
+/// Whether a join may go into this linked folder, asked before anything is
+/// written. The folder must be there (a user's folder is never recreated), must
+/// hold this very project of this very host, and without `overwrite` its project
+/// file must be the state it last agreed on or the state it is about to get. So
+/// nothing that skips the trust dialog (a reconnect) can lose a local edit.
+/// A project file that isn't there matches nothing: a host that renamed its
+/// project ends up here too, and the dialog then offers to overwrite, which keeps
+/// the old file under its old name.
+fn check_dest(
+    dir: &Path,
+    overwrite: bool,
+    project: Option<&str>,
+    owner: &PeerId,
+    project_file: &str,
+    files: &[FileMeta],
+) -> Result<String, String> {
+    if !dir.is_absolute() || !dir.is_dir() {
+        return Err(LINK_MISSING_MESSAGE.into());
+    }
+    let Some(link) = read_link(dir) else {
+        return Err(LINK_FOREIGN_MESSAGE.into());
+    };
+    if project != Some(link.project.as_str()) || link.owner != owner.to_string() {
+        return Err(LINK_FOREIGN_MESSAGE.into());
+    }
+    if !overwrite && !project_file_agrees(dir, project_file, &link.hash, files) {
+        return Err(LOCAL_CHANGED_MESSAGE.into());
+    }
+    Ok(link.hash)
+}
+
+/// The local project file is the state the link names or the manifest's.
+fn project_file_agrees(dir: &Path, project_file: &str, base: &str, files: &[FileMeta]) -> bool {
+    let Ok(local) = blake3_file(&dir.join(project_file)) else { return false };
+    local == base || files.iter().any(|f| f.path == project_file && f.hash == local)
+}
+
+/// `fs::rename`, with a moment's patience for a file that is merely busy.
+fn rename_patiently(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut last = None;
+    for attempt in 0..MOVE_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(MOVE_PAUSE);
+        }
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("rename failed")))
+}
+
+/// The status message for a file of a linked copy that wouldn't move. REAPER
+/// holds the media of the project it has open, and Windows won't move those.
+fn busy_message(path: &Path, e: &std::io::Error) -> String {
+    eprintln!("[reamesh] can't move {}: {e}", path.display());
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    format!("{LINK_BUSY_MESSAGE}: {name}")
+}
+
+/// Whether a file could be moved right now, by moving it and putting it back:
+/// better to know before downloading its replacement than after.
+fn check_movable(path: &Path) -> Result<(), String> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let aside = path.with_file_name(format!(".reamesh-moving-{name}"));
+    rename_patiently(path, &aside).map_err(|e| busy_message(path, &e))?;
+    rename_patiently(&aside, path).map_err(|e| busy_message(path, &e))
+}
+
+/// A folder for this join's backups: `<dir>/.reamesh-backup/<unix seconds>`, the
+/// next free second when that one is taken.
+fn new_backup_root(dir: &Path) -> std::io::Result<PathBuf> {
+    let parent = dir.join(BACKUP_DIR);
+    fs::create_dir_all(&parent)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let mut last = None;
+    for n in 0..100 {
+        let root = parent.join((now + n).to_string());
+        match fs::create_dir(&root) {
+            Ok(()) => return Ok(root),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no free backup folder")))
+}
+
+/// Put a finished download into its linked folder. Everything so far went to
+/// temp files beside the old ones, so a download that breaks off leaves the copy
+/// as it was and reads as a pending update. Here the old files go to the backup
+/// folder and the new ones take their place, the project file last: until it has
+/// landed the link still names the old state. A failure on the way puts everything
+/// back and fails the join. The project file of a plain update needs no backup,
+/// it is what the session already knows; any other file does, since a re-rendered
+/// wav can't be told from a host's change.
+fn commit_dest(dl: &Download, dest: &DestJoin) -> Result<(), String> {
+    // The user may have saved in REAPER while this downloaded.
+    if !dest.overwrite
+        && dl.files.iter().any(|f| f.tmp != f.dest && f.meta.path == dl.project_file)
+        && dl.dir.join(&dl.project_file).exists()
+    {
+        let metas: Vec<FileMeta> = dl.files.iter().map(|f| f.meta.clone()).collect();
+        if !project_file_agrees(&dl.dir, &dl.project_file, &dest.base, &metas) {
+            return Err(LOCAL_CHANGED_MESSAGE.into());
+        }
+    }
+    let mut pending: Vec<&FileDl> = dl.files.iter().filter(|f| f.tmp != f.dest).collect();
+    pending.sort_by_key(|f| f.meta.path == dl.project_file);
+
+    let mut root: Option<PathBuf> = None;
+    let mut landed: Vec<(&FileDl, Option<PathBuf>)> = Vec::new();
+    let result = (|| -> Result<(), String> {
+        for f in &pending {
+            let exists = f.dest.symlink_metadata().is_ok();
+            let mut backup = None;
+            if exists && (dest.overwrite || f.meta.path != dl.project_file) {
+                if root.is_none() {
+                    root = Some(new_backup_root(&dl.dir).map_err(|e| busy_message(&f.dest, &e))?);
+                }
+                let rel = safe_relative_path(&f.meta.path)
+                    .ok_or_else(|| busy_message(&f.dest, &std::io::Error::other("unsafe path")))?;
+                let to = root.as_ref().unwrap().join(rel);
+                to.parent().map(fs::create_dir_all).transpose().map_err(|e| busy_message(&f.dest, &e))?;
+                rename_patiently(&f.dest, &to).map_err(|e| busy_message(&f.dest, &e))?;
+                backup = Some(to);
+            }
+            if let Err(e) = rename_patiently(&f.tmp, &f.dest) {
+                if let Some(to) = &backup {
+                    let _ = rename_patiently(to, &f.dest);
+                }
+                return Err(busy_message(&f.dest, &e));
+            }
+            landed.push((f, backup));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        // Newest first. The new file goes back to its temp name, which the
+        // failure path clears; a restore that can't happen leaves the old file
+        // in the backup folder, and that is never emptied.
+        for (f, backup) in landed.iter().rev() {
+            let _ = rename_patiently(&f.dest, &f.tmp);
+            if let Some(to) = backup
+                && let Err(e) = rename_patiently(to, &f.dest)
+            {
+                eprintln!("[reamesh] couldn't restore {}: {e}", f.dest.display());
+            }
+        }
+        if let Some(root) = &root {
+            remove_empty_tree(root);
+        }
+    }
+    result
+}
+
+/// Remove a folder tree that holds nothing but folders. Anything with a file in
+/// it stays.
+fn remove_empty_tree(dir: &Path) {
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                remove_empty_tree(&entry.path());
+            }
+        }
+    }
+    let _ = fs::remove_dir(dir);
 }
 
 /// Folder (under the staging root) a join downloads into: the session name
@@ -4103,7 +4412,16 @@ struct Download {
     /// Joined session id: the session topic is subscribed only once the owner
     /// accepts our token (manifest served), never at request time.
     session_id: String,
+    session_name: String,
     dir: PathBuf,
+    /// Set when `dir` is a linked folder of the user's rather than a staging
+    /// folder: every file waits under its temp name until all of them are here.
+    dest: Option<DestJoin>,
+    /// Where identical files may be copied from: the staging root, never the
+    /// surroundings of a user's folder.
+    reuse_root: PathBuf,
+    /// What the folder's link says once the project file is in place.
+    link: Option<CopyLink>,
     project_file: String,
     auth: String,
     got_manifest: bool,
@@ -5454,6 +5772,8 @@ fn start_join(
     session_id: &str,
     passphrase: &str,
 ) -> Option<Download> {
+    // For this join only, however it goes.
+    let dest = shared.join_dest.lock().unwrap().take();
     let info = shared.sessions.lock().unwrap().get(session_id).cloned();
     let Some(info) = info else {
         set_status(shared, |s| {
@@ -5494,7 +5814,14 @@ fn start_join(
     // wrong-passphrase joiner flashes up as a ghost peer on
     // everyone's roster until its download fails. The
     // subscribe happens when the manifest arrives.
-    let dir = staging_dir_for(staging_dir, &info.session_name, session_id, &owner);
+    let staged = staging_dir_for(staging_dir, &info.session_name, session_id, &owner);
+    let reuse_root = staged.parent().map_or_else(|| staged.clone(), Path::to_path_buf);
+    let (dir, dest) = match dest {
+        Some(d) => (d.dir, Some(DestJoin { overwrite: d.overwrite, base: String::new() })),
+        None => (staged, None),
+    };
+    shared.dest_join.store(dest.is_some(), Ordering::Relaxed);
+    shared.own_media.lock().unwrap().clear();
     shared.servable.lock().unwrap().clear();
     let sid = session_id.to_string();
     let name = info.session_name.clone();
@@ -5533,7 +5860,11 @@ fn start_join(
     Some(Download {
         owner,
         session_id: session_id.to_string(),
+        session_name: info.session_name.clone(),
         dir,
+        dest,
+        reuse_root,
+        link: None,
         project_file: info.project_file.clone(),
         auth: token,
         got_manifest: false,
@@ -6066,6 +6397,9 @@ async fn run_network(
                     if !relay_slots.is_empty() {
                         relay::set_status(json!([]));
                     }
+                    // Leaving mid-download: no temp files left behind, least of
+                    // all in a folder of the user's.
+                    download_cleanup(&mut download);
                     break;
                 }
             },
@@ -7027,13 +7361,23 @@ async fn run_network(
                             // files a manifest listed; on a client, what its
                             // manifest listed or it fetched since; on both, media
                             // a live item names (added since, or recorded by
-                            // this guest and proposed).
+                            // this guest and proposed). A guest's linked folder is
+                            // the user's own and may hold anything: there, an item
+                            // naming a file isn't enough, or a session member
+                            // could pull out whatever it can guess the name of.
                             let may_serve = |p: &str| {
                                 let key = path_key(p);
                                 match hosting.as_ref() {
                                     Some(h) if h.ever_listed.contains(&key) => ServeScope::Listed,
                                     Some(h) if h.doc_admitted.contains(&key) => ServeScope::Contained,
                                     None if shared.servable.lock().unwrap().contains(&key) => ServeScope::Contained,
+                                    None if shared.dest_join.load(Ordering::Relaxed) => {
+                                        if shared.own_media.lock().unwrap().contains(&key) {
+                                            ServeScope::Contained
+                                        } else {
+                                            ServeScope::No
+                                        }
+                                    }
                                     _ if session_references(&shared, p) => ServeScope::Contained,
                                     _ => ServeScope::No,
                                 }
@@ -7098,10 +7442,15 @@ async fn run_network(
                                             .unwrap_or_default();
                                         let dir = staging_dir_for(cfg.staging_dir.as_deref(), &name, &p.session_id, &p.owner);
                                         let needed = bytes_needed(&dir, files);
+                                        let project_hash = files
+                                            .iter()
+                                            .find(|f| &f.path == project_file)
+                                            .map_or("", |f| f.hash.as_str());
                                         let mut preview = json!({
                                             "files": files.len() as u64,
                                             "bytes": files.iter().map(|f| f.size).sum::<u64>(),
                                             "project_file": project_file,
+                                            "project_hash": project_hash,
                                             "meta": parsed_meta,
                                             "needed": needed,
                                         });
@@ -7248,6 +7597,7 @@ fn file_matches(path: &Path, meta: &FileMeta) -> bool {
 /// `MAX_PROJECT_BYTES` fails the join (`TOO_LARGE_MESSAGE`), and so does a
 /// project whose missing files won't fit on the disk (`DISK_SPACE_MESSAGE`).
 fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()> {
+    let staged = dl.dest.is_some();
     let mut seen: HashSet<String> = HashSet::new();
     let mut plan: Vec<(FileMeta, PathBuf, bool)> = Vec::new();
     let mut total: u64 = 0;
@@ -7257,6 +7607,12 @@ fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()
             eprintln!("[reamesh] skipping unsafe path in manifest: {:?}", meta.path);
             continue;
         };
+        // Nothing a real host lists (see `build_manifest`), and a copy's link and
+        // backups are not for a host to write.
+        if meta.path.split('/').any(skip_in_manifest) {
+            eprintln!("[reamesh] skipping hidden path in manifest: {:?}", meta.path);
+            continue;
+        }
         if !seen.insert(path_key(&meta.path)) {
             eprintln!("[reamesh] skipping repeated path in manifest: {:?}", meta.path);
             continue;
@@ -7276,11 +7632,22 @@ fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()
     if !space_for(&dl.dir, needed) {
         return Err(std::io::Error::other(DISK_SPACE_MESSAGE));
     }
+    if staged {
+        for (_, dest, present) in &plan {
+            if !present && dest.symlink_metadata().is_ok() {
+                check_movable(dest).map_err(std::io::Error::other)?;
+            }
+        }
+    }
 
-    let reuse = build_reuse_index(dl.dir.parent().unwrap_or(&dl.dir));
+    let reuse = build_reuse_index(&dl.reuse_root);
     for (meta, dest, present) in plan {
         let idx = dl.files.len();
         dl.total += meta.size;
+        let tmp = dest.with_file_name(format!(
+            ".reamesh-part-{}",
+            dest.file_name().unwrap_or_default().to_string_lossy()
+        ));
 
         // Or an identical copy elsewhere under the staging root (another
         // session's download of the same project)?
@@ -7295,14 +7662,17 @@ fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()
                         })
                     })
                     .map(|src| {
+                        let to = if staged { &tmp } else { &dest };
                         dest.parent().map(fs::create_dir_all).transpose().is_ok()
-                            && fs::copy(src, &dest).is_ok()
+                            && fs::copy(src, to).is_ok()
                     })
                     .unwrap_or(false));
         let media = is_media_path(&meta.path);
         if reused {
             dl.done += meta.size;
-            dl.files.push(FileDl { meta, tmp: dest.clone(), dest, file: None, remaining: 0, tries: 0, owner_only: false, complete: true, media });
+            // A copy for a linked folder still has to take its place.
+            let tmp = if staged && !present { tmp } else { dest.clone() };
+            dl.files.push(FileDl { meta, tmp, dest, file: None, remaining: 0, tries: 0, owner_only: false, complete: true, media });
             continue;
         }
 
@@ -7310,10 +7680,6 @@ fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = dest.with_file_name(format!(
-            ".reamesh-part-{}",
-            dest.file_name().unwrap_or_default().to_string_lossy()
-        ));
         let f = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -7325,7 +7691,9 @@ fn download_build(dl: &mut Download, files: Vec<FileMeta>) -> std::io::Result<()
         let remaining = pieces.len() as u64;
         if remaining == 0 {
             drop(f); // empty file: complete immediately
-            fs::rename(&tmp, &dest)?;
+            if !staged {
+                fs::rename(&tmp, &dest)?;
+            }
             dl.files.push(FileDl { meta, tmp, dest, file: None, remaining: 0, tries: 0, owner_only: false, complete: true, media });
             continue;
         }
@@ -7455,7 +7823,11 @@ mod transfer_safety_tests {
         Download {
             owner: PeerId::random(),
             session_id: "sid".into(),
+            session_name: "Song".into(),
+            reuse_root: dir.parent().unwrap_or(&dir).to_path_buf(),
             dir,
+            dest: None,
+            link: None,
             project_file: "Song.rpp".into(),
             auth: String::new(),
             got_manifest: true,
@@ -7563,6 +7935,190 @@ mod transfer_safety_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A scratch folder holding a project file, linked to `owner`.
+    fn linked_folder(tag: &str, owner: &PeerId, body: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("reamesh-link-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Song.rpp"), body).unwrap();
+        let link = CopyLink {
+            project: "p".repeat(32),
+            owner: owner.to_string(),
+            project_file: "Song.rpp".into(),
+            name: "Song".into(),
+            hash: blake3_file(&dir.join("Song.rpp")).unwrap(),
+        };
+        write_link(&dir, &link).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_link_matches_only_project_and_host_together() {
+        let (owner, stranger) = (PeerId::random(), PeerId::random());
+        let dir = linked_folder("match", &owner, b"base");
+        let project = "p".repeat(32);
+        let base = blake3_file(&dir.join("Song.rpp")).unwrap();
+        let files = |hash: &str| vec![meta("Song.rpp", 4, hash)];
+        let check = |id: Option<&str>, who: &PeerId, overwrite: bool, hash: &str| {
+            check_dest(&dir, overwrite, id, who, "Song.rpp", &files(hash))
+        };
+        // Same as the base (an update), same as the host (nothing to do).
+        assert_eq!(check(Some(&project), &owner, false, "other"), Ok(base.clone()));
+        fs::write(dir.join("Song.rpp"), b"host").unwrap();
+        let host = blake3_file(&dir.join("Song.rpp")).unwrap();
+        assert_eq!(check(Some(&project), &owner, false, &host), Ok(base.clone()));
+        // Neither: a local edit. Overwriting is the only way past that.
+        assert_eq!(check(Some(&project), &owner, false, "other"), Err(LOCAL_CHANGED_MESSAGE.into()));
+        assert_eq!(check(Some(&project), &owner, true, "other"), Ok(base.clone()));
+        // Another host with a copied id, or another project: overwriting or not.
+        for overwrite in [false, true] {
+            assert_eq!(check(Some(&project), &stranger, overwrite, &host), Err(LINK_FOREIGN_MESSAGE.into()));
+            assert_eq!(check(Some("q"), &owner, overwrite, &host), Err(LINK_FOREIGN_MESSAGE.into()));
+            assert_eq!(check(None, &owner, overwrite, &host), Err(LINK_FOREIGN_MESSAGE.into()));
+        }
+        // A relative path means nothing to a user's folder.
+        let relative = check_dest(Path::new("Song"), false, Some(&project), &owner, "Song.rpp", &files(&host));
+        assert_eq!(relative, Err(LINK_MISSING_MESSAGE.into()));
+        assert_eq!(
+            project_id_of(r#"{"project":"0123456789abcdef0123456789abcdef"}"#).as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        for bad in ["", "{}", r#"{"project":"short"}"#, r#"{"project":"0123456789ABCDEF0123456789ABCDEF"}"#, r#"{"project":7}"#] {
+            assert_eq!(project_id_of(bad), None, "{bad}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hidden_folders_stay_out_of_every_manifest() {
+        let root = std::env::temp_dir().join(format!("reamesh-hidden-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".reamesh-backup/170/Audio")).unwrap();
+        fs::create_dir_all(root.join("Audio")).unwrap();
+        fs::write(root.join(".reamesh-backup/170/Audio/old.wav"), b"old").unwrap();
+        fs::write(root.join(".reamesh-link.json"), b"{}").unwrap();
+        fs::write(root.join("Audio/new.wav"), b"new").unwrap();
+        let listed: Vec<String> = build_manifest(&root).unwrap().into_iter().map(|f| f.path).collect();
+        assert_eq!(listed, ["Audio/new.wav"]);
+        for hidden in [".reamesh-backup/170/Audio/old.wav", "Audio/.x/old.wav", ".reamesh-link.json"] {
+            assert!(hidden.split('/').any(skip_in_manifest), "{hidden}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_host_cannot_write_a_copys_link_or_backups() {
+        let root = std::env::temp_dir().join(format!("reamesh-plant-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("Song-0123456789abcdef");
+        fs::create_dir_all(&dir).unwrap();
+        let mut dl = test_download(dir);
+        download_build(
+            &mut dl,
+            vec![
+                meta(".reamesh-link.json", 2, "a"),
+                meta(".reamesh-backup/1/x.wav", 2, "b"),
+                meta("Audio/.hidden/x.wav", 2, "c"),
+                meta("Song.rpp", 2, "d"),
+            ],
+        )
+        .unwrap();
+        let planned: Vec<&str> = dl.files.iter().map(|f| f.meta.path.as_str()).collect();
+        assert_eq!(planned, ["Song.rpp"]);
+        download_cleanup(&mut Some(dl));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A finished download of `Song.rpp` and `Audio/a.wav` over an older copy of
+    /// both, waiting under temp names.
+    fn finished_download(tag: &str, overwrite: bool) -> Download {
+        let owner = PeerId::random();
+        let dir = linked_folder(tag, &owner, b"old project");
+        fs::create_dir_all(dir.join("Audio")).unwrap();
+        fs::write(dir.join("Audio/a.wav"), b"old a").unwrap();
+        let base = blake3_file(&dir.join("Song.rpp")).unwrap();
+        let mut dl = test_download(dir.clone());
+        dl.dest = Some(DestJoin { overwrite, base });
+        for (path, body) in [("Audio/a.wav", &b"new a"[..]), ("Song.rpp", &b"new project"[..])] {
+            let dest = dir.join(path);
+            let name = dest.file_name().unwrap().to_string_lossy().into_owned();
+            let tmp = dest.with_file_name(format!(".reamesh-part-{name}"));
+            fs::write(&tmp, body).unwrap();
+            dl.files.push(FileDl {
+                meta: meta(path, body.len() as u64, "h"),
+                tmp,
+                dest,
+                file: None,
+                remaining: 0,
+                tries: 0,
+                owner_only: false,
+                complete: true,
+                media: false,
+            });
+        }
+        dl
+    }
+
+    fn backup_roots(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir.join(BACKUP_DIR)).map(|rd| rd.map(|e| e.unwrap().path()).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn committing_a_plain_update_backs_up_all_but_the_project_file() {
+        let dl = finished_download("commit-plain", false);
+        commit_dest(&dl, dl.dest.as_ref().unwrap()).unwrap();
+        assert_eq!(fs::read(dl.dir.join("Song.rpp")).unwrap(), b"new project");
+        assert_eq!(fs::read(dl.dir.join("Audio/a.wav")).unwrap(), b"new a");
+        let roots = backup_roots(&dl.dir);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(fs::read(roots[0].join("Audio/a.wav")).unwrap(), b"old a");
+        assert!(!roots[0].join("Song.rpp").exists());
+        let _ = fs::remove_dir_all(&dl.dir);
+    }
+
+    #[test]
+    fn committing_an_overwrite_backs_up_everything() {
+        let dl = finished_download("commit-overwrite", true);
+        commit_dest(&dl, dl.dest.as_ref().unwrap()).unwrap();
+        assert_eq!(fs::read(dl.dir.join("Song.rpp")).unwrap(), b"new project");
+        let roots = backup_roots(&dl.dir);
+        assert_eq!(fs::read(roots[0].join("Song.rpp")).unwrap(), b"old project");
+        assert_eq!(fs::read(roots[0].join("Audio/a.wav")).unwrap(), b"old a");
+        let _ = fs::remove_dir_all(&dl.dir);
+    }
+
+    #[test]
+    fn a_save_during_the_download_stops_the_update() {
+        let dl = finished_download("commit-saved", false);
+        fs::write(dl.dir.join("Song.rpp"), b"saved in REAPER meanwhile").unwrap();
+        let err = commit_dest(&dl, dl.dest.as_ref().unwrap()).unwrap_err();
+        assert_eq!(err, LOCAL_CHANGED_MESSAGE);
+        assert_eq!(fs::read(dl.dir.join("Song.rpp")).unwrap(), b"saved in REAPER meanwhile");
+        assert_eq!(fs::read(dl.dir.join("Audio/a.wav")).unwrap(), b"old a");
+        assert!(backup_roots(&dl.dir).is_empty());
+        let _ = fs::remove_dir_all(&dl.dir);
+    }
+
+    /// The project file goes last, so everything before it has to come back when
+    /// it can't land.
+    #[cfg(windows)]
+    #[test]
+    fn a_commit_that_fails_puts_every_old_file_back() {
+        use std::os::windows::fs::OpenOptionsExt;
+        for overwrite in [false, true] {
+            let dl = finished_download(if overwrite { "commit-busy-o" } else { "commit-busy-p" }, overwrite);
+            let held = fs::OpenOptions::new().read(true).share_mode(1).open(dl.dir.join("Song.rpp")).unwrap();
+            let err = commit_dest(&dl, dl.dest.as_ref().unwrap()).unwrap_err();
+            assert!(err.starts_with(LINK_BUSY_MESSAGE) && err.ends_with("Song.rpp"), "{err}");
+            drop(held);
+            assert_eq!(fs::read(dl.dir.join("Song.rpp")).unwrap(), b"old project");
+            assert_eq!(fs::read(dl.dir.join("Audio/a.wav")).unwrap(), b"old a");
+            assert_eq!(fs::read(dl.dir.join("Audio/.reamesh-part-a.wav")).unwrap(), b"new a", "back under its temp name");
+            assert!(backup_roots(&dl.dir).is_empty(), "no empty backup left behind");
+            let _ = fs::remove_dir_all(&dl.dir);
+        }
+    }
+
     #[test]
     fn serving_refuses_hidden_special_and_escaping_files() {
         let root = std::env::temp_dir().join(format!("reamesh-serve-{}", std::process::id()));
@@ -7571,6 +8127,9 @@ mod transfer_safety_tests {
         fs::create_dir_all(root.join("outside")).unwrap();
         fs::write(dir.join("Audio/a.wav"), b"audio").unwrap();
         fs::write(dir.join(".hidden.wav"), b"x").unwrap();
+        fs::write(dir.join(".reamesh-link.json"), b"{}").unwrap();
+        fs::create_dir_all(dir.join(".reamesh-backup/170")).unwrap();
+        fs::write(dir.join(".reamesh-backup/170/a.wav"), b"old").unwrap();
         fs::write(dir.join("Audio/a.wav.reapeaks"), b"x").unwrap();
         fs::write(root.join("outside/secret.wav"), b"secret").unwrap();
         #[cfg(unix)]
@@ -7618,6 +8177,8 @@ mod transfer_safety_tests {
         assert!(refused(ask("Audio/a.wav", ServeScope::No)));
         assert!(refused(ask(".hidden.wav", ServeScope::Listed)));
         assert!(refused(ask("Audio/a.wav.reapeaks", ServeScope::Listed)));
+        assert!(refused(ask(".reamesh-link.json", ServeScope::Listed)), "a copy's own record");
+        assert!(refused(ask(".reamesh-backup/170/a.wav", ServeScope::Listed)), "what a join replaced");
         assert!(refused(ask("Audio", ServeScope::Listed)), "a folder is not a file");
         #[cfg(unix)]
         {
@@ -7682,6 +8243,21 @@ fn download_fail(download: &mut Option<Download>, shared: &Shared, msg: String) 
 
 fn download_finalize(shared: &Shared, download: &mut Option<Download>) {
     let Some(dl) = download.as_ref() else { return };
+    if let Some(dest) = &dl.dest {
+        if let Err(message) = commit_dest(dl, dest) {
+            return download_fail(download, shared, message);
+        }
+        // The project file is in place: only now does the link move on.
+        if let Some(link) = &dl.link {
+            let mut link = link.clone();
+            if link.hash.is_empty() {
+                link.hash = blake3_file(&dl.dir.join(&dl.project_file)).unwrap_or_default();
+            }
+            if let Err(e) = write_link(&dl.dir, &link) {
+                eprintln!("[reamesh] couldn't update {LINK_FILE}: {e}");
+            }
+        }
+    }
     let path = dl.dir.join(&dl.project_file);
     eprintln!("[reamesh] download complete: {}", path.display());
     // This copy is now what we serve to (and fetch from) other peers.
@@ -7764,7 +8340,11 @@ fn release_media(dl: &mut Download) {
         }
     }
     dl.media_released = true;
-    let order = fs::read_to_string(dl.dir.join(&dl.project_file))
+    // In a linked folder the new project file is still under its temp name.
+    let project_path = project_idx
+        .filter(|_| dl.dest.is_some())
+        .map_or_else(|| dl.dir.join(&dl.project_file), |i| dl.files[i].tmp.clone());
+    let order = fs::read_to_string(project_path)
         .map(|t| media_order_from_rpp(&t))
         .unwrap_or_default();
     let mut media = std::mem::take(&mut dl.media);
@@ -7788,7 +8368,9 @@ fn download_idle(dl: &Download) -> bool {
 /// is in place. Idempotent.
 fn download_progress_check(shared: &Shared, dl: &mut Download) {
     release_media(dl);
-    if dl.early_ready || !dl.media_released {
+    // A linked folder takes its new files together, at the end: nothing to open
+    // early, and the old project stays usable meanwhile.
+    if dl.early_ready || !dl.media_released || dl.dest.is_some() {
         return;
     }
     let small_done = dl.files.iter().all(|f| f.media || f.complete);
@@ -7869,26 +8451,58 @@ fn handle_download_manifest(
                 if dl.got_manifest {
                     return; // duplicate (a retry raced the response)
                 }
-                // Remember what the host *claimed* the project loads; the
-                // extension checks the received .rpp against this before
-                // Main_openProject (a dishonest list must not survive).
-                *shared.session_meta.lock().unwrap() = meta;
                 // The owner-supplied project file name is later joined onto the
                 // staging dir and handed to Main_openProject; validate it like
                 // every other manifest path so a malicious owner can't point the
                 // open outside the staging directory.
-                if safe_relative_path(&project_file).is_none() {
+                if safe_relative_path(&project_file).is_none() || project_file.split('/').any(skip_in_manifest) {
                     return download_fail(
                         download,
                         shared,
                         format!("unsafe project file in manifest: {project_file}"),
                     );
                 }
+                let project = project_id_of(&meta);
+                if let Some(dest) = dl.dest.as_mut() {
+                    match check_dest(&dl.dir, dest.overwrite, project.as_deref(), &dl.owner, &project_file, &files) {
+                        Ok(base) => dest.base = base,
+                        Err(message) => return download_fail(download, shared, message),
+                    }
+                    // Still hashing (it has just started hosting): ask again.
+                    // `download_tick` does, while `manifest_req` is empty.
+                    if files.iter().any(|f| f.hash.is_empty()) && dl.started.elapsed() < DEST_HASH_WAIT {
+                        return;
+                    }
+                }
+                // Remember what the host *claimed* the project loads; the
+                // extension checks the received .rpp against this before
+                // Main_openProject (a dishonest list must not survive).
+                *shared.session_meta.lock().unwrap() = meta;
                 if let Err(e) = fs::create_dir_all(&dl.dir) {
                     return download_fail(download, shared, format!("create staging dir: {e}"));
                 }
                 dl.got_manifest = true;
                 dl.last_progress = Instant::now();
+                dl.link = project.map(|project| CopyLink {
+                    project,
+                    owner: dl.owner.to_string(),
+                    project_file: project_file.clone(),
+                    name: dl.session_name.clone(),
+                    hash: files
+                        .iter()
+                        .find(|f| f.path == project_file)
+                        .map(|f| f.hash.clone())
+                        .unwrap_or_default(),
+                });
+                // A staging folder gets its link now. A linked folder keeps the
+                // one it has until the new project file is in place, so a broken
+                // off update still reads as an update.
+                if dl.dest.is_none()
+                    && let Some(link) = &dl.link
+                    && let Err(e) = write_link(&dl.dir, link)
+                {
+                    eprintln!("[reamesh] couldn't write {LINK_FILE}: {e}");
+                }
                 dl.project_file = project_file;
                 if let Err(e) = download_build(dl, files) {
                     return download_fail(download, shared, e.to_string());
@@ -8017,11 +8631,12 @@ fn handle_download_piece(
     });
 
     if dl.files[piece.file].remaining == 0 {
+        let staged = dl.dest.is_some();
         let fd = &mut dl.files[piece.file];
         fd.file = None; // close before verifying/renaming
         if fd.meta.hash.is_empty() {
             // No hash to check (host was still hashing when we joined).
-            if let Err(e) = fs::rename(&fd.tmp, &fd.dest) {
+            if !staged && let Err(e) = fs::rename(&fd.tmp, &fd.dest) {
                 let dest = fd.dest.display().to_string();
                 return download_fail(download, shared, format!("finalize {dest}: {e}"));
             }
@@ -8073,9 +8688,10 @@ fn handle_verify_result(
         return;
     };
     dl.verifying -= 1;
+    let staged = dl.dest.is_some();
     let fd = &mut dl.files[idx];
     if ok {
-        if let Err(e) = fs::rename(&fd.tmp, &fd.dest) {
+        if !staged && let Err(e) = fs::rename(&fd.tmp, &fd.dest) {
             let dest = fd.dest.display().to_string();
             return download_fail(download, shared, format!("finalize {dest}: {e}"));
         }
@@ -8401,6 +9017,31 @@ pub extern "C" fn reamesh_join_ticket(
     let r = unsafe { &*handle };
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.join_ticket(&t, &pass)))
         .unwrap_or(false)
+}
+
+/// Have the next join on this handle go into `dest`, a folder holding a linked
+/// copy of the project (null/empty = a staging folder, as usual). Without
+/// `overwrite` the join is refused when the copy changed locally; with it, what
+/// the join replaces is moved to `.reamesh-backup` inside that folder.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_set_join_dest(handle: *mut Reamesh, dest: *const c_char, overwrite: bool) {
+    if handle.is_null() {
+        return;
+    }
+    let dest = cstr_arg(dest).unwrap_or_default();
+    let r = unsafe { &*handle };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.set_join_dest(&dest, overwrite)));
+}
+
+/// The session is over and the project file on disk holds what it ended with:
+/// record that in the copy's link, if it has one.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_note_local_project(handle: *mut Reamesh) {
+    if handle.is_null() {
+        return;
+    }
+    let r = unsafe { &*handle };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.note_local_project()));
 }
 
 /// Dial a nearby host from an address hint (see `Reamesh::dial_hint`).

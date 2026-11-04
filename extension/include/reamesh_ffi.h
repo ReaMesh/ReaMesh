@@ -98,6 +98,20 @@ char *reamesh_session_ticket(struct ReameshHandle *handle);
 bool reamesh_join_ticket(struct ReameshHandle *handle, const char *ticket, const char *passphrase);
 
 /**
+ * Have the next join on this handle go into `dest`, a folder holding a linked
+ * copy of the project (null/empty = a staging folder, as usual). Without
+ * `overwrite` the join is refused when the copy changed locally; with it, what
+ * the join replaces is moved to `.reamesh-backup` inside that folder.
+ */
+void reamesh_set_join_dest(struct ReameshHandle *handle, const char *dest, bool overwrite);
+
+/**
+ * The session is over and the project file on disk holds what it ended with:
+ * record that in the copy's link, if it has one.
+ */
+void reamesh_note_local_project(struct ReameshHandle *handle);
+
+/**
  * Dial a nearby host from an address hint (see `Reamesh::dial_hint`).
  */
 bool reamesh_dial_hint(struct ReameshHandle *handle, const char *json);

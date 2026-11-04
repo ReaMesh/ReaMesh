@@ -1807,3 +1807,494 @@ fn large_field_syncs_compressed() {
 fn large_field_syncs_compressed_sealed() {
     big_field_round_trip("bigfield-sealed", "hunter2");
 }
+
+// ---------- linked copies ----------
+
+const PROJECT_ID: &str = "0123456789abcdef0123456789abcdef";
+const LINK_FILE: &str = ".reamesh-link.json";
+const BACKUP_DIR: &str = ".reamesh-backup";
+
+fn blake3_of(path: &Path) -> String {
+    blake3::hash(&fs::read(path).unwrap()).to_hex().to_string()
+}
+
+fn status_of(peer: &Reamesh) -> Value {
+    serde_json::from_str(&peer.status_json()).unwrap()
+}
+
+/// Hosts `project` with the lasting project id its meta carries.
+fn host_linked(project: &Path) -> Box<Reamesh> {
+    let owner = host("linked", project.to_str().unwrap(), "Song.rpp", "").expect("host failed");
+    owner.set_session_meta(&format!(r#"{{"v":1,"project":"{PROJECT_ID}"}}"#));
+    owner
+}
+
+/// A fresh client that sees `owner`'s session. Returns the session id too.
+fn discover(owner: &Reamesh, staging: &Path) -> (Box<Reamesh>, String) {
+    let client = join(staging.to_str().unwrap()).expect("join failed");
+    let sid = session_id_of(owner);
+    let found = wait_until(Duration::from_secs(20), || {
+        interconnect(owner, &client);
+        client.sessions_json().contains(&sid)
+    });
+    assert!(found, "client never saw the session announcement");
+    (client, sid)
+}
+
+/// Waits for a join to end one way or the other, and returns the final status.
+fn join_outcome(client: &Reamesh) -> Value {
+    let mut last = Value::Null;
+    let ended = wait_until(Duration::from_secs(40), || {
+        last = status_of(client);
+        last["state"] == "ready" || last["state"] == "failed"
+    });
+    assert!(ended, "join never ended: {last}");
+    last
+}
+
+/// Everything in a folder, dotfiles included, as (relative path, bytes).
+fn snapshot_tree(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            } else {
+                let rel = e.path().strip_prefix(dir).unwrap().to_string_lossy().replace('\\', "/");
+                out.push((rel, fs::read(e.path()).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for (rel, bytes) in snapshot_tree(from) {
+        let target = to.join(&rel);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, bytes).unwrap();
+    }
+}
+
+fn session_owner(client: &Reamesh, sid: &str) -> String {
+    let sessions: Value = serde_json::from_str(&client.sessions_json()).unwrap();
+    sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session_id"] == sid)
+        .map(|s| s["owner"].as_str().unwrap().to_string())
+        .unwrap()
+}
+
+/// A real first join into a staging folder and its "save as": the host's project,
+/// a folder the guest owns with a copy of it, and the guest's own things next to it.
+struct Linked {
+    project: PathBuf,
+    staging: PathBuf,
+    saved: PathBuf,
+    owner: Box<Reamesh>,
+}
+
+impl Linked {
+    fn new(tag: &str) -> Self {
+        let project = temp_dir(&format!("linked-proj-{tag}"));
+        let staging = temp_dir(&format!("linked-staging-{tag}"));
+        make_project(&project);
+        let owner = host_linked(&project);
+        let (client, sid) = discover(&owner, &staging);
+        assert!(client.join_session(&sid, ""), "join_session refused");
+        let done = join_outcome(&client);
+        assert_eq!(done["state"], "ready", "first join: {done}");
+        let dir = PathBuf::from(done["dir"].as_str().unwrap());
+
+        // Every join leaves its link, naming the project, the host and the file.
+        let link: Value = serde_json::from_slice(&fs::read(dir.join(LINK_FILE)).unwrap()).unwrap();
+        assert_eq!(link["project"], PROJECT_ID);
+        assert_eq!(link["owner"], session_owner(&client, &sid));
+        assert_eq!(link["project_file"], "Song.rpp");
+        assert_eq!(link["name"], "linked");
+        assert_eq!(link["hash"], blake3_of(&project.join("Song.rpp")), "the manifest's project hash");
+        drop(client);
+
+        let saved = temp_dir(&format!("linked-saved-{tag}")).join("Song");
+        copy_tree(&dir, &saved);
+        fs::create_dir_all(saved.join("Private")).unwrap();
+        fs::write(saved.join("Private/secret.txt"), b"mine").unwrap();
+        Linked { project, staging, saved, owner }
+    }
+
+    /// The host changes its project and a media file on disk; returns once a
+    /// manifest with the change is being served.
+    fn host_changes(&self) -> String {
+        fs::write(
+            self.project.join("Song.rpp"),
+            fs::read_to_string(self.project.join("Song.rpp")).unwrap() + "<!-- host edit -->\n",
+        )
+        .unwrap();
+        fs::write(self.project.join("Audio/kick.wav"), b"a new kick").unwrap();
+        self.served_hash(&blake3_of(&self.project.join("Song.rpp")))
+    }
+
+    fn served_hash(&self, want: &str) -> String {
+        let (probe, sid) = discover(&self.owner, &self.staging);
+        let served = wait_until(Duration::from_secs(20), || {
+            probe.check_passphrase(&sid, "");
+            std::thread::sleep(Duration::from_millis(400));
+            status_of(&probe)["probe"]["preview"]["project_hash"] == want
+        });
+        assert!(served, "the new project hash was never served: {}", status_of(&probe)["probe"]);
+        want.to_string()
+    }
+
+    fn join_dest(&self, overwrite: bool) -> (Box<Reamesh>, Value) {
+        let (client, sid) = discover(&self.owner, &self.staging);
+        client.set_join_dest(self.saved.to_str().unwrap(), overwrite);
+        assert!(client.join_session(&sid, ""), "join_session refused");
+        let done = join_outcome(&client);
+        (client, done)
+    }
+
+    fn backups(&self) -> Vec<PathBuf> {
+        match fs::read_dir(self.saved.join(BACKUP_DIR)) {
+            Ok(rd) => rd.map(|e| e.unwrap().path()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn link_hash(&self) -> String {
+        let link: Value = serde_json::from_slice(&fs::read(self.saved.join(LINK_FILE)).unwrap()).unwrap();
+        link["hash"].as_str().unwrap().to_string()
+    }
+
+    fn assert_no_temp_files(&self) {
+        for (rel, _) in snapshot_tree(&self.saved) {
+            assert!(!rel.contains(".reamesh-part-") && !rel.contains(".reamesh-moving-"), "left behind: {rel}");
+        }
+    }
+}
+
+impl Drop for Linked {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.project);
+        let _ = fs::remove_dir_all(&self.staging);
+        let _ = fs::remove_dir_all(self.saved.parent().unwrap());
+    }
+}
+
+#[test]
+fn an_update_lands_in_the_linked_folder() {
+    let t = Linked::new("update");
+    let old_kick = fs::read(t.saved.join("Audio/kick.wav")).unwrap();
+    let mine = fs::read(t.saved.join("Private/secret.txt")).unwrap();
+    let new_hash = t.host_changes();
+
+    let (client, done) = t.join_dest(false);
+    assert_eq!(done["state"], "ready", "{done}");
+    assert_eq!(PathBuf::from(done["project_path"].as_str().unwrap()), t.saved.join("Song.rpp"));
+    assert_eq!(blake3_of(&t.saved.join("Song.rpp")), new_hash);
+    assert_eq!(fs::read(t.saved.join("Audio/kick.wav")).unwrap(), b"a new kick");
+    assert_eq!(t.link_hash(), new_hash, "the link moved on with the project file");
+
+    // The project file was what the session already knew; a wav can't be told
+    // from a host's change, so it is kept. The user's own things stay put.
+    let backups = t.backups();
+    assert_eq!(backups.len(), 1, "one backup folder");
+    assert_eq!(fs::read(backups[0].join("Audio/kick.wav")).unwrap(), old_kick);
+    assert!(!backups[0].join("Song.rpp").exists(), "a plain update backs up no project file");
+    assert_eq!(fs::read(t.saved.join("Private/secret.txt")).unwrap(), mine);
+    t.assert_no_temp_files();
+
+    // The session has ended and the copy on disk holds its last state: that is
+    // the base from now on.
+    fs::write(t.saved.join("Song.rpp"), b"<REAPER_PROJECT session end\n>\n").unwrap();
+    client.note_local_project();
+    assert_eq!(t.link_hash(), blake3_of(&t.saved.join("Song.rpp")));
+    drop(client);
+
+    // Host and copy agree on the media: nothing is replaced but the project file,
+    // again without a backup.
+    let (client, done) = t.join_dest(false);
+    assert_eq!(done["state"], "ready", "{done}");
+    assert_eq!(blake3_of(&t.saved.join("Song.rpp")), new_hash);
+    assert_eq!(t.backups().len(), 1, "no new backup");
+    drop(client);
+
+    // Same state on both sides: nothing at all happens.
+    let before = snapshot_tree(&t.saved);
+    let (client, done) = t.join_dest(false);
+    assert_eq!(done["state"], "ready", "{done}");
+    assert_eq!(snapshot_tree(&t.saved), before);
+    drop(client);
+}
+
+#[test]
+fn a_changed_copy_is_refused_and_keeps_every_byte() {
+    let t = Linked::new("refused");
+    t.host_changes();
+    fs::write(t.saved.join("Song.rpp"), b"<REAPER_PROJECT my own edit\n>\n").unwrap();
+    let before = snapshot_tree(&t.saved);
+
+    let (client, done) = t.join_dest(false);
+    assert_eq!(done["state"], "failed", "{done}");
+    assert!(done["message"].as_str().unwrap().contains("your copy of the project has changed"), "{done}");
+    drop(client);
+    assert_eq!(snapshot_tree(&t.saved), before, "nothing was written");
+
+    // A project file that isn't there matches nothing either.
+    fs::rename(t.saved.join("Song.rpp"), t.saved.join("Elsewhere.rpp")).unwrap();
+    let before = snapshot_tree(&t.saved);
+    let (client, done) = t.join_dest(false);
+    assert_eq!(done["state"], "failed", "{done}");
+    drop(client);
+    assert_eq!(snapshot_tree(&t.saved), before, "nothing was written");
+}
+
+#[test]
+fn overwriting_keeps_everything_it_replaces() {
+    let t = Linked::new("overwrite");
+    let old_kick = fs::read(t.saved.join("Audio/kick.wav")).unwrap();
+    let new_hash = t.host_changes();
+    let mine = b"<REAPER_PROJECT my own edit\n>\n";
+    fs::write(t.saved.join("Song.rpp"), mine).unwrap();
+    fs::write(t.saved.join("notes.txt"), b"my notes").unwrap();
+    fs::write(t.saved.join("no-longer-listed.wav"), b"stays").unwrap();
+
+    let (client, done) = t.join_dest(true);
+    assert_eq!(done["state"], "ready", "{done}");
+    assert_eq!(blake3_of(&t.saved.join("Song.rpp")), new_hash);
+    assert_eq!(fs::read(t.saved.join("Audio/kick.wav")).unwrap(), b"a new kick");
+    assert_eq!(fs::read(t.saved.join("notes.txt")).unwrap(), b"", "the host's (empty) notes");
+    assert_eq!(t.link_hash(), new_hash);
+
+    let backups = t.backups();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(fs::read(backups[0].join("Song.rpp")).unwrap(), mine);
+    assert_eq!(fs::read(backups[0].join("Audio/kick.wav")).unwrap(), old_kick);
+    assert_eq!(fs::read(backups[0].join("notes.txt")).unwrap(), b"my notes");
+    assert_eq!(fs::read(t.saved.join("no-longer-listed.wav")).unwrap(), b"stays", "nothing is deleted");
+    t.assert_no_temp_files();
+    drop(client);
+}
+
+#[test]
+fn a_folder_that_is_not_this_copy_is_refused() {
+    let t = Linked::new("foreign");
+    let link: Value = serde_json::from_slice(&fs::read(t.saved.join(LINK_FILE)).unwrap()).unwrap();
+
+    // Another host's copy of a project with the very same id, and another project
+    // of this host: anyone can copy an id, nobody can take a peer id.
+    for (key, value) in [("owner", "12D3KooWSomeoneElse"), ("project", "ffffffffffffffffffffffffffffffff")] {
+        let mut other = link.clone();
+        other[key] = Value::from(value);
+        fs::write(t.saved.join(LINK_FILE), other.to_string()).unwrap();
+        let before = snapshot_tree(&t.saved);
+        for overwrite in [false, true] {
+            let (client, done) = t.join_dest(overwrite);
+            assert_eq!(done["state"], "failed", "{key}: {done}");
+            assert!(done["message"].as_str().unwrap().contains("holds something else"), "{done}");
+            drop(client);
+            assert_eq!(snapshot_tree(&t.saved), before, "{key}: nothing was written");
+        }
+    }
+
+    // No link at all.
+    fs::remove_file(t.saved.join(LINK_FILE)).unwrap();
+    let before = snapshot_tree(&t.saved);
+    let (client, done) = t.join_dest(false);
+    assert_eq!(done["state"], "failed", "{done}");
+    assert!(done["message"].as_str().unwrap().contains("holds something else"), "{done}");
+    drop(client);
+    assert_eq!(snapshot_tree(&t.saved), before);
+
+    // No folder at all (an unplugged drive): it isn't made up on the spot.
+    let gone = t.saved.parent().unwrap().join("gone");
+    let (client, sid) = discover(&t.owner, &t.staging);
+    client.set_join_dest(gone.to_str().unwrap(), false);
+    assert!(client.join_session(&sid, ""));
+    let done = join_outcome(&client);
+    assert_eq!(done["state"], "failed", "{done}");
+    assert!(done["message"].as_str().unwrap().contains("linked folder not found"), "{done}");
+    assert!(!gone.exists(), "a user's folder is never recreated");
+    drop(client);
+
+    // Without a dest the join is the plain one, into the staging root.
+    let (client, sid) = discover(&t.owner, &t.staging);
+    client.set_join_dest(gone.to_str().unwrap(), false);
+    client.set_join_dest("", false);
+    assert!(client.join_session(&sid, ""));
+    let done = join_outcome(&client);
+    assert_eq!(done["state"], "ready", "{done}");
+    assert!(PathBuf::from(done["dir"].as_str().unwrap()).starts_with(&t.staging));
+    drop(client);
+}
+
+/// Windows won't move a file another program holds without delete sharing, which
+/// is how REAPER holds the media of the project it has open.
+#[cfg(windows)]
+#[test]
+fn a_file_in_use_fails_the_join_with_every_old_file_in_place() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let t = Linked::new("busy");
+    t.host_changes();
+    let before = snapshot_tree(&t.saved);
+    let held = fs::OpenOptions::new().read(true).share_mode(1).open(t.saved.join("Audio/kick.wav")).unwrap();
+
+    let (client, done) = t.join_dest(false);
+    assert_eq!(done["state"], "failed", "{done}");
+    let message = done["message"].as_str().unwrap();
+    assert!(message.contains("a file of your copy is in use") && message.contains("kick.wav"), "{done}");
+    drop(client);
+    drop(held);
+    assert_eq!(snapshot_tree(&t.saved), before, "nothing moved");
+
+    // Free again, the same join goes through.
+    let (client, done) = t.join_dest(false);
+    assert_eq!(done["state"], "ready", "{done}");
+    assert_eq!(fs::read(t.saved.join("Audio/kick.wav")).unwrap(), b"a new kick");
+    drop(client);
+}
+
+#[test]
+fn an_update_that_breaks_off_leaves_the_copy_as_it_was() {
+    let t = Linked::new("interrupted");
+    let f = fs::File::create(t.project.join("Audio/kick.wav")).unwrap();
+    f.set_len(512 << 20).unwrap();
+    drop(f);
+    fs::write(
+        t.project.join("Song.rpp"),
+        fs::read_to_string(t.project.join("Song.rpp")).unwrap() + "<!-- big -->\n",
+    )
+    .unwrap();
+    t.served_hash(&blake3_of(&t.project.join("Song.rpp")));
+    let before = snapshot_tree(&t.saved);
+
+    let (client, sid) = discover(&t.owner, &t.staging);
+    client.set_join_dest(t.saved.to_str().unwrap(), false);
+    assert!(client.join_session(&sid, ""));
+    let started = wait_until(Duration::from_secs(20), || {
+        let s = status_of(&client);
+        s["state"] == "downloading" && s["done_bytes"].as_u64().unwrap_or(0) > 0
+    });
+    assert!(started, "never started: {}", status_of(&client));
+    assert_ne!(status_of(&client)["state"], "ready");
+    drop(client);
+    assert_eq!(snapshot_tree(&t.saved), before, "the old project stays whole, its link too");
+}
+
+#[test]
+fn a_linked_folder_serves_the_session_and_nothing_else_of_the_users() {
+    let t = Linked::new("serving");
+    let (client, done) = t.join_dest(false);
+    assert_eq!(done["state"], "ready", "{done}");
+    assert!(wait_until(Duration::from_secs(15), || t.owner.connected_peers() >= 1), "no mesh");
+    // The owner only asks peers whose beacon it has verified.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let tries = |path: &str| {
+        let target = t.project.join(path);
+        wait_until(Duration::from_secs(4), || {
+            t.owner.fetch_file(path);
+            target.exists()
+        })
+    };
+
+    // A session member naming a file in a live item doesn't open it up, not even
+    // once the user touches that item: only what the user brought in does.
+    t.owner.push_local(
+        r#"{"items":{"{SNOOP}":{"present":true,"track":"{T1}","chunk":"<ITEM\n  <SOURCE WAVE\n    FILE \"Private/secret.txt\"\n  >\n>\n"}}}"#,
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    let _ = client.drain_remote();
+    assert!(!tries("Private/secret.txt"), "a file of the user's was served for an item naming it");
+    std::thread::sleep(Duration::from_secs(3));
+    client.push_local(
+        r#"{"items":{"{SNOOP}":{"present":true,"track":"{T1}","chunk":"<ITEM\n  POSITION 1\n  <SOURCE WAVE\n    FILE \"Private/secret.txt\"\n  >\n>\n"}}}"#,
+    );
+    assert!(!tries("Private/secret.txt"), "touching an item opened up what it names");
+
+    // What the guest itself puts on the timeline is served, like from any copy.
+    let vox: Vec<u8> = (0..123_456).map(|i| (i % 13) as u8).collect();
+    fs::write(t.saved.join("Audio/vox.wav"), &vox).unwrap();
+    assert!(!tries("Audio/vox.wav"), "not before it is on the timeline");
+    client.push_local(
+        r#"{"items":{"{VOX}":{"present":true,"track":"{T1}","chunk":"<ITEM\n  <SOURCE WAVE\n    FILE \"Audio/vox.wav\"\n  >\n>\n"}}}"#,
+    );
+    let fetched = wait_until(Duration::from_secs(20), || {
+        t.owner.fetch_file("Audio/vox.wav");
+        t.project.join("Audio/vox.wav").exists()
+    });
+    assert!(fetched, "the owner never got the guest's recording");
+    assert_eq!(fs::read(t.project.join("Audio/vox.wav")).unwrap(), vox);
+    drop(client);
+}
+
+/// The same way into a linked folder through an invite link, which reaches
+/// `start_join` only once the host's announce has come in.
+#[test]
+fn an_invite_link_goes_into_the_linked_folder() {
+    let t = Linked::new("ticket");
+    let new_hash = t.host_changes();
+    let mut ticket = String::new();
+    assert!(wait_until(Duration::from_secs(10), || {
+        ticket = t.owner.session_ticket();
+        !ticket.is_empty()
+    }));
+    let client = join(t.staging.to_str().unwrap()).expect("join failed");
+    client.set_join_dest(t.saved.to_str().unwrap(), false);
+    assert!(client.join_ticket(&ticket, ""));
+    let done = join_outcome(&client);
+    assert_eq!(done["state"], "ready", "{done}");
+    assert_eq!(PathBuf::from(done["dir"].as_str().unwrap()), t.saved);
+    assert_eq!(blake3_of(&t.saved.join("Song.rpp")), new_hash);
+    drop(client);
+}
+
+/// A join that comes in while the host's first hashing pass runs waits for it,
+/// instead of replacing (and backing up) every file it can't compare yet.
+#[test]
+fn a_join_into_a_linked_folder_waits_for_the_hosts_hashes() {
+    let project = temp_dir("linked-hashing");
+    let staging = temp_dir("linked-hashing-staging");
+    let saved = temp_dir("linked-hashing-saved");
+    make_project(&project);
+    let big = |dir: &Path| {
+        let f = fs::File::create(dir.join("Audio/big.wav")).unwrap();
+        f.set_len(512 << 20).unwrap();
+    };
+    big(&project);
+    fs::write(
+        project.join("Song.rpp"),
+        fs::read_to_string(project.join("Song.rpp")).unwrap() + "<!-- Audio/big.wav -->\n",
+    )
+    .unwrap();
+    fs::create_dir_all(saved.join("Audio")).unwrap();
+    big(&saved);
+    fs::copy(project.join("Song.rpp"), saved.join("Song.rpp")).unwrap();
+    fs::copy(project.join("Audio/kick.wav"), saved.join("Audio/kick.wav")).unwrap();
+
+    let owner = host_linked(&project);
+    let (client, sid) = discover(&owner, &staging);
+    let link = serde_json::json!({
+        "project": PROJECT_ID,
+        "owner": session_owner(&client, &sid),
+        "project_file": "Song.rpp",
+        "name": "linked",
+        "hash": blake3_of(&saved.join("Song.rpp")),
+    });
+    fs::write(saved.join(LINK_FILE), link.to_string()).unwrap();
+    client.set_join_dest(saved.to_str().unwrap(), false);
+    assert!(client.join_session(&sid, ""));
+    let done = join_outcome(&client);
+    assert_eq!(done["state"], "ready", "{done}");
+    assert!(!saved.join(BACKUP_DIR).exists(), "the same files were replaced anyway");
+    drop(client);
+    drop(owner);
+    let _ = fs::remove_dir_all(project);
+    let _ = fs::remove_dir_all(staging);
+    let _ = fs::remove_dir_all(saved);
+}

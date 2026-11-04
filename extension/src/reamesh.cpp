@@ -66,6 +66,10 @@
 #define REAPERAPI_WANT_Main_OnCommand
 #define REAPERAPI_WANT_EnumProjects
 #define REAPERAPI_WANT_Main_SaveProject
+// A hosted project's lasting id, and a linked copy with unsaved edits.
+#define REAPERAPI_WANT_GetProjExtState
+#define REAPERAPI_WANT_SetProjExtState
+#define REAPERAPI_WANT_IsProjectDirty
 #define REAPERAPI_WANT_Main_openProject
 #define REAPERAPI_WANT_GetResourcePath
 #define REAPERAPI_WANT_GetSetObjectState
@@ -206,6 +210,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <set>
 #include <string>
 #include <string_view>
@@ -621,6 +626,12 @@ struct LastSession {
   // sessions). A ticket host is usually NOT on this LAN, so waiting for its
   // lobby announce would wait forever: the rejoin re-dials the ticket instead.
   std::string ticket;
+  // The linked folder the session was joined into ("" = a staging folder). A way
+  // back never overwrites: the core refuses it when the copy has changed since,
+  // and only the trust dialog can ask about that.
+  std::string dest;
+  // The core refused that folder, and would again: only the dialog can go on.
+  bool refused = false;
 };
 static std::optional<LastSession> g_lastSession;
 
@@ -636,6 +647,11 @@ static std::string g_joinPassphrase;
 // Invite ticket the current session was joined with ("" = discovered on the
 // LAN), kept for auto-rejoin like the passphrase.
 static std::string g_joinTicket;
+// Linked folder the current session was joined into ("" = a staging folder),
+// kept for auto-rejoin like the ticket.
+static std::string g_joinDest;
+// Hosting: the project's lasting id, which a guest's linked copy goes by.
+static std::string g_hostProjectId;
 
 // Two parameter-free convenience actions; the ReaMesh app is the real UI
 // and drives everything (browse/join/leave) over the control server instead.
@@ -5720,7 +5736,8 @@ static void refreshSessionMeta(bool force) {
   const json meta = {{"v", 1},
                      {"tracks", CountTracks(nullptr)},
                      {"plugins", plugins},
-                     {"reaper", g_reaperVersion}};
+                     {"reaper", g_reaperVersion},
+                     {"project", g_hostProjectId}};
   reamesh_set_session_meta(g_handle, dumpJson(meta).c_str());
 }
 
@@ -5826,6 +5843,9 @@ static void leaveSession(const char* code, json params, const std::string& text)
   // the suppress + re-baseline is correct; it's a no-op when nothing is tinted.
   restoreAllItemTints();
   saveSessionCopy();  // after the tints: the real colors go to disk
+  // What is on disk now is what this copy last agreed on with the session. Not on
+  // the way in: a download that broke off agreed on nothing.
+  if (g_handle && g_mode == Mode::ClientActive) reamesh_note_local_project(g_handle);
   if (g_handle) {
     reamesh_shutdown(g_handle);
     g_handle = nullptr;
@@ -5884,14 +5904,34 @@ static bool startBrowse() {
   return true;
 }
 
+// Whether REAPER holds edits to a project in this folder that never reached the
+// disk. The core can only compare files: opening the session's project in that
+// tab would make REAPER offer to save those edits over what was just downloaded.
+static bool hasUnsavedEdits(const std::string& dir) {
+  for (int i = 0;; ++i) {
+    char buf[4096] = {0};
+    ReaProject* proj = EnumProjects(i, buf, sizeof(buf));
+    if (!proj) return false;
+    if (!pathInsideDir(buf, dir).empty() && IsProjectDirty(proj)) return true;
+  }
+}
+
 // Join a session (Browsing -> Downloading): one of the announced sessions by
 // id, or (with a non-empty `ticket`) through a pasted invite ticket. For a
 // ticket the Rust side dials the ticket's addresses and joins once the host's
 // announce arrives over that connection; that is how a session outside
-// mDNS/multicast reach (VPN, strict LAN) is joined.
+// mDNS/multicast reach (VPN, strict LAN) is joined. A `dest` is the folder of a
+// linked copy, which then takes the download instead of a staging folder.
 static bool joinSession(const std::string& sid, const std::string& ticket,
-                        const std::string& sname, const std::string& passphrase) {
+                        const std::string& sname, const std::string& passphrase,
+                        const std::string& dest, bool overwrite) {
   if (g_mode != Mode::Browsing || !g_handle) return false;
+  if (!dest.empty() && hasUnsavedEdits(dest)) {
+    g_lastError = logEvent("linked_copy_unsaved", json::object(),
+                           "your copy has unsaved changes. Save them in REAPER first");
+    return false;
+  }
+  reamesh_set_join_dest(g_handle, dest.c_str(), overwrite);
   const bool ok = ticket.empty()
                       ? reamesh_join_session(g_handle, sid.c_str(), passphrase.c_str())
                       : reamesh_join_ticket(g_handle, ticket.c_str(), passphrase.c_str());
@@ -5906,6 +5946,7 @@ static bool joinSession(const std::string& sid, const std::string& ticket,
                        "could not join \"" + sname + "\" (it may have just closed); try again")
             : logEvent("bad_ticket", json::object(),
                        "that invite code doesn't look valid. Copy it again from the host");
+    reamesh_set_join_dest(g_handle, nullptr, false);
     return false;
   }
   // Rust resets its cumulative revert counter for the new session; match it
@@ -5916,6 +5957,7 @@ static bool joinSession(const std::string& sid, const std::string& ticket,
   g_lastError = json();
   g_joinPassphrase = passphrase;
   g_joinTicket = ticket;
+  g_joinDest = dest;
   logEvent("joining", {{"name", sname}}, "joining \"" + sname + "\". The project is downloading");
   return true;
 }
@@ -5940,6 +5982,7 @@ static void beginReconnect(const json& st) {
   if (session.sessionName.empty()) session.sessionName = "session";
   session.passphrase = g_joinPassphrase;
   session.ticket = g_joinTicket;
+  session.dest = g_joinDest;
   leaveSession("", json::object(), "");  // silent: this is not (yet) an error
   if (!session.sessionId.empty()) g_lastSession = session;
   if (session.sessionId.empty() || !startBrowse()) {
@@ -5984,7 +6027,7 @@ static void reconnectTick() {
   if (!g_reconnect->ticket.empty()) {
     Reconnect rc = *g_reconnect;
     g_reconnect.reset();
-    joinSession("", rc.ticket, rc.sessionName, rc.passphrase);
+    joinSession("", rc.ticket, rc.sessionName, rc.passphrase, rc.dest, false);
     return;
   }
   json sessions = handleJson(reamesh_sessions, json::array());
@@ -5993,7 +6036,7 @@ static void reconnectTick() {
     if (s.is_object() && jsonStr(s, "session_id") == g_reconnect->sessionId) {
       Reconnect rc = *g_reconnect;
       g_reconnect.reset();
-      joinSession(rc.sessionId, "", rc.sessionName, rc.passphrase);
+      joinSession(rc.sessionId, "", rc.sessionName, rc.passphrase, rc.dest, false);
       return;
     }
   }
@@ -6072,6 +6115,28 @@ static bool ensureProjectSaved() {
   return false;
 }
 
+// The id a guest's linked copy recognizes this project by, kept in the project
+// itself so it survives a re-host, a restart and a move. A guest's own copy of the
+// file carries it too, which does no harm: a link matches id and host together.
+static std::string lastingProjectId() {
+  char buf[64] = {0};
+  GetProjExtState(nullptr, "ReaMesh", "project_id", buf, sizeof(buf));
+  std::string id = buf;
+  const bool valid = id.size() == 32 && std::all_of(id.begin(), id.end(), [](unsigned char c) {
+                       return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+                     });
+  if (valid) return id;
+  std::random_device rd;
+  id.clear();
+  for (int i = 0; i < 16; ++i) {
+    char hex[3];
+    snprintf(hex, sizeof(hex), "%02x", (unsigned)(rd() & 0xff));
+    id += hex;
+  }
+  SetProjExtState(nullptr, "ReaMesh", "project_id", id.c_str());
+  return id;
+}
+
 static void onHost(const std::string& passphrase) {
   if (g_mode == Mode::Hosting) return;
   // Before leaving the Lobby: a cancelled Save As changes nothing.
@@ -6082,6 +6147,7 @@ static void onHost(const std::string& passphrase) {
   g_noFx = false;  // hosting is always a full, read-write session
 
   const std::string path = currentProjectPath();
+  g_hostProjectId = lastingProjectId();  // before the save, so it is in the file
   Main_SaveProject(nullptr, false);  // share what's on screen, not a stale file
 
   size_t slash = path.find_last_of("/\\");
@@ -6293,9 +6359,12 @@ static void ctlDispatch(const json& cmd) {
     // "Join without effects": strictly view-only, every FX chain stripped.
     // Adopted only once the join is under way: a join refused because one is
     // already in progress must not flip the flag of the session it refused for.
+    // Always a temporary copy, never a linked folder.
+    const bool nofx = cmdBool("nofx");
     if (joinSession(jsonStr(cmd, "session_id"), jsonStr(cmd, "ticket"),
-                    name.empty() ? "session" : name, jsonStr(cmd, "passphrase"))) {
-      g_noFx = cmdBool("nofx");
+                    name.empty() ? "session" : name, jsonStr(cmd, "passphrase"),
+                    nofx ? "" : jsonStr(cmd, "dest"), cmdBool("overwrite"))) {
+      g_noFx = nofx;
       g_lastSession.reset();
     }
   } else if (c == "reconnect_cancel") {
@@ -6305,8 +6374,8 @@ static void ctlDispatch(const json& cmd) {
       g_lastError = logEvent("host_lost", json::object(), "lost the connection to the host");
     }
   } else if (c == "reconnect") {
-    if (g_lastSession && !g_reconnect && (g_mode == Mode::Idle || g_mode == Mode::Browsing) &&
-        startBrowse()) {
+    if (g_lastSession && !g_lastSession->refused && !g_reconnect &&
+        (g_mode == Mode::Idle || g_mode == Mode::Browsing) && startBrowse()) {
       g_lastError = json();
       startReconnect(*g_lastSession);
     }
@@ -6506,6 +6575,7 @@ static void ctlPublishState() {
     }
     state["in_use"] = std::move(inUse);
     state["session_dir"] = sessionDir;
+    state["session_linked"] = !sessionDir.empty() && !g_joinDest.empty();
   }
   // This REAPER's version, for the app's host-version mismatch warning.
   state["reaper"] = g_reaperVersion;
@@ -6515,7 +6585,11 @@ static void ctlPublishState() {
   // Recent pings, for the HUD notice (see sharePing).
   state["pings"] = pingsJson();
   state["reconnecting"] = static_cast<bool>(g_reconnect);
-  state["can_reconnect"] = g_lastSession.has_value() && !g_reconnect;
+  state["can_reconnect"] = g_lastSession.has_value() && !g_reconnect && !g_lastSession->refused;
+  // What the normal join path needs to find that session again.
+  state["last_join"] = g_lastSession ? json{{"session_id", g_lastSession->sessionId},
+                                            {"ticket", g_lastSession->ticket}}
+                                     : json();
   // Passphrase pre-check result ({session_id, ok|null} or null), passed through
   // so the Lobby can show "wrong password" inline without a session transition.
   state["probe"] = (st.contains("probe")) ? st["probe"] : json();
@@ -6852,7 +6926,26 @@ static void pollDownload() {
     // "Beitritt fehlgeschlagen: manifest timeout". `join_failed` with a
     // {reason} stays as the last-resort fallback for anything genuinely
     // unexpected.
-    if (msg.find("not enough disk space") != std::string::npos)
+    const auto refused = [] {
+      if (g_lastSession) g_lastSession->refused = true;
+    };
+    if (msg.find("your copy of the project has changed") != std::string::npos) {
+      refused();
+      leaveSession("local_copy_changed", json::object(),
+                   "your copy of the project has changed since the last session");
+    } else if (msg.find("linked folder not found") != std::string::npos) {
+      refused();
+      leaveSession("linked_copy_missing", json::object(), "couldn't find the folder of your copy");
+    } else if (msg.find("linked folder holds something else") != std::string::npos) {
+      refused();
+      leaveSession("linked_copy_foreign", json::object(),
+                   "the folder of your copy holds a different project");
+    } else if (msg.find("a file of your copy is in use") != std::string::npos) {
+      const size_t colon = msg.rfind(": ");
+      const std::string file = colon == std::string::npos ? "" : msg.substr(colon + 2);
+      leaveSession("linked_copy_busy", {{"file", file}},
+                   file + " is still open. Close the project in REAPER and join again");
+    } else if (msg.find("not enough disk space") != std::string::npos)
       leaveSession("disk_space", json::object(),
                    "not enough free disk space to download this project");
     else if (msg.find("project too large") != std::string::npos)
