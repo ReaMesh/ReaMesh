@@ -59,7 +59,8 @@ import { send } from "@/lib/connection";
 import { MAX_RELAYS, parseRelayCode, relayHost, type RelayCode } from "@/lib/relay";
 import { addRelay, relayAbout, removeRelay, useRelays } from "@/lib/relays";
 import { noticeApplies, noticeLine, relayNotes, relayVersionLine } from "@/lib/relayInfo";
-import type { Instance, RelayTest } from "@/lib/types";
+import { relayKeepsList, relayName, useRelayWatch } from "@/lib/relayLists";
+import type { Instance, RelayList, RelayTest } from "@/lib/types";
 
 const SOURCE_URL = "https://github.com/ReaMesh/ReaMesh";
 
@@ -132,6 +133,13 @@ function relayOutcomeText(outcome: string): string {
   }
 }
 
+/** Whether a relay keeps a session list, as a row's second line. */
+function relayListText(peer: string, list: RelayList | undefined): string | undefined {
+  if (!list && !relayKeepsList(peer, list)) return undefined;
+  if (!relayKeepsList(peer, list)) return t("relayListOff");
+  return list?.count ? t("relayListOn", { count: list.count }) : t("relayListOnEmpty");
+}
+
 // The relays this install hosts through. A test answers on the `relay`
 // message, so it is matched to its row by request id. The section is
 // "Network": rows about how others reach this device follow as children.
@@ -169,6 +177,8 @@ function RelaySection({
   }, [test, pending]);
   // A hosting run keeps the relays it started with.
   const hosting = instance?.state?.mode === "hosting";
+  // A hosting run reports these by itself, on the connection it already has.
+  useRelayWatch("settings", !hosting, instance?.port ?? null, send);
   const changed = () => {
     if (hosting) toast(t("relayNextHost"));
   };
@@ -219,15 +229,16 @@ function RelaySection({
             <div key={r.peer}>
               {i > 0 && <Divider inset={false} />}
               <Row
-                label={r.label || relayHost(r)}
+                label={relayName(r)}
                 sub={
                   result ? (
                     <span className={cn(failed && "text-amber-500")}>
                       {relayOutcomeText(result.outcome)}
                     </span>
-                  ) : r.label ? (
-                    relayHost(r)
-                  ) : undefined
+                  ) : (
+                    (relayListText(r.peer, instance?.relay?.lists[r.peer]) ??
+                    (r.label ? relayHost(r) : undefined))
+                  )
                 }
               >
                 <Button

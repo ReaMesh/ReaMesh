@@ -219,6 +219,7 @@ export function TrustDialog({
   hostId,
   hostName,
   bytes,
+  via,
   preview,
   viaInvite = false,
   onJoin,
@@ -233,6 +234,10 @@ export function TrustDialog({
   hostName?: string;
   /** Announce-level size (fallback when the preview lacks it). */
   bytes?: number;
+  /** Found on a relay's list: which relays, and the operator's name for the
+   *  host's key. The host's name above is the host's own word, this is the
+   *  relay's, so both are shown. */
+  via?: { names: string; keyLabel: string };
   /** Manifest preview from a successful probe (may be null on older hosts). */
   preview?: SessionPreview | null;
   /** Joining by invite code, the path that can run over the host's relay. */
@@ -294,6 +299,18 @@ export function TrustDialog({
                   {hostId && (
                     <span className="font-normal text-muted-foreground">
                       {seen > 0 ? t("hostSeenTimes", { count: seen }) : t("hostSeenNever")}
+                    </span>
+                  )}
+                </span>
+              </DialogFact>
+            )}
+            {via && (
+              <DialogFact label={t("trustViaLabel")}>
+                <span className="flex min-w-0 flex-col items-end">
+                  <span className="max-w-full truncate">{via.names}</span>
+                  {via.keyLabel && (
+                    <span className="max-w-full truncate font-normal text-muted-foreground">
+                      {t("trustViaKey", { key: via.keyLabel })}
                     </span>
                   )}
                 </span>

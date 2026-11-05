@@ -12,6 +12,7 @@ import { getProfile } from "./profile";
 import { getOverlaySettings, subscribeOverlaySettings } from "./overlaySettings";
 import { openCtlSocket } from "./ctlSocket";
 import { getRelays, noteRelayInfo, subscribeRelays } from "./relays";
+import { getHiddenRelays, noteRelayLists, subscribeHiddenRelays } from "./relayLists";
 import { PROTO } from "./version";
 
 const ALL_PORTS = [47415, 47416, 47417, 47418];
@@ -92,6 +93,7 @@ function attach(port: number, ws: WebSocket) {
     sendTint(port);
     sendCursors(port);
     sendRelays(port);
+    sendRelayListing(port);
     emit();
   };
   ws.onmessage = (ev) => {
@@ -125,6 +127,7 @@ function attach(port: number, ws: WebSocket) {
       // the relays said about themselves.
       inst.relay = normalizeRelay(msg);
       noteRelayInfo(inst.relay.info);
+      noteRelayLists(inst.relay.lists);
     }
     live.set(port, inst);
     ensureActive();
@@ -182,6 +185,18 @@ subscribeRelays(() => {
  *  them to authenticate) to one extension. */
 export function sendRelays(port: number) {
   send({ cmd: "set_relays", codes: getRelays().map((c) => c.code) }, port);
+}
+
+// The user took a session off a relay's list, or put it back. A running
+// hosting run acts on it at once.
+subscribeHiddenRelays(() => {
+  for (const p of sockets.keys()) sendRelayListing(p);
+});
+
+/** Which relays' lists this install's sessions stay off. Until an extension has
+ *  heard this, it lists nothing. */
+export function sendRelayListing(port: number) {
+  send({ cmd: "relay_listing", hidden: getHiddenRelays() }, port);
 }
 
 let lastTintSent: boolean | null = null;

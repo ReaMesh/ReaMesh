@@ -18,11 +18,15 @@ import { HostCrown } from "@/components/HostCrown";
 import { ListSlot } from "@/components/ListSlot";
 import { useSlowLink } from "@/components/LinkNotice";
 import { PeerAvatar } from "@/components/PeerAvatar";
+import { RelayListingLine } from "@/components/RelayListing";
 import { DrawnCheck, SwapIcon, SwapText } from "@/components/Swap";
 import { TrackLabel } from "@/components/TrackLabel";
 import { send, useConnections } from "@/lib/connection";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
 import { t } from "@/lib/i18n";
+import { hostListNote, hostVisibleText, listRelays, useHiddenRelays } from "@/lib/relayLists";
+import type { RelayCode } from "@/lib/relay";
+import { useRelays } from "@/lib/relays";
 import { ticketAddrs, ticketReach } from "@/lib/ticket";
 import { relayAbout } from "@/lib/relays";
 import { noticeApplies, noticeLine, relayNotes, type RelayAbout } from "@/lib/relayInfo";
@@ -249,7 +253,18 @@ function InviteRow({ children, action }: { children: React.ReactNode; action: Re
 // LAN) join: opening it takes them straight into their app's join flow,
 // pasting it in their Lobby works too. The row names it; the link itself only
 // shows when the clipboard refuses it, so it can be copied by hand.
-function InviteCode({ ticket, line, notes = [] }: { ticket: string; line: InviteLine | null; notes?: InviteLine[] }) {
+function InviteCode({
+  ticket,
+  line,
+  notes = [],
+  listing,
+}: {
+  ticket: string;
+  line: InviteLine | null;
+  notes?: InviteLine[];
+  /** Makes the second line open where the session is listed. */
+  listing?: { relays: RelayCode[]; note: string };
+}) {
   const [copied, setCopied] = useState(false);
   const [reveal, setReveal] = useState(false);
   useEffect(() => {
@@ -292,14 +307,19 @@ function InviteCode({ ticket, line, notes = [] }: { ticket: string; line: Invite
               {t("inviteCode")}
             </p>
           </Hint>
-          {line && (
-            <p
-              role="status"
-              className={cn("truncate text-[12px]", line.warn ? "text-amber-500" : "text-muted-foreground")}
-            >
-              {line.text}
-            </p>
-          )}
+          {line &&
+            (listing ? (
+              <RelayListingLine relays={listing.relays} note={listing.note} side="bottom" warn={line.warn}>
+                {line.text}
+              </RelayListingLine>
+            ) : (
+              <p
+                role="status"
+                className={cn("truncate text-[12px]", line.warn ? "text-amber-500" : "text-muted-foreground")}
+              >
+                {line.text}
+              </p>
+            ))}
           {notes.map((n) => (
             <p
               key={n.text}
@@ -320,8 +340,11 @@ type InviteLine = { text: string; warn: boolean };
 // How the host's relays stand. Nothing without a relay configured.
 function relayLine(status: RelayStatus[]): InviteLine | null {
   if (status.length === 0) return null;
-  const reserved = status.find((r) => r.state === "reserved");
-  if (reserved) return { text: t("relayReachable", { name: reserved.label || reserved.host }), warn: false };
+  const reserved = status.filter((r) => r.state === "reserved");
+  if (reserved.length > 1) return { text: t("relayReachableMany", { count: reserved.length }), warn: false };
+  if (reserved[0]) {
+    return { text: t("relayReachable", { name: reserved[0].label || reserved[0].host }), warn: false };
+  }
   if (status.some((r) => r.state === "connecting")) return { text: t("relayConnecting"), warn: false };
   if (status.some((r) => r.reason === "paused")) return { text: t("relayPaused"), warn: false };
   const reasons = status.map((r) => r.reason);
@@ -447,6 +470,9 @@ export function Session({
   const { instances } = useConnections();
   const relayState = instances.find((i) => i.port === port)?.relay;
   const relayStatus = relayState?.status ?? [];
+  const relays = useRelays();
+  const listChoices = listRelays(relays, relayState?.lists ?? {});
+  const hiddenRelays = useHiddenRelays();
   const [confirmStop, setConfirmStop] = useState(false);
   // Guest the host is about to block (the confirm dialog's subject).
   const [banTarget, setBanTarget] = useState<Peer | null>(null);
@@ -531,6 +557,14 @@ export function Session({
                   ticket={state.ticket}
                   line={relayLine(relayStatus) ?? reachLine(state.ticket)}
                   notes={relayExtraLines(relayStatus, relayLine(relayStatus), relayState?.info)}
+                  listing={
+                    listChoices.length > 0
+                      ? {
+                          relays: listChoices,
+                          note: `${hostVisibleText(listChoices, hiddenRelays)}. ${hostListNote(listChoices, hiddenRelays, !!hostPass)}`,
+                        }
+                      : undefined
+                  }
                 />
               )}
               {!!state.ticket && !!hostPass && <Divider inset={false} />}

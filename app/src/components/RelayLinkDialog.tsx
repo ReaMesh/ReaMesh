@@ -11,6 +11,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { send, useActiveInstance } from "@/lib/connection";
 import { t } from "@/lib/i18n";
 import { MAX_RELAYS, parseRelayCode, relayHost } from "@/lib/relay";
 import { clearRelayLink, useRelayLink } from "@/lib/relayLink";
@@ -39,6 +40,18 @@ export function RelayLinkDialog({ hosting }: { hosting: boolean }) {
     clearRelayLink();
   }, [refusal]);
 
+  // Whether it keeps a session list is its own to say, so the question names
+  // that consequence only once the relay answered. Nothing is added by asking.
+  const open = !!relay && !refusal;
+  const code = open ? relay.code : "";
+  const testId = code ? `link-${relay?.peer.slice(-8)}` : "";
+  const instance = useActiveInstance();
+  useEffect(() => {
+    if (code) send({ cmd: "relay_test", code, id: testId }, instance?.port);
+  }, [code, testId, instance?.port]);
+  const test = instance?.relay?.test;
+  const hasList = !!testId && test?.id === testId && test.list === true;
+
   const add = async () => {
     clearRelayLink();
     if (!relay) return;
@@ -46,7 +59,6 @@ export function RelayLinkDialog({ hosting }: { hosting: boolean }) {
     else toast(t("relayDuplicate"));
   };
 
-  const open = !!relay && !refusal;
   return (
     <Dialog open={open} onOpenChange={(o) => !o && clearRelayLink()}>
       <DialogContent>
@@ -61,6 +73,9 @@ export function RelayLinkDialog({ hosting }: { hosting: boolean }) {
               <span className="truncate">{relayHost(relay)}</span>
             </DialogFact>
           </DialogFacts>
+        )}
+        {hasList && (
+          <p className="text-[12.5px] leading-normal text-muted-foreground">{t("relayLinkList")}</p>
         )}
         <DialogFooter>
           <Button variant="secondary" onClick={clearRelayLink}>

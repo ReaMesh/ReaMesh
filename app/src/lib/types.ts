@@ -275,6 +275,41 @@ export interface RelayTest {
   label?: string;
   /** How long the relay took to answer, in ms (0 = not measured). */
   rtt?: number;
+  /** Whether the relay keeps a session list (null: it didn't get to say). */
+  list?: boolean | null;
+}
+
+/** One session on a relay's list, already checked by the extension. */
+export interface RelayListEntry {
+  session_id: string;
+  session_name: string;
+  owner: string;
+  owner_name: string;
+  owner_color: string;
+  auth: boolean;
+  files: number;
+  bytes: number;
+  proto: number;
+  version: string;
+  /** The way in: an invite link naming only this relay. */
+  ticket: string;
+  /** The operator's name for the host's key. The name above is the host's own. */
+  key_label: string;
+}
+
+/** A relay's session list as far as this install knows it. */
+export interface RelayList {
+  /** idle: nobody is looking. down: not reachable. refused: see `reason`. */
+  state: "idle" | "connecting" | "ok" | "down" | "refused";
+  /** bad_key | banned | expired | refused */
+  reason: string;
+  /** Whether it keeps a list; null until it said. */
+  enabled: boolean | null;
+  /** The month's budget is used up: joining takes a direct connection. */
+  budget_used: boolean;
+  /** Sessions on it, not counting our own. */
+  count: number;
+  entries: RelayListEntry[];
 }
 
 export interface RelayInfo {
@@ -282,6 +317,8 @@ export interface RelayInfo {
   test: RelayTest | null;
   /** What each relay said about itself, by peer id. */
   info: Record<string, RelayAbout>;
+  /** By relay peer id. */
+  lists: Record<string, RelayList>;
 }
 
 export function normalizeRelay(msg: Record<string, unknown>): RelayInfo {
@@ -294,7 +331,15 @@ export function normalizeRelay(msg: Record<string, unknown>): RelayInfo {
     msg.info && typeof msg.info === "object" && !Array.isArray(msg.info)
       ? (msg.info as Record<string, RelayAbout>)
       : {};
-  return { status, test, info };
+  const lists: Record<string, RelayList> = {};
+  if (msg.lists && typeof msg.lists === "object") {
+    for (const [peer, l] of Object.entries(msg.lists as Record<string, RelayList>)) {
+      if (l && typeof l === "object") {
+        lists[peer] = { ...l, entries: Array.isArray(l.entries) ? l.entries : [] };
+      }
+    }
+  }
+  return { status, test, info, lists };
 }
 
 export function displayName(p: Peer): string {

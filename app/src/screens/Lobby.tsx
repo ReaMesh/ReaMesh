@@ -32,10 +32,23 @@ import { ListSlot } from "@/components/ListSlot";
 import { TrustDialog } from "@/components/TrustDialog";
 import { SwapText } from "@/components/Swap";
 import { Hint } from "@/components/Hint";
+import { RelayListingLine } from "@/components/RelayListing";
 import { FOUND_COLOR, inkFor } from "@/lib/colors";
 import { send, useActiveInstance } from "@/lib/connection";
 import { stageHostPass } from "@/lib/hostPass";
 import { offerInvite, takeInvite, useInviteSeq } from "@/lib/invite";
+import { useRelays } from "@/lib/relays";
+import {
+  hostListNote,
+  hostVisibleText,
+  listRelays,
+  relaySections,
+  useHiddenRelays,
+  useRelayWatch,
+  viaNames,
+  type RelayRow,
+  type RelaySection,
+} from "@/lib/relayLists";
 import { recordHostJoin } from "@/lib/knownHosts";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
@@ -75,6 +88,9 @@ const CHECK_TIMEOUT_MS = 12_000;
 /// Ticket checks legitimately take longer: the extension is dialing a host that
 /// may be across a VPN, and only fast-fails after its own connect timeout.
 const TICKET_CHECK_TIMEOUT_MS = 35_000;
+
+/** What a relay section's rows count as already there when the Lobby opens. */
+const RELAY_FIRST_ANSWER_MS = 6000;
 
 /** The spring the Lobby's cards unfold on, the one the invite card always had:
  *  no hard start, no overshoot, settled after about 0.3 s. */
@@ -471,11 +487,14 @@ function SessionCard({
   error: extError,
   lobbyMountedAt,
   port,
+  relay,
 }: {
   session: SessionAd;
   probe?: ExtState["probe"];
   error: ExtState["error"];
   lobbyMountedAt: number;
+  /** Found on a relay's list: the way in is that entry's link, not the LAN. */
+  relay?: RelayRow;
   /** The instance this card was rendered for. Every command names it
    *  explicitly, so a command can never land on a different REAPER because the
    *  active instance changed between render and click. */
@@ -497,6 +516,9 @@ function SessionCard({
   // Another build can't be joined: say which side needs the update instead.
   const skew = protoSkew(session.proto);
 
+  // A session on a relay's list is reached like one from an invite link.
+  const target = relay ? { ticket: relay.ticket } : { session_id: session.session_id };
+
   const join = (nofx: boolean, into: { dest?: string; overwrite?: boolean }) => {
     if (joining) return;
     setJoining(true);
@@ -506,7 +528,7 @@ function SessionCard({
     send(
       {
         cmd: "join",
-        session_id: session.session_id,
+        ...target,
         session_name: session.session_name,
         passphrase: pass,
         nofx,
@@ -519,7 +541,7 @@ function SessionCard({
   const { checking, begin } = usePassphraseCheck(
     session.session_id,
     probe,
-    CHECK_TIMEOUT_MS,
+    relay ? TICKET_CHECK_TIMEOUT_MS : CHECK_TIMEOUT_MS,
     (outcome) => {
       if (outcome === "ok") return setConfirmOpen(true);
       // A refused probe for an open session means the host did not answer,
@@ -540,7 +562,7 @@ function SessionCard({
     if (needName()) return;
     setError("");
     begin();
-    send({ cmd: "check", session_id: session.session_id, passphrase: pass }, port ?? undefined);
+    send({ cmd: "check", ...target, passphrase: pass }, port ?? undefined);
   };
   const ask = useRef(() => {});
   ask.current = () => (session.auth && !pass ? setOpen(true) : beginJoin());
@@ -692,6 +714,7 @@ function SessionCard({
         hostId={session.owner}
         hostName={session.contested ? undefined : session.owner_name}
         bytes={session.bytes}
+        via={relay && { names: viaNames(relay.via), keyLabel: relay.keyLabel }}
         preview={probe?.session_id === session.session_id ? probe?.preview : undefined}
         onJoin={join}
       />
@@ -989,6 +1012,10 @@ function HostCard({
   const [pass, setPass] = useState("");
   const instance = useActiveInstance();
   const reaperBusy = !!instance?.busy;
+  // Where the session will show: only a relay that keeps a list gets a say.
+  const relays = useRelays();
+  const listChoices = listRelays(relays, instance?.relay?.lists ?? {});
+  const hiddenRelays = useHiddenRelays();
   // Pending until the mode flips to hosting (which unmounts the Lobby) or the
   // host attempt fails (a new error arrives, or the Save As was cancelled).
   // Saving a large project before hosting takes a moment; without this the
@@ -1041,13 +1068,24 @@ function HostCard({
   return (
     <div className="flex shrink-0 flex-col gap-2.5 rounded-xl bg-card p-3">
       <div className="flex min-h-7 items-center gap-3">
-        <Hint label={project || undefined} overflowOnly>
-          <span
-            className="min-w-0 flex-1 truncate text-[13px] font-semibold"
-          >
-            {project || t("untitledProject")}
-          </span>
-        </Hint>
+        <div className="flex min-w-0 flex-1 flex-col items-start">
+          <Hint label={project || undefined} overflowOnly>
+            <span className="max-w-full truncate text-[13px] font-semibold">
+              {project || t("untitledProject")}
+            </span>
+          </Hint>
+          {listChoices.length > 0 && (
+            <RelayListingLine
+              relays={listChoices}
+              side="top"
+              // Above the project name, which it would otherwise cover.
+              offset={24}
+              note={hostListNote(listChoices, hiddenRelays, pass.length > 0)}
+            >
+              {hostVisibleText(listChoices, hiddenRelays)}
+            </RelayListingLine>
+          )}
+        </div>
         <PendingButton
           size="sm"
           className="h-7 min-w-[68px] px-3 text-[12px]"
@@ -1371,11 +1409,101 @@ function LastSessionBlock({
   );
 }
 
+/** One relay's sessions, or why there are none to show. A relay nobody hosts on
+ *  never gets here: it has no section at all. */
+function RelaySessions({
+  section,
+  state,
+  mountedAt,
+  port,
+}: {
+  section: RelaySection;
+  state: ExtState;
+  mountedAt: number;
+  port: number | null;
+}) {
+  const { name, problem, rows } = section;
+  return (
+    <motion.section
+      key={section.relay.peer}
+      initial={{ height: 0, opacity: 0 }}
+      animate={{ height: "auto", opacity: 1 }}
+      exit={{ height: 0, opacity: 0 }}
+      transition={FOLD}
+      className="shrink-0 overflow-hidden"
+    >
+      <div className="flex flex-col gap-2">
+        <SectionLabel aside={rows.length > 0 ? rows.length : undefined}>
+          {t("sessionsOnRelay", { name })}
+        </SectionLabel>
+        <Group>
+          <AnimatePresence initial={false}>
+            {rows.map((row, i) => (
+              <ListSlot key={row.session.session_id}>
+                {i > 0 && <Divider />}
+                <SessionCard
+                  session={row.session}
+                  relay={row}
+                  probe={state.probe}
+                  error={state.error}
+                  // A relay answers a moment after the Lobby opens: what was
+                  // already on its list isn't news.
+                  lobbyMountedAt={mountedAt + RELAY_FIRST_ANSWER_MS}
+                  port={port}
+                />
+              </ListSlot>
+            ))}
+          </AnimatePresence>
+          {problem === "down" && (
+            <div role="status" className="flex flex-col gap-0.5 p-3">
+              <p className="text-[12.5px] text-amber-500">{t("relayListDown", { name })}</p>
+              <p className="text-[12px] text-muted-foreground">{t("relayListRetry")}</p>
+            </div>
+          )}
+          {(problem === "refused" || problem === "expired") && (
+            <div role="status" className="flex items-center gap-3 p-3">
+              <div className="min-w-0 flex-1">
+                <p className="text-[12.5px] text-amber-500">
+                  {t(problem === "expired" ? "relayListExpired" : "relayListRefused", { name })}
+                </p>
+                <p className="text-[12px] text-muted-foreground">{t("relayListAskOperator")}</p>
+              </div>
+              <Button
+                variant="ghost"
+                size="xs"
+                className="-my-1 shrink-0 text-foreground/80"
+                onClick={() => invoke("open_settings").catch(() => {})}
+              >
+                {t("settings")}
+              </Button>
+            </div>
+          )}
+        </Group>
+        {section.budgetUsed && rows.length > 0 && (
+          <p className="px-1 text-[11.5px] leading-normal text-amber-500">
+            {t("relayListNoBudget", { name })}
+          </p>
+        )}
+      </div>
+    </motion.section>
+  );
+}
+
 export function Lobby({ state, port }: { state: ExtState; port: number | null }) {
   // Sessions discovered after this timestamp get a one-time highlight.
   const mountedAt = useRef(Date.now()).current;
-  const count = state.sessions.length;
   const last = useLastSession(port);
+  // The relays' lists are read as long as this screen is up, and no longer.
+  useRelayWatch("lobby", true, port, send);
+  const relays = useRelays();
+  const relayLists = useActiveInstance()?.relay?.lists ?? {};
+  const { sections, contested } = relaySections(relays, relayLists, state.sessions);
+  const sessions = contested.size
+    ? state.sessions.map((s) => (contested.has(s.session_id) ? { ...s, contested: true } : s))
+    : state.sessions;
+  const count = sessions.length;
+  // An empty local network says nothing while a relay has sessions to show.
+  const showLan = count > 0 || !sections.some((s) => s.rows.length > 0);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-[18px] px-4 pt-1.5 pb-4">
@@ -1398,51 +1526,69 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
         )}
       </AnimatePresence>
 
-      <section className="flex min-h-0 flex-1 flex-col gap-2">
-        <SectionLabel>{t("sessionsOnNetwork")}</SectionLabel>
-        <Group className="min-h-0 shrink">
-          {/* Sessions open and close their rows like people in the roster,
-              and the empty note folds away as the first one arrives (and back
-              when the last one goes), so the card grows instead of jumping. */}
-          <div className="scroll-slim min-h-0 overflow-y-auto">
-            <AnimatePresence initial={false}>
-              {state.sessions.map((s, i) => (
-                <ListSlot key={s.session_id}>
-                  {i > 0 && <Divider />}
-                  <SessionCard
-                    session={s}
-                    probe={state.probe}
-                    error={state.error}
-                    lobbyMountedAt={mountedAt}
-                    port={port}
-                  />
-                </ListSlot>
-              ))}
-            </AnimatePresence>
-          </div>
-          <AnimatePresence initial={false}>
-            {count === 0 && (
-              <motion.div
-                key="empty"
-                initial={{ height: 0, opacity: 0, filter: "blur(4px)" }}
-                animate={{ height: "auto", opacity: 1, filter: "blur(0px)" }}
-                exit={{ height: 0, opacity: 0, filter: "blur(4px)" }}
-                transition={FOLD}
-                className="shrink-0 overflow-hidden"
-              >
-                {/* Quiet on purpose: no permanent discovery spinner. */}
-                <div className="px-6 py-6 text-center">
-                  <p className="text-[13px] text-muted-foreground">{t("noSessionsYet")}</p>
-                  <VpnHint />
-                  <NearbySearch empty={count === 0} />
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </Group>
-        {/* A session you can't see here is still a session. */}
-        <InviteCard sessions={state.sessions} probe={state.probe} error={state.error} port={port} />
-      </section>
+      {/* Everything scrolls together; the host card below stays put. A pixel
+          of room on the sides keeps the focus rings unclipped. */}
+      <div className="scroll-slim -mx-1 flex min-h-0 flex-1 flex-col gap-[18px] overflow-y-auto px-1">
+        {showLan && (
+          <section className="flex shrink-0 flex-col gap-2">
+            <SectionLabel>{t("sessionsOnNetwork")}</SectionLabel>
+            <Group>
+              {/* Sessions open and close their rows like people in the roster,
+                  and the empty note folds away as the first one arrives (and back
+                  when the last one goes), so the card grows instead of jumping. */}
+              <AnimatePresence initial={false}>
+                {sessions.map((s, i) => (
+                  <ListSlot key={s.session_id}>
+                    {i > 0 && <Divider />}
+                    <SessionCard
+                      session={s}
+                      probe={state.probe}
+                      error={state.error}
+                      lobbyMountedAt={mountedAt}
+                      port={port}
+                    />
+                  </ListSlot>
+                ))}
+              </AnimatePresence>
+              <AnimatePresence initial={false}>
+                {count === 0 && (
+                  <motion.div
+                    key="empty"
+                    initial={{ height: 0, opacity: 0, filter: "blur(4px)" }}
+                    animate={{ height: "auto", opacity: 1, filter: "blur(0px)" }}
+                    exit={{ height: 0, opacity: 0, filter: "blur(4px)" }}
+                    transition={FOLD}
+                    className="shrink-0 overflow-hidden"
+                  >
+                    {/* Quiet on purpose: no permanent discovery spinner. */}
+                    <div className="px-6 py-6 text-center">
+                      <p className="text-[13px] text-muted-foreground">{t("noSessionsYet")}</p>
+                      <VpnHint />
+                      <NearbySearch empty={count === 0} />
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </Group>
+          </section>
+        )}
+        <AnimatePresence initial={false}>
+          {sections.map((section) => (
+            <RelaySessions
+              key={section.relay.peer}
+              section={section}
+              state={state}
+              mountedAt={mountedAt}
+              port={port}
+            />
+          ))}
+        </AnimatePresence>
+        {/* A session you can't see here is still a session. It stays close
+            under the list it continues. */}
+        <div className="-mt-2.5 shrink-0">
+          <InviteCard sessions={state.sessions} probe={state.probe} error={state.error} port={port} />
+        </div>
+      </div>
 
       {/* Blocks outlive the session they were made in: keep them revocable. */}
       <BanList bans={state.bans ?? []} port={port} gap={18} />

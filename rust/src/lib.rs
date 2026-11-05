@@ -117,7 +117,7 @@ const LOBBY_TOPIC: &str = "reamesh/v2/lobby";
 /// instead of tested. Mirrored in the app (`app/src/lib/version.ts`,
 /// `app/src-tauri/src/lib.rs`); app/src/lib/version.test.ts checks the copies
 /// agree.
-pub const PROTO: u32 = 7;
+pub const PROTO: u32 = 8;
 /// This build's version, the same number across the core, the extension and
 /// the ReaMesh app (they release together).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

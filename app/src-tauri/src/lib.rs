@@ -22,7 +22,7 @@ mod updater;
 /// `PROTO` (rust/src/lib.rs; app/src/lib/version.test.ts checks the copies
 /// agree). An update is restarted into mid-session only when its manifest
 /// names the same number.
-pub(crate) const PROTO: u32 = 7;
+pub(crate) const PROTO: u32 = 8;
 
 #[cfg(target_os = "macos")]
 const PLUGIN_NAME: &str = "reaper_reamesh.dylib";
@@ -851,6 +851,19 @@ fn reaper_running() -> bool {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         false
+    }
+}
+
+/// Open Settings, the way the menu does: a window of its own on macOS, the main
+/// window's screen elsewhere.
+#[tauri::command]
+fn open_settings(app: AppHandle) {
+    #[cfg(target_os = "macos")]
+    std::thread::spawn(move || open_settings_window(&app));
+    #[cfg(not(target_os = "macos"))]
+    {
+        use tauri::Emitter;
+        let _ = app.emit("menu:settings", ());
     }
 }
 
@@ -1913,6 +1926,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            open_settings,
             reaper_status,
             install_extension,
             extension_stale,
