@@ -124,6 +124,7 @@ reconnects everyone once.
 | `public_addrs`, `dns_name` | detected | What the relay code points to |
 | `mode` | `full` | `coordination`: only help connections go direct, relay no bulk traffic |
 | `log_addresses` | `false` | Client IP addresses are never logged unless set |
+| `session_list` | `false` | Everyone with a key sees the sessions hosted here (see below) |
 | `limits.max_hosts` | 32 | Hosts at the same time |
 | `limits.max_circuits` | 64 | Relayed connections at the same time (also `_per_host` 16, `_per_ip` 8) |
 | `limits.circuit_max_minutes`, `circuit_max_mb` | 720, 0 | Per relayed connection (0 MB = no limit); ReaMesh reconnects it |
@@ -193,6 +194,28 @@ A relay can't test its own public address from inside, so `hosts_gone` is a sign
 not a proof. Try the command with `reamesh-relay alert test`. The Docker image has
 no shell, so there alerts only reach the log.
 
+## Session list
+
+Off by default. With `reamesh-relay list on` the relay keeps a list of the sessions
+hosted through it, and everyone with a key sees it in their lobby and joins open
+sessions with one click, each with their own key. Removing a key or letting it run
+out takes that person's view away at once. `list off` forgets the list on the spot;
+both apply without a restart. A relay without a list works exactly as before, and
+a ReaMesh older than 1.2 neither sees the list nor shows up on it.
+
+The host decides per relay whether a session is listed, and can change that during
+the session. An entry is signed by the host and only valid on this relay, ends when
+the host's reservation ends, and lives only in memory. It takes up about a kilobyte,
+and people looking at the list take no host place. The list keeps working when the
+monthly budget is used up; ReaMesh then says joining takes a direct connection.
+
+`status` shows how many sessions are listed, how many people are watching and which
+hosts are listed, never a session's name.
+
+A relay code printed while the list is on says so, and ReaMesh tells the person
+adding the relay from that code what it means for their sessions. Codes printed
+before keep working; ReaMesh finds out about the list on its first connection then.
+
 ## Updates
 
 The relay, the ReaMesh app and the extension release together under one version.
@@ -230,6 +253,7 @@ reamesh-relay key add <name>  create a key and print its relay code (--expires 3
 reamesh-relay key list        names, fingerprints, dates and when each key was last used
 reamesh-relay key expires <name> <when>  change a key's last day (a date, 30d, never)
 reamesh-relay key remove <name>  delete a key; its hosts lose access within a few seconds
+reamesh-relay list [on|off]   whether everyone with a key sees the sessions hosted here
 reamesh-relay notice [set|clear]  show, set or clear the announcement hosts see
 reamesh-relay alert test      try the alert command
 reamesh-relay update          get the newest version now
@@ -315,6 +339,18 @@ encrypted between host and guests; the relay sees only that bytes pass.
 and ID), `seen.json` when each key was last used. Reading the release channel is
 the only connection the relay opens by itself; `auto = false` doesn't stop that,
 it only stops installing.
+
+**With the session list on, that changes for what's on the list:** the relay holds
+the name of each listed session, its host's name and the project's size, and passes
+them to everyone with a key. It holds them in memory only, and writes them neither
+to the log nor to `status.json`. For an open session the entry also contains the
+secret that lets people join, and that is the point of the list: it is how a click
+is enough. So you, as the operator, could join an open session, and you'd show up
+in its list of people like anyone else. You still can't read along: what a session
+sends stays encrypted between the people in it. A session with a password is listed
+without any way in, and a host who doesn't want a session seen at all turns it off
+for this relay. An entry never names the host's IP address or the project's file
+name.
 
 ## License and the logo
 

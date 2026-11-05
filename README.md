@@ -69,6 +69,10 @@ through a relay always has a secret: its password, or for an open session a
 random secret that travels inside the invite code. Open sessions stay open on
 the local network.
 
+A relay can also keep a session list, if its operator turns that on: everyone with
+a key then sees in their lobby what the others host through it, and joins with a
+click. The host chooses per relay whether a session shows up there.
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="proprietary/screenshots/invite-dark.png">
   <img alt="Inviting by link: the host copies the invite code from the session, the guest pastes it in the lobby and confirms the join" src="proprietary/screenshots/invite-light.png">
