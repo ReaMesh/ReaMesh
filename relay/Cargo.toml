@@ -7,6 +7,11 @@ repository = "https://github.com/ReaMesh/ReaMesh"
 description = "Self-hostable libp2p relay that lets ReaMesh sessions reach each other across NATs"
 publish = false
 
+# relay-proto is shared with the core; a member here so its own tests can run from
+# this directory, against this lockfile.
+[workspace]
+members = ["../relay-proto"]
+
 [dependencies]
 anstream = "1.0"
 anyhow = "1.0"

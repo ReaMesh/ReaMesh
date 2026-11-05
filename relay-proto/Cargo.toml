@@ -6,6 +6,7 @@ license = "GPL-3.0-only"
 repository = "https://github.com/ReaMesh/ReaMesh"
 description = "The relay code, auth exchange and session list shared by ReaMesh and reamesh-relay"
 publish = false
+workspace = "../relay"
 
 [dependencies]
 blake3 = "1.5"
