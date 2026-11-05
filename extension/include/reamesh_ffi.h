@@ -19,7 +19,7 @@
  * `app/src-tauri/src/lib.rs`); app/src/lib/version.test.ts checks the copies
  * agree.
  */
-#define PROTO 6
+#define PROTO 7
 
 typedef struct ReameshHandle ReameshHandle;
 

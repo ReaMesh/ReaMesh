@@ -24,9 +24,10 @@ export async function buildDiagnostics(): Promise<string> {
     ...instances.map(
       (i) =>
         `  :${i.port} ext=${i.version ?? "?"}/${i.proto ?? "?"} mode=${i.state?.mode ?? "?"} state=${i.state?.state ?? "?"} people=${i.state?.peers.length ?? 0} busy=${!!i.busy}` +
-        // Relay states and reasons only: no addresses, no keys.
+        // Relay states, reasons and versions only: no addresses, no keys, not
+        // the operator's texts.
         (i.relay?.status.length
-          ? ` relays=${i.relay.status.map((r) => `${r.state}${r.reason ? `:${r.reason}` : ""}`).join(",")}`
+          ? ` relays=${i.relay.status.map((r) => `${r.state}${r.reason ? `:${r.reason}` : ""}${i.relay?.info[r.peer]?.version ? `@${i.relay.info[r.peer].version}` : ""}`).join(",")}`
           : "") +
         ` links=${(i.state?.peers ?? []).filter((p) => p.link).map((p) => p.link).join(",") || "-"}`,
     ),

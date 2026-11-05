@@ -2,15 +2,17 @@
 //! substream reads and writes (relayed data plus the small protocols), and a
 //! ledger keeps the month's total in `traffic.json`.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::{AsyncRead, AsyncWrite};
+use libp2p::PeerId;
 use libp2p::core::muxing::{StreamMuxer, StreamMuxerBox, StreamMuxerEvent, SubstreamBox};
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +22,14 @@ use crate::config::Mode;
 pub struct Counters {
     pub sent: AtomicU64,
     pub received: AtomicU64,
+    /// The same per peer, to tell which key the traffic belongs to.
+    peers: Mutex<HashMap<PeerId, Arc<PeerCount>>>,
+}
+
+#[derive(Debug, Default)]
+pub struct PeerCount {
+    sent: AtomicU64,
+    received: AtomicU64,
 }
 
 impl Counters {
@@ -30,22 +40,52 @@ impl Counters {
             self.received.swap(0, Ordering::Relaxed),
         )
     }
+
+    pub fn peer(&self, peer: PeerId) -> Arc<PeerCount> {
+        self.peers.lock().unwrap().entry(peer).or_default().clone()
+    }
+
+    /// Bytes per peer since the last call, peers with none left out. A peer
+    /// whose connections are all gone drops out of the table here.
+    pub fn take_peers(&self) -> Vec<(PeerId, u64, u64)> {
+        let mut peers = self.peers.lock().unwrap();
+        let out = peers
+            .iter()
+            .map(|(p, c)| {
+                (
+                    *p,
+                    c.sent.swap(0, Ordering::Relaxed),
+                    c.received.swap(0, Ordering::Relaxed),
+                )
+            })
+            .filter(|(_, s, r)| *s != 0 || *r != 0)
+            .collect();
+        peers.retain(|_, c| Arc::strong_count(c) > 1);
+        out
+    }
 }
 
 pub struct CountingMuxer {
     inner: StreamMuxerBox,
     counters: Arc<Counters>,
+    peer: Arc<PeerCount>,
 }
 
 impl CountingMuxer {
-    pub fn new(inner: StreamMuxerBox, counters: Arc<Counters>) -> Self {
-        Self { inner, counters }
+    pub fn new(inner: StreamMuxerBox, counters: Arc<Counters>, peer: PeerId) -> Self {
+        let count = counters.peer(peer);
+        Self {
+            inner,
+            counters,
+            peer: count,
+        }
     }
 
     fn wrap(&self, s: SubstreamBox) -> CountingStream {
         CountingStream {
             inner: s,
             counters: self.counters.clone(),
+            peer: self.peer.clone(),
         }
     }
 }
@@ -85,6 +125,7 @@ impl StreamMuxer for CountingMuxer {
 pub struct CountingStream {
     inner: SubstreamBox,
     counters: Arc<Counters>,
+    peer: Arc<PeerCount>,
 }
 
 impl AsyncRead for CountingStream {
@@ -97,6 +138,7 @@ impl AsyncRead for CountingStream {
         self.counters
             .received
             .fetch_add(n as u64, Ordering::Relaxed);
+        self.peer.received.fetch_add(n as u64, Ordering::Relaxed);
         Poll::Ready(Ok(n))
     }
 }
@@ -109,6 +151,7 @@ impl AsyncWrite for CountingStream {
     ) -> Poll<io::Result<usize>> {
         let n = futures::ready!(Pin::new(&mut self.inner).poll_write(cx, buf))?;
         self.counters.sent.fetch_add(n as u64, Ordering::Relaxed);
+        self.peer.sent.fetch_add(n as u64, Ordering::Relaxed);
         Poll::Ready(Ok(n))
     }
 
@@ -128,6 +171,12 @@ pub struct Ledger {
     pub month: String,
     pub sent: u64,
     pub received: u64,
+    /// Bytes sent this month on behalf of each key's hosts and their guests.
+    #[serde(default)]
+    pub keys: BTreeMap<String, u64>,
+    /// The alerts that went out this month, so a restart doesn't repeat them.
+    #[serde(default)]
+    pub alerted: BTreeSet<String>,
     #[serde(skip)]
     path: Option<PathBuf>,
 }
@@ -160,12 +209,28 @@ impl Ledger {
         self.month = month.to_owned();
         self.sent = 0;
         self.received = 0;
+        self.keys.clear();
+        self.alerted.clear();
         true
     }
 
     pub fn add(&mut self, sent: u64, received: u64) {
         self.sent = self.sent.saturating_add(sent);
         self.received = self.received.saturating_add(received);
+    }
+
+    pub fn add_key(&mut self, label: &str, sent: u64) {
+        let total = self.keys.entry(label.to_owned()).or_default();
+        *total = total.saturating_add(sent);
+    }
+
+    pub fn key_sent(&self, label: &str) -> u64 {
+        self.keys.get(label).copied().unwrap_or(0)
+    }
+
+    /// True the first time this month, for alerts that go out once.
+    pub fn first_alert(&mut self, what: &str) -> bool {
+        self.alerted.insert(what.to_owned())
     }
 
     pub fn exhausted(&self, budget: u64) -> bool {
@@ -181,6 +246,14 @@ impl Ledger {
             configured
         }
     }
+}
+
+/// Whole percent of a budget used, 0 without a budget, at most 100.
+pub fn percent_of(used: u64, budget: u64) -> u8 {
+    if budget == 0 {
+        return 0;
+    }
+    (u128::from(used) * 100 / u128::from(budget)).min(100) as u8
 }
 
 pub fn current_month() -> String {
@@ -218,6 +291,14 @@ mod tests {
     }
 
     #[test]
+    fn percent_of_a_budget() {
+        assert_eq!(percent_of(5, 0), 0);
+        assert_eq!(percent_of(899, 1000), 89);
+        assert_eq!(percent_of(5000, 1000), 100);
+        assert_eq!(percent_of(u64::MAX, u64::MAX), 100);
+    }
+
+    #[test]
     fn budget_switches_to_coordination_and_resets_monthly() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("traffic.json");
@@ -243,9 +324,15 @@ mod tests {
         assert_eq!((again.sent, again.received), (1_000, 5_000));
         assert!(again.exhausted(budget));
 
-        // A new month starts from zero.
+        // A new month starts from zero, the keys and alerts too.
         let mut next = again.clone();
+        next.add_key("lena", 5);
+        assert!(next.first_alert("budget"));
+        assert!(!next.first_alert("budget"));
+        assert_eq!(next.key_sent("lena"), 5);
         assert!(next.roll("2999-01"));
+        assert_eq!(next.key_sent("lena"), 0);
+        assert!(next.first_alert("budget"));
         assert!(!next.roll("2999-01"));
         assert_eq!(next.effective_mode(Mode::Full, budget), Mode::Full);
     }

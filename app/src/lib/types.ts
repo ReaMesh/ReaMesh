@@ -1,3 +1,4 @@
+import type { RelayAbout, RelayNotice } from "./relayInfo";
 // Shapes of the JSON the extension's control server sends. One `state`
 // message mirrors the whole extension state; the app holds no other truth.
 
@@ -33,6 +34,8 @@ export interface Peer {
    *  once a relayed connection was upgraded to a direct one; "" / absent for
    *  the plain LAN or VPN case. */
   link?: "relay" | "direct" | "";
+  /** On the relay because a hole punch to them failed. */
+  relay_only?: boolean;
 }
 
 /** Join preview from the owner's manifest. Sizes and metadata are host-reported;
@@ -43,7 +46,15 @@ export interface SessionPreview {
   project_file?: string;
   /** `reaper` is the host's REAPER version ("7.42"; absent from an older
    *  host): the trust dialog warns when it differs from the local one. */
-  meta?: { v?: number; tracks?: number; plugins?: string[]; reaper?: string; project?: string } | null;
+  meta?: {
+    v?: number;
+    tracks?: number;
+    plugins?: string[];
+    reaper?: string;
+    project?: string;
+    /** What the host's relays announce: a guest can't ask them itself. */
+    relay_notices?: RelayNotice[];
+  } | null;
   /** blake3 of the host's project file; "" while it is still hashing. */
   project_hash?: string;
   /** Bytes a join would still write: what isn't already in this session's copy. */
@@ -248,8 +259,9 @@ export interface RelayStatus {
   label: string;
   host: string;
   state: "connecting" | "reserved" | "retrying" | "refused";
-  /** Why the last attempt failed: bad_key, banned, full, not_relay,
-   *  unreachable, timeout, lost, refused ("" = it didn't). */
+  /** Why the last attempt failed: bad_key, banned, expired, full, not_relay,
+   *  unreachable, timeout, lost, refused ("" = it didn't), or paused when the
+   *  relay announced it was going away. */
   reason: string;
 }
 
@@ -257,15 +269,19 @@ export interface RelayStatus {
 export interface RelayTest {
   id: string;
   peer: string;
-  /** testing | ok | bad_key | banned | full | not_relay | unreachable |
+  /** testing | ok | bad_key | banned | expired | full | not_relay | unreachable |
    *  timeout | invalid | refused */
   outcome: string;
   label?: string;
+  /** How long the relay took to answer, in ms (0 = not measured). */
+  rtt?: number;
 }
 
 export interface RelayInfo {
   status: RelayStatus[];
   test: RelayTest | null;
+  /** What each relay said about itself, by peer id. */
+  info: Record<string, RelayAbout>;
 }
 
 export function normalizeRelay(msg: Record<string, unknown>): RelayInfo {
@@ -274,7 +290,11 @@ export function normalizeRelay(msg: Record<string, unknown>): RelayInfo {
     msg.test && typeof msg.test === "object" && typeof (msg.test as RelayTest).id === "string"
       ? (msg.test as RelayTest)
       : null;
-  return { status, test };
+  const info =
+    msg.info && typeof msg.info === "object" && !Array.isArray(msg.info)
+      ? (msg.info as Record<string, RelayAbout>)
+      : {};
+  return { status, test, info };
 }
 
 export function displayName(p: Peer): string {

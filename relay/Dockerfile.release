@@ -1,0 +1,12 @@
+# The published relay image: the release's signed static builds, nothing compiled
+# here (.github/workflows/release.yml). The build context holds the two binaries
+# and an empty data/; relay/Dockerfile builds one from source instead.
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG TARGETARCH
+COPY reamesh-relay-${TARGETARCH} /usr/local/bin/reamesh-relay
+COPY --chown=65532:65532 data /data
+ENV REAMESH_RELAY_DATA=/data
+VOLUME /data
+EXPOSE 4001/tcp 4001/udp
+ENTRYPOINT ["/usr/local/bin/reamesh-relay"]
+CMD ["run"]

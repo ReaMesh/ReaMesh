@@ -8,7 +8,8 @@
 # `published`), which promotes it to Stable the same way. A full release fires
 # both events; the second run finds the channels already on that version.
 # A manifest is only replaced by a version at least as new, so publishing an
-# older release late never moves a channel back.
+# older release late never moves a channel back. The relay's Docker image follows
+# the same way: its `beta` and `latest` tags move with the two channels.
 name: channel
 on:
   release:
@@ -16,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: update-channels
@@ -54,6 +56,11 @@ jobs:
             cp new/latest.json "$1.json"
             gh release upload updater "$1.json" --repo "$REPO" --clobber
             echo "$1 → $NEW"
+            # A release from before the relay was released has no image.
+            docker buildx imagetools create -t "$IMAGE:$2" "$IMAGE:$NEW" ||
+              echo "::warning::no relay image for $NEW"
           }
-          publish beta
-          if [ "$PRERELEASE" != "true" ]; then publish stable; fi
+          IMAGE="ghcr.io/$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')/reamesh-relay"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          publish beta beta
+          if [ "$PRERELEASE" != "true" ]; then publish stable latest; fi

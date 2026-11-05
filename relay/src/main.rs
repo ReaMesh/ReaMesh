@@ -2,14 +2,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context as _;
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand, ValueEnum};
 use reamesh_relay::addrs;
 use reamesh_relay::config::{self, Config};
 use reamesh_relay::seen::Seen;
-use reamesh_relay::server::{self, Options};
+use reamesh_relay::server::{self, Options, Stopped};
 use reamesh_relay::status::Status;
 use reamesh_relay::term::{self, Problem, Style};
+use reamesh_relay::traffic::Ledger;
+use reamesh_relay::update::{self, Checked};
 use reamesh_relay_proto::{RelayAddr, RelayCode};
 
 // The top-level help, laid out by hand: clap's own lists `key` as one command
@@ -27,12 +30,17 @@ const HELP: &str = concat!(
     "  \x1b[1mcode\x1b[0m [name] [--copy]   Print the relay code for a key (every key without a name)\n",
     "  \x1b[1mkey add\x1b[0m <name>         Create a key and print its relay code\n",
     "  \x1b[1mkey list\x1b[0m               List the keys and when each was last used\n",
-    "  \x1b[1mkey remove\x1b[0m <name>      Delete a key; hosts using it lose access within a few seconds\n\n",
+    "  \x1b[1mkey expires\x1b[0m <name> <when>  Change a key's last day (a date, 30d, never)\n",
+    "  \x1b[1mkey remove\x1b[0m <name>      Delete a key; hosts using it lose access within a few seconds\n",
+    "  \x1b[1mnotice\x1b[0m [set|clear]     Show, set or clear the announcement hosts see in ReaMesh\n",
+    "  \x1b[1malert test\x1b[0m             Try the alert command from config.toml\n",
+    "  \x1b[1mupdate\x1b[0m                 Get the newest version now\n\n",
     "\x1b[1mOptions\x1b[0m\n{options}\n\n",
     "\x1b[1mExamples\x1b[0m\n",
     "  reamesh-relay                    \x1b[90mRun it; the first start prints the relay code\x1b[0m\n",
     "  reamesh-relay key add band       \x1b[90mA key for your band, and its relay code\x1b[0m\n",
     "  reamesh-relay code band --copy   \x1b[90mPut it on your clipboard, also over SSH\x1b[0m\n",
+    "  reamesh-relay notice set \"Moving servers\" --from \"2026-11-11 09:00\" --until \"2026-11-11 14:00\"\n",
     "  reamesh-relay status -w          \x1b[90mKeep the status on screen, updated live\x1b[0m\n",
     "  reamesh-relay --data /srv/rr     \x1b[90mKeep the identity, keys and config in /srv/rr\x1b[0m\n",
 );
@@ -104,6 +112,41 @@ enum Command {
         #[command(subcommand)]
         command: KeyCommand,
     },
+    /// Show, set or clear the announcement hosts see in ReaMesh.
+    Notice {
+        #[command(subcommand)]
+        command: Option<NoticeCommand>,
+    },
+    /// Try the alert command from config.toml.
+    Alert {
+        #[command(subcommand)]
+        command: AlertCommand,
+    },
+    /// Get the newest version now; a running relay restarts into it once nothing
+    /// is being relayed.
+    Update,
+}
+
+#[derive(Subcommand)]
+enum NoticeCommand {
+    /// Announce something, like downtime. Replaces the current notice.
+    Set {
+        text: String,
+        /// When it starts, like "2026-11-11 09:00" (this machine's time zone).
+        #[arg(long, value_name = "TIME")]
+        from: Option<String>,
+        /// When it ends; after that ReaMesh stops showing it.
+        #[arg(long, value_name = "TIME")]
+        until: Option<String>,
+    },
+    /// Remove the notice.
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum AlertCommand {
+    /// Run the command once, and say whether it worked.
+    Test,
 }
 
 #[derive(Subcommand)]
@@ -114,9 +157,14 @@ enum KeyCommand {
         /// Also put the code on the clipboard.
         #[arg(long)]
         copy: bool,
+        /// The last day it works: a date like 2026-12-24, or a span like 30d or 6w.
+        #[arg(long, value_name = "WHEN")]
+        expires: Option<String>,
     },
     /// List the keys.
     List,
+    /// Change a key's last day: a date, a span like 30d, or "never".
+    Expires { name: String, when: String },
     /// Delete a key; hosts using it lose access within a few seconds.
     Remove { name: String },
 }
@@ -132,6 +180,11 @@ fn main() -> ExitCode {
             code(&dir, name.as_deref(), copy).map(|()| ExitCode::SUCCESS)
         }
         Command::Key { command } => key(&dir, command).map(|()| ExitCode::SUCCESS),
+        Command::Notice { command } => notice(&dir, command).map(|()| ExitCode::SUCCESS),
+        Command::Alert {
+            command: AlertCommand::Test,
+        } => alert_test(&dir),
+        Command::Update => update_now(&dir).map(|()| ExitCode::SUCCESS),
     };
     result.unwrap_or_else(|e| {
         let (what, hint) = match e.chain().find_map(|c| c.downcast_ref::<Problem>()) {
@@ -143,12 +196,140 @@ fn main() -> ExitCode {
     })
 }
 
+fn notice(dir: &Path, command: Option<NoticeCommand>) -> anyhow::Result<()> {
+    config::init(dir)?;
+    let s = Style::stdout();
+    match command {
+        None => {
+            let cfg = Config::load(dir)?;
+            match cfg.notice {
+                Some(n) => {
+                    let (from, until) = n.window();
+                    let line = term::notice_line(&reamesh_relay_proto::Notice {
+                        text: n.text,
+                        from,
+                        until,
+                    });
+                    let over = until != 0 && until <= unix_now();
+                    anstream::println!(
+                        "{line}{}",
+                        if over {
+                            s.dim(" (over)")
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
+                None => anstream::println!(
+                    "No notice. {}",
+                    s.dim(
+                        "Set one with: reamesh-relay notice set <text> --from <time> --until <time>"
+                    )
+                ),
+            }
+        }
+        Some(NoticeCommand::Set { text, from, until }) => {
+            config::validate_notice_text(&text)
+                .map_err(|e| term::problem(format!("{e:#}."), ""))?;
+            let from = from.as_deref().map(config::parse_notice_time).transpose()?;
+            let until = until
+                .as_deref()
+                .map(config::parse_notice_time)
+                .transpose()?;
+            if let (Some(a), Some(b)) = (from, until)
+                && b <= a
+            {
+                return Err(term::problem("--until is not after --from.", ""));
+            }
+            config::set_notice(dir, Some((&text, from, until)))?;
+            anstream::println!(
+                "{}",
+                s.done("Notice set. Hosts see it within a few seconds; a running relay picks it up by itself.")
+            );
+        }
+        Some(NoticeCommand::Clear) => {
+            config::set_notice(dir, None)?;
+            anstream::println!("{}", s.done("Notice removed."));
+        }
+    }
+    Ok(())
+}
+
+fn update_now(dir: &Path) -> anyhow::Result<()> {
+    config::init(dir)?;
+    let s = Style::stdout();
+    let cfg = Config::load(dir)?;
+    match update::check(dir, &cfg.update.channel, true)? {
+        Checked::UpToDate | Checked::Available(_) => {
+            anstream::println!(
+                "{}",
+                s.done(&format!("Version {} is the newest here.", update::VERSION))
+            );
+        }
+        Checked::Staged(v) => {
+            anstream::println!(
+                "{}",
+                s.done(&format!(
+                    "Version {v} is ready. A running relay restarts into it once nothing is being relayed; otherwise the next start uses it."
+                ))
+            );
+        }
+    }
+    Ok(())
+}
+
+fn alert_test(dir: &Path) -> anyhow::Result<ExitCode> {
+    config::init(dir)?;
+    let s = Style::stdout();
+    let cfg = Config::load(dir)?;
+    let Some(command) = cfg.alerts.command else {
+        return Err(term::problem(
+            "No alert command is set.",
+            "Set command under [alerts] in config.toml.",
+        ));
+    };
+    let status =
+        reamesh_relay::alert::spawn(&command, "test", "This is a test of the relay's alerts.")
+            .and_then(|mut child| child.wait())
+            .context("running the alert command")?;
+    if status.success() {
+        anstream::println!("{}", s.done("The alert command ran."));
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Err(term::problem(
+            format!("The alert command failed: {status}."),
+            "",
+        ))
+    }
+}
+
 fn key(dir: &Path, command: KeyCommand) -> anyhow::Result<()> {
     config::init(dir)?;
     let s = Style::stdout();
     match command {
-        KeyCommand::Add { name, copy } => {
-            config::add_key(dir, &name)?;
+        KeyCommand::Expires { name, when } => {
+            let date = if when.trim().eq_ignore_ascii_case("never") {
+                None
+            } else {
+                Some(config::parse_expiry(&when, config::local_today())?)
+            };
+            config::set_key_expiry(dir, &name, date)?;
+            let text = match date {
+                Some(d) => format!("Key {} works through {d}.", s.strong(&name)),
+                None => format!("Key {} no longer expires.", s.strong(&name)),
+            };
+            anstream::println!("{}", s.done(&text));
+        }
+        KeyCommand::Add {
+            name,
+            copy,
+            expires,
+        } => {
+            let expires = expires
+                .as_deref()
+                .map(|w| config::parse_expiry(w, config::local_today()))
+                .transpose()?;
+            config::add_key_until(dir, &name, expires)?;
             let cfg = Config::load(dir)?;
             let code = relay_code(dir, &cfg, &name)?;
             let done = s.done(&format!("Key {} added.", s.strong(&name)));
@@ -183,6 +364,11 @@ fn key(dir: &Path, command: KeyCommand) -> anyhow::Result<()> {
                 .map(|st| st.hosts.into_iter().map(|h| h.label).collect())
                 .unwrap_or_default();
             let seen = Seen::load(dir).last;
+            let ledger = Ledger::load(&dir.join(config::TRAFFIC_FILE));
+            let today = config::local_today();
+            // Only what anyone uses gets a column.
+            let any_expiry = cfg.keys.iter().any(|k| k.expires.is_some());
+            let any_traffic = cfg.keys.iter().any(|k| ledger.key_sent(&k.label) > 0);
             let rows: Vec<Vec<String>> = cfg
                 .keys
                 .iter()
@@ -202,13 +388,30 @@ fn key(dir: &Path, command: KeyCommand) -> anyhow::Result<()> {
                             None => "never".to_owned(),
                         }
                     };
-                    vec![k.label.clone(), fp, added, last]
+                    let mut row = vec![k.label.clone(), fp, added];
+                    if any_expiry {
+                        row.push(match k.expiry_date() {
+                            Some(d) if k.is_expired(today) => format!("{d} (expired)"),
+                            Some(d) => d.to_string(),
+                            None => "-".to_owned(),
+                        });
+                    }
+                    row.push(last);
+                    if any_traffic {
+                        row.push(term::bytes(ledger.key_sent(&k.label)));
+                    }
+                    row
                 })
                 .collect();
-            anstream::print!(
-                "{}",
-                term::table(s, &["NAME", "FINGERPRINT", "ADDED", "LAST SEEN"], &rows)
-            );
+            let mut header = vec!["NAME", "FINGERPRINT", "ADDED"];
+            if any_expiry {
+                header.push("LAST DAY");
+            }
+            header.push("LAST SEEN");
+            if any_traffic {
+                header.push("THIS MONTH");
+            }
+            anstream::print!("{}", term::table(s, &header, &rows));
         }
         KeyCommand::Remove { name } => {
             config::remove_key(dir, &name)?;
@@ -226,13 +429,17 @@ fn key(dir: &Path, command: KeyCommand) -> anyhow::Result<()> {
 
 fn run(dir: PathBuf, format: LogFormat) -> anyhow::Result<()> {
     init_logging(format);
+    // A newer downloaded copy takes over from here. Only `run` does this: the
+    // other commands may run as root, and the copy is the service user's file.
+    update::start_staged(&dir);
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    let stopped = rt.block_on(async {
         let first_start = config::init(&dir)?;
         let mut opts = Options::new(&dir);
         opts.first_start = first_start;
         // JSON logs are for machines; the banner would only get in the way.
         opts.banner = format == LogFormat::Plain;
+        opts.updates = true;
         let handle = server::spawn(opts)?;
         let stop = handle.shutdown_sender();
         tokio::spawn(async move {
@@ -240,7 +447,16 @@ fn run(dir: PathBuf, format: LogFormat) -> anyhow::Result<()> {
             let _ = stop.send(true);
         });
         handle.join().await
-    })
+    })?;
+    // Everything is stopped and saved. The ports need a moment to close.
+    drop(rt);
+    if stopped == Stopped::ForUpdate {
+        std::thread::sleep(Duration::from_millis(500));
+        update::start_staged(&dir);
+        // Still here: no copy to start after all. Let the supervisor restart us.
+        return Err(term::problem("Could not start the new version.", ""));
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {

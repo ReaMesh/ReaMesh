@@ -11,7 +11,7 @@ import { normalizeRelay, normalizeState, type ExtState, type Instance } from "./
 import { getProfile } from "./profile";
 import { getOverlaySettings, subscribeOverlaySettings } from "./overlaySettings";
 import { openCtlSocket } from "./ctlSocket";
-import { getRelays, subscribeRelays } from "./relays";
+import { getRelays, noteRelayInfo, subscribeRelays } from "./relays";
 import { PROTO } from "./version";
 
 const ALL_PORTS = [47415, 47416, 47417, 47418];
@@ -121,8 +121,10 @@ function attach(port: number, ws: WebSocket) {
       // ticking (usually a modal dialog waiting for an answer over there).
       inst.busy = Boolean(msg.busy);
     } else if (msg.type === "relay") {
-      // The hosting run's relay reservations and the latest relay test.
+      // The hosting run's relay reservations, the latest relay test and what
+      // the relays said about themselves.
       inst.relay = normalizeRelay(msg);
+      noteRelayInfo(inst.relay.info);
     }
     live.set(port, inst);
     ensureActive();

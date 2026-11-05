@@ -300,6 +300,39 @@ pub fn month_bounds(month: &str) -> Option<(u64, u64)> {
     Some((at(first)?, at(first.checked_add(1.month()).ok()?)?))
 }
 
+/// A notice with its time window in this machine's time zone:
+/// "Serverumzug, Nov 11 09:00 to 14:00".
+pub fn notice_line(n: &reamesh_relay_proto::Notice) -> String {
+    let tz = jiff::tz::TimeZone::system();
+    let at = |unix: u64| {
+        jiff::Timestamp::from_second(unix as i64)
+            .ok()
+            .map(|t| t.to_zoned(tz.clone()))
+    };
+    let (from, until) = (
+        at(n.from).filter(|_| n.from != 0),
+        at(n.until).filter(|_| n.until != 0),
+    );
+    let day_time = "%b %-d %H:%M";
+    match (from, until) {
+        (Some(a), Some(b)) if a.date() == b.date() => format!(
+            "{}, {} to {}",
+            n.text,
+            a.strftime(day_time),
+            b.strftime("%H:%M")
+        ),
+        (Some(a), Some(b)) => format!(
+            "{}, {} to {}",
+            n.text,
+            a.strftime(day_time),
+            b.strftime(day_time)
+        ),
+        (Some(a), None) => format!("{}, from {}", n.text, a.strftime(day_time)),
+        (None, Some(b)) => format!("{}, until {}", n.text, b.strftime(day_time)),
+        (None, None) => n.text.clone(),
+    }
+}
+
 /// When something local happened: "23:39" today, "Oct 30" before.
 pub fn local_since(unix: u64) -> String {
     let tz = jiff::tz::TimeZone::system();

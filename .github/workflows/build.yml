@@ -232,3 +232,8 @@ jobs:
       - name: Test
         run: cargo test --release --locked -p reamesh-relay -p reamesh-relay-proto
         working-directory: relay
+      # Only a debug build takes a test channel and key, so the update path gets
+      # its own run.
+      - name: Update path test
+        run: cargo test --locked -p reamesh-relay --test update
+        working-directory: relay

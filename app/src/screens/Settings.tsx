@@ -57,7 +57,8 @@ import { nearbyBlocked, setNearby, useNearby } from "@/lib/nearby";
 import { cn, focusRing } from "@/lib/utils";
 import { send } from "@/lib/connection";
 import { MAX_RELAYS, parseRelayCode, relayHost, type RelayCode } from "@/lib/relay";
-import { addRelay, removeRelay, useRelays } from "@/lib/relays";
+import { addRelay, relayAbout, removeRelay, useRelays } from "@/lib/relays";
+import { noticeApplies, noticeLine, relayNotes, relayVersionLine } from "@/lib/relayInfo";
 import type { Instance, RelayTest } from "@/lib/types";
 
 const SOURCE_URL = "https://github.com/ReaMesh/ReaMesh";
@@ -114,6 +115,8 @@ function relayOutcomeText(outcome: string): string {
       return t("relayBadKey");
     case "banned":
       return t("relayBanned");
+    case "expired":
+      return t("relayExpired");
     case "full":
       return t("relayIsFull");
     case "not_relay":
@@ -148,6 +151,12 @@ function RelaySection({
   const [pending, setPending] = useState<Record<string, string>>({});
   const [results, setResults] = useState<Record<string, RelayTest>>({});
   const test = instance?.relay?.test ?? null;
+  const appVersion = useAppVersion();
+  // How the relays stand, for the rows below (at most once a minute out there).
+  const port = instance?.port;
+  useEffect(() => {
+    if (port !== undefined && relays.length > 0) send({ cmd: "relay_info" }, port);
+  }, [port, relays.length]);
   useEffect(() => {
     if (!test || pending[test.peer] !== test.id) return;
     setResults((r) => ({ ...r, [test.peer]: test }));
@@ -196,6 +205,16 @@ function RelaySection({
           const result = results[r.peer];
           // Neutral when it works; only a failure is worth a colour.
           const failed = !!result && result.outcome !== "testing" && result.outcome !== "ok";
+          const about = relayAbout(instance?.relay?.info, r.peer);
+          const notes = relayNotes(about);
+          const facts = [
+            relayVersionLine(about, appVersion),
+            result?.rtt ? `${result.rtt} ms` : "",
+            about?.max_hosts ? t("relayHosts", { hosts: about.hosts ?? 0, max: about.max_hosts }) : "",
+          ].filter(Boolean);
+          // Whom to ask stays out of sight until there is something to ask.
+          const contact =
+            about?.contact && (failed || notes.some((n) => n.warn)) ? about.contact : "";
           return (
             <div key={r.peer}>
               {i > 0 && <Divider inset={false} />}
@@ -229,6 +248,19 @@ function RelaySection({
                   {t("removeShort")}
                 </Button>
               </Row>
+              {/* Below the row: these lines need its full width. */}
+              {(facts.length > 0 || noticeApplies(about?.notice) || notes.length > 0 || contact) && (
+                <div className="-mt-1 space-y-0.5 px-3 pb-2 text-pretty text-[12px] leading-snug text-muted-foreground">
+                  {facts.length > 0 && <p>{facts.join(" · ")}</p>}
+                  {noticeApplies(about?.notice) && <p>{noticeLine(about.notice)}</p>}
+                  {notes.map((n) => (
+                    <p key={n.key} className={cn(n.warn && "text-amber-500")}>
+                      {t(n.key, n.params)}
+                    </p>
+                  ))}
+                  {contact && <p>{t("relayContact", { contact })}</p>}
+                </div>
+              )}
             </div>
           );
         })}

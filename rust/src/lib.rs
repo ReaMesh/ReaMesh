@@ -38,6 +38,11 @@ pub use relay::set_relays;
 
 /// The hosting run's relays as `[{peer,label,host,state,reason}]` (`state`:
 /// connecting | reserved | retrying | refused), `[]` when not hosting.
+pub fn relay_ctl_message() -> String {
+    relay::ctl_message().1
+}
+
+/// The hosting run's relay status, as JSON.
 pub fn relay_status_json() -> String {
     relay::status().to_string()
 }
@@ -98,7 +103,7 @@ const LOBBY_TOPIC: &str = "reamesh/v2/lobby";
 /// instead of tested. Mirrored in the app (`app/src/lib/version.ts`,
 /// `app/src-tauri/src/lib.rs`); app/src/lib/version.test.ts checks the copies
 /// agree.
-pub const PROTO: u32 = 6;
+pub const PROTO: u32 = 7;
 /// This build's version, the same number across the core, the extension and
 /// the ReaMesh app (they release together).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -784,6 +789,9 @@ struct LinkState {
     direct: usize,
     relayed: usize,
     was_relayed: bool,
+    /// The last hole punch to this peer failed: its router doesn't let a direct
+    /// connection through, or ours doesn't.
+    punch_failed: bool,
 }
 
 impl LinkState {
@@ -3045,13 +3053,13 @@ impl Reamesh {
         let banned = self.shared.banned.lock().unwrap();
         // How each directly connected person is reached ("relay" / "direct"
         // after a hole punch / "" for the plain LAN or VPN case).
-        let links: HashMap<String, &'static str> = self
+        let links: HashMap<String, (&'static str, bool)> = self
             .shared
             .links
             .lock()
             .unwrap()
             .iter()
-            .map(|(p, l)| (p.to_string(), l.label()))
+            .map(|(p, l)| (p.to_string(), (l.label(), l.direct == 0 && l.punch_failed)))
             .collect();
         for id in others {
             if banned.contains(&id) {
@@ -3074,7 +3082,9 @@ impl Reamesh {
                     now.duration_since(info.last_seen).as_millis() as u64,
                     false,
                 );
-                e["link"] = json!(links.get(&id).copied().unwrap_or(""));
+                let (link, punch_failed) = links.get(&id).copied().unwrap_or(("", false));
+                e["link"] = json!(link);
+                e["relay_only"] = json!(link == "relay" && punch_failed);
                 arr.push(e);
             }
         }
@@ -4297,6 +4307,7 @@ struct Behaviour {
     identify: libp2p::identify::Behaviour,
     /// The host's `/reamesh/relay-auth/1` proof before it reserves.
     relay_auth: relay::AuthBehaviour,
+    relay_info: relay::InfoBehaviour,
 }
 
 /// Gossipsub protocol prefix for session topics. The lobby keeps the default
@@ -4411,6 +4422,7 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
                 dcutr: libp2p::dcutr::Behaviour::new(key.public().to_peer_id()),
                 identify,
                 relay_auth: relay::auth_behaviour(),
+                relay_info: relay::info_behaviour(),
             })
         })
         .map_err(|e| anyhow::anyhow!("behaviour: {e}"))?
@@ -5123,7 +5135,7 @@ fn serve_xfer(
                 session_name: h.session_name.clone(),
                 project_file: h.project_file.clone(),
                 files: h.files.clone(),
-                meta: h.meta.clone(),
+                meta: relay::meta_with_notices(&h.meta, &h.relays),
                 host_proof: xfer_proof(auth_token, PROOF_HOST, me, requester),
             },
             None => XferResponse::Error {
@@ -5469,6 +5481,17 @@ struct RelaySlot {
     /// Consecutive ping timeouts to the relay (a dead path the OS hasn't
     /// noticed yet, e.g. after a network change).
     ping_misses: u32,
+    /// The request asking how the relay stands, out and held by the relay until
+    /// its answer changes, and that answer's `rev`.
+    info_req: Option<request_response::OutboundRequestId>,
+    info_rev: u64,
+    info_next: Instant,
+    /// The relay doesn't know the info protocol: don't ask again.
+    info_unsupported: bool,
+    /// The address our connection to it runs over.
+    connected: Option<Multiaddr>,
+    /// When the relay said it is going away.
+    stopping_at: Option<Instant>,
 }
 
 const RELAY_BACKOFF_MIN: Duration = Duration::from_secs(2);
@@ -5480,6 +5503,12 @@ const RELAY_STEP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Ping timeouts in a row after which the relay connection is dropped (and
 /// re-established).
 const RELAY_PING_MISSES: u32 = 3;
+/// A pause between two answers of a relay, in case its answers keep changing.
+const RELAY_INFO_GAP: Duration = Duration::from_secs(5);
+/// How soon to ask again after a request failed.
+const RELAY_INFO_RETRY: Duration = Duration::from_secs(30);
+/// After the relay said it is going away, losing it is no surprise for this long.
+const RELAY_PAUSE_CALM: Duration = Duration::from_secs(10 * 60);
 
 impl RelaySlot {
     fn new(code: relay::RelayCode) -> Self {
@@ -5491,6 +5520,12 @@ impl RelaySlot {
             key_label: String::new(),
             reason: "",
             ping_misses: 0,
+            info_req: None,
+            info_rev: 0,
+            info_next: Instant::now(),
+            info_unsupported: false,
+            connected: None,
+            stopping_at: None,
         }
     }
 
@@ -5503,7 +5538,7 @@ impl RelaySlot {
         eprintln!("[reamesh] relay {}: {reason}", self.code.addr.host());
         self.reason = reason;
         self.ping_misses = 0;
-        if matches!(reason, "bad_key" | "banned" | "not_relay") {
+        if matches!(reason, "bad_key" | "banned" | "not_relay" | "expired") {
             self.phase = RelayPhase::Refused;
             return;
         }
@@ -5520,18 +5555,60 @@ impl RelaySlot {
             RelayPhase::Idle if !self.reason.is_empty() => "retrying",
             _ => "connecting",
         };
+        // Announced by the relay itself, so not a problem to report.
+        let paused = state != "reserved"
+            && state != "refused"
+            && self.stopping_at.is_some_and(|t| t.elapsed() < RELAY_PAUSE_CALM);
         json!({
             "peer": self.peer().to_string(),
             "label": if self.key_label.is_empty() { self.code.label.clone() } else { self.key_label.clone() },
             "host": self.code.addr.host(),
             "state": state,
-            "reason": self.reason,
+            "reason": if paused { "paused" } else { self.reason },
         })
     }
 }
 
 fn publish_relay_status(slots: &[RelaySlot]) {
     relay::set_status(JsonValue::Array(slots.iter().map(RelaySlot::status).collect()));
+}
+
+fn relay_send_info(swarm: &mut Swarm<Behaviour>, slot: &mut RelaySlot) {
+    let me = *swarm.local_peer_id();
+    let proof = relay::auth_proof(&slot.code.key, &slot.peer(), &me).to_vec();
+    let req = relay::InfoRequest { proof, rev: slot.info_rev };
+    slot.info_req = Some(swarm.behaviour_mut().relay_info.send_request(&slot.peer(), req));
+}
+
+/// The relay answered: file it, and take a changed address along.
+fn relay_on_info(
+    slots: &mut [RelaySlot],
+    req: request_response::OutboundRequestId,
+    resp: Result<relay::InfoResponse, bool>,
+) {
+    let Some(slot) = slots.iter_mut().find(|s| s.info_req == Some(req)) else { return };
+    slot.info_req = None;
+    match resp {
+        Ok(r) => {
+            let r = r.sanitized();
+            slot.info_rev = if r.ok { r.rev } else { 0 };
+            slot.info_next = Instant::now() + RELAY_INFO_GAP;
+            if r.stopping {
+                slot.stopping_at = Some(Instant::now());
+            }
+            let new = r.ok.then(|| r.updated_addr(&slot.code.addr, slot.connected.as_ref(), loopback_only())).flatten();
+            let new_code = new.map(|addr| {
+                slot.code.addr = addr;
+                slot.code.encode()
+            });
+            relay::set_info(&slot.peer(), relay::info_json(&r, new_code));
+        }
+        Err(true) => {
+            slot.info_unsupported = true;
+            relay::set_info_outdated(&slot.peer());
+        }
+        Err(false) => slot.info_next = Instant::now() + RELAY_INFO_RETRY,
+    }
 }
 
 fn relay_send_auth(swarm: &mut Swarm<Behaviour>, slot: &mut RelaySlot) {
@@ -5545,6 +5622,13 @@ fn relay_send_auth(swarm: &mut Swarm<Behaviour>, slot: &mut RelaySlot) {
 fn relay_tick(swarm: &mut Swarm<Behaviour>, slots: &mut [RelaySlot]) {
     let now = Instant::now();
     for slot in slots.iter_mut() {
+        if matches!(slot.phase, RelayPhase::Reserved { .. })
+            && slot.info_req.is_none()
+            && !slot.info_unsupported
+            && now >= slot.info_next
+        {
+            relay_send_info(swarm, slot);
+        }
         match slot.phase {
             RelayPhase::Idle if now >= slot.retry_at => {
                 if swarm.is_connected(&slot.peer()) {
@@ -5580,8 +5664,9 @@ fn relay_tick(swarm: &mut Swarm<Behaviour>, slots: &mut [RelaySlot]) {
 
 /// A (direct) connection to a relay peer came up: authenticate if we were
 /// waiting for it.
-fn relay_on_connected(swarm: &mut Swarm<Behaviour>, slots: &mut [RelaySlot], peer: &PeerId) {
+fn relay_on_connected(swarm: &mut Swarm<Behaviour>, slots: &mut [RelaySlot], peer: &PeerId, addr: &Multiaddr) {
     for slot in slots.iter_mut().filter(|s| s.peer() == *peer) {
+        slot.connected = Some(addr.clone());
         if matches!(slot.phase, RelayPhase::Dialing { .. }) {
             relay_send_auth(swarm, slot);
         }
@@ -5617,7 +5702,16 @@ fn relay_on_auth(
                 }
             }
         }
-        Ok(r) => slot.fail(relay::refusal_reason(&r)),
+        Ok(r) => {
+            let reason = relay::refusal_reason(&r);
+            slot.fail(reason);
+            // Why it is full or who to ask about an expired key: worth one
+            // question while the connection is up.
+            if matches!(reason, "full" | "expired") && slot.info_req.is_none() && !slot.info_unsupported {
+                slot.info_rev = 0;
+                relay_send_info(swarm, slot);
+            }
+        }
         Err(reason) => slot.fail(reason),
     }
 }
@@ -5632,6 +5726,7 @@ fn relay_on_reserved(slots: &mut [RelaySlot], relay_peer: &PeerId) {
             slot.phase = RelayPhase::Reserved { listener };
             slot.backoff = RELAY_BACKOFF_MIN;
             slot.reason = "";
+            slot.stopping_at = None;
         }
     }
 }
@@ -6817,7 +6912,7 @@ async fn run_network(
                     if relayed {
                         shared.relayed_conns.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        relay_on_connected(&mut swarm, &mut relay_slots, &peer_id);
+                        relay_on_connected(&mut swarm, &mut relay_slots, &peer_id, endpoint.get_remote_address());
                     }
                     if hint_conns.remove(&connection_id) {
                         add_explicit_both(&mut swarm, &peer_id);
@@ -6911,10 +7006,28 @@ async fn run_network(
                     };
                     relay_on_auth(&mut swarm, &mut relay_slots, request_id, Err(reason));
                 }
+                SwarmEvent::Behaviour(BehaviourEvent::RelayInfo(request_response::Event::Message {
+                    message: request_response::Message::Response { request_id, response },
+                    ..
+                })) => {
+                    relay_on_info(&mut relay_slots, request_id, Ok(response));
+                    publish_relay_status(&relay_slots);
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::RelayInfo(request_response::Event::OutboundFailure {
+                    request_id, error, ..
+                })) => {
+                    // An older relay, which just doesn't say anything: not a failure.
+                    let older = matches!(error, request_response::OutboundFailure::UnsupportedProtocols);
+                    relay_on_info(&mut relay_slots, request_id, Err(older));
+                }
                 SwarmEvent::Behaviour(BehaviourEvent::Dcutr(libp2p::dcutr::Event { remote_peer_id, result })) => {
+                    let failed = result.is_err();
                     match result {
                         Ok(_) => eprintln!("[reamesh] hole punch to {remote_peer_id}: direct"),
                         Err(e) => eprintln!("[reamesh] hole punch to {remote_peer_id} failed ({e}); staying on the relay"),
+                    }
+                    if let Some(l) = shared.links.lock().unwrap().get_mut(&remote_peer_id) {
+                        l.punch_failed = failed;
                     }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { peer, result, .. })) => {

@@ -20,6 +20,7 @@ import { Hint } from "@/components/Hint";
 import { useActiveInstance } from "@/lib/connection";
 import { findLink, joinInto, linkLabel, linkStateOf, type LinkedCopy, type LinkState } from "@/lib/copyLink";
 import { formatBytes, reaperVersionKey } from "@/lib/format";
+import { noticeApplies, noticeLine } from "@/lib/relayInfo";
 import { t } from "@/lib/i18n";
 import { hostSeenCount } from "@/lib/knownHosts";
 import { parseFxName, pluginStatus, useInstalledPlugins, type PluginStatus } from "@/lib/plugins";
@@ -219,6 +220,7 @@ export function TrustDialog({
   hostName,
   bytes,
   preview,
+  viaInvite = false,
   onJoin,
 }: {
   open: boolean;
@@ -233,6 +235,8 @@ export function TrustDialog({
   bytes?: number;
   /** Manifest preview from a successful probe (may be null on older hosts). */
   preview?: SessionPreview | null;
+  /** Joining by invite code, the path that can run over the host's relay. */
+  viaInvite?: boolean;
   /** `into` is what the `join` command needs for a linked copy. */
   onJoin: (nofx: boolean, into: { dest?: string; overwrite?: boolean }) => void;
 }) {
@@ -254,6 +258,12 @@ export function TrustDialog({
   // round for edits). Silent when either side doesn't report a version.
   const hostReaper = preview?.meta?.reaper;
   const localReaper = useActiveInstance()?.state?.reaper;
+  // What the host's relay announces. On the LAN the relay plays no part.
+  const relayNotices = viaInvite
+    ? (Array.isArray(preview?.meta?.relay_notices) ? preview.meta.relay_notices : [])
+        .filter((n) => typeof n?.text === "string" && noticeApplies(n))
+        .slice(0, 3)
+    : [];
   const mismatch = !!hostReaper && !!localReaper && hostReaper !== localReaper;
 
   // The download would refuse to start for lack of room, so say it here. That is
@@ -333,6 +343,11 @@ export function TrustDialog({
                 </Hint>
               </DialogFact>
             )}
+            {relayNotices.map((n) => (
+              <DialogFact key={n.text} label={t("relayNoticeJoin")}>
+                {noticeLine(n)}
+              </DialogFact>
+            ))}
           </DialogFacts>
 
           {plugins && plugins.length > 0 && <PluginList plugins={plugins} />}

@@ -1,6 +1,6 @@
 [package]
 name = "reamesh-relay"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/ReaMesh/ReaMesh"
@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 anstream = "1.0"
 anyhow = "1.0"
+base64 = "0.22"
 blake3 = "1.8"
 clap = { version = "4.6", features = ["derive", "env"] }
 futures = "0.3"
@@ -21,9 +22,13 @@ if-addrs = "0.15"
 jiff = "0.2"
 # The relay code and auth exchange, shared with ReaMesh itself.
 reamesh-relay-proto = { path = "../relay-proto" }
+# Checks a downloaded update against the release key.
+minisign-verify = "0.2"
 libp2p = { version = "0.57.0", features = ["tokio", "tcp", "quic", "noise", "yamux", "relay", "identify", "ping", "autonat", "macros", "request-response", "cbor"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Downloads updates; TLS with bundled roots, so it works in a bare container.
+ureq = "3"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "fs"] }
 toml = "0.9"
 # Edits config.toml from the `key` commands without dropping its comments.

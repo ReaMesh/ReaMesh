@@ -3,7 +3,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { PROTO, compareVersions, protoSkew, versionSkew } from "./version";
 
-// App, extension and core release together under one version and one PROTO.
+// App, extension, core and relay release together under one version; the first
+// three also under one PROTO.
 // These keep the copies from drifting apart.
 const repo = fileURLToPath(new URL("../../../", import.meta.url));
 const read = (p: string) => readFileSync(repo + p, "utf8");
@@ -28,6 +29,8 @@ describe("version", () => {
     expect(JSON.parse(read("app/src-tauri/tauri.conf.json")).version).toBe(v);
     expect(cargoVersion("app/src-tauri/Cargo.toml")).toBe(v);
     expect(cargoVersion("rust/Cargo.toml")).toBe(v);
+    expect(cargoVersion("relay/Cargo.toml")).toBe(v);
+    expect(/name = "reamesh-relay"\nversion = "([^"]+)"/.exec(read("relay/Cargo.lock"))?.[1]).toBe(v);
   });
 });
 

@@ -2,11 +2,9 @@
 # relay code. Keys: `docker compose exec relay reamesh-relay key add <label>`.
 services:
   relay:
-    # The repository root: the build also needs relay-proto/ and proprietary/.
-    build:
-      context: ..
-      dockerfile: relay/Dockerfile
-    image: reamesh-relay
+    # The relay updates itself inside its data volume. To build it from source
+    # instead, see Dockerfile.
+    image: ghcr.io/reamesh/reamesh-relay:latest
     restart: unless-stopped
     # Host networking: the relay sees the server's real addresses (for the
     # relay code and IPv6) and UDP needs no port mapping. Without it, map

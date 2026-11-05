@@ -36,8 +36,14 @@ use libp2p::swarm::{
 use libp2p::{Multiaddr, PeerId, StreamProtocol, noise, tcp, yamux};
 use serde_json::{Value as JsonValue, json};
 
-pub use reamesh_relay_proto::{AuthRequest, AuthResponse, RelayAddr, RelayCode, auth_proof, refusal_reason};
-use reamesh_relay_proto::{RELAY_AUTH_PROTOCOL, RELAY_LABEL_MAX, RELAY_MAX_IPS, valid_dns_name};
+pub use reamesh_relay_proto::{
+    AuthRequest, AuthResponse, InfoRequest, InfoResponse, RelayAddr, RelayCode, auth_proof,
+    refusal_reason,
+};
+use reamesh_relay_proto::{
+    INFO_TIMEOUT_SECS, RELAY_AUTH_PROTOCOL, RELAY_INFO_PROTOCOL, RELAY_LABEL_MAX, RELAY_MAX_IPS,
+    RELAY_REQUIRED_LEVEL, valid_dns_name,
+};
 
 /// Most relays a user can configure. The host reserves on all of them and the
 /// invite link names all of them.
@@ -100,6 +106,19 @@ pub fn auth_behaviour() -> AuthBehaviour {
     )
 }
 
+/// cbindgen:ignore
+pub type InfoBehaviour = request_response::cbor::Behaviour<InfoRequest, InfoResponse>;
+
+/// Asking a relay how it stands: outbound only. The relay holds a request until
+/// its answer changes, so the timeout is long.
+pub fn info_behaviour() -> InfoBehaviour {
+    request_response::cbor::Behaviour::new(
+        [(StreamProtocol::new(RELAY_INFO_PROTOCOL), ProtocolSupport::Outbound)],
+        request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(INFO_TIMEOUT_SECS)),
+    )
+}
+
 // ---------- configured relays (process-global, set by the app) ----------
 
 /// The relays the app configured. Global like the
@@ -122,7 +141,23 @@ pub fn set_relays(codes: &[String]) -> usize {
         }
     }
     let n = out.len();
-    *RELAYS.lock().unwrap() = out;
+    let peers: HashSet<String> = out.iter().map(|c| c.addr.peer.to_string()).collect();
+    let mut relays = RELAYS.lock().unwrap();
+    let same = relays.len() == out.len()
+        && relays.iter().all(|c| peers.contains(&c.addr.peer.to_string()));
+    *relays = out;
+    drop(relays);
+    if !same {
+        // A relay that was just added is worth asking at once, and what a
+        // removed one said is nobody's business any more.
+        *LAST_REFRESH.lock().unwrap() = None;
+        let mut info = INFO.lock().unwrap();
+        let before = info.len();
+        info.retain(|peer, _| peers.contains(peer));
+        if info.len() != before {
+            GEN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     n
 }
 
@@ -135,8 +170,89 @@ pub fn configured_relays() -> Vec<RelayCode> {
 static STATUS: LazyLock<Mutex<JsonValue>> = LazyLock::new(|| Mutex::new(json!([])));
 /// Latest relay test result (`{id,peer,outcome,label}`), Null before any.
 static TEST_RESULT: LazyLock<Mutex<JsonValue>> = LazyLock::new(|| Mutex::new(JsonValue::Null));
-/// Bumped on every change to either, so the control server knows to send.
+/// What each relay said about itself, by peer id (see `info_json`). Kept when
+/// the relay goes away: a notice explains exactly that.
+static INFO: LazyLock<Mutex<HashMap<String, JsonValue>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// When the relays were last asked outside a hosting run.
+static LAST_REFRESH: Mutex<Option<Instant>> = Mutex::new(None);
+/// How often the app's `relay_info` really goes out to the relays.
+const REFRESH_EVERY: Duration = Duration::from_secs(60);
+/// Bumped on every change to any of these, so the control server knows to send.
 static GEN: AtomicU64 = AtomicU64::new(0);
+
+/// What the app gets to know about a relay from its answer. `new_code` is the
+/// relay's code with a changed address, for the app to store.
+pub fn info_json(r: &InfoResponse, new_code: Option<String>) -> JsonValue {
+    let mut v = json!({
+        "ok": r.ok,
+        "reason": r.reason.as_deref().unwrap_or(""),
+        "version": r.version,
+        "outdated": r.ok && r.level < RELAY_REQUIRED_LEVEL,
+        "mode": r.mode,
+        "budget_percent": r.budget_percent,
+        "budget_exhausted": r.budget_exhausted,
+        "key_budget_percent": r.key_budget_percent,
+        "key_budget_exhausted": r.key_budget_exhausted,
+        "budget_resets": r.budget_resets,
+        "hosts": r.hosts,
+        "max_hosts": r.max_hosts,
+        "notice": r.notice.as_ref().map(|n| json!({ "text": n.text, "from": n.from, "until": n.until })),
+        "name": r.name,
+        "contact": r.contact,
+        "key_expires": r.key_expires,
+        "stopping": r.stopping,
+    });
+    if let Some(code) = new_code {
+        v["new_code"] = json!(code);
+    }
+    v
+}
+
+pub fn set_info(peer: &PeerId, v: JsonValue) {
+    let mut info = INFO.lock().unwrap();
+    if info.get(&peer.to_string()) != Some(&v) {
+        info.insert(peer.to_string(), v);
+        GEN.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A relay that doesn't know the info protocol at all.
+pub fn set_info_outdated(peer: &PeerId) {
+    set_info(peer, json!({ "ok": true, "outdated": true, "version": "" }));
+}
+
+/// Notices of the given relays that aren't over, for the guests a hosting run
+/// serves (see `meta_with_notices`).
+fn notices_of(relays: &[RelayCode], now_secs: u64) -> Vec<JsonValue> {
+    let info = INFO.lock().unwrap();
+    relays
+        .iter()
+        .filter_map(|c| info.get(&c.addr.peer.to_string())?.get("notice").cloned())
+        .filter(|n| {
+            let until = n["until"].as_u64().unwrap_or(0);
+            n.is_object() && (until == 0 || until > now_secs)
+        })
+        .collect()
+}
+
+/// The session meta a joining guest gets, with the notices of the host's relays
+/// added: a guest has no key and can't ask them itself. Only where something is
+/// announced, and only in what goes out, never in the host's own meta.
+pub fn meta_with_notices(meta: &str, relays: &[RelayCode]) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let notices = notices_of(relays, now);
+    if notices.is_empty() {
+        return meta.to_owned();
+    }
+    let mut v: JsonValue = serde_json::from_str(meta).unwrap_or_else(|_| json!({}));
+    if !v.is_object() {
+        return meta.to_owned();
+    }
+    v["relay_notices"] = JsonValue::Array(notices);
+    v.to_string()
+}
 
 pub fn set_status(v: JsonValue) {
     let mut s = STATUS.lock().unwrap();
@@ -159,6 +275,7 @@ pub fn ctl_message() -> (u64, String) {
         "type": "relay",
         "status": STATUS.lock().unwrap().clone(),
         "test": TEST_RESULT.lock().unwrap().clone(),
+        "info": JsonValue::Object(INFO.lock().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
     });
     (generation, msg.to_string())
 }
@@ -168,6 +285,7 @@ pub fn ctl_message() -> (u64, String) {
 #[derive(NetworkBehaviour)]
 struct TestBehaviour {
     auth: AuthBehaviour,
+    info: InfoBehaviour,
 }
 
 fn test_swarm() -> anyhow::Result<libp2p::Swarm<TestBehaviour>> {
@@ -177,7 +295,7 @@ fn test_swarm() -> anyhow::Result<libp2p::Swarm<TestBehaviour>> {
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
         .with_quic()
         .with_dns_config(dns_cfg, dns_opts)
-        .with_behaviour(|_| TestBehaviour { auth: auth_behaviour() })
+        .with_behaviour(|_| TestBehaviour { auth: auth_behaviour(), info: info_behaviour() })
         .map_err(|e| anyhow::anyhow!("behaviour: {e}"))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(5)))
         .build())
@@ -187,63 +305,140 @@ fn test_swarm() -> anyhow::Result<libp2p::Swarm<TestBehaviour>> {
 /// Dials the relay with this install's identity (a ban is per device) and
 /// runs the auth exchange; no reservation, which would replace a running
 /// host's own. Outcomes: `ok` (reachable, key accepted), `bad_key`,
-/// `banned`, `full`, `not_relay` (answers, but not the auth protocol),
-/// `unreachable`, `timeout`, `invalid` (the code doesn't parse).
+/// `banned`, `expired`, `full`, `not_relay` (answers, but not the auth
+/// protocol), `unreachable`, `timeout`, `invalid` (the code doesn't parse).
+/// `rtt` is how long the auth round trip took, in ms.
 pub async fn run_test(code: String, id: String) {
     let parsed = parse_relay_code(&code);
     let peer = parsed.as_ref().map(|c| c.addr.peer.to_string()).unwrap_or_default();
     *TEST_RESULT.lock().unwrap() = json!({ "id": id, "peer": peer, "outcome": "testing" });
     GEN.fetch_add(1, Ordering::Relaxed);
-    let (outcome, label) = match parsed {
-        None => ("invalid", String::new()),
-        Some(c) => match tokio::time::timeout(TEST_TIMEOUT, test_relay(&c)).await {
+    let probe = match parsed {
+        None => Probe::failed("invalid"),
+        Some(c) => match tokio::time::timeout(TEST_TIMEOUT, probe_relay(&c, true)).await {
             Ok(r) => r,
-            Err(_) => ("timeout", String::new()),
+            Err(_) => Probe::failed("timeout"),
         },
     };
     *TEST_RESULT.lock().unwrap() =
-        json!({ "id": id, "peer": peer, "outcome": outcome, "label": label });
+        json!({ "id": id, "peer": peer, "outcome": probe.outcome, "label": probe.label, "rtt": probe.rtt });
     GEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Asks every configured relay how it stands (`relay_info`), so the app knows
+/// about a notice before anyone hosts. Not while hosting (the run hears from
+/// them anyway), and at most once a minute however often the app asks.
+pub fn refresh_info() {
+    if status().as_array().is_some_and(|a| !a.is_empty()) {
+        return;
+    }
+    {
+        let mut last = LAST_REFRESH.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed() < REFRESH_EVERY) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    for code in configured_relays() {
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(TEST_TIMEOUT, probe_relay(&code, false)).await;
+        });
+    }
+}
+
+/// What came of talking to a relay.
+pub struct Probe {
+    pub outcome: &'static str,
+    pub label: String,
+    pub rtt: u64,
+}
+
+impl Probe {
+    fn failed(outcome: &'static str) -> Self {
+        Self { outcome, label: String::new(), rtt: 0 }
+    }
 }
 
 /// The test itself (see `run_test`), unbounded in time.
 pub async fn test_relay(code: &RelayCode) -> (&'static str, String) {
-    let Ok(mut swarm) = test_swarm() else { return ("unreachable", String::new()) };
+    let p = probe_relay(code, true).await;
+    (p.outcome, p.label)
+}
+
+/// Connects, proves the key (with `auth`: over the auth exchange too) and files
+/// what the relay says about itself under `set_info`.
+async fn probe_relay(code: &RelayCode, auth: bool) -> Probe {
+    let Ok(mut swarm) = test_swarm() else { return Probe::failed("unreachable") };
     let relay = code.addr.peer;
     if swarm
         .dial(DialOpts::peer_id(relay).addresses(code.addr.dial_addrs()).build())
         .is_err()
     {
-        return ("unreachable", String::new());
+        return Probe::failed("unreachable");
     }
     let me = *swarm.local_peer_id();
+    let proof = auth_proof(&code.key, &relay, &me).to_vec();
+    let mut connected = None;
+    let mut sent_auth = Instant::now();
+    let mut result = Probe { outcome: "ok", label: String::new(), rtt: 0 };
     loop {
         match swarm.select_next_some().await {
-            SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == relay => {
-                let proof = auth_proof(&code.key, &relay, &me).to_vec();
-                swarm.behaviour_mut().auth.send_request(&relay, AuthRequest { proof });
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } if peer_id == relay => {
+                connected = Some(endpoint.get_remote_address().clone());
+                let info = InfoRequest { proof: proof.clone(), rev: 0 };
+                if auth {
+                    sent_auth = Instant::now();
+                    swarm.behaviour_mut().auth.send_request(&relay, AuthRequest { proof: proof.clone() });
+                } else {
+                    swarm.behaviour_mut().info.send_request(&relay, info);
+                }
             }
             SwarmEvent::OutgoingConnectionError { peer_id: Some(p), .. } if p == relay => {
-                return ("unreachable", String::new());
+                return Probe::failed("unreachable");
             }
             SwarmEvent::Behaviour(TestBehaviourEvent::Auth(request_response::Event::Message {
                 message: request_response::Message::Response { response, .. },
                 ..
             })) => {
                 let label = response.key_label.clone().unwrap_or_default();
-                let label = crate::limits::clip(&label, RELAY_LABEL_MAX);
-                return if response.ok { ("ok", label) } else { (refusal_reason(&response), label) };
+                result.label = crate::limits::clip(&label, RELAY_LABEL_MAX);
+                result.rtt = sent_auth.elapsed().as_millis() as u64;
+                if !response.ok {
+                    result.outcome = refusal_reason(&response);
+                }
+                // Nothing to learn with a key it doesn't take.
+                if matches!(result.outcome, "bad_key" | "banned") {
+                    return result;
+                }
+                let info = InfoRequest { proof: proof.clone(), rev: 0 };
+                swarm.behaviour_mut().info.send_request(&relay, info);
             }
             SwarmEvent::Behaviour(TestBehaviourEvent::Auth(
                 request_response::Event::OutboundFailure { error, .. },
             )) => {
-                return match error {
-                    request_response::OutboundFailure::UnsupportedProtocols => {
-                        ("not_relay", String::new())
-                    }
-                    request_response::OutboundFailure::Timeout => ("timeout", String::new()),
-                    _ => ("unreachable", String::new()),
-                };
+                return Probe::failed(match error {
+                    request_response::OutboundFailure::UnsupportedProtocols => "not_relay",
+                    request_response::OutboundFailure::Timeout => "timeout",
+                    _ => "unreachable",
+                });
+            }
+            SwarmEvent::Behaviour(TestBehaviourEvent::Info(request_response::Event::Message {
+                message: request_response::Message::Response { response, .. },
+                ..
+            })) => {
+                let r = response.sanitized();
+                let new = r.ok.then(|| r.updated_addr(&code.addr, connected.as_ref(), crate::loopback_only())).flatten();
+                let new_code = new.map(|addr| RelayCode { addr, ..code.clone() }.encode());
+                set_info(&relay, info_json(&r, new_code));
+                return result;
+            }
+            SwarmEvent::Behaviour(TestBehaviourEvent::Info(
+                request_response::Event::OutboundFailure { error, .. },
+            )) => {
+                if matches!(error, request_response::OutboundFailure::UnsupportedProtocols) {
+                    set_info_outdated(&relay);
+                }
+                return result;
             }
             _ => {}
         }
@@ -583,6 +778,42 @@ mod tests {
         assert_eq!(got[1].addr.peer, other);
         set_relays(&[]);
         assert!(configured_relays().is_empty());
+    }
+
+    #[test]
+    fn guests_get_a_relays_notice_only_while_it_applies() {
+        let peer: PeerId = PeerId::random();
+        let code = RelayCode {
+            addr: RelayAddr {
+                peer,
+                ips: vec!["203.0.113.5".parse().unwrap()],
+                dns: String::new(),
+                tcp: 4001,
+                quic: 4001,
+            },
+            key: [1; 32],
+            label: String::new(),
+        };
+        let relays = [code];
+        let meta = r#"{"tracks":3}"#;
+        // Nothing announced: the meta goes out untouched.
+        assert_eq!(meta_with_notices(meta, &relays), meta);
+        let notice = |until: u64| InfoResponse {
+            ok: true,
+            notice: Some(reamesh_relay_proto::Notice { text: "Moving".into(), from: 0, until }),
+            ..InfoResponse::default()
+        };
+        set_info(&peer, info_json(&notice(u64::MAX), None));
+        let v: JsonValue = serde_json::from_str(&meta_with_notices(meta, &relays)).unwrap();
+        assert_eq!(v["tracks"], 3);
+        assert_eq!(v["relay_notices"][0]["text"], "Moving");
+        // Over: not sent any more. And an empty meta still gets one.
+        set_info(&peer, info_json(&notice(1), None));
+        assert_eq!(meta_with_notices(meta, &relays), meta);
+        set_info(&peer, info_json(&notice(0), None));
+        let v: JsonValue = serde_json::from_str(&meta_with_notices("", &relays)).unwrap();
+        assert_eq!(v["relay_notices"][0]["text"], "Moving");
+        INFO.lock().unwrap().remove(&peer.to_string());
     }
 
     #[test]

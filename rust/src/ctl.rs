@@ -12,8 +12,10 @@
 //! and must work before one exists: `set_profile` (display name + color for
 //! presence beacons), `set_relays` (`{codes:[relay code…]}`, taken by the next
 //! hosting run) and `relay_test` (`{code,id}`: dial the relay and run its auth
-//! exchange). The server also sends `{"type":"relay", status, test}` whenever
-//! the hosting run's relay status or a test result changes, and to every new
+//! exchange), `relay_info` (ask the relays how they stand, at most once a
+//! minute). The server also sends `{"type":"relay", status, test, info}` whenever
+//! the hosting run's relay status, a test result or what a relay said changes,
+//! and to every new
 //! client.
 //!
 //! Multiple REAPER instances on one machine (the documented dev setup) each
@@ -536,6 +538,10 @@ fn handle_inbound(shared: &CtlShared, msg: String) {
             Some("relay_test") => {
                 let (code, id) = (get("code").to_string(), crate::limits::clip(get("id"), 64));
                 tokio::spawn(crate::relay::run_test(code, id));
+                return;
+            }
+            Some("relay_info") => {
+                crate::relay::refresh_info();
                 return;
             }
             _ => {}

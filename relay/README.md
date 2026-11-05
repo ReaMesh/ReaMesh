@@ -30,8 +30,7 @@ VM is plenty, and bandwidth only goes to the sessions it has to relay.
 ### Docker
 
 ```sh
-git clone https://github.com/ReaMesh/ReaMesh
-cd ReaMesh/relay
+curl -fsSLO https://raw.githubusercontent.com/ReaMesh/ReaMesh/main/relay/docker-compose.yml
 docker compose up -d && docker compose logs
 ```
 
@@ -42,25 +41,28 @@ docker compose exec relay reamesh-relay key add lena
 docker compose exec relay reamesh-relay status
 ```
 
-The image builds from the repository root (compose sets that up), since the
-relay shares its protocol crate (`relay-proto/`) with ReaMesh.
-
 The config lives in the `data` volume (`/data/config.toml` in the container);
-`docker compose exec relay reamesh-relay code` prints the codes again.
+`docker compose exec relay reamesh-relay code` prints the codes again. To build
+the image from source instead: `docker build -f relay/Dockerfile -t
+ghcr.io/reamesh/reamesh-relay:latest .` from a checkout of the repository.
 
 ### VPS with systemd
 
-1. Build and install (needs [Rust](https://rustup.rs)):
+1. Download the build for your machine (`x86_64`, or `aarch64` for Arm servers
+   and a 64-bit Raspberry Pi). It is one static file and runs on any Linux:
 
    ```sh
-   cargo install --locked --git https://github.com/ReaMesh/ReaMesh reamesh-relay
-   sudo cp ~/.cargo/bin/reamesh-relay /usr/local/bin/
+   curl -fsSL -o reamesh-relay https://github.com/ReaMesh/ReaMesh/releases/latest/download/reamesh-relay-linux-x86_64
+   sudo install -m 0755 reamesh-relay /usr/local/bin/
    ```
+
+   With [Rust](https://rustup.rs) you can build it instead:
+   `cargo install --locked --git https://github.com/ReaMesh/ReaMesh reamesh-relay`.
 
 2. Install the service (`reamesh-relay.service` from this folder) and start it:
 
    ```sh
-   sudo cp reamesh-relay.service /etc/systemd/system/
+   sudo curl -fsSL -o /etc/systemd/system/reamesh-relay.service https://raw.githubusercontent.com/ReaMesh/ReaMesh/main/relay/reamesh-relay.service
    sudo systemctl enable --now reamesh-relay
    ```
 
@@ -75,8 +77,8 @@ the running relay picks the change up by itself.
 
 ### Raspberry Pi
 
-The same as a VPS (64-bit Raspberry Pi OS; building takes a while on the Pi,
-or use Docker). A Pi at home sits behind your router, so:
+The same as a VPS with the `aarch64` build (64-bit Raspberry Pi OS), or Docker.
+A Pi at home sits behind your router, so:
 
 1. Forward TCP and UDP port 4001 on the router to the Pi.
 2. Your home IP probably changes: set up a dynamic DNS name (many routers
@@ -126,9 +128,96 @@ reconnects everyone once.
 | `limits.max_circuits` | 64 | Relayed connections at the same time (also `_per_host` 16, `_per_ip` 8) |
 | `limits.circuit_max_minutes`, `circuit_max_mb` | 720, 0 | Per relayed connection (0 MB = no limit); ReaMesh reconnects it |
 | `limits.monthly_budget_gb` | 500 | Data sent per month (UTC); then coordination mode until the month ends (0 = unlimited) |
+| `name`, `contact` | none | Who runs it; ReaMesh only shows them when something is wrong with the relay |
+| `alerts.command`, `alerts.budget_percent` | none, 80 | See [Alerts](#alerts) |
+| `update.auto`, `update.channel` | `true`, `stable` | See [Updates](#updates) |
 
 The budget counts what the relay sends (what providers usually bill), as the
 data inside the encrypted connections: real traffic is a few percent higher.
+
+## Telling your hosts something
+
+```sh
+reamesh-relay notice set "Moving servers" --from "2026-11-11 09:00" --until "2026-11-11 14:00"
+reamesh-relay notice clear
+```
+
+Hosts holding a key see it in ReaMesh within seconds, in their own time zone and
+language: in the Lobby from a week ahead, in Settings and on the Session screen.
+Guests joining by invite link see it in the join dialog. Both times are optional;
+after `--until` it goes away by itself. A relay that stops or restarts also tells
+its hosts on the way out, so they see a calm "pausing" line instead of a warning.
+
+## Keys: dates and limits
+
+```sh
+reamesh-relay key add guest --expires 30d     # or a date: --expires 2026-12-24
+reamesh-relay key expires guest 2027-01-31    # or: never
+```
+
+The key works through that day (the relay's time zone), then its hosts lose
+access and see that it expired; renewing it works at once. In `config.toml` a
+`[[keys]]` entry can also have its own limits:
+
+```toml
+max_hosts = 2             # hosts it may have online at once
+monthly_budget_gb = 50    # its share of the traffic
+```
+
+`status` and `key list` show what each key used this month, counted for its hosts
+and their guests. Once a key's share is used up its relayed connections last only
+as long as coordination mode allows: enough to go direct, not enough to carry a
+session.
+
+## Alerts
+
+With a command set, the relay runs it through the shell when something needs your
+attention, with `REAMESH_RELAY_ALERT` (what) and `REAMESH_RELAY_MESSAGE` (a
+sentence) in its environment:
+
+```toml
+[alerts]
+command = 'curl -s -d "$REAMESH_RELAY_MESSAGE" https://ntfy.sh/my-relay'
+budget_percent = 80
+```
+
+| `REAMESH_RELAY_ALERT` | When |
+| --- | --- |
+| `budget_warning`, `budget_used_up` | The monthly budget reached `budget_percent`, or ran out (once a month) |
+| `key_budget_used_up` | A key used up its own share (once a month) |
+| `key_expired` | A key's last day has passed |
+| `udp_blocked` | Connections only ever arrive over TCP: UDP looks closed |
+| `hosts_gone` | Several hosts left at once and none came back in 5 minutes |
+
+A relay can't test its own public address from inside, so `hosts_gone` is a sign,
+not a proof. Try the command with `reamesh-relay alert test`. The Docker image has
+no shell, so there alerts only reach the log.
+
+## Updates
+
+The relay, the ReaMesh app and the extension release together under one version.
+By default the relay keeps itself up to date: every 6 hours it reads the release
+channel, downloads a newer build into `update/` in the data dir, and restarts into
+it at a moment nothing is being relayed. Hosts reconnect by themselves; guests
+already connected directly don't notice. If nothing is ever free it simply waits.
+
+Every build is signed with the ReaMesh release key, checked after the download and
+before every start, and has to run and report the announced version before it is
+kept. A build that doesn't get as far as listening is dropped on the next start,
+the relay carries on with the version it had and doesn't take that one again.
+
+With `auto = false` under `[update]` the relay only says when a version is out, in
+the log and in `status`; `reamesh-relay update` gets it. `channel = "beta"` also
+takes pre-releases. The installed binary (or image) stays untouched as the
+fallback, and installing a newer one simply takes over. Updates come for the
+published Linux builds; a relay built yourself for another system updates by
+rebuilding.
+
+**Older ReaMesh versions keep working.** A relay only passes encrypted bytes along
+and never sees what a session contains, so a 1.3.0 relay carries 1.2.0 sessions
+just as well. Host and guests have to run the same ReaMesh version among
+themselves, with or without a relay. ReaMesh shows the relay's version in Settings,
+and calls it outdated only when it lacks something the app needs.
 
 ## Commands
 
@@ -137,9 +226,13 @@ reamesh-relay [run]           run the relay (creates the data dir on first start
 reamesh-relay status          whether it runs, this month's traffic, the hosts online
 reamesh-relay status --watch  the same, kept on screen and updated every 2 seconds
 reamesh-relay code [name]     print the relay code for a key (every key without a name)
-reamesh-relay key add <name>  create a key and print its relay code
+reamesh-relay key add <name>  create a key and print its relay code (--expires 30d)
 reamesh-relay key list        names, fingerprints, dates and when each key was last used
+reamesh-relay key expires <name> <when>  change a key's last day (a date, 30d, never)
 reamesh-relay key remove <name>  delete a key; its hosts lose access within a few seconds
+reamesh-relay notice [set|clear]  show, set or clear the announcement hosts see
+reamesh-relay alert test      try the alert command
+reamesh-relay update          get the newest version now
 ```
 
 `code <name> --copy` and `key add <name> --copy` also put the code on your
@@ -158,7 +251,7 @@ All take `--data <dir>` (or `REAMESH_RELAY_DATA`). `run` also takes
 A first start, in a terminal (the ReaMesh R sits left of the block):
 
 ```
-ReaMesh Relay 0.1.0
+ReaMesh Relay 1.1.0
 
 ● running   mode full
 port      4001, TCP and QUIC, IPv4 and IPv6
@@ -189,7 +282,7 @@ itself, so there the relay leaves its own time out.
 `status` while it runs:
 
 ```
-● running for 2 h 14 min   mode full   version 0.1.0
+● running for 2 h 14 min   mode full   version 1.1.0
 
 traffic   32 GB this month, now 1.4 MB/s
 budget    █░░░░░░░░░░░░░░░░░░░  6 % of 500 GB, about 96 GB by Nov 30
@@ -208,7 +301,9 @@ ever gets through, UDP is most likely closed in a firewall.
 
 Warnings worth acting on are tagged: `limit` when a host, a guest address or
 the relay as a whole is at its limit, `budget` when the month's budget is used
-up, `firewall` when several connections came in over TCP and none over QUIC. In `docker logs`, journald or any other non-terminal (and with `NO_COLOR`
+up or nearly, `firewall` when several connections came in over TCP and none over
+QUIC, `key` when a key expired, `update` when an update failed, `reachability`
+when every host left at once. In `docker logs`, journald or any other non-terminal (and with `NO_COLOR`
 set) the output is the same text without colour or symbols.
 
 ## Privacy
@@ -217,7 +312,9 @@ The relay logs events by key name and counts, not who connected from where;
 set `log_addresses = true` to log client IPs. Relayed sessions stay end-to-end
 encrypted between host and guests; the relay sees only that bytes pass.
 `status.json` in the data dir lists the hosts currently connected (key label
-and ID), `seen.json` when each key was last used.
+and ID), `seen.json` when each key was last used. Reading the release channel is
+the only connection the relay opens by itself; `auto = false` doesn't stop that,
+it only stops installing.
 
 ## License and the logo
 

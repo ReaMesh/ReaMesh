@@ -17,6 +17,11 @@
 //! handler when the connection opens, so a mode switch (budget used up, a new
 //! month, a config change to those limits or the ports) rebuilds the swarm:
 //! everyone reconnects once, and hosts reserve again within the auth grace.
+//!
+//! Key holders can ask how the relay stands (`/reamesh/relay-info/1`). A request
+//! carrying the `rev` of the last answer is held until the answer changes, so
+//! hosts hear about a notice, a used-up budget or a shutdown right away without
+//! the relay ever opening anything towards them.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -32,7 +37,7 @@ use libp2p::core::transport::Transport as _;
 use libp2p::core::upgrade;
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Protocol;
-use libp2p::request_response::{self, ProtocolSupport};
+use libp2p::request_response::{self, ProtocolSupport, ResponseChannel};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, autonat, connection_limits, identify, noise, ping,
@@ -42,13 +47,18 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use crate::addrs;
+use crate::alert::{self, HostsWatch};
 use crate::auth::AuthState;
 use crate::config::{self, Config, Mode};
 use crate::seen::Seen;
-use crate::status::{self, HostStatus, Inbound, Status};
+use crate::status::{self, HostStatus, Inbound, KeyUsage, Status};
 use crate::term::{self, Style, problem};
-use crate::traffic::{Counters, CountingMuxer, Ledger};
-use reamesh_relay_proto::{self as proto, AuthRequest, AuthResponse, RelayAddr, RelayCode};
+use crate::traffic::{Counters, CountingMuxer, Ledger, percent_of};
+use crate::update::{self, Checked};
+use reamesh_relay_proto::{
+    self as proto, AuthRequest, AuthResponse, InfoRequest, InfoResponse, Notice, RelayAddr,
+    RelayCode,
+};
 
 /// Per-circuit limits in coordination mode: plenty for identify and a DCUtR
 /// hole punch, useless for bulk transfer.
@@ -65,6 +75,16 @@ const MAX_OBSERVED: usize = 4;
 const LIMIT_LOG_EVERY: Duration = Duration::from_secs(60);
 /// Room for a banner value in 80 columns, after the R and the label.
 const BANNER_VALUE_WIDTH: usize = 52;
+/// How long a stopping relay keeps going so hosts get to read why.
+const FAREWELL: Duration = Duration::from_millis(500);
+/// An `expires` date that passed longer ago than this was dealt with before;
+/// no alert for it after a restart or at the start of a month.
+const EXPIRED_ALERT_DAYS: i32 = 3;
+/// How often the release channel is read, the first time soon after the start.
+const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+const UPDATE_FIRST_CHECK: Duration = Duration::from_secs(60);
+/// How often a running relay looks for a downloaded update to restart into.
+const UPDATE_RESTART_POLL: Duration = Duration::from_secs(30);
 
 pub struct Options {
     pub data_dir: PathBuf,
@@ -76,6 +96,9 @@ pub struct Options {
     pub banner: bool,
     /// The data dir was just created: the banner includes the relay code.
     pub first_start: bool,
+    /// Read the release channel (the CLI does; tests don't). Which also decides
+    /// whether a downloaded update ends the relay.
+    pub updates: bool,
 }
 
 impl Options {
@@ -86,8 +109,17 @@ impl Options {
             tick: Duration::from_secs(1),
             banner: true,
             first_start: false,
+            updates: false,
         }
     }
+}
+
+/// Why a relay stopped by itself or on request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    Asked,
+    /// A newer version is ready: start it (`update::start_staged`).
+    ForUpdate,
 }
 
 #[derive(NetworkBehaviour)]
@@ -95,18 +127,37 @@ struct Behaviour {
     limits: connection_limits::Behaviour,
     relay: relay::Behaviour,
     auth: request_response::cbor::Behaviour<AuthRequest, AuthResponse>,
+    info: request_response::cbor::Behaviour<InfoRequest, InfoResponse>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     autonat: autonat::v1::Behaviour,
     autonat_v2: autonat::v2::server::Behaviour,
 }
 
+/// An active relayed connection.
+#[derive(Debug)]
+struct Circuit {
+    src: PeerId,
+    dst: PeerId,
+    src_ip: Option<IpAddr>,
+    opened: Instant,
+    /// What its guest sent and received since, in bytes.
+    bytes: u64,
+}
+
+/// An `InfoRequest` waiting for its answer to change.
+struct HeldInfo {
+    channel: ResponseChannel<InfoResponse>,
+    label: String,
+    rev: u64,
+    since: Instant,
+}
+
 /// State the relay's limiter hooks read, shared with the event loop.
 #[derive(Debug, Default)]
 struct Gate {
     auth: AuthState,
-    /// Active circuits: (source, destination, source IP, opened).
-    circuits: Vec<(PeerId, PeerId, Option<IpAddr>, Instant)>,
+    circuits: Vec<Circuit>,
     max_circuits: usize,
     max_circuits_per_ip: usize,
     max_circuits_per_host: usize,
@@ -119,7 +170,11 @@ impl Gate {
         }
         match ip {
             Some(ip) => {
-                self.circuits.iter().filter(|c| c.2 == Some(ip)).count() < self.max_circuits_per_ip
+                self.circuits
+                    .iter()
+                    .filter(|c| c.src_ip == Some(ip))
+                    .count()
+                    < self.max_circuits_per_ip
             }
             None => true,
         }
@@ -128,6 +183,11 @@ impl Gate {
     fn apply(&mut self, cfg: &Config) {
         self.auth.max_hosts = cfg.limits.max_hosts;
         self.auth.banned = cfg.banned().unwrap_or_default();
+        self.auth.key_max_hosts = cfg
+            .keys
+            .iter()
+            .filter_map(|k| Some((k.label.clone(), k.max_hosts?)))
+            .collect();
         self.max_circuits = cfg.limits.max_circuits;
         self.max_circuits_per_ip = cfg.limits.max_circuits_per_ip;
         self.max_circuits_per_host = cfg.limits.max_circuits_per_host;
@@ -171,7 +231,7 @@ pub struct RelayHandle {
     pub peer_id: PeerId,
     listen: watch::Receiver<Vec<Multiaddr>>,
     shutdown: watch::Sender<bool>,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<anyhow::Result<Stopped>>,
 }
 
 impl RelayHandle {
@@ -202,11 +262,11 @@ impl RelayHandle {
 
     pub async fn stop(self) -> anyhow::Result<()> {
         let _ = self.shutdown.send(true);
-        self.task.await.context("relay task panicked")?
+        self.task.await.context("relay task panicked")?.map(|_| ())
     }
 
-    /// Resolves when the relay stops by itself (an error).
-    pub async fn join(self) -> anyhow::Result<()> {
+    /// Resolves when the relay stops.
+    pub async fn join(self) -> anyhow::Result<Stopped> {
         self.task.await.context("relay task panicked")?
     }
 
@@ -239,6 +299,7 @@ pub fn spawn(opts: Options) -> anyhow::Result<RelayHandle> {
 enum Outcome {
     Rebuild,
     Shutdown,
+    Update,
 }
 
 struct Relay {
@@ -280,6 +341,14 @@ struct Relay {
     hosts_seen: HashSet<PeerId>,
     circuits_opened: u64,
     sent_total: u64,
+    /// Requests waiting for their answer to change, one per peer.
+    held_info: HashMap<PeerId, HeldInfo>,
+    /// The day keys were last checked against their dates.
+    expiry_day: Option<jiff::civil::Date>,
+    hosts_watch: HostsWatch,
+    /// A newer version the channel named, not downloaded (yet).
+    update_available: Arc<Mutex<Option<String>>>,
+    update_polled: Instant,
     _lock: std::fs::File,
 }
 
@@ -290,7 +359,7 @@ async fn run(
     cfg: Config,
     listen_tx: watch::Sender<Vec<Multiaddr>>,
     mut shutdown: watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Stopped> {
     let gate = Arc::new(Mutex::new(Gate::default()));
     gate.lock().unwrap().apply(&cfg);
     let ledger = Ledger::load(&opts.data_dir.join(config::TRAFFIC_FILE));
@@ -322,14 +391,26 @@ async fn run(
         hosts_seen: HashSet::new(),
         circuits_opened: 0,
         sent_total: 0,
+        held_info: HashMap::new(),
+        expiry_day: None,
+        hosts_watch: HostsWatch::default(),
+        update_available: Arc::default(),
+        update_polled: Instant::now(),
         _lock: lock,
         opts,
     };
+    if relay.opts.updates {
+        tokio::spawn(update_loop(
+            relay.opts.data_dir.clone(),
+            relay.update_available.clone(),
+        ));
+    }
     #[cfg(unix)]
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .context("installing the SIGHUP handler")?;
     #[cfg(not(unix))]
     let mut hangup = ();
+    let stopped;
     loop {
         let params = relay.params();
         debug!(mode = ?params.mode, "starting the relay");
@@ -357,6 +438,7 @@ async fn run(
             .auth
             .all_disconnected(Instant::now());
         relay.gate.lock().unwrap().circuits.clear();
+        relay.held_info.clear();
         relay.peers.clear();
         relay.reserved_since.clear();
         relay.bound_tcp = None;
@@ -365,7 +447,14 @@ async fn run(
         let _ = relay.listen_tx.send(Vec::new());
         drop(swarm);
         match outcome {
-            Outcome::Shutdown => break,
+            Outcome::Shutdown => {
+                stopped = Stopped::Asked;
+                break;
+            }
+            Outcome::Update => {
+                stopped = Stopped::ForUpdate;
+                break;
+            }
             // Give the old sockets a moment to close before binding again.
             Outcome::Rebuild => tokio::time::sleep(Duration::from_millis(300)).await,
         }
@@ -373,7 +462,51 @@ async fn run(
     relay.save_ledger();
     relay.write_status(false, &[]);
     info!("{}", relay.stop_summary());
-    Ok(())
+    Ok(stopped)
+}
+
+/// Reads the release channel every few hours, on a thread of its own: a slow
+/// download never holds up the relay. A running relay notices the finished copy
+/// by itself.
+async fn update_loop(data: PathBuf, available: Arc<Mutex<Option<String>>>) {
+    tokio::time::sleep(UPDATE_FIRST_CHECK).await;
+    let mut last_error = String::new();
+    loop {
+        if let Ok(cfg) = Config::load(&data) {
+            let dir = data.clone();
+            let found = tokio::task::spawn_blocking(move || {
+                update::check(&dir, &cfg.update.channel, cfg.update.auto)
+            })
+            .await;
+            match found {
+                Ok(Ok(Checked::UpToDate)) => *available.lock().unwrap() = None,
+                Ok(Ok(Checked::Available(v))) => {
+                    let mut now = available.lock().unwrap();
+                    if now.as_deref() != Some(v.as_str()) {
+                        info!("version {v} is out: reamesh-relay update");
+                    }
+                    *now = Some(v);
+                }
+                Ok(Ok(Checked::Staged(v))) => {
+                    let mut now = available.lock().unwrap();
+                    if now.as_deref() != Some(v.as_str()) {
+                        info!("version {v} is ready, restarting once nothing is being relayed");
+                    }
+                    *now = Some(v);
+                }
+                Ok(Err(e)) => {
+                    // Once per different problem: every 6 hours is still noise.
+                    let text = format!("{e:#}");
+                    if text != last_error {
+                        warn!(kind = "update", "cannot update: {text}");
+                        last_error = text;
+                    }
+                }
+                Err(e) => error!("the update check failed: {e}"),
+            }
+        }
+        tokio::time::sleep(UPDATE_CHECK_EVERY).await;
+    }
 }
 
 impl Relay {
@@ -436,10 +569,8 @@ impl Relay {
                         .map(|(p, m), _| (p, StreamMuxerBox::new(m)));
                     Ok(quic.or_transport(tcp).map(move |either, _| {
                         let (p, m) = either.into_inner();
-                        (
-                            p,
-                            StreamMuxerBox::new(CountingMuxer::new(m, counters.clone())),
-                        )
+                        let counted = CountingMuxer::new(m, counters.clone(), p);
+                        (p, StreamMuxerBox::new(counted))
                     }))
                 },
             )
@@ -462,6 +593,14 @@ impl Relay {
                         )],
                         request_response::Config::default()
                             .with_request_timeout(Duration::from_secs(20)),
+                    ),
+                    info: request_response::cbor::Behaviour::new(
+                        [(
+                            StreamProtocol::new(proto::RELAY_INFO_PROTOCOL),
+                            ProtocolSupport::Inbound,
+                        )],
+                        request_response::Config::default()
+                            .with_request_timeout(Duration::from_secs(proto::INFO_TIMEOUT_SECS)),
                     ),
                     identify: identify::Behaviour::new(
                         identify::Config::new("/reamesh-relay/1".into(), key.public())
@@ -585,8 +724,10 @@ impl Relay {
         let mut ready = false;
         loop {
             tokio::select! {
-                _ = shutdown.wait_for(|stop| *stop) => {
+                // In a block: the guard it returns must not outlive the wait.
+                _ = async { let _ = shutdown.wait_for(|stop| *stop).await; } => {
                     self.account();
+                    self.farewell(swarm).await;
                     return Outcome::Shutdown;
                 }
                 event = swarm.select_next_some() => {
@@ -600,6 +741,14 @@ impl Relay {
                     self.account();
                     let now = Instant::now();
                     self.gate.lock().unwrap().auth.purge(now);
+                    self.check_key_dates(swarm);
+                    self.enforce_key_budgets(swarm);
+                    self.check_alerts(now);
+                    self.answer_held_info(swarm, false);
+                    if self.update_due(now) {
+                        self.farewell(swarm).await;
+                        return Outcome::Update;
+                    }
                     if now.duration_since(last_ledger) >= LEDGER_EVERY {
                         self.save_ledger();
                         last_ledger = now;
@@ -610,17 +759,20 @@ impl Relay {
                     }
                     if self.params() != *params {
                         self.announce_mode_change(params.mode);
+                        self.farewell(swarm).await;
                         return Outcome::Rebuild;
                     }
                 }
                 _ = reload.tick() => {
                     if config_stamp(&self.opts.data_dir) != self.cfg_stamp && self.reload(swarm) {
+                        self.farewell(swarm).await;
                         return Outcome::Rebuild;
                     }
                 }
                 _ = hangup_recv(hangup) => {
                     info!("reloading the config");
                     if self.reload(swarm) {
+                        self.farewell(swarm).await;
                         return Outcome::Rebuild;
                     }
                 }
@@ -631,6 +783,7 @@ impl Relay {
     /// Both transports listen: the banner on the first start of the swarm,
     /// a log line every time.
     fn on_ready(&self) {
+        update::confirm_started(&self.opts.data_dir);
         if self.builds == 1 {
             let first_code = || {
                 let label = &self.cfg.keys.first()?.label;
@@ -672,6 +825,320 @@ impl Relay {
         self.ledger.add(sent, received);
         self.rate_bytes = self.rate_bytes.saturating_add(sent);
         self.sent_total = self.sent_total.saturating_add(sent);
+        // Traffic counts for the key of the host it serves: a host's own, or
+        // the host a guest's relayed connection leads to.
+        let peers = self.counters.take_peers();
+        if peers.is_empty() {
+            return;
+        }
+        let gate = self.gate.clone();
+        let mut gate = gate.lock().unwrap();
+        for (peer, sent, received) in peers {
+            let mut host = None;
+            for c in gate.circuits.iter_mut().filter(|c| c.src == peer) {
+                c.bytes = c.bytes.saturating_add(sent).saturating_add(received);
+                host.get_or_insert(c.dst);
+            }
+            let label = gate
+                .auth
+                .label(&peer)
+                .or_else(|| host.and_then(|h| gate.auth.label(&h)));
+            if let Some(label) = label {
+                self.ledger.add_key(label, sent);
+            }
+        }
+    }
+
+    /// A downloaded version is waiting and this is a moment nobody would notice:
+    /// nothing is being relayed. Hosts lose their reservation for a few seconds,
+    /// guests already connected directly don't notice at all.
+    fn update_due(&mut self, now: Instant) -> bool {
+        if !self.opts.updates
+            || now.duration_since(self.update_polled) < update::restart_poll(UPDATE_RESTART_POLL)
+        {
+            return false;
+        }
+        self.update_polled = now;
+        let Some(version) = update::pending_version(&self.opts.data_dir) else {
+            return false;
+        };
+        if !self.gate.lock().unwrap().circuits.is_empty() {
+            return false;
+        }
+        info!("restarting into version {version}");
+        true
+    }
+
+    /// The newer version, as one line for `status`.
+    fn update_line(&self) -> Option<String> {
+        if let Some(v) = update::pending_version(&self.opts.data_dir) {
+            return Some(format!("{v} ready, restarts once nothing is being relayed"));
+        }
+        let available = self.update_available.lock().unwrap();
+        available
+            .as_ref()
+            .map(|v| format!("{v} is out, get it with: reamesh-relay update"))
+    }
+
+    /// The operator's notice, unless its time is over.
+    fn active_notice(&self) -> Option<Notice> {
+        let n = self.cfg.notice.as_ref()?;
+        let (from, until) = n.window();
+        (until == 0 || until > unix_now()).then(|| Notice {
+            text: n.text.clone(),
+            from,
+            until,
+        })
+    }
+
+    /// What a holder of the key `label` gets to know.
+    fn info_for(&self, label: &str, stopping: bool) -> InfoResponse {
+        let entry = self.cfg.entry(label);
+        let key_budget = entry.map_or(0, |k| k.budget_bytes());
+        let key_sent = self.ledger.key_sent(label);
+        let budget = self.cfg.budget_bytes();
+        let (hosts, max_hosts) = {
+            let gate = self.gate.lock().unwrap();
+            (gate.auth.reserved.len(), gate.auth.max_hosts)
+        };
+        let (tcp, quic) = self.ports();
+        let mut r = InfoResponse {
+            ok: true,
+            reason: None,
+            rev: 0,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            level: proto::RELAY_LEVEL,
+            mode: mode_name(self.params().mode).to_owned(),
+            budget_percent: percent_of(self.ledger.sent, budget),
+            budget_exhausted: self.ledger.exhausted(budget),
+            key_budget_percent: percent_of(key_sent, key_budget),
+            key_budget_exhausted: key_budget > 0 && key_sent >= key_budget,
+            budget_resets: term::month_bounds(&self.ledger.month).map_or(0, |(_, end)| end),
+            hosts: hosts as u32,
+            max_hosts: max_hosts as u32,
+            notice: self.active_notice(),
+            name: self.cfg.name.clone().unwrap_or_default(),
+            contact: self.cfg.contact.clone().unwrap_or_default(),
+            key_expires: entry.map_or(0, |k| k.expires_at()),
+            stopping,
+            ips: self
+                .advertised_ips()
+                .into_iter()
+                .filter(|ip| !addrs::unspecified(ip))
+                .collect(),
+            dns: self.cfg.dns_name.clone().unwrap_or_default(),
+            tcp,
+            quic,
+        };
+        r.rev = r.content_rev();
+        r
+    }
+
+    /// Answers an `InfoRequest` now, or holds it while nothing has changed.
+    fn on_info_request(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        peer: PeerId,
+        req: InfoRequest,
+        channel: ResponseChannel<InfoResponse>,
+    ) {
+        let keys = self.cfg.keys();
+        let label = proto::verify_proof(
+            keys.iter().map(|(l, k)| (l.as_str(), k)),
+            &self.peer_id,
+            &peer,
+            &req.proof,
+        )
+        .map(str::to_owned);
+        let banned = self.gate.lock().unwrap().auth.banned.contains(&peer);
+        let response = match label {
+            _ if banned => InfoResponse::refused(proto::REASON_BANNED),
+            None => InfoResponse::refused(proto::REASON_BAD_KEY),
+            Some(label) => {
+                let expired = self
+                    .cfg
+                    .entry(&label)
+                    .is_some_and(|k| k.is_expired(config::local_today()));
+                if expired {
+                    // Whoever holds it should know whom to ask.
+                    InfoResponse {
+                        name: self.cfg.name.clone().unwrap_or_default(),
+                        contact: self.cfg.contact.clone().unwrap_or_default(),
+                        ..InfoResponse::refused(proto::REASON_EXPIRED)
+                    }
+                } else {
+                    let info = self.info_for(&label, false);
+                    if req.rev != 0 && req.rev == info.rev {
+                        self.held_info.insert(
+                            peer,
+                            HeldInfo {
+                                channel,
+                                label,
+                                rev: req.rev,
+                                since: Instant::now(),
+                            },
+                        );
+                        return;
+                    }
+                    info
+                }
+            }
+        };
+        let _ = swarm.behaviour_mut().info.send_response(channel, response);
+    }
+
+    /// Answers the held requests whose answer changed or that waited long
+    /// enough; with `stopping`, all of them. Returns how many went out.
+    fn answer_held_info(&mut self, swarm: &mut Swarm<Behaviour>, stopping: bool) -> usize {
+        let hold = Duration::from_secs(proto::INFO_HOLD_SECS);
+        let mut sent = 0;
+        for (peer, held) in std::mem::take(&mut self.held_info) {
+            if !held.channel.is_open() {
+                continue;
+            }
+            let info = self.info_for(&held.label, stopping);
+            if stopping || info.rev != held.rev || held.since.elapsed() >= hold {
+                sent += 1;
+                let _ = swarm.behaviour_mut().info.send_response(held.channel, info);
+            } else {
+                self.held_info.insert(peer, held);
+            }
+        }
+        sent
+    }
+
+    /// Tells the hosts the relay is going away, and keeps the connections open
+    /// for a moment: "sent" only means handed to the connection, and dropping
+    /// it right away can lose what is still on its way.
+    async fn farewell(&mut self, swarm: &mut Swarm<Behaviour>) {
+        if self.answer_held_info(swarm, true) == 0 {
+            return;
+        }
+        let deadline = tokio::time::sleep(FAREWELL);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => return,
+                _ = swarm.select_next_some() => {}
+            }
+        }
+    }
+
+    /// Once a day (and once right after the start): keys whose last day has
+    /// passed lose access.
+    fn check_key_dates(&mut self, swarm: &mut Swarm<Behaviour>) {
+        let today = config::local_today();
+        if self.expiry_day == Some(today) {
+            return;
+        }
+        self.expiry_day = Some(today);
+        self.revoke_expired(swarm, today);
+    }
+
+    fn revoke_expired(&mut self, swarm: &mut Swarm<Behaviour>, today: jiff::civil::Date) {
+        let active = self.cfg.active_labels(today);
+        let revoked = self.gate.lock().unwrap().auth.revoke(&active);
+        for peer in &revoked {
+            self.reserved_since.remove(peer);
+            let _ = swarm.disconnect_peer_id(*peer);
+        }
+        let command = self.cfg.alerts.command.clone();
+        let expired: Vec<(String, jiff::civil::Date)> = self
+            .cfg
+            .keys
+            .iter()
+            .filter(|k| k.is_expired(today))
+            .filter_map(|k| Some((k.label.clone(), k.expiry_date()?)))
+            .collect();
+        for (label, last) in expired {
+            let recent = (today - last).get_days() <= EXPIRED_ALERT_DAYS;
+            if recent && self.ledger.first_alert(&format!("key_expired:{label}")) {
+                let msg = format!("key {label} expired on {last}");
+                warn!(kind = "key", key = label.as_str(), "{msg}");
+                alert::fire(command.as_deref(), "key_expired", &msg);
+            }
+        }
+    }
+
+    /// A key whose own budget is used up keeps what coordination mode gives
+    /// everyone: enough to go direct, not enough to carry a session. libp2p
+    /// fixes a circuit's limits when the connection opens, so the guest is
+    /// dropped once its relayed connection went past them.
+    fn enforce_key_budgets(&mut self, swarm: &mut Swarm<Behaviour>) {
+        let used_up: HashSet<&str> = self
+            .cfg
+            .keys
+            .iter()
+            .filter(|k| k.budget_bytes() > 0 && self.ledger.key_sent(&k.label) >= k.budget_bytes())
+            .map(|k| k.label.as_str())
+            .collect();
+        if used_up.is_empty() {
+            return;
+        }
+        let over = {
+            let gate = self.gate.lock().unwrap();
+            guests_over_budget(&gate, &used_up, Instant::now())
+        };
+        for (guest, label) in over {
+            let _ = swarm.disconnect_peer_id(guest);
+            self.limit(format!(
+                "key {label} used up its budget, ending its relayed connections"
+            ));
+        }
+    }
+
+    /// What goes to the operator's command, each at most once a month.
+    fn check_alerts(&mut self, now: Instant) {
+        let command = self.cfg.alerts.command.clone();
+        let budget = self.cfg.budget_bytes();
+        if self.ledger.exhausted(budget) {
+            // The switch to coordination mode logs this one itself.
+            self.ledger.first_alert("budget_warning");
+            if self.ledger.first_alert("budget_used_up") {
+                let msg = format!(
+                    "the monthly budget of {} GB is used up, coordination only until {}",
+                    self.cfg.limits.monthly_budget_gb,
+                    term::next_month_start(&self.ledger.month)
+                );
+                alert::fire(command.as_deref(), "budget_used_up", &msg);
+            }
+        } else {
+            let used = percent_of(self.ledger.sent, budget);
+            if budget > 0
+                && used >= self.cfg.alerts.budget_percent
+                && self.ledger.first_alert("budget_warning")
+            {
+                let msg = format!(
+                    "{used} % of the monthly budget of {} GB used",
+                    self.cfg.limits.monthly_budget_gb
+                );
+                warn!(kind = "budget", "{msg}");
+                alert::fire(command.as_deref(), "budget_warning", &msg);
+            }
+        }
+        let used_up: Vec<String> = self
+            .cfg
+            .keys
+            .iter()
+            .filter(|k| k.budget_bytes() > 0 && self.ledger.key_sent(&k.label) >= k.budget_bytes())
+            .map(|k| k.label.clone())
+            .collect();
+        for label in used_up {
+            if self.ledger.first_alert(&format!("key_budget:{label}")) {
+                let msg = format!("key {label} used up its monthly budget");
+                warn!(kind = "budget", key = label.as_str(), "{msg}");
+                alert::fire(command.as_deref(), "key_budget_used_up", &msg);
+            }
+        }
+        let hosts = self.gate.lock().unwrap().auth.reserved.len();
+        if self.hosts_watch.tick(hosts, now) {
+            let msg = format!(
+                "every host left at once and none came back in {} min: is the relay still reachable from outside?",
+                alert::HOSTS_GONE_AFTER.as_secs() / 60
+            );
+            warn!(kind = "reachability", "{msg}");
+            alert::fire(command.as_deref(), "hosts_gone", &msg);
+        }
     }
 
     /// "stopped after 3 h 12 min: 4 hosts, 11 relayed connections, 1.2 GB
@@ -716,11 +1183,12 @@ impl Relay {
         {
             self.quic_warned = true;
             let (_, q) = self.ports();
-            warn!(
-                kind = "firewall",
+            let msg = format!(
                 "{} connections came in over TCP and none over QUIC: check that UDP {q} is open",
                 self.inbound_tcp.count
             );
+            warn!(kind = "firewall", "{msg}");
+            alert::fire(self.cfg.alerts.command.as_deref(), "udp_blocked", &msg);
         }
     }
 
@@ -770,7 +1238,9 @@ impl Relay {
                 .iter()
                 .map(|p| (*p, host_name(&gate.auth, p)))
                 .collect();
-            let revoked = gate.auth.revoke(&labels);
+            let revoked = gate
+                .auth
+                .revoke(&self.cfg.active_labels(config::local_today()));
             let lost: Vec<String> = revoked
                 .iter()
                 .filter_map(|p| names.get(p).cloned())
@@ -806,6 +1276,7 @@ impl Relay {
         for name in lost {
             info!("host {name} lost access");
         }
+        self.revoke_expired(swarm, config::local_today());
         if self.params() != before {
             self.announce_mode_change(before.mode);
             return true;
@@ -910,6 +1381,14 @@ impl Relay {
                 let response = self.authenticate(&peer, &request);
                 let _ = swarm.behaviour_mut().auth.send_response(channel, response);
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Info(request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            })) => self.on_info_request(swarm, peer, request, channel),
             SwarmEvent::Behaviour(BehaviourEvent::Relay(e)) => self.on_relay_event(swarm, e),
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
@@ -948,11 +1427,16 @@ impl Relay {
             peer,
             &req.proof,
         );
+        let expired = label
+            .and_then(|l| self.cfg.entry(l))
+            .is_some_and(|k| k.is_expired(config::local_today()));
         let mut gate = self.gate.lock().unwrap();
         let response = if gate.auth.banned.contains(peer) {
             AuthResponse::refused(proto::REASON_BANNED)
+        } else if expired {
+            AuthResponse::refused(proto::REASON_EXPIRED)
         } else if let Some(label) = label {
-            if gate.auth.is_full(peer) {
+            if gate.auth.is_full(peer) || gate.auth.key_is_full(peer, label) {
                 AuthResponse::refused(proto::REASON_FULL)
             } else {
                 let conns = self.peers.get(peer).map_or(1, |e| e.0);
@@ -963,14 +1447,28 @@ impl Relay {
             AuthResponse::refused(proto::REASON_BAD_KEY)
         };
         let max_hosts = gate.auth.max_hosts;
+        let key_full =
+            label.is_some_and(|l| !gate.auth.is_full(peer) && gate.auth.key_is_full(peer, l));
         drop(gate);
         match response.reason.as_deref() {
             None => debug!(key = label.unwrap_or_default(), "host authorized"),
+            Some(proto::REASON_FULL) if key_full => {
+                let label = label.unwrap_or_default();
+                self.limit(format!(
+                    "key {label} has as many hosts online as it may, refusing one more"
+                ));
+            }
             Some(proto::REASON_FULL) => {
                 let label = label.unwrap_or_default();
                 self.limit(format!("{max_hosts} hosts connected, refusing {label}"));
             }
             Some(proto::REASON_BANNED) => info!("a banned host was refused"),
+            Some(proto::REASON_EXPIRED) => {
+                info!(
+                    key = label.unwrap_or_default(),
+                    "a host with an expired key was refused"
+                );
+            }
             Some(_) => info!("a host with an unknown key was refused"),
         }
         response
@@ -1016,7 +1514,13 @@ impl Relay {
             } => {
                 let name = host_name(&gate.auth, &dst_peer_id);
                 let max = gate.max_circuits_per_host;
-                if gate.circuits.iter().filter(|c| c.1 == dst_peer_id).count() >= max {
+                if gate
+                    .circuits
+                    .iter()
+                    .filter(|c| c.dst == dst_peer_id)
+                    .count()
+                    >= max
+                {
                     // No hook sees the destination before this, so the guest
                     // over the limit is dropped instead of refused.
                     self.refused.insert((src_peer_id, dst_peer_id));
@@ -1029,8 +1533,13 @@ impl Relay {
                     return;
                 }
                 let ip = self.peers.get(&src_peer_id).and_then(|e| e.1);
-                gate.circuits
-                    .push((src_peer_id, dst_peer_id, ip, Instant::now()));
+                gate.circuits.push(Circuit {
+                    src: src_peer_id,
+                    dst: dst_peer_id,
+                    src_ip: ip,
+                    opened: Instant::now(),
+                    bytes: 0,
+                });
                 self.circuits_opened += 1;
                 info!(
                     key = gate.auth.label(&dst_peer_id).unwrap_or_default(),
@@ -1048,11 +1557,11 @@ impl Relay {
                 if let Some(i) = gate
                     .circuits
                     .iter()
-                    .position(|c| c.0 == src_peer_id && c.1 == dst_peer_id)
+                    .position(|c| c.src == src_peer_id && c.dst == dst_peer_id)
                 {
                     // A few seconds usually means the two went direct; hours,
                     // that the relay carried the session.
-                    let opened = gate.circuits.swap_remove(i).3;
+                    let opened = gate.circuits.swap_remove(i).opened;
                     let name = host_name(&gate.auth, &dst_peer_id);
                     info!(
                         key = gate.auth.label(&dst_peer_id).unwrap_or_default(),
@@ -1075,7 +1584,7 @@ impl Relay {
                         connections(gate.max_circuits)
                     ))
                 } else if ip.is_some()
-                    && gate.circuits.iter().filter(|c| c.2 == ip).count()
+                    && gate.circuits.iter().filter(|c| c.src_ip == ip).count()
                         >= gate.max_circuits_per_ip
                 {
                     Some(format!(
@@ -1276,7 +1785,7 @@ impl Relay {
                         .map(|k| config::fingerprint(&k))
                         .unwrap_or_default(),
                     since: self.reserved_since.get(&p).map_or(unix_now(), |t| unix(*t)),
-                    guests: gate.circuits.iter().filter(|c| c.1 == p).count(),
+                    guests: gate.circuits.iter().filter(|c| c.dst == p).count(),
                     label,
                     peer_id: p.to_string(),
                 })
@@ -1288,12 +1797,40 @@ impl Relay {
             rate,
             inbound_tcp: self.inbound_tcp,
             inbound_quic: self.inbound_quic,
+            keys: self
+                .cfg
+                .keys
+                .iter()
+                .map(|k| KeyUsage {
+                    label: k.label.clone(),
+                    sent: self.ledger.key_sent(&k.label),
+                    budget: k.budget_bytes(),
+                })
+                .collect(),
+            notice: self.active_notice().map(|n| term::notice_line(&n)),
+            update: self.update_line(),
         };
         drop(gate);
         if let Err(e) = status.write(&self.opts.data_dir) {
             error!("cannot write status.json: {e}");
         }
     }
+}
+
+/// The guests whose relayed connection to a host of a used-up key went past
+/// what coordination mode allows, with that key's label.
+fn guests_over_budget(gate: &Gate, used_up: &HashSet<&str>, now: Instant) -> Vec<(PeerId, String)> {
+    gate.circuits
+        .iter()
+        .filter(|c| {
+            c.bytes >= COORDINATION_CIRCUIT_BYTES
+                || now.duration_since(c.opened) >= COORDINATION_CIRCUIT_DURATION
+        })
+        .filter_map(|c| {
+            let label = gate.auth.label(&c.dst)?;
+            used_up.contains(label).then(|| (c.src, label.to_owned()))
+        })
+        .collect()
 }
 
 fn connections(n: usize) -> String {
@@ -1356,6 +1893,30 @@ fn config_changes(old: &Config, new: &Config) -> Vec<String> {
         old.log_addresses.to_string(),
         new.log_addresses.to_string(),
     );
+    let text = |t: &Option<String>| t.clone().unwrap_or_else(|| "none".to_owned());
+    diff("name", text(&old.name), text(&new.name));
+    diff("contact", text(&old.contact), text(&new.contact));
+    let notice = |n: &Option<config::NoticeEntry>| {
+        n.as_ref().map_or("none".to_owned(), |n| {
+            let (from, until) = n.window();
+            term::notice_line(&Notice {
+                text: n.text.clone(),
+                from,
+                until,
+            })
+        })
+    };
+    diff("notice", notice(&old.notice), notice(&new.notice));
+    diff(
+        "alert_command",
+        text(&old.alerts.command),
+        text(&new.alerts.command),
+    );
+    diff(
+        "alert_budget_percent",
+        old.alerts.budget_percent.to_string(),
+        new.alerts.budget_percent.to_string(),
+    );
     let (a, b) = (&old.limits, &new.limits);
     diff(
         "max_hosts",
@@ -1411,6 +1972,13 @@ fn config_changes(old: &Config, new: &Config) -> Vec<String> {
             .any(|o| o.label == k.label && o.key != k.key)
         {
             out.push(format!("key {} replaced", k.label));
+        }
+        if let Some(o) = old.keys.iter().find(|o| o.label == k.label)
+            && (o.expires != k.expires
+                || o.max_hosts != k.max_hosts
+                || o.monthly_budget_gb != k.monthly_budget_gb)
+        {
+            out.push(format!("key {} changed", k.label));
         }
     }
     out
@@ -1523,4 +2091,40 @@ fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_used_up_key_keeps_only_a_short_relayed_connection() {
+        let (lena, band) = (PeerId::random(), PeerId::random());
+        let now = Instant::now();
+        let mut gate = Gate::default();
+        gate.auth.authorize(lena, "lena", 1);
+        gate.auth.authorize(band, "band", 1);
+        let circuit = |dst, bytes, age: u64| Circuit {
+            src: PeerId::random(),
+            dst,
+            src_ip: None,
+            opened: now - Duration::from_secs(age),
+            bytes,
+        };
+        gate.circuits = vec![
+            // Fresh and small: may still go direct.
+            circuit(lena, 1_000, 1),
+            // Past the byte limit.
+            circuit(lena, COORDINATION_CIRCUIT_BYTES, 1),
+            // Past the time limit.
+            circuit(lena, 0, COORDINATION_CIRCUIT_DURATION.as_secs() + 1),
+            // The other key is fine, however much it carries.
+            circuit(band, u64::MAX / 2, 100_000),
+        ];
+        let want: Vec<PeerId> = vec![gate.circuits[1].src, gate.circuits[2].src];
+        let used_up = HashSet::from(["lena"]);
+        let over = guests_over_budget(&gate, &used_up, now);
+        assert_eq!(over.iter().map(|o| o.0).collect::<Vec<_>>(), want);
+        assert!(over.iter().all(|o| o.1 == "lena"));
+    }
 }

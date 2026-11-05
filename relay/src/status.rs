@@ -45,6 +45,24 @@ pub struct Status {
     pub inbound_tcp: Inbound,
     #[serde(default)]
     pub inbound_quic: Inbound,
+    /// This month's traffic per key.
+    #[serde(default)]
+    pub keys: Vec<KeyUsage>,
+    /// The operator's notice as one line, while it applies.
+    #[serde(default)]
+    pub notice: Option<String>,
+    /// A newer version, as one line.
+    #[serde(default)]
+    pub update: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyUsage {
+    pub label: String,
+    /// Bytes sent this month for its hosts and their guests.
+    pub sent: u64,
+    /// Its own monthly budget in bytes, 0 for none.
+    pub budget: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,10 +182,16 @@ impl Status {
             out += &s.field("budget", &format!("{line}\n"));
         }
         out += &s.field("inbound", &format!("{}\n", self.inbound_line(now, s)));
+        if let Some(notice) = &self.notice {
+            out += &s.field("notice", &format!("{notice}\n"));
+        }
+        if let Some(update) = &self.update {
+            out += &s.field("update", &format!("{update}\n"));
+        }
         out.push('\n');
         if self.hosts.is_empty() {
             out += &s.dim("No hosts connected.\n");
-            return out;
+            return out + &self.keys_table(s);
         }
         let rows: Vec<Vec<String>> = self
             .hosts
@@ -193,7 +217,32 @@ impl Status {
                 ]
             })
             .collect();
-        out + &term::table(s, &["HOST", "KEY", "ONLINE", "RELAYED"], &rows)
+        out + &term::table(s, &["HOST", "KEY", "ONLINE", "RELAYED"], &rows) + &self.keys_table(s)
+    }
+
+    /// Who used how much of this month's traffic: only once there is
+    /// something to tell.
+    fn keys_table(&self, s: Style) -> String {
+        if self.keys.iter().all(|k| k.sent == 0 && k.budget == 0) {
+            return String::new();
+        }
+        let rows: Vec<Vec<String>> = self
+            .keys
+            .iter()
+            .map(|k| {
+                let budget = if k.budget == 0 {
+                    "-".to_owned()
+                } else {
+                    let used = crate::traffic::percent_of(k.sent, k.budget);
+                    format!("{used} % of {}", term::bytes(k.budget))
+                };
+                vec![k.label.clone(), term::bytes(k.sent), budget]
+            })
+            .collect();
+        format!(
+            "\n{}",
+            term::table(s, &["KEY", "THIS MONTH", "OWN BUDGET"], &rows)
+        )
     }
 }
 
@@ -285,6 +334,9 @@ mod tests {
             rate: 0,
             inbound_tcp: Inbound::default(),
             inbound_quic: Inbound::default(),
+            keys: Vec::new(),
+            notice: None,
+            update: None,
         }
     }
 
@@ -306,6 +358,33 @@ mod tests {
         // Too early in the month to tell.
         let out = st.render(start + 3600, Style::plain());
         assert!(out.contains("budget    40 % of 500 GB\n"));
+    }
+
+    #[test]
+    fn status_shows_the_notice_and_what_each_key_used() {
+        let mut st = status();
+        let out = st.render(9000, Style::plain());
+        assert!(!out.contains("notice"));
+        assert!(!out.contains("THIS MONTH"));
+        st.notice = Some("Serverumzug".into());
+        st.keys = vec![
+            KeyUsage {
+                label: "band".into(),
+                sent: 3_000_000_000,
+                budget: 0,
+            },
+            KeyUsage {
+                label: "lena".into(),
+                sent: 2_000_000_000,
+                budget: 50_000_000_000,
+            },
+        ];
+        let out = st.render(9000, Style::plain());
+        assert!(out.contains("notice    Serverumzug\n"), "{out}");
+        assert!(out.contains("band   3 GB"), "{out}");
+        assert!(out.contains("4 % of 50 GB"), "{out}");
+        // Also while no host is online; that is when it gets read.
+        assert!(out.contains("No hosts connected."));
     }
 
     #[test]

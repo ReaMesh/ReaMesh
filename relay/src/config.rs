@@ -24,6 +24,9 @@ pub const SEEN_FILE: &str = "seen.json";
 pub const LOCK_FILE: &str = "relay.lock";
 
 pub const DEFAULT_PORT: u16 = 4001;
+/// The relay warns (and runs the alert command) at this share of a budget,
+/// unless `[alerts] budget_percent` says otherwise.
+pub const DEFAULT_ALERT_PERCENT: u8 = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -45,8 +48,67 @@ pub struct Config {
     pub mode: Mode,
     pub log_addresses: bool,
     pub banned_peers: Vec<String>,
+    /// Who runs this relay. Optional, and ReaMesh only shows them when
+    /// something is wrong with the relay.
+    pub name: Option<String>,
+    pub contact: Option<String>,
     pub limits: Limits,
+    pub alerts: Alerts,
+    pub update: UpdateConfig,
+    pub notice: Option<NoticeEntry>,
     pub keys: Vec<KeyEntry>,
+}
+
+/// An announcement for everyone holding a key (`reamesh-relay notice`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoticeEntry {
+    pub text: String,
+    /// Date and time with offset; without them it counts from now on, until
+    /// removed.
+    #[serde(default)]
+    pub from: Option<toml::value::Datetime>,
+    #[serde(default)]
+    pub until: Option<toml::value::Datetime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Alerts {
+    /// Run through the shell when something needs the operator's attention,
+    /// with `REAMESH_RELAY_ALERT` (what) and `REAMESH_RELAY_MESSAGE` (a
+    /// sentence) in its environment.
+    pub command: Option<String>,
+    /// Share of the monthly budget that sets off a warning, 1 to 100.
+    pub budget_percent: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Download new versions and restart into them while nothing is being
+    /// relayed. Off, the relay only says when one is out.
+    pub auto: bool,
+    /// `stable`, or `beta` for pre-releases too.
+    pub channel: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            channel: "stable".to_owned(),
+        }
+    }
+}
+
+impl Default for Alerts {
+    fn default() -> Self {
+        Self {
+            command: None,
+            budget_percent: DEFAULT_ALERT_PERCENT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -72,6 +134,65 @@ pub struct KeyEntry {
     /// there was a date have none.
     #[serde(default)]
     pub added: Option<toml::value::Datetime>,
+    /// The last day the key works (a date, in the relay's time zone).
+    #[serde(default)]
+    pub expires: Option<toml::value::Datetime>,
+    /// Hosts this key may have online at once.
+    #[serde(default)]
+    pub max_hosts: Option<usize>,
+    /// Data sent per calendar month for this key's hosts and their guests, in
+    /// GB. Once used up, its relayed connections only last long enough to go
+    /// direct.
+    #[serde(default)]
+    pub monthly_budget_gb: Option<u64>,
+}
+
+impl KeyEntry {
+    /// The last day the key works, if it has one.
+    pub fn expiry_date(&self) -> Option<jiff::civil::Date> {
+        toml_date(self.expires.as_ref()?)
+    }
+
+    pub fn is_expired(&self, today: jiff::civil::Date) -> bool {
+        self.expiry_date().is_some_and(|d| today > d)
+    }
+
+    /// The first second the key no longer works, 0 for never.
+    pub fn expires_at(&self) -> u64 {
+        self.expiry_date()
+            .and_then(|d| d.tomorrow().ok())
+            .and_then(|d| d.to_zoned(jiff::tz::TimeZone::system()).ok())
+            .map_or(0, |z| z.timestamp().as_second().max(0) as u64)
+    }
+
+    pub fn budget_bytes(&self) -> u64 {
+        self.monthly_budget_gb
+            .unwrap_or(0)
+            .saturating_mul(1_000_000_000)
+    }
+}
+
+/// A TOML date without a time, as a calendar date.
+fn toml_date(d: &toml::value::Datetime) -> Option<jiff::civil::Date> {
+    if d.time.is_some() {
+        return None;
+    }
+    let date = d.date?;
+    jiff::civil::Date::new(date.year as i16, date.month as i8, date.day as i8).ok()
+}
+
+/// A TOML date-time with an offset, as Unix seconds.
+fn toml_instant(d: &toml::value::Datetime) -> Option<u64> {
+    let t: jiff::Timestamp = d.to_string().parse().ok()?;
+    u64::try_from(t.as_second()).ok()
+}
+
+impl NoticeEntry {
+    /// `(from, until)` in Unix seconds, 0 for open-ended.
+    pub fn window(&self) -> (u64, u64) {
+        let at = |d: &Option<toml::value::Datetime>| d.as_ref().and_then(toml_instant).unwrap_or(0);
+        (at(&self.from), at(&self.until))
+    }
 }
 
 impl Default for Config {
@@ -85,7 +206,12 @@ impl Default for Config {
             mode: Mode::Full,
             log_addresses: false,
             banned_peers: Vec::new(),
+            name: None,
+            contact: None,
             limits: Limits::default(),
+            alerts: Alerts::default(),
+            update: UpdateConfig::default(),
+            notice: None,
             keys: Vec::new(),
         }
     }
@@ -144,6 +270,46 @@ impl Config {
             if !seen.insert(k.label.as_str()) {
                 bail!("two keys are labeled {:?}", k.label);
             }
+            if k.expires.is_some() && k.expiry_date().is_none() {
+                bail!("key {:?}: expires must be a date, like 2026-12-24", k.label);
+            }
+            if k.max_hosts == Some(0) {
+                bail!("key {:?}: max_hosts must be at least 1", k.label);
+            }
+        }
+        if let Some(n) = &self.notice {
+            validate_notice_text(&n.text)?;
+            for (what, value) in [("from", &n.from), ("until", &n.until)] {
+                if value.as_ref().is_some_and(|d| toml_instant(d).is_none()) {
+                    bail!(
+                        "notice: {what} must be a date and time with offset, like 2026-11-11T09:00:00+01:00"
+                    );
+                }
+            }
+            let (from, until) = n.window();
+            if from != 0 && until != 0 && until <= from {
+                bail!("notice: until must be after from");
+            }
+        }
+        for (what, value, max) in [
+            ("name", &self.name, reamesh_relay_proto::RELAY_NAME_MAX),
+            (
+                "contact",
+                &self.contact,
+                reamesh_relay_proto::RELAY_CONTACT_MAX,
+            ),
+        ] {
+            if let Some(v) = value
+                && (v.chars().count() > max || v.chars().any(char::is_control))
+            {
+                bail!("{what} must be at most {max} printable characters");
+            }
+        }
+        if !matches!(self.update.channel.as_str(), "stable" | "beta") {
+            bail!("update.channel must be \"stable\" or \"beta\"");
+        }
+        if !(1..=100).contains(&self.alerts.budget_percent) {
+            bail!("alerts.budget_percent must be between 1 and 100");
         }
         self.banned()?;
         if self.listen_addrs.is_empty() {
@@ -194,6 +360,32 @@ impl Config {
     pub fn budget_bytes(&self) -> u64 {
         self.limits.monthly_budget_gb.saturating_mul(1_000_000_000)
     }
+
+    pub fn entry(&self, label: &str) -> Option<&KeyEntry> {
+        self.keys.iter().find(|k| k.label == label)
+    }
+
+    /// The labels of the keys that work today.
+    pub fn active_labels(&self, today: jiff::civil::Date) -> HashSet<String> {
+        self.keys
+            .iter()
+            .filter(|k| !k.is_expired(today))
+            .map(|k| k.label.clone())
+            .collect()
+    }
+}
+
+/// Today where the relay runs, the calendar `expires` dates are meant in.
+pub fn local_today() -> jiff::civil::Date {
+    jiff::Zoned::now().date()
+}
+
+pub fn validate_notice_text(text: &str) -> anyhow::Result<()> {
+    let max = reamesh_relay_proto::NOTICE_TEXT_MAX;
+    if text.trim().is_empty() || text.chars().count() > max || text.chars().any(char::is_control) {
+        bail!("a notice must be 1 to {max} printable characters on one line");
+    }
+    Ok(())
 }
 
 pub fn validate_label(label: &str) -> anyhow::Result<()> {
@@ -351,8 +543,142 @@ fn restrict_dir(_dir: &Path) {
     }
 }
 
+/// A date like `2026-12-24` or a span like `30d`, `6w`, as the last day a key
+/// works. Spans count from today.
+pub fn parse_expiry(text: &str, today: jiff::civil::Date) -> anyhow::Result<jiff::civil::Date> {
+    let text = text.trim();
+    if let Ok(d) = text.parse::<jiff::civil::Date>() {
+        return Ok(d);
+    }
+    let bad = || {
+        problem(
+            format!("{text:?} is neither a date nor a span."),
+            "Use a date like 2026-12-24, or a span like 30d or 6w.",
+        )
+    };
+    let split = text.len().saturating_sub(1);
+    if !text.is_char_boundary(split) {
+        return Err(bad());
+    }
+    let (n, unit) = text.split_at(split);
+    let n: i64 = n.parse().map_err(|_| bad())?;
+    let days = match unit {
+        "d" => n,
+        "w" => n.saturating_mul(7),
+        _ => return Err(bad()),
+    };
+    if !(1..=36_500).contains(&days) {
+        return Err(bad());
+    }
+    today
+        .checked_add(jiff::Span::new().days(days))
+        .map_err(|_| bad())
+}
+
+fn toml_date_value(d: jiff::civil::Date) -> toml_edit::Datetime {
+    toml_edit::Datetime {
+        date: Some(toml_edit::Date {
+            year: d.year() as u16,
+            month: d.month() as u8,
+            day: d.day() as u8,
+        }),
+        time: None,
+        offset: None,
+    }
+}
+
+/// Sets or clears a key's last day.
+pub fn set_key_expiry(
+    dir: &Path,
+    label: &str,
+    expires: Option<jiff::civil::Date>,
+) -> anyhow::Result<()> {
+    let cfg = Config::load(dir)?;
+    if !cfg.keys.iter().any(|k| k.label == label) {
+        return Err(no_such_key(label));
+    }
+    edit_config(dir, |doc| {
+        let keys = doc
+            .get_mut("keys")
+            .and_then(|k| k.as_array_of_tables_mut())
+            .context("`keys` in config.toml is not a [[keys]] list")?;
+        for t in keys.iter_mut() {
+            if t.get("label").and_then(|l| l.as_str()) == Some(label) {
+                match expires {
+                    Some(d) => t["expires"] = toml_edit::value(toml_date_value(d)),
+                    None => {
+                        t.remove("expires");
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A time the operator typed: `2026-11-11 09:00`, `2026-11-11T09:00` or a full
+/// RFC 3339 time. Without an offset it means the relay's time zone.
+pub fn parse_notice_time(text: &str) -> anyhow::Result<jiff::Timestamp> {
+    let text = text.trim();
+    if let Ok(t) = text.parse::<jiff::Timestamp>() {
+        return Ok(t);
+    }
+    text.parse::<jiff::civil::DateTime>()
+        .ok()
+        .and_then(|d| d.to_zoned(jiff::tz::TimeZone::system()).ok())
+        .map(|z| z.timestamp())
+        .ok_or_else(|| {
+            problem(
+                format!("{text:?} is not a date and time."),
+                "Use the form 2026-11-11 09:00.",
+            )
+        })
+}
+
+/// The form config.toml keeps a notice's times in: to the second, with this
+/// machine's offset, so the file reads as what the operator typed.
+fn notice_time_value(t: jiff::Timestamp) -> anyhow::Result<toml_edit::Datetime> {
+    let z = t.to_zoned(jiff::tz::TimeZone::system());
+    z.strftime("%Y-%m-%dT%H:%M:%S%:z")
+        .to_string()
+        .parse()
+        .context("formatting a time")
+}
+
+/// Sets the notice (replacing any) or, with no text, removes it.
+pub fn set_notice(
+    dir: &Path,
+    notice: Option<(&str, Option<jiff::Timestamp>, Option<jiff::Timestamp>)>,
+) -> anyhow::Result<()> {
+    edit_config(dir, |doc| {
+        doc.remove("notice");
+        let Some((text, from, until)) = notice else {
+            return Ok(());
+        };
+        let mut t = toml_edit::Table::new();
+        t["text"] = toml_edit::value(text);
+        if let Some(from) = from {
+            t["from"] = toml_edit::value(notice_time_value(from)?);
+        }
+        if let Some(until) = until {
+            t["until"] = toml_edit::value(notice_time_value(until)?);
+        }
+        doc.insert("notice", toml_edit::Item::Table(t));
+        Ok(())
+    })
+}
+
 /// Adds a key to config.toml (comments kept) and returns it.
 pub fn add_key(dir: &Path, label: &str) -> anyhow::Result<AccessKey> {
+    add_key_until(dir, label, None)
+}
+
+/// `add_key` with a last day.
+pub fn add_key_until(
+    dir: &Path,
+    label: &str,
+    expires: Option<jiff::civil::Date>,
+) -> anyhow::Result<AccessKey> {
     validate_label(label)?;
     let cfg = Config::load(dir)?;
     if cfg.keys.iter().any(|k| k.label == label) {
@@ -372,6 +698,9 @@ pub fn add_key(dir: &Path, label: &str) -> anyhow::Result<AccessKey> {
         t["label"] = toml_edit::value(label);
         t["key"] = toml_edit::value(hex::encode(key));
         t["added"] = toml_edit::value(today());
+        if let Some(d) = expires {
+            t["expires"] = toml_edit::value(toml_date_value(d));
+        }
         keys.push(t);
         Ok(())
     })?;
@@ -482,6 +811,11 @@ log_addresses = false
 # Peer IDs that may not use this relay.
 banned_peers = []
 
+# Who runs this relay. ReaMesh only shows these when something is wrong with
+# the relay, so hosts know whom to ask. Both optional.
+# name = "Studio relay"
+# contact = "lena@example.org"
+
 [limits]
 # Hosts that may hold a reservation at the same time.
 max_hosts = 32
@@ -497,8 +831,32 @@ circuit_max_mb = 0
 # Once used up it switches to coordination mode until the month ends.
 monthly_budget_gb = 500
 
+[alerts]
+# Runs through the shell when something needs your attention: the budget nearly
+# or fully used up, a key's budget used up, a key that expired, UDP that looks
+# blocked, or every host gone at once with none coming back. It gets
+# REAMESH_RELAY_ALERT (what happened) and REAMESH_RELAY_MESSAGE (a sentence) in
+# its environment. Try it with `reamesh-relay alert test`.
+# command = "curl -s -d \"$REAMESH_RELAY_MESSAGE\" https://ntfy.sh/my-relay"
+# Share of the monthly budget that sets off a warning.
+budget_percent = {DEFAULT_ALERT_PERCENT}
+
+[update]
+# Download new versions (signed by the ReaMesh release key) and restart into them
+# at a moment nothing is being relayed. Hosts reconnect by themselves. With
+# false the relay only says when one is out; `reamesh-relay update` then gets it.
+auto = true
+# "stable", or "beta" for pre-releases too.
+channel = "stable"
+
 # Access keys. Each one gives a relay code; hand one to each host (or one for
-# everyone). Manage them with `reamesh-relay key add|list|remove`.
+# everyone). Manage them with `reamesh-relay key add|list|expires|remove`.
+# A key can also have, each optional:
+#   expires = 2026-12-24      the last day it works
+#   max_hosts = 2             hosts it may have online at once
+#   monthly_budget_gb = 50    its own share of the traffic; once used up, its
+#                             relayed connections only last long enough to go
+#                             direct
 [[keys]]
 label = "default"
 key = "{default_key}"
@@ -520,6 +878,9 @@ mod tests {
                 label: "default".into(),
                 key,
                 added: Some("2026-10-28".parse().unwrap()),
+                expires: None,
+                max_hosts: None,
+                monthly_budget_gb: None,
             }],
             ..Config::default()
         };
@@ -570,7 +931,87 @@ mod tests {
     }
 
     #[test]
+    fn expiry_counts_the_last_day_as_valid() {
+        let cfg = Config::parse(
+            "[[keys]]\nlabel = \"a\"\nkey = \"0000000000000000000000000000000000000000000000000000000000000000\"\nexpires = 2026-12-24\n",
+        )
+        .unwrap();
+        let k = &cfg.keys[0];
+        let day: jiff::civil::Date = "2026-12-24".parse().unwrap();
+        assert!(!k.is_expired(day));
+        assert!(k.is_expired(day.tomorrow().unwrap()));
+        assert!(k.expires_at() > 0);
+    }
+
+    #[test]
+    fn expiry_parses_dates_and_spans() {
+        let today: jiff::civil::Date = "2026-11-05".parse().unwrap();
+        let d = |s: &str| parse_expiry(s, today).unwrap().to_string();
+        assert_eq!(d("2026-12-24"), "2026-12-24");
+        assert_eq!(d("30d"), "2026-12-05");
+        assert_eq!(d("2w"), "2026-11-19");
+        for bad in ["soon", "0d", "-3d", "5y", "", "ä"] {
+            assert!(parse_expiry(bad, today).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn key_and_notice_commands_edit_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path()).unwrap();
+        let day: jiff::civil::Date = "2026-12-24".parse().unwrap();
+        add_key_until(dir.path(), "gast", Some(day)).unwrap();
+        assert_eq!(
+            Config::load(dir.path())
+                .unwrap()
+                .entry("gast")
+                .unwrap()
+                .expiry_date(),
+            Some(day)
+        );
+        set_key_expiry(dir.path(), "gast", None).unwrap();
+        assert_eq!(
+            Config::load(dir.path())
+                .unwrap()
+                .entry("gast")
+                .unwrap()
+                .expires,
+            None
+        );
+        assert!(set_key_expiry(dir.path(), "nobody", None).is_err());
+
+        let from = parse_notice_time("2026-11-11T09:00:00+01:00").unwrap();
+        let until = parse_notice_time("2026-11-11 14:00").unwrap();
+        set_notice(dir.path(), Some(("Serverumzug", Some(from), Some(until)))).unwrap();
+        let cfg = Config::load(dir.path()).unwrap();
+        let n = cfg.notice.unwrap();
+        assert_eq!(n.text, "Serverumzug");
+        assert_eq!(
+            n.window(),
+            (from.as_second() as u64, until.as_second() as u64)
+        );
+        // The key tables stay intact behind the new table.
+        assert_eq!(cfg.keys.len(), 2);
+        set_notice(dir.path(), None).unwrap();
+        assert_eq!(Config::load(dir.path()).unwrap().notice, None);
+        // Times the wrong way round don't get in.
+        assert!(set_notice(dir.path(), Some(("x", Some(until), Some(from)))).is_err());
+    }
+
+    #[test]
     fn rejects_bad_config() {
+        assert!(Config::parse("[notice]\ntext = \"\"").is_err());
+        assert!(Config::parse("[notice]\ntext = \"x\"\nfrom = 2026-11-11").is_err());
+        assert!(Config::parse("name = \"a\\nb\"").is_err());
+        assert!(Config::parse("[alerts]\nbudget_percent = 0").is_err());
+        let k = "key = \"0000000000000000000000000000000000000000000000000000000000000000\"";
+        assert!(
+            Config::parse(&format!(
+                "[[keys]]\nlabel = \"a\"\n{k}\nexpires = 2026-12-24T10:00:00Z"
+            ))
+            .is_err()
+        );
+        assert!(Config::parse(&format!("[[keys]]\nlabel = \"a\"\n{k}\nmax_hosts = 0")).is_err());
         assert!(Config::parse("tcp_port = 1\nbogus = 2").is_err());
         assert!(Config::parse("[[keys]]\nlabel = \"a\"\nkey = \"abcd\"").is_err());
         assert!(Config::parse("banned_peers = [\"nope\"]").is_err());

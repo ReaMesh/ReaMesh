@@ -36,10 +36,14 @@ struct AuthResponse {
     key_label: Option<String>,
 }
 
+/// What a test relay says about itself, shared with the test.
+type Said = Arc<Mutex<Option<reamesh_relay_proto::InfoResponse>>>;
+
 #[derive(NetworkBehaviour)]
 struct RelayBehaviour {
     relay: relay::Behaviour,
     auth: request_response::cbor::Behaviour<AuthRequest, AuthResponse>,
+    info: request_response::cbor::Behaviour<reamesh_relay_proto::InfoRequest, reamesh_relay_proto::InfoResponse>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
 }
@@ -51,6 +55,9 @@ struct TestRelay {
     quic: u16,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// `Some`: the relay answers `/reamesh/relay-info/1` with this. Set by the
+    /// test at any time; a held request is answered when it changes.
+    said: Said,
 }
 
 impl TestRelay {
@@ -79,7 +86,14 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A relay from before the info protocol.
 fn start_relay(key: [u8; 32]) -> TestRelay {
+    start_relay_with(key, false)
+}
+
+fn start_relay_with(key: [u8; 32], speaks_info: bool) -> TestRelay {
+    let said: Said = Arc::default();
+    let said_by_relay = said.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<(PeerId, u16, u16)>();
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
     let thread = std::thread::spawn(move || {
@@ -111,6 +125,12 @@ fn start_relay(key: [u8; 32]) -> TestRelay {
                             [(StreamProtocol::new("/reamesh/relay-auth/1"), ProtocolSupport::Inbound)],
                             request_response::Config::default(),
                         ),
+                        info: request_response::cbor::Behaviour::new(
+                            speaks_info.then(|| {
+                                (StreamProtocol::new(reamesh_relay_proto::RELAY_INFO_PROTOCOL), ProtocolSupport::Inbound)
+                            }),
+                            request_response::Config::default().with_request_timeout(Duration::from_secs(300)),
+                        ),
                         identify: identify::Behaviour::new(identify::Config::new(
                             "/reamesh-relay/1".into(),
                             key.public(),
@@ -125,9 +145,27 @@ fn start_relay(key: [u8; 32]) -> TestRelay {
             swarm.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()).unwrap();
             let me = *swarm.local_peer_id();
             let (mut tcp_port, mut quic_port, mut sent) = (0u16, 0u16, false);
+            let mut held = Vec::new();
+            let mut poll = tokio::time::interval(Duration::from_millis(100));
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => break,
+                    _ = poll.tick() => {
+                        // A held info request is answered once the answer differs.
+                        let now = said_by_relay.lock().unwrap().clone();
+                        if let Some(mut r) = now {
+                            r.rev = r.content_rev();
+                            let mut still = Vec::new();
+                            for (rev, channel) in held.drain(..) {
+                                if rev == r.rev {
+                                    still.push((rev, channel));
+                                } else {
+                                    let _ = swarm.behaviour_mut().info.send_response(channel, r.clone());
+                                }
+                            }
+                            held = still;
+                        }
+                    }
                     ev = swarm.select_next_some() => match ev {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             swarm.add_external_address(address.clone());
@@ -162,6 +200,23 @@ fn start_relay(key: [u8; 32]) -> TestRelay {
                             };
                             let _ = swarm.behaviour_mut().auth.send_response(channel, resp);
                         }
+                        SwarmEvent::Behaviour(RelayBehaviourEvent::Info(request_response::Event::Message {
+                            message: request_response::Message::Request { request, channel, .. },
+                            ..
+                        })) => {
+                            let now = said_by_relay.lock().unwrap().clone();
+                            match now {
+                                Some(mut r) => {
+                                    r.rev = r.content_rev();
+                                    if request.rev == r.rev {
+                                        held.push((request.rev, channel));
+                                    } else {
+                                        let _ = swarm.behaviour_mut().info.send_response(channel, r);
+                                    }
+                                }
+                                None => drop(channel),
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -169,7 +224,7 @@ fn start_relay(key: [u8; 32]) -> TestRelay {
         });
     });
     let (peer, tcp, quic) = ready_rx.recv_timeout(Duration::from_secs(10)).expect("relay never listened");
-    TestRelay { peer, tcp, quic, stop: Some(stop_tx), thread: Some(thread) }
+    TestRelay { peer, tcp, quic, stop: Some(stop_tx), thread: Some(thread), said }
 }
 
 fn host(name: &str, dir: &Path, pass: &str) -> Box<Reamesh> {
@@ -331,7 +386,7 @@ fn bad_key_is_refused_and_nothing_is_reserved() {
     let (outcome, _) = reamesh::relay_test_blocking(&relay.code(&wrong));
     assert_eq!(outcome, "bad_key");
     // A relay nobody listens on.
-    let dead = TestRelay { peer: PeerId::random(), tcp: 9, quic: 9, stop: None, thread: None };
+    let dead = TestRelay { peer: PeerId::random(), tcp: 9, quic: 9, stop: None, thread: None, said: Arc::default() };
     let (outcome, _) = reamesh::relay_test_blocking(&dead.code(&KEY));
     assert!(outcome == "unreachable" || outcome == "timeout", "{outcome}");
     assert_eq!(reamesh::relay_test_blocking("reamesh://relay/garbage").0, "invalid");
@@ -436,4 +491,103 @@ fn open_session_over_relay_requires_the_link_secret() {
     let _ = fs::remove_dir_all(project);
     let _ = fs::remove_dir_all(staging);
     let _ = fs::remove_dir_all(lan_staging);
+}
+
+/// What the app last heard about `relay`.
+fn relay_info(relay: &PeerId) -> Option<Value> {
+    let v: Value = serde_json::from_str(&reamesh::relay_ctl_message()).unwrap();
+    v["info"].get(relay.to_string()).cloned()
+}
+
+#[test]
+fn a_host_hears_what_its_relay_announces_and_tells_its_guests() {
+    use reamesh_relay_proto::{InfoResponse, Notice};
+    let relay = start_relay_with(KEY, true);
+    let plain = InfoResponse {
+        ok: true,
+        version: "1.2.0".into(),
+        level: reamesh_relay_proto::RELAY_LEVEL,
+        mode: "full".into(),
+        ips: vec!["127.0.0.1".parse().unwrap()],
+        tcp: relay.tcp,
+        quic: relay.quic,
+        ..InfoResponse::default()
+    };
+    *relay.said.lock().unwrap() = Some(plain.clone());
+
+    let project = temp_dir("info-proj");
+    make_project(&project);
+    reamesh::set_loopback_only(true);
+    let (owner, ticket) = host_on_relay(&relay, "info-session", &project, "");
+    assert!(
+        wait_until(Duration::from_secs(20), || relay_info(&relay.peer).is_some_and(|i| i["version"] == "1.2.0")),
+        "the relay's answer never arrived"
+    );
+    let info = relay_info(&relay.peer).unwrap();
+    assert_eq!(info["outdated"], false);
+    assert_eq!(info["notice"], Value::Null);
+    assert!(info.get("new_code").is_none(), "the address didn't change: {info}");
+
+    // Announced later: the held request hears it right away.
+    let notice = Notice { text: "Moving servers".into(), from: 0, until: u64::MAX };
+    *relay.said.lock().unwrap() = Some(InfoResponse { notice: Some(notice), ..plain.clone() });
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            relay_info(&relay.peer).is_some_and(|i| i["notice"]["text"] == "Moving servers")
+        }),
+        "the notice never arrived"
+    );
+
+    // A guest learns it from the host, in the join preview.
+    let guest = join(&temp_dir("info-staging"));
+    assert!(guest.check_ticket(&ticket, ""));
+    assert!(
+        wait_until(Duration::from_secs(30), || status(&guest)["probe"]["ok"] == true),
+        "the check never passed: {}",
+        guest.status_json()
+    );
+    let probe = status(&guest)["probe"].clone();
+    assert_eq!(
+        probe["preview"]["meta"]["relay_notices"][0]["text"], "Moving servers",
+        "{probe}"
+    );
+    drop(guest);
+
+    // A new address comes with the code to keep.
+    *relay.said.lock().unwrap() = Some(InfoResponse {
+        ips: vec!["127.0.0.1".parse().unwrap(), "203.0.113.9".parse().unwrap()],
+        ..plain.clone()
+    });
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            relay_info(&relay.peer).is_some_and(|i| i["new_code"].as_str().is_some_and(|c| c.contains("203.0.113.9")))
+        }),
+        "the new address never arrived"
+    );
+
+    // Going away: losing it is announced, not a problem.
+    *relay.said.lock().unwrap() = Some(InfoResponse { stopping: true, ..plain.clone() });
+    assert!(wait_until(Duration::from_secs(10), || {
+        relay_info(&relay.peer).is_some_and(|i| i["stopping"] == true)
+    }));
+    let peer = relay.peer;
+    drop(relay);
+    assert!(
+        wait_until(Duration::from_secs(20), || relay_state(&peer).is_some_and(|s| s["reason"] == "paused")),
+        "{:?}",
+        relay_state(&peer)
+    );
+    drop(owner);
+    reamesh::set_relays(&[]);
+}
+
+#[test]
+fn an_older_relay_counts_as_outdated_but_keeps_working() {
+    let relay = start_relay(KEY);
+    reamesh::set_loopback_only(true);
+    let (outcome, _) = reamesh::relay_test_blocking(&relay.code(&KEY));
+    assert_eq!(outcome, "ok");
+    let info = relay_info(&relay.peer).expect("nothing filed about the relay");
+    assert_eq!(info["outdated"], true);
+    assert_eq!(info["version"], "");
 }

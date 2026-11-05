@@ -13,6 +13,10 @@
 // It also writes `extension.json`, the same format for the extension binaries
 // (`reaper_reamesh.dylib` / `.dll` with their `.sig`): the app fetches it next
 // to the downloaded update to install the new extension before it restarts.
+//
+// The relay's builds (`reamesh-relay-linux-<arch>` with their `.sig`) go into
+// latest.json under `relay`, so a relay reads the same channel manifests as the
+// app. Tauri's updater ignores the extra field, as it does `proto`.
 
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -32,6 +36,7 @@ const files = readdirSync(dir);
 type Platforms = Record<string, { signature: string; url: string }>;
 const platforms: Platforms = {};
 const extension: Platforms = {};
+const relay: Platforms = {};
 const entry = (key: string, test: (f: string) => boolean, into = platforms) => {
   const file = files.find((f) => test(f) && files.includes(`${f}.sig`));
   if (!file) return;
@@ -46,6 +51,9 @@ for (const mac of ["darwin-aarch64", "darwin-x86_64"]) {
 }
 entry("windows-x86_64", (f) => f.endsWith("-setup.exe"));
 entry("windows-x86_64", (f) => f === "reaper_reamesh.dll", extension);
+for (const arch of ["x86_64", "aarch64"]) {
+  entry(`linux-${arch}`, (f) => f === `reamesh-relay-linux-${arch}`, relay);
+}
 if (!Object.keys(platforms).length) throw new Error(`no signed updater artifacts in ${dir}`);
 
 const manifest = {
@@ -55,8 +63,12 @@ const manifest = {
   pub_date: new Date().toISOString(),
   platforms,
 };
-writeFileSync(join(dir, "latest.json"), JSON.stringify(manifest, null, 2) + "\n");
-console.log(`latest.json: ${version}, proto ${proto}, ${Object.keys(platforms).join(", ")}`);
+// Every release carries the relay along: one that lost it would strand relays.
+for (const arch of ["linux-x86_64", "linux-aarch64"]) {
+  if (!relay[arch]) throw new Error(`no signed relay build for ${arch} in ${dir}`);
+}
+writeFileSync(join(dir, "latest.json"), JSON.stringify({ ...manifest, relay }, null, 2) + "\n");
+console.log(`latest.json: ${version}, proto ${proto}, ${Object.keys(platforms).join(", ")}, relay ${Object.keys(relay).join(", ")}`);
 
 // Optional: a release without it still updates; the extension then only
 // changes when the app restarts into the update.

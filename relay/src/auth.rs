@@ -27,6 +27,8 @@ pub struct AuthState {
     pub reserved: HashSet<PeerId>,
     pub banned: HashSet<PeerId>,
     pub max_hosts: usize,
+    /// Keys with their own limit on hosts online at once.
+    pub key_max_hosts: HashMap<String, usize>,
 }
 
 impl AuthState {
@@ -58,9 +60,24 @@ impl AuthState {
         !self.reserved.contains(peer) && self.reserved.len() >= self.max_hosts
     }
 
+    /// This key has as many hosts online as it may (an existing host renewing
+    /// always fits).
+    pub fn key_is_full(&self, peer: &PeerId, label: &str) -> bool {
+        !self.reserved.contains(peer)
+            && self.key_max_hosts.get(label).is_some_and(|max| {
+                self.reserved
+                    .iter()
+                    .filter(|p| self.label(p) == Some(label))
+                    .count()
+                    >= *max
+            })
+    }
+
     /// The reservation limiter's verdict.
     pub fn may_reserve(&self, peer: &PeerId, now: Instant) -> bool {
-        self.is_authorized(peer, now) && !self.is_full(peer)
+        self.is_authorized(peer, now)
+            && !self.is_full(peer)
+            && !self.label(peer).is_some_and(|l| self.key_is_full(peer, l))
     }
 
     pub fn connection_count(&mut self, peer: &PeerId, connections: usize, now: Instant) {
@@ -149,6 +166,26 @@ mod tests {
         s.reserved.insert(host);
         assert!(s.may_reserve(&host, t0));
         assert!(!s.may_reserve(&other, t0));
+    }
+
+    #[test]
+    fn a_key_limit_applies_to_that_key_only() {
+        let mut s = AuthState {
+            max_hosts: 8,
+            ..Default::default()
+        };
+        s.key_max_hosts.insert("lena".into(), 1);
+        let (a, b, c) = (peer(), peer(), peer());
+        let now = Instant::now();
+        s.authorize(a, "lena", 1);
+        s.authorize(b, "lena", 1);
+        s.authorize(c, "band", 1);
+        assert!(s.may_reserve(&b, now));
+        s.reserved.insert(a);
+        assert!(!s.may_reserve(&b, now));
+        // The host already in may renew, and the other key doesn't care.
+        assert!(s.may_reserve(&a, now));
+        assert!(s.may_reserve(&c, now));
     }
 
     #[test]

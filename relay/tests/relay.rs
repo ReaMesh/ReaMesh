@@ -13,7 +13,7 @@ use reamesh_relay::config::{self, Config};
 use reamesh_relay::server::{self, COORDINATION_CIRCUIT_BYTES, Options, RelayHandle};
 use reamesh_relay::status::Status;
 use reamesh_relay::traffic::{Ledger, current_month};
-use reamesh_relay_proto::{self as proto, AuthRequest, AuthResponse};
+use reamesh_relay_proto::{self as proto, AuthRequest, AuthResponse, InfoRequest, InfoResponse};
 
 const WAIT: Duration = Duration::from_secs(15);
 
@@ -21,6 +21,7 @@ const WAIT: Duration = Duration::from_secs(15);
 struct Client {
     relay: relay::client::Behaviour,
     auth: request_response::cbor::Behaviour<AuthRequest, AuthResponse>,
+    info: request_response::cbor::Behaviour<InfoRequest, InfoResponse>,
 }
 
 fn client() -> Swarm<Client> {
@@ -42,6 +43,14 @@ fn client() -> Swarm<Client> {
                     ProtocolSupport::Outbound,
                 )],
                 request_response::Config::default(),
+            ),
+            info: request_response::cbor::Behaviour::new(
+                [(
+                    StreamProtocol::new(proto::RELAY_INFO_PROTOCOL),
+                    ProtocolSupport::Outbound,
+                )],
+                request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(proto::INFO_TIMEOUT_SECS)),
             ),
         })
         .unwrap()
@@ -183,6 +192,56 @@ async fn authenticate(swarm: &mut Swarm<Client>, relay_id: PeerId, key: &[u8; 32
 enum Reservation {
     Accepted { data_limit: Option<u64> },
     Refused,
+}
+
+fn ask_info(
+    swarm: &mut Swarm<Client>,
+    relay_id: PeerId,
+    key: &[u8; 32],
+    rev: u64,
+) -> OutboundRequestId {
+    let me = *swarm.local_peer_id();
+    let proof = proto::auth_proof(key, &relay_id, &me).to_vec();
+    swarm
+        .behaviour_mut()
+        .info
+        .send_request(&relay_id, InfoRequest { proof, rev })
+}
+
+fn info_answer(e: SwarmEvent<ClientEvent>, id: OutboundRequestId) -> Option<InfoResponse> {
+    match e {
+        SwarmEvent::Behaviour(ClientEvent::Info(request_response::Event::Message {
+            message:
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                },
+            ..
+        })) if request_id == id => Some(response),
+        SwarmEvent::Behaviour(ClientEvent::Info(request_response::Event::OutboundFailure {
+            error,
+            ..
+        })) => panic!("info request failed: {error}"),
+        _ => None,
+    }
+}
+
+async fn info(
+    swarm: &mut Swarm<Client>,
+    relay_id: PeerId,
+    key: &[u8; 32],
+    rev: u64,
+) -> InfoResponse {
+    let id = ask_info(swarm, relay_id, key, rev);
+    until(swarm, |e| info_answer(e, id)).await
+}
+
+/// Text at the end of config.toml: belongs to the last `[[keys]]` entry, or
+/// starts a table of its own.
+fn append_config(dir: &Path, extra: &str) {
+    let path = dir.join(config::CONFIG_FILE);
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(path, format!("{text}{extra}\n")).unwrap();
 }
 
 async fn reserve(swarm: &mut Swarm<Client>, relay: &Multiaddr) -> Reservation {
@@ -475,4 +534,292 @@ async fn config_reload_applies_keys_and_limits_live() {
     .await;
 
     relay.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn info_needs_the_key_and_a_held_request_hears_about_changes() {
+    let dir = data_dir("");
+    let path = dir.path().join(config::CONFIG_FILE);
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("# name = \"Studio relay\"", "name = \"Studio\"")
+        .replace(
+            "# contact = \"lena@example.org\"",
+            "contact = \"lena@example.org\"",
+        );
+    std::fs::write(&path, text).unwrap();
+    let mut relay = start(dir.path());
+    let relay_id = relay.peer_id;
+    let addr = relay_tcp_addr(&mut relay).await;
+    let mut host = client();
+    connect(&mut host, &addr, relay_id).await;
+
+    // A wrong key learns nothing.
+    let r = info(&mut host, relay_id, &[9u8; 32], 0).await;
+    assert!(!r.ok);
+    assert_eq!(r.reason.as_deref(), Some(proto::REASON_BAD_KEY));
+    assert!(r.name.is_empty() && r.version.is_empty() && r.ips.is_empty());
+
+    let key = default_key(dir.path());
+    let r = info(&mut host, relay_id, &key, 0).await;
+    assert!(r.ok);
+    assert_eq!(r.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(r.mode, "full");
+    assert_eq!(
+        (r.name.as_str(), r.contact.as_str()),
+        ("Studio", "lena@example.org")
+    );
+    assert_eq!(r.max_hosts, 32);
+    assert_ne!(r.rev, 0);
+    assert_eq!(r.notice, None);
+    assert!(r.budget_resets > 0);
+    assert!(r.tcp != 0, "the relay names the port it really got");
+
+    // Nothing changed: the request waits.
+    let id = ask_info(&mut host, relay_id, &key, r.rev);
+    let early = tokio::time::timeout(
+        Duration::from_secs(2),
+        until(&mut host, |e| info_answer(e, id)),
+    )
+    .await;
+    assert!(early.is_err(), "answered although nothing changed");
+
+    // A notice wakes it up.
+    config::set_notice(
+        dir.path(),
+        Some((
+            "Moving servers",
+            None,
+            Some(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(5)),
+        )),
+    )
+    .unwrap();
+    let woke = until(&mut host, |e| info_answer(e, id)).await;
+    assert_eq!(woke.notice.as_ref().unwrap().text, "Moving servers");
+    assert_ne!(woke.rev, r.rev);
+
+    // A notice whose time is over isn't sent any more.
+    config::set_notice(
+        dir.path(),
+        Some((
+            "Old",
+            None,
+            Some(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1)),
+        )),
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let r = info(&mut host, relay_id, &key, 0).await;
+    assert_eq!(r.notice, None);
+
+    relay.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stopping_relay_tells_the_hosts_that_are_listening() {
+    let dir = data_dir("");
+    let mut relay = start(dir.path());
+    let relay_id = relay.peer_id;
+    let addr = relay_tcp_addr(&mut relay).await;
+    let mut host = client();
+    connect(&mut host, &addr, relay_id).await;
+    let key = default_key(dir.path());
+    let r = info(&mut host, relay_id, &key, 0).await;
+    assert!(!r.stopping);
+    let id = ask_info(&mut host, relay_id, &key, r.rev);
+    // Let the request reach the relay before it stops.
+    let _ = tokio::time::timeout(
+        Duration::from_millis(500),
+        until(&mut host, |e| info_answer(e, id)),
+    )
+    .await;
+    let stopping = tokio::spawn(relay.stop());
+    let r = until(&mut host, |e| info_answer(e, id)).await;
+    assert!(r.stopping);
+    stopping.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn an_expired_key_is_refused_but_still_learns_whom_to_ask() {
+    let dir = data_dir("");
+    let path = dir.path().join(config::CONFIG_FILE);
+    let text = std::fs::read_to_string(&path).unwrap().replace(
+        "# contact = \"lena@example.org\"",
+        "contact = \"lena@example.org\"",
+    );
+    std::fs::write(&path, text).unwrap();
+    let mut relay = start(dir.path());
+    let relay_id = relay.peer_id;
+    let addr = relay_tcp_addr(&mut relay).await;
+    let key = default_key(dir.path());
+
+    // Still valid, a running host holds a reservation.
+    let mut host = client();
+    connect(&mut host, &addr, relay_id).await;
+    assert!(authenticate(&mut host, relay_id, &key).await.ok);
+    assert!(matches!(
+        reserve(&mut host, &addr).await,
+        Reservation::Accepted { .. }
+    ));
+
+    // The date passes (here: is set in the past): it loses access.
+    config::set_key_expiry(dir.path(), "default", Some("2000-01-01".parse().unwrap())).unwrap();
+    until(&mut host, |e| match e {
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            num_established: 0,
+            ..
+        } if peer_id == relay_id => Some(()),
+        _ => None,
+    })
+    .await;
+
+    connect(&mut host, &addr, relay_id).await;
+    let r = authenticate(&mut host, relay_id, &key).await;
+    assert_eq!(r.reason.as_deref(), Some(proto::REASON_EXPIRED));
+    assert_eq!(proto::refusal_reason(&r), proto::REASON_EXPIRED);
+    let r = info(&mut host, relay_id, &key, 0).await;
+    assert!(!r.ok);
+    assert_eq!(r.reason.as_deref(), Some(proto::REASON_EXPIRED));
+    assert_eq!(r.contact, "lena@example.org");
+
+    // Renewed: it works again.
+    config::set_key_expiry(dir.path(), "default", None).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(authenticate(&mut host, relay_id, &key).await.ok);
+
+    relay.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_key_can_have_its_own_host_limit_and_traffic_share() {
+    let dir = data_dir("");
+    append_config(dir.path(), "max_hosts = 1\nmonthly_budget_gb = 1");
+    let mut ledger = Ledger::load(&dir.path().join(config::TRAFFIC_FILE));
+    ledger.add_key("default", 950_000_000);
+    ledger.save().unwrap();
+    let mut relay = start(dir.path());
+    let relay_id = relay.peer_id;
+    let addr = relay_tcp_addr(&mut relay).await;
+    let key = default_key(dir.path());
+
+    let mut first = client();
+    connect(&mut first, &addr, relay_id).await;
+    assert!(authenticate(&mut first, relay_id, &key).await.ok);
+    assert!(matches!(
+        reserve(&mut first, &addr).await,
+        Reservation::Accepted { .. }
+    ));
+
+    // The key's own limit is reached; the relay as a whole has room.
+    let mut second = client();
+    connect(&mut second, &addr, relay_id).await;
+    let id = {
+        let me = *second.local_peer_id();
+        let proof = proto::auth_proof(&key, &relay_id, &me).to_vec();
+        second
+            .behaviour_mut()
+            .auth
+            .send_request(&relay_id, AuthRequest { proof })
+    };
+    let r = until_with(&mut second, &mut first, |e| match e {
+        SwarmEvent::Behaviour(ClientEvent::Auth(request_response::Event::Message {
+            message:
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                },
+            ..
+        })) if request_id == id => Some(response),
+        _ => None,
+    })
+    .await;
+    assert_eq!(r.reason.as_deref(), Some(proto::REASON_FULL));
+
+    // The share shows in the answer, and what this host caused is counted.
+    let id = ask_info(&mut first, relay_id, &key, 0);
+    let r = until(&mut first, |e| info_answer(e, id)).await;
+    assert_eq!(r.key_budget_percent, 95);
+    assert!(!r.key_budget_exhausted);
+    assert_eq!(r.budget_percent, 0);
+    tokio::time::timeout(Duration::from_secs(7), async {
+        loop {
+            tokio::select! {
+                _ = first.select_next_some() => {}
+                _ = second.select_next_some() => {}
+            }
+        }
+    })
+    .await
+    .unwrap_err();
+    let status = Status::read(dir.path()).unwrap();
+    let usage = status.keys.iter().find(|k| k.label == "default").unwrap();
+    assert!(usage.sent > 950_000_000, "{usage:?}");
+    assert_eq!(usage.budget, 1_000_000_000);
+
+    relay.stop().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn the_alert_command_hears_about_the_budget_once_a_month() {
+    let dir = data_dir("monthly_budget_gb = 1");
+    let out = dir.path().join("alerts");
+    append_config(
+        dir.path(),
+        &format!(
+            "[alerts]\ncommand = 'echo \"$REAMESH_RELAY_ALERT: $REAMESH_RELAY_MESSAGE\" >> {}'\nbudget_percent = 80",
+            out.display()
+        ),
+    );
+    let path = dir.path().join(config::CONFIG_FILE);
+    // The template has its own [alerts]; a second would not parse.
+    let text = std::fs::read_to_string(&path).unwrap().replacen(
+        "[alerts]\n# Runs through the shell",
+        "# Runs through the shell",
+        1,
+    );
+    let text = text.replacen(
+        &format!("budget_percent = {}\n", config::DEFAULT_ALERT_PERCENT),
+        "",
+        1,
+    );
+    std::fs::write(&path, text).unwrap();
+    let ledger_path = dir.path().join(config::TRAFFIC_FILE);
+    let mut ledger = Ledger::load(&ledger_path);
+    ledger.add(850_000_000, 0);
+    ledger.save().unwrap();
+
+    let mut relay = start(dir.path());
+    let _ = relay_tcp_addr(&mut relay).await;
+    let read = || std::fs::read_to_string(&out).unwrap_or_default();
+    tokio::time::timeout(WAIT, async {
+        while !read().contains("budget_warning") {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the alert command did not run");
+    assert!(
+        read().contains("85 % of the monthly budget of 1 GB used"),
+        "{}",
+        read()
+    );
+    relay.stop().await.unwrap();
+
+    // A restart in the same month stays quiet.
+    let mut relay = start(dir.path());
+    let _ = relay_tcp_addr(&mut relay).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(read().matches("budget_warning").count(), 1, "{}", read());
+    relay.stop().await.unwrap();
+}
+
+#[test]
+fn info_messages_survive_fields_the_other_side_does_not_know() {
+    // Serde ignores unknown fields and defaults missing ones, which is what
+    // lets relay and app be updated apart.
+    let older: InfoResponse = serde_json::from_str(r#"{"ok":true,"future":1}"#).unwrap();
+    assert!(older.ok);
+    assert_eq!(older.notice, None);
 }

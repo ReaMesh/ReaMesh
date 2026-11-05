@@ -3,7 +3,10 @@
 # can install it before the app restarts) plus the macOS installer DMG, and
 # publishes them, with the updater manifests, as a draft release of this
 # repository. Publishing the draft is what hands it to installed apps
-# (channel.yml copies its latest.json into the channel manifests). A version
+# (channel.yml copies its latest.json into the channel manifests). The relay
+# releases with them under the same version: signed static Linux builds on the
+# release, which running relays update themselves from, and a Docker image on
+# GHCR whose moving tags (latest, beta) channel.yml sets on publishing. A version
 # with a suffix (1.1.0-beta.1) is drafted as a pre-release, i.e. Beta only;
 # a plain one (1.1.0) as a stable release, which reaches Stable and Beta.
 #
@@ -33,6 +36,45 @@ permissions:
   contents: read
 
 jobs:
+  # The relay: static (musl) Linux builds, so one file runs on any distribution
+  # and in a bare container. Built inside Alpine on a runner of each architecture;
+  # the container's steps are plain commands because JavaScript actions don't run
+  # in an Alpine container on arm64. Signed in `publish`, never here.
+  relay:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test and build
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src/relay rust:1-alpine sh -euc '
+            apk add --no-cache musl-dev gcc g++ make cmake perl
+            cargo test --release --locked -p reamesh-relay -p reamesh-relay-proto
+            cargo build --release --locked
+            chown -R '"$(id -u):$(id -g)"' target
+          '
+          mkdir -p release-relay
+          cp relay/target/release/reamesh-relay "release-relay/reamesh-relay-linux-${{ matrix.arch }}"
+      - name: Check it is what we ship
+        run: |
+          B="release-relay/reamesh-relay-linux-${{ matrix.arch }}"
+          V="$(sed -n 's/^version = "\(.*\)"/\1/p' relay/Cargo.toml | head -n1)"
+          "$B" --version | grep -qw "$V"
+          if ldd "$B" 2> /dev/null | grep -q '=>'; then
+            echo "::error::the relay build is not static"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: relay-${{ matrix.arch }}
+          path: release-relay/*
+
   windows:
     runs-on: windows-latest
     steps:
@@ -243,10 +285,11 @@ jobs:
         run: tools/check-intel.sh
 
   publish:
-    needs: [windows, macos, macos-intel]
+    needs: [relay, windows, macos, macos-intel]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -254,6 +297,20 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # The same key as the app's updates. Dependencies are installed before the
+      # key is in the environment, and only the signer sees it.
+      - name: Install the signer
+        run: bun install --frozen-lockfile --ignore-scripts
+        working-directory: app
+      - name: Sign the relay builds
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          for B in ../dist/reamesh-relay-linux-*; do
+            bun run tauri signer sign --app-version "$(bun -p 'require("./package.json").version')" "$B"
+          done
       - name: Updater manifest
         run: |
           VERSION="$(jq -r .version app/package.json)"
@@ -264,6 +321,21 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           bun app/scripts/release-manifest.ts dist "$VERSION" \
             "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION"
+      # Only this version's tag: `latest` and `beta` move when it is published
+      # (channel.yml). COPY needs no emulation, so one builder makes both.
+      - name: Relay image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IMAGE="ghcr.io/$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')/reamesh-relay"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          C="$(mktemp -d)"
+          install -m 0755 dist/reamesh-relay-linux-x86_64 "$C/reamesh-relay-amd64"
+          install -m 0755 dist/reamesh-relay-linux-aarch64 "$C/reamesh-relay-arm64"
+          mkdir "$C/data"
+          docker buildx create --use
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            -f relay/Dockerfile.release -t "$IMAGE:$VERSION" "$C"
       # A draft: nothing reaches installed apps until it is published by hand.
       # A suffixed version is a Beta (pre-release), a plain one Stable.
       - name: Draft the release

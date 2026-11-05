@@ -39,6 +39,9 @@ import { offerInvite, takeInvite, useInviteSeq } from "@/lib/invite";
 import { recordHostJoin } from "@/lib/knownHosts";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
+import { relayHost } from "@/lib/relay";
+import { noticeApplies, noticeLine, type RelayAbout } from "@/lib/relayInfo";
+import { relayAbout, useRelays } from "@/lib/relays";
 import { localizeLogEntry, reconnectingText } from "@/lib/log";
 import { isCopyRefusal, setLastSession, useLastSession, type LastSession } from "@/lib/lastSession";
 import {
@@ -437,6 +440,30 @@ function UpdateButton() {
 // The Lobby's "last session" block can ask a session's card to start the normal
 // way in: the password if it needs one, then the trust dialog.
 const joinAsks = new Map<string, () => void>();
+
+// What the relays this install hosts through announce, before anyone hosts:
+// the one moment it can still change a plan. The relays are asked when the
+// Lobby opens; their last answer stands in while one can't be reached.
+function RelayNotices({ port, info }: { port: number | null; info?: Record<string, RelayAbout> }) {
+  const relays = useRelays();
+  useEffect(() => {
+    if (port !== null && relays.length > 0) send({ cmd: "relay_info" }, port);
+  }, [port, relays.length]);
+  const lines = relays.flatMap((r) => {
+    const notice = relayAbout(info, r.peer)?.notice;
+    return noticeApplies(notice) ? [{ peer: r.peer, name: r.label || relayHost(r), text: noticeLine(notice) }] : [];
+  });
+  if (lines.length === 0) return null;
+  return (
+    <>
+      {lines.map((l) => (
+        <p key={l.peer} className="text-pretty text-[12px] leading-snug text-muted-foreground">
+          {l.name}: {l.text}
+        </p>
+      ))}
+    </>
+  );
+}
 
 function SessionCard({
   session,
@@ -937,6 +964,7 @@ function InviteCard({
         hostId={ticket?.peer}
         hostName={hostName}
         preview={ticket && probe?.session_id === ticket.sid ? probe?.preview : undefined}
+        viaInvite
         onJoin={join}
       />
     </div>
@@ -1038,6 +1066,7 @@ function HostCard({
         onKeyDown={(e) => e.key === "Enter" && host(false)}
       />
       {tooShort && <ErrorLine>{t("passwordTooShort", { min: MIN_PASSPHRASE })}</ErrorLine>}
+      <RelayNotices port={port} info={instance?.relay?.info} />
 
       {/* Confirm media size, free space, and cloud-folder warnings. The row
           labels say what the numbers mean. */}

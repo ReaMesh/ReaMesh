@@ -24,6 +24,8 @@ import { send, useConnections } from "@/lib/connection";
 import { forgetHostPass, getHostPass } from "@/lib/hostPass";
 import { t } from "@/lib/i18n";
 import { ticketAddrs, ticketReach } from "@/lib/ticket";
+import { relayAbout } from "@/lib/relays";
+import { noticeApplies, noticeLine, relayNotes, type RelayAbout } from "@/lib/relayInfo";
 import { displayName, type ExtState, type Peer, type RelayStatus } from "@/lib/types";
 import { cn, focusRing } from "@/lib/utils";
 
@@ -68,7 +70,10 @@ function PeerMeta({
   }
   // Least urgent, and only once a relay was involved.
   if (!text && (hosting || peer.is_owner)) {
-    if (peer.link === "relay") text = t("viaRelay");
+    if (peer.link === "relay" && peer.relay_only) {
+      text = t("relayOnlyLink");
+      title = t("relayOnlyLinkHint");
+    } else if (peer.link === "relay") text = t("viaRelay");
     else if (peer.link === "direct") text = t("directLink");
   }
   if (!text) return null;
@@ -244,7 +249,7 @@ function InviteRow({ children, action }: { children: React.ReactNode; action: Re
 // LAN) join: opening it takes them straight into their app's join flow,
 // pasting it in their Lobby works too. The row names it; the link itself only
 // shows when the clipboard refuses it, so it can be copied by hand.
-function InviteCode({ ticket, line }: { ticket: string; line: InviteLine | null }) {
+function InviteCode({ ticket, line, notes = [] }: { ticket: string; line: InviteLine | null; notes?: InviteLine[] }) {
   const [copied, setCopied] = useState(false);
   const [reveal, setReveal] = useState(false);
   useEffect(() => {
@@ -295,6 +300,14 @@ function InviteCode({ ticket, line }: { ticket: string; line: InviteLine | null 
               {line.text}
             </p>
           )}
+          {notes.map((n) => (
+            <p
+              key={n.text}
+              className={cn("text-pretty text-[12px] leading-snug", n.warn ? "text-amber-500" : "text-muted-foreground")}
+            >
+              {n.text}
+            </p>
+          ))}
         </>
       )}
     </InviteRow>
@@ -310,8 +323,29 @@ function relayLine(status: RelayStatus[]): InviteLine | null {
   const reserved = status.find((r) => r.state === "reserved");
   if (reserved) return { text: t("relayReachable", { name: reserved.label || reserved.host }), warn: false };
   if (status.some((r) => r.state === "connecting")) return { text: t("relayConnecting"), warn: false };
-  const keyRefused = status.some((r) => r.reason === "bad_key");
-  return { text: t(keyRefused ? "relayKeyRefused" : "relayDown"), warn: true };
+  if (status.some((r) => r.reason === "paused")) return { text: t("relayPaused"), warn: false };
+  const reasons = status.map((r) => r.reason);
+  if (reasons.includes("expired")) return { text: t("relayKeyExpired"), warn: true };
+  return { text: t(reasons.includes("bad_key") ? "relayKeyRefused" : "relayDown"), warn: true };
+}
+
+// What the relay in use has to add: the operator's notice, what isn't working,
+// and only then whom to ask.
+function relayExtraLines(status: RelayStatus[], line: InviteLine | null, info: Record<string, RelayAbout> | undefined): InviteLine[] {
+  const relay = status.find((r) => r.state === "reserved") ?? status[0];
+  if (!relay) return [];
+  const about = relayAbout(info, relay.peer);
+  if (!about) return [];
+  const out: InviteLine[] = [];
+  if (noticeApplies(about.notice)) out.push({ text: noticeLine(about.notice), warn: false });
+  // The rest of it goes to Settings: only what touches this session shows here.
+  for (const n of relayNotes(about)) {
+    if (n.warn) out.push({ text: t(n.key, n.params), warn: true });
+  }
+  if (about.contact && (line?.warn || out.some((l) => l.warn))) {
+    out.push({ text: t("relayContact", { contact: about.contact }), warn: false });
+  }
+  return out;
 }
 
 const REACH_TEXT = {
@@ -411,7 +445,8 @@ export function Session({
 }) {
   const hosting = state.mode === "hosting";
   const { instances } = useConnections();
-  const relayStatus = instances.find((i) => i.port === port)?.relay?.status ?? [];
+  const relayState = instances.find((i) => i.port === port)?.relay;
+  const relayStatus = relayState?.status ?? [];
   const [confirmStop, setConfirmStop] = useState(false);
   // Guest the host is about to block (the confirm dialog's subject).
   const [banTarget, setBanTarget] = useState<Peer | null>(null);
@@ -491,7 +526,13 @@ export function Session({
           <section className="flex shrink-0 flex-col gap-2">
             <SectionLabel>{t("invite")}</SectionLabel>
             <Group>
-              {!!state.ticket && <InviteCode ticket={state.ticket} line={relayLine(relayStatus) ?? reachLine(state.ticket)} />}
+              {!!state.ticket && (
+                <InviteCode
+                  ticket={state.ticket}
+                  line={relayLine(relayStatus) ?? reachLine(state.ticket)}
+                  notes={relayExtraLines(relayStatus, relayLine(relayStatus), relayState?.info)}
+                />
+              )}
               {!!state.ticket && !!hostPass && <Divider inset={false} />}
               {!!hostPass && <HostPassword pass={hostPass} />}
             </Group>
