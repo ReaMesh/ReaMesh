@@ -3,6 +3,118 @@
 Downloads and install notes are on the
 [Releases](https://github.com/ReaMesh/ReaMesh/releases) page.
 
+## 1.2.0
+
+<sub>November 5, 2026</sub>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="proprietary/changelog/1.2.0-banner-dark.png">
+  <img alt="ReaMesh 1.2: a REAPER project with Lena's, Sam's and Alex's cursors shaped like the tools they are using, next to the session window, where Lena and Alex are connected via a relay and Sam directly" src="proprietary/changelog/1.2.0-banner-light.png">
+</picture>
+
+Everyone in a session needs ReaMesh 1.2. It can't join sessions hosted with 1.1,
+and 1.1 can't join sessions hosted with 1.2. The Lobby greys out sessions from
+another version and says who has to update.
+
+### Work together over the internet
+
+Until now, computers had to reach each other over a local network or a VPN. They
+can now also connect across the internet through a relay: a small server you run
+yourself, for your band, studio or circle of collaborators. There is no public
+relay and no account.
+
+Paste the relay's code in Settings → Relay. While you host, your invite code also
+names the relay, so guests set nothing up. Computers connect directly whenever
+their routers allow it and use the relay only when that fails. The people list
+shows how each person is connected. The relay forwards encrypted traffic it can't
+read, and a session reachable through a relay always has a secret: its password,
+or for an open session a random secret inside the invite code.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="proprietary/changelog/1.2.0-relay-dark.png">
+  <img alt="Two ReaMesh windows. Lena's Lobby lists the sessions on Studio Relay, with a switch for whether her own session shows up there. Ben's session shows the invite code online via Studio Relay and how each guest is connected" src="proprietary/changelog/1.2.0-relay-light.png">
+</picture>
+
+A relay can also keep a session list, if its operator turns that on. Everyone with
+a key then sees in the Lobby what the others host through it and joins with one
+click. As a host you choose per relay whether your session shows up there.
+
+### Run your own relay
+
+The relay ships with this release for the first time: static builds for Linux on
+x86_64 and aarch64, and a Docker image. On its first start it prints the relay code
+to hand out. [The relay's README](https://github.com/ReaMesh/ReaMesh/tree/main/relay)
+covers setup, including a small VPS or a Raspberry Pi at home.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="proprietary/changelog/1.2.0-relay-server-dark.png">
+  <img alt="A terminal with the ReaMesh R and the relay's start screen, then reamesh-relay status with this month's traffic and budget, the hosts online and the traffic per key" src="proprietary/changelog/1.2.0-relay-server-light.png">
+</picture>
+
+- `reamesh-relay status` shows the traffic, the budget and who is online.
+- Each person can get their own key, with a last day, a limit on hosts and a monthly
+  budget. Removing a key takes that person's access away within seconds.
+- `notice set` sends a message to everyone using the relay, shown in the app.
+- A running relay updates itself. It checks the signature of a new version and
+  restarts into it only while nothing is being relayed.
+
+### See what the others are doing
+
+A person's cursor in the arrange view now takes the shape of the tool they are using:
+trimming an item edge, dragging a fade, adjusting a crossfade, slip editing or
+making a razor edit. The shapes morph into each other as they move.
+
+<img alt="Close-up of the arrange view: Lena's cursor between two items, Alex's on a fade and Sam's as a razor, each in their own color with a name tag" src="proprietary/changelog/1.2.0-tool-cursors.png">
+
+### Keep your copy
+
+When a session ends, your copy of the project is saved with everything you worked on.
+The Lobby shows the last session with a way back in, and you can save the copy to a
+folder of your choice. Settings → Joined projects shows how many days each copy has
+left and lets you keep one for good.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="proprietary/changelog/1.2.0-copies-dark.png">
+  <img alt="The Lobby with the last session and a Save as button for your copy, next to the Joined projects list with the days each copy has left" src="proprietary/changelog/1.2.0-copies-light.png">
+</picture>
+
+A saved or kept copy stays linked to its project. Joining that project again updates
+the copy in its own folder and keeps the project file it replaces. If you changed the
+copy yourself, ReaMesh asks first. After a save as, an open tab moves over to the new
+folder when that is safe.
+
+### Other changes
+
+- In the floating people list, one click on the eye follows a person, and Ping sends
+  right away. Pings appear below the list, and the notice that someone is editing
+  also shows when the list is collapsed.
+- The people lists show a track's name. A new setting switches back to numbers only.
+- When a session ends on its own, the floating list stays up and says why.
+- Items whose media never arrived are reported in the floating list, with a retry.
+- The Lobby shows each session's project size, and the password field opens when you
+  click Join. An empty list offers the Bluetooth search.
+- An untitled project can be saved and hosted in one click.
+- A join that won't fit on the disk is refused before it starts.
+- A new hosting run shows up in the Lobby at once.
+- Hosting and joining no longer fail on an iPhone hotspot on macOS.
+- Tooltips, buttons, dialogs and screen changes have new, calmer animations, and
+  Settings keeps its scroll position.
+- On Windows, the window can no longer be maximized.
+
+### Security
+
+- Lobby announcements stay on the local network and never cross a relay.
+- The number of connections is limited in total, per person and per address.
+- Opening a relay link only asks whether to add it. Nothing is contacted before you
+  agree.
+- Resetting your network identity now asks first, since others stop recognizing you.
+- Dependencies were updated past known security advisories.
+
+### Good to know
+
+Relays built from source before this release don't update themselves. Install this
+version once, and they keep themselves up to date from then on.
+
 ## 1.1.0
 
 <sub>October 21, 2026</sub>
