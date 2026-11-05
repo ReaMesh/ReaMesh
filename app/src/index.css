@@ -207,3 +207,9 @@
   .dialog-panel[data-state="closed"] { animation: rm-fade-out 160ms var(--ease-out) both; }
   [data-sonner-toaster] [data-sonner-toast] { filter: none !important; }
 }
+
+/* Radix positions a tooltip through a wrapper of the same size. Without this a
+   tooltip that overlaps a button takes its hover and its click. */
+[data-radix-popper-content-wrapper]:has(> [data-slot="tooltip-content"]) {
+  pointer-events: none;
+}

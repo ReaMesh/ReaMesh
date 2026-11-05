@@ -1,3 +1,4 @@
+import { Hint } from "@/components/Hint";
 import { t } from "@/lib/i18n";
 import { useOverlaySettings } from "@/lib/overlaySettings";
 import { cn } from "@/lib/utils";
@@ -22,14 +23,15 @@ export function TrackLabel({
   const number = t("trackN", { n: cur });
   const label = trackNumbersOnly ? "" : name?.trim();
   return (
-    <span
-      title={label ? `${number}: ${label}` : undefined}
-      className={cn(
-        "shrink-0 truncate tabular-nums text-muted-foreground",
-        small ? "max-w-[92px] text-[11px]" : "max-w-[112px] text-[12px]",
-      )}
-    >
-      {label || number}
-    </span>
+    <Hint label={label ? `${number}: ${label}` : undefined}>
+      <span
+        className={cn(
+          "shrink-0 truncate tabular-nums text-muted-foreground",
+          small ? "max-w-[92px] text-[11px]" : "max-w-[112px] text-[12px]",
+        )}
+      >
+        {label || number}
+      </span>
+    </Hint>
   );
 }

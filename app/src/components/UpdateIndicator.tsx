@@ -4,6 +4,7 @@ import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { toast } from "sonner";
 import { ArcRing } from "@/components/ArcRing";
 import { Button } from "@/components/ui/button";
+import { Hint } from "@/components/Hint";
 import { t } from "@/lib/i18n";
 import { restartToUpdate, useUpdate } from "@/lib/updater";
 import { cn, focusRing } from "@/lib/utils";
@@ -19,26 +20,26 @@ export function UpdateIndicator({ className }: { className?: string }) {
     <div className={cn("flex items-center", className)}>
       <AnimatePresence mode="wait" initial={false}>
         {update.phase === "downloading" && (
-          <motion.span
-            key="ring"
-            role="status"
-            aria-label={t("updateDownloadingTip", { version: update.version, pct })}
-            title={t("updateDownloadingTip", { version: update.version, pct })}
-            className="relative block size-3.5"
-            initial={{ opacity: 0, scale: 0.6 }}
-            animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.6 }}
-            transition={{ type: "spring", stiffness: 400, damping: 30 }}
-          >
-            <ArcRing
-              size={14}
-              radius={5.5}
-              strokeWidth={1.6}
-              spinning={update.progress <= 0}
-              progress={update.progress}
-              color="var(--muted-foreground)"
-            />
-          </motion.span>
+          <Hint key="ring" label={t("updateDownloadingTip", { version: update.version, pct })}>
+            <motion.span
+              role="status"
+              aria-label={t("updateDownloadingTip", { version: update.version, pct })}
+              className="relative block size-3.5"
+              initial={{ opacity: 0, scale: 0.6 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.6 }}
+              transition={{ type: "spring", stiffness: 400, damping: 30 }}
+            >
+              <ArcRing
+                size={14}
+                radius={5.5}
+                strokeWidth={1.6}
+                spinning={update.progress <= 0}
+                progress={update.progress}
+                color="var(--muted-foreground)"
+              />
+            </motion.span>
+          </Hint>
         )}
         {update.phase === "ready" && (
           <motion.span

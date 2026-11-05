@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Hint } from "@/components/Hint";
 import { t } from "@/lib/i18n";
 import type { Peer } from "@/lib/types";
 
@@ -43,8 +44,10 @@ export function SlowHostLine({ peers }: { peers: Peer[] }) {
   const slow = useSlowLink(rtt);
   if (!slow) return null;
   return (
-    <p role="status" className="text-[12px] text-amber-500" title={t("slowLinkRtt", { ms: Math.round(rtt) })}>
-      {t("slowLinkToHost")}
-    </p>
+    <Hint label={t("slowLinkRtt", { ms: Math.round(rtt) })}>
+      <p role="status" className="text-[12px] text-amber-500">
+        {t("slowLinkToHost")}
+      </p>
+    </Hint>
   );
 }

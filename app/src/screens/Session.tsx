@@ -13,7 +13,7 @@ import {
 import { Menu, MenuContent, MenuItem, MenuSeparator, MenuTrigger } from "@/components/ui/menu";
 import { BanList } from "@/components/BanList";
 import { Divider, Group, SectionLabel } from "@/components/Group";
-import { HintProvider } from "@/components/Hint";
+import { Hint, HintProvider, ROSTER_DELAY } from "@/components/Hint";
 import { HostCrown } from "@/components/HostCrown";
 import { ListSlot } from "@/components/ListSlot";
 import { useSlowLink } from "@/components/LinkNotice";
@@ -25,7 +25,7 @@ import { forgetHostPass, getHostPass } from "@/lib/hostPass";
 import { t } from "@/lib/i18n";
 import { ticketAddrs, ticketReach } from "@/lib/ticket";
 import { displayName, type ExtState, type Peer, type RelayStatus } from "@/lib/types";
-import { cn, focusRing, noContextMenu } from "@/lib/utils";
+import { cn, focusRing } from "@/lib/utils";
 
 /** What someone else is doing right now, as one line of text, most urgent
  *  first. Your own row has none: who follows you is said at their row. */
@@ -73,9 +73,11 @@ function PeerMeta({
   }
   if (!text) return null;
   return (
-    <p className={cn("truncate text-[12px]", tone)} title={title}>
-      {text}
-    </p>
+    <Hint label={title}>
+      <p className={cn("truncate text-[12px]", tone)}>
+        {text}
+      </p>
+    </Hint>
   );
 }
 
@@ -129,24 +131,28 @@ function PeerRow({
       exit={{ opacity: 0 }}
       transition={{ duration: 0.2, ease: "easeOut" }}
       onClick={clickable ? reveal : undefined}
-      title={clickable ? t("revealPeerTrack", { name }) : undefined}
       className={cn(
         "relative flex min-h-[52px] items-center gap-3 px-3 py-2",
         clickable && "cursor-pointer transition-colors hover:bg-white/[0.03]",
       )}
     >
       <span ref={flashScope} aria-hidden className="pointer-events-none absolute inset-0" />
-      <PeerAvatar peer={peer} />
-      <div className="flex min-w-0 flex-1 flex-col gap-px">
-        <div className="flex min-w-0 items-baseline gap-1.5">
-          <span className="truncate text-[13px] font-semibold">{name}</span>
-          {peer.is_self && (
-            <span className="shrink-0 text-[12px] text-muted-foreground">{t("youBadge")}</span>
-          )}
-          {peer.is_owner && <HostCrown />}
+      {/* Not on the whole row: the actions on the right have nothing to do with it. */}
+      <Hint label={clickable ? t("revealPeerTrack", { name }) : undefined}>
+        <div className="flex min-w-0 flex-1 items-center gap-3">
+          <PeerAvatar peer={peer} />
+          <div className="flex min-w-0 flex-1 flex-col gap-px">
+            <div className="flex min-w-0 items-baseline gap-1.5">
+              <span className="truncate text-[13px] font-semibold">{name}</span>
+              {peer.is_self && (
+                <span className="shrink-0 text-[12px] text-muted-foreground">{t("youBadge")}</span>
+              )}
+              {peer.is_owner && <HostCrown />}
+            </div>
+            <PeerMeta peer={peer} peers={peers} hosting={hosting} following={following} />
+          </div>
         </div>
-        <PeerMeta peer={peer} peers={peers} hosting={hosting} following={following} />
-      </div>
+      </Hint>
       {/* The track as plain text, right-aligned in one column; your own row
           keeps the menu's width empty so it lines up too. */}
       <div
@@ -171,7 +177,7 @@ function PeerRow({
                 <Ellipsis className="size-4" aria-hidden="true" />
               </button>
             </MenuTrigger>
-            <MenuContent onContextMenu={noContextMenu}>
+            <MenuContent>
               <MenuItem onSelect={() => follow(!following)}>
                 {following ? <EyeOff /> : <Eye />}
                 {following ? t("stopFollowing") : t("followAction")}
@@ -276,9 +282,11 @@ function InviteCode({ ticket, line }: { ticket: string; line: InviteLine | null 
         />
       ) : (
         <>
-          <p className="truncate text-[13px]" title={t("inviteTicketHint")}>
-            {t("inviteCode")}
-          </p>
+          <Hint label={t("inviteTicketHint")}>
+            <p className="truncate text-[13px]">
+              {t("inviteCode")}
+            </p>
+          </Hint>
           {line && (
             <p
               role="status"
@@ -438,25 +446,25 @@ export function Session({
   const banName = banTarget ? displayName(banTarget) : "";
 
   return (
-    <HintProvider>
-      <div className="flex min-h-0 flex-1 flex-col">
-        {/* The name, and nothing that the list or the button below already
-            say: the role is in the button, the host is in the list. */}
-        <header className="flex shrink-0 flex-col gap-1 px-5 pt-1">
-          <h2 className="truncate text-[21px] leading-tight font-semibold tracking-[-0.015em]">
-            {state.session || t("sessionFallback")}
-          </h2>
-          {state.nofx && <p className="text-[12px] text-muted-foreground">{t("nofxSub")}</p>}
-        </header>
+    <div className="flex min-h-0 flex-1 flex-col">
+      {/* The name, and nothing that the list or the button below already
+          say: the role is in the button, the host is in the list. */}
+      <header className="flex shrink-0 flex-col gap-1 px-5 pt-1">
+        <h2 className="truncate text-[21px] leading-tight font-semibold tracking-[-0.015em]">
+          {state.session || t("sessionFallback")}
+        </h2>
+        {state.nofx && <p className="text-[12px] text-muted-foreground">{t("nofxSub")}</p>}
+      </header>
 
-        <AnimatePresence initial={false}>
-          {loading && <LoadingStrip key="loading" state={state} />}
-        </AnimatePresence>
+      <AnimatePresence initial={false}>
+        {loading && <LoadingStrip key="loading" state={state} />}
+      </AnimatePresence>
 
-        <div className="scroll-slim flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-4 pt-3.5 pb-1">
-          <section className="flex shrink-0 flex-col gap-2">
-            <SectionLabel>{t("people")}</SectionLabel>
-            <Group aria-label={t("peopleList")} onContextMenu={noContextMenu}>
+      <div className="scroll-slim flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-4 pt-3.5 pb-1">
+        <section className="flex shrink-0 flex-col gap-2">
+          <SectionLabel>{t("people")}</SectionLabel>
+          <HintProvider delay={ROSTER_DELAY}>
+            <Group aria-label={t("peopleList")}>
               {/* Animate later roster changes, but not the initial peer list. */}
               <AnimatePresence initial={false}>
                 {state.peers.map((p, i) => (
@@ -476,63 +484,63 @@ export function Session({
                 ))}
               </AnimatePresence>
             </Group>
+          </HintProvider>
+        </section>
+
+        {hosting && (!!state.ticket || !!hostPass) && (
+          <section className="flex shrink-0 flex-col gap-2">
+            <SectionLabel>{t("invite")}</SectionLabel>
+            <Group>
+              {!!state.ticket && <InviteCode ticket={state.ticket} line={relayLine(relayStatus) ?? reachLine(state.ticket)} />}
+              {!!state.ticket && !!hostPass && <Divider inset={false} />}
+              {!!hostPass && <HostPassword pass={hostPass} />}
+            </Group>
           </section>
+        )}
 
-          {hosting && (!!state.ticket || !!hostPass) && (
-            <section className="flex shrink-0 flex-col gap-2">
-              <SectionLabel>{t("invite")}</SectionLabel>
-              <Group>
-                {!!state.ticket && <InviteCode ticket={state.ticket} line={relayLine(relayStatus) ?? reachLine(state.ticket)} />}
-                {!!state.ticket && !!hostPass && <Divider inset={false} />}
-                {!!hostPass && <HostPassword pass={hostPass} />}
-              </Group>
-            </section>
-          )}
-
-          {hosting && <BanList bans={state.bans ?? []} port={port} gap={14} />}
-        </div>
-
-        {/* One anchored action; toasts appear at the top and never cover it. */}
-        <footer className="flex shrink-0 px-4 pt-3 pb-4">
-          <Button variant="secondary" className="h-9 flex-1" onClick={requestLeave}>
-            {hosting ? t("stopHosting") : t("leaveSession")}
-          </Button>
-        </footer>
-
-        <Dialog open={banTarget !== null} onOpenChange={(o) => !o && setBanTarget(null)}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>{t("banTitle", { name: banName })}</DialogTitle>
-              <DialogDescription>{t("banBody", { name: banName })}</DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button variant="secondary" onClick={() => setBanTarget(null)}>
-                {t("cancel")}
-              </Button>
-              <Button variant="destructive" onClick={ban}>
-                {t("banConfirm")}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
-        <Dialog open={confirmStop} onOpenChange={setConfirmStop}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>{t("stopHostingTitle")}</DialogTitle>
-              <DialogDescription>
-                {others === 1 ? t("stopHostingBodyOne") : t("stopHostingBodyMany", { count: others })}
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button variant="secondary" onClick={() => setConfirmStop(false)}>
-                {t("cancel")}
-              </Button>
-              <Button onClick={leave}>{t("stopHosting")}</Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+        {hosting && <BanList bans={state.bans ?? []} port={port} gap={14} />}
       </div>
-    </HintProvider>
+
+      {/* One anchored action; toasts appear at the top and never cover it. */}
+      <footer className="flex shrink-0 px-4 pt-3 pb-4">
+        <Button variant="secondary" className="h-9 flex-1" onClick={requestLeave}>
+          {hosting ? t("stopHosting") : t("leaveSession")}
+        </Button>
+      </footer>
+
+      <Dialog open={banTarget !== null} onOpenChange={(o) => !o && setBanTarget(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("banTitle", { name: banName })}</DialogTitle>
+            <DialogDescription>{t("banBody", { name: banName })}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="secondary" onClick={() => setBanTarget(null)}>
+              {t("cancel")}
+            </Button>
+            <Button variant="destructive" onClick={ban}>
+              {t("banConfirm")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={confirmStop} onOpenChange={setConfirmStop}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("stopHostingTitle")}</DialogTitle>
+            <DialogDescription>
+              {others === 1 ? t("stopHostingBodyOne") : t("stopHostingBodyMany", { count: others })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="secondary" onClick={() => setConfirmStop(false)}>
+              {t("cancel")}
+            </Button>
+            <Button onClick={leave}>{t("stopHosting")}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
   );
 }

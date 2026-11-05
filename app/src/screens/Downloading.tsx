@@ -20,6 +20,7 @@ import { ArcRing } from "@/components/ArcRing";
 import { SlowHostLine } from "@/components/LinkNotice";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { PluginBox, PluginRow } from "@/components/TrustDialog";
+import { Hint } from "@/components/Hint";
 import { FOUND_COLOR } from "@/lib/colors";
 import { send } from "@/lib/connection";
 import { formatBytes, useTransfer } from "@/lib/format";
@@ -312,12 +313,13 @@ export function Downloading({
       </div>
 
       <div className="mt-5 w-full space-y-1">
-        <h2
-          className="truncate text-[18px] font-semibold tracking-[-0.01em]"
-          title={state.session || undefined}
-        >
-          {state.session || t("sessionFallback")}
-        </h2>
+        <Hint label={state.session || undefined} overflowOnly>
+          <h2
+            className="truncate text-[18px] font-semibold tracking-[-0.01em]"
+          >
+            {state.session || t("sessionFallback")}
+          </h2>
+        </Hint>
         {/* One narration line per wait, trading places on phase changes with
             the blur swap the join button uses; the stats update in place
             without re-animating. Fixed-height so the swap never shifts the

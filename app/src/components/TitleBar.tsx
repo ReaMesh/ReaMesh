@@ -2,6 +2,7 @@ import { Minus, Settings, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Lockup } from "@/components/RMark";
 import { UpdateIndicator } from "@/components/UpdateIndicator";
+import { Hint } from "@/components/Hint";
 import { useConnections, setActivePort } from "@/lib/connection";
 import { t } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
@@ -32,23 +33,23 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
         const label = inst.state?.project || `REAPER :${inst.port}`;
         const active = inst.port === activePort;
         return (
-          <button
-            key={inst.port}
-            type="button"
-            role="radio"
-            aria-checked={active}
-            title={`${label} (:${inst.port})`}
-            onClick={() => setActivePort(inst.port)}
-            className={cn(
-              "max-w-28 truncate rounded-md px-2 py-1 text-[11px] transition-colors",
-              active
-                ? "bg-foreground/[0.14] text-foreground"
-                : "text-muted-foreground hover:text-foreground",
-              focusRing,
-            )}
-          >
-            {label}
-          </button>
+          <Hint key={inst.port} label={`${label} (:${inst.port})`}>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={active}
+              onClick={() => setActivePort(inst.port)}
+              className={cn(
+                "max-w-28 truncate rounded-md px-2 py-1 text-[11px] transition-colors",
+                active
+                  ? "bg-foreground/[0.14] text-foreground"
+                  : "text-muted-foreground hover:text-foreground",
+                focusRing,
+              )}
+            >
+              {label}
+            </button>
+          </Hint>
         );
       })}
     </nav>
@@ -64,18 +65,19 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
         <UpdateIndicator className="ml-2.5" />
         <div className="ml-auto flex h-full items-center gap-1">
           {tabs}
-          <button
-            type="button"
-            onClick={onOpenSettings}
-            aria-label={t("settings")}
-            title={t("settings")}
-            className={cn(
-              "mr-1 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground",
-              focusRing,
-            )}
-          >
-            <Settings className="size-4" aria-hidden="true" />
-          </button>
+          <Hint label={t("settings")}>
+            <button
+              type="button"
+              onClick={onOpenSettings}
+              aria-label={t("settings")}
+              className={cn(
+                "mr-1 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground",
+                focusRing,
+              )}
+            >
+              <Settings className="size-4" aria-hidden="true" />
+            </button>
+          </Hint>
           <WindowControls />
         </div>
       </header>
@@ -131,24 +133,26 @@ function WindowControls() {
   );
   return (
     <div className="flex h-full items-stretch">
-      <button
-        type="button"
-        onClick={call((w) => w.minimize())}
-        aria-label={t("minimizeWindow")}
-        title={t("minimizeWindow")}
-        className={cn(base, "hover:bg-secondary hover:text-foreground")}
-      >
-        <Minus className="size-4" aria-hidden="true" />
-      </button>
-      <button
-        type="button"
-        onClick={call((w) => w.close())}
-        aria-label={t("closeWindow")}
-        title={t("closeWindow")}
-        className={cn(base, "hover:bg-[#c42b1c] hover:text-white")}
-      >
-        <X className="size-4" aria-hidden="true" />
-      </button>
+      <Hint label={t("minimizeWindow")}>
+        <button
+          type="button"
+          onClick={call((w) => w.minimize())}
+          aria-label={t("minimizeWindow")}
+          className={cn(base, "hover:bg-secondary hover:text-foreground")}
+        >
+          <Minus className="size-4" aria-hidden="true" />
+        </button>
+      </Hint>
+      <Hint label={t("closeWindow")}>
+        <button
+          type="button"
+          onClick={call((w) => w.close())}
+          aria-label={t("closeWindow")}
+          className={cn(base, "hover:bg-[#c42b1c] hover:text-white")}
+        >
+          <X className="size-4" aria-hidden="true" />
+        </button>
+      </Hint>
     </div>
   );
 }

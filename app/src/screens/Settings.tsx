@@ -20,6 +20,7 @@ import { Divider, Group, SectionLabel } from "@/components/Group";
 import { PathField } from "@/components/PathField";
 import { ProfileEditor } from "@/components/ProfileEditor";
 import { DrawnCheck, SwapIcon } from "@/components/Swap";
+import { Hint } from "@/components/Hint";
 import { buildDiagnostics } from "@/lib/diagnostics";
 import { getLangPref, resolveLang, setLangPref, t, useLang, type LangPref } from "@/lib/i18n";
 import {
@@ -839,15 +840,16 @@ export function Settings({
 
         <RelaySection instance={instance} ghost={ghost}>
           <Row label={t("networkIdentity")}>
-            <Button
-              variant="ghost"
-              size="sm"
-              title={t("resetIdentityHint")}
-              className={cn(ghost, "text-muted-foreground hover:text-destructive")}
-              onClick={() => setConfirmReset(true)}
-            >
-              {t("resetShort")}
-            </Button>
+            <Hint label={t("resetIdentityHint")}>
+              <Button
+                variant="ghost"
+                size="sm"
+                className={cn(ghost, "text-muted-foreground hover:text-destructive")}
+                onClick={() => setConfirmReset(true)}
+              >
+                {t("resetShort")}
+              </Button>
+            </Hint>
           </Row>
         </RelaySection>
 

@@ -10,7 +10,7 @@ import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 
 import { AnimatePresence, motion, useAnimate } from "motion/react";
 import { BookmarkPlus, ChevronUp, Eye, Flag } from "lucide-react";
 import { currentMonitor, getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
-import { Hint, HintProvider } from "@/components/Hint";
+import { Hint, HintProvider, ROSTER_DELAY } from "@/components/Hint";
 import { HostCrown } from "@/components/HostCrown";
 import { PeerAvatar } from "@/components/PeerAvatar";
 import { DrawnCheck, SwapIcon } from "@/components/Swap";
@@ -19,7 +19,7 @@ import { t, useLang } from "@/lib/i18n";
 import { localizeLogEntry, reconnectingText } from "@/lib/log";
 import { displayName, type Peer, type PingEntry } from "@/lib/types";
 import { useOverlaySettings } from "@/lib/overlaySettings";
-import { cn, noContextMenu } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 import { useOverlayState } from "./useOverlayState";
 
 const WIDTH = 232;
@@ -485,14 +485,13 @@ export function Overlay({ port }: { port: number | null }) {
   return (
     // The card is the tooltip boundary: the OS window hugs it exactly, so a
     // bubble outside the card would be clipped (see Hint.tsx).
-    <HintProvider boundary={cardRef}>
+    <HintProvider boundary={cardRef} delay={ROSTER_DELAY}>
     <div
       ref={cardRef}
       style={{ width: WIDTH }}
       // A plain card: a backdrop blur has nothing to soften behind a
       // transparent window.
       className="overflow-hidden rounded-xl border border-white/10 bg-background text-foreground opacity-90 transition-opacity duration-200 hover:opacity-100"
-      onContextMenu={noContextMenu}
     >
       {/* The session is over or reconnecting: only the line that says so stays. */}
       <AnimatePresence initial={false}>
@@ -636,9 +635,11 @@ export function Overlay({ port }: { port: number | null }) {
                       <p className="truncate text-[11px] font-medium text-amber-500">
                         {t("mediaMissing", { count: missing.count })}
                       </p>
-                      <p className="truncate text-[11px] text-muted-foreground" title={missing.file}>
-                        {missing.file}
-                      </p>
+                      <Hint label={missing.file} overflowOnly>
+                        <p className="truncate text-[11px] text-muted-foreground">
+                          {missing.file}
+                        </p>
+                      </Hint>
                     </div>
                     <button
                       type="button"

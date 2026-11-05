@@ -4,6 +4,7 @@ import ReactDOM from "react-dom/client";
 import "./index.css";
 import { initLanguage } from "./lib/i18n";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { HintProvider } from "./components/Hint";
 
 // Three entry points share this bundle. The floating presence HUD is opened as
 // a separate Tauri window pointed at `index.html?overlay=1&port=<n>`, the macOS
@@ -114,6 +115,13 @@ if (import.meta.env.DEV && params.get("mock") === "tauri") {
     },
   };
 }
+// No webview context menu (Reload / Inspect Element) in any window. Text fields
+// keep theirs, for copy and paste.
+window.addEventListener("contextmenu", (e) => {
+  if (e.target instanceof Element && e.target.closest("input, textarea")) return;
+  e.preventDefault();
+});
+
 const root = ReactDOM.createRoot(document.getElementById("root") as HTMLElement);
 
 // Both windows render localized strings; sync the language preference with the
@@ -142,7 +150,9 @@ if (params.get("overlay") === "1") {
       <React.StrictMode>
         <MotionConfig reducedMotion="user">
           <ErrorBoundary where="settings">
-            <SettingsWindow />
+            <HintProvider>
+              <SettingsWindow />
+            </HintProvider>
           </ErrorBoundary>
         </MotionConfig>
       </React.StrictMode>,
@@ -154,7 +164,9 @@ if (params.get("overlay") === "1") {
       <React.StrictMode>
         <MotionConfig reducedMotion="user">
           <ErrorBoundary>
-            <App />
+            <HintProvider>
+              <App />
+            </HintProvider>
           </ErrorBoundary>
         </MotionConfig>
       </React.StrictMode>,

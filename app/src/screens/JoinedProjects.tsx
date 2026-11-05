@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Divider, Group, SectionLabel } from "@/components/Group";
+import { Hint } from "@/components/Hint";
 import { useConnections } from "@/lib/connection";
 import { copyDaysLeft } from "@/lib/copyLink";
 import { formatBytes } from "@/lib/format";
@@ -185,28 +186,30 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
                 <div key={copy.path} className="flex flex-col">
                   {i > 0 && <Divider inset={false} />}
                   <div className="flex min-h-11 items-center gap-2 pr-2">
-                    <button
-                      type="button"
-                      title={t(isWindows ? "showInExplorer" : "showInFinder")}
-                      onClick={() => revealItemInDir(copy.path).catch(() => {})}
-                      className={cn(
-                        "min-w-0 flex-1 px-3 py-2 text-left transition-colors hover:bg-white/[0.03]",
-                        focusRing,
-                      )}
-                    >
-                      <p className="truncate text-[13px]">{copy.name}</p>
-                      <p className="truncate text-[12px] text-muted-foreground">{copy.path}</p>
-                    </button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      title={t("unlink")}
-                      aria-label={`${t("unlink")}: ${copy.name}`}
-                      className="size-8 shrink-0 p-0 text-muted-foreground hover:text-foreground"
-                      onClick={() => unlinkCopy(copy.path).catch((e) => toast.error(String(e)))}
-                    >
-                      <Unlink className="size-4" aria-hidden="true" />
-                    </Button>
+                    <Hint label={t(isWindows ? "showInExplorer" : "showInFinder")} slow>
+                      <button
+                        type="button"
+                        onClick={() => revealItemInDir(copy.path).catch(() => {})}
+                        className={cn(
+                          "min-w-0 flex-1 px-3 py-2 text-left transition-colors hover:bg-white/[0.03]",
+                          focusRing,
+                        )}
+                      >
+                        <p className="truncate text-[13px]">{copy.name}</p>
+                        <p className="truncate text-[12px] text-muted-foreground">{copy.path}</p>
+                      </button>
+                    </Hint>
+                    <Hint label={t("unlink")}>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        aria-label={`${t("unlink")}: ${copy.name}`}
+                        className="size-8 shrink-0 p-0 text-muted-foreground hover:text-foreground"
+                        onClick={() => unlinkCopy(copy.path).catch((e) => toast.error(String(e)))}
+                      >
+                        <Unlink className="size-4" aria-hidden="true" />
+                      </Button>
+                    </Hint>
                   </div>
                 </div>
               ))}
@@ -233,45 +236,47 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
                   <div key={p.dir} className="flex flex-col">
                     {i > 0 && <Divider inset={false} />}
                     <div className="flex min-h-11 items-center gap-2 pr-2">
-                      <button
-                        type="button"
-                        title={t(isWindows ? "showInExplorer" : "showInFinder")}
-                        onClick={() => revealItemInDir(p.path).catch(() => {})}
-                        className={cn(
-                          "min-w-0 flex-1 px-3 py-2 text-left transition-colors hover:bg-white/[0.03]",
-                          focusRing,
-                        )}
-                      >
-                        <p className="truncate text-[13px]">{p.name}</p>
-                        {/* Size and date side by side, each its own fact. */}
-                        <p className="flex gap-3 truncate text-[12px] text-muted-foreground tabular-nums">
-                          <span>{formatBytes(p.bytes)}</span>
-                          {p.kept ? (
-                            <span className="truncate">{t("keptCopy")}</span>
-                          ) : savedCopy ? (
-                            <span className="truncate" title={savedCopy.path}>
-                              {t("savedElsewhere")}
-                            </span>
-                          ) : (
-                            date(p.modified) && <span className="truncate">{date(p.modified)}</span>
+                      <Hint label={t(isWindows ? "showInExplorer" : "showInFinder")} slow>
+                        <button
+                          type="button"
+                          onClick={() => revealItemInDir(p.path).catch(() => {})}
+                          className={cn(
+                            "min-w-0 flex-1 px-3 py-2 text-left transition-colors hover:bg-white/[0.03]",
+                            focusRing,
                           )}
-                          {left && <span className="shrink-0">{left}</span>}
-                        </p>
-                      </button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        title={t(p.kept ? "stopKeeping" : "keepCopy")}
-                        aria-label={`${t("keepCopy")}: ${p.name}`}
-                        aria-pressed={!!p.kept}
-                        className={cn(
-                          "size-8 shrink-0 p-0 hover:text-foreground",
-                          p.kept ? "text-foreground" : "text-muted-foreground",
-                        )}
-                        onClick={() => toggleKept(p)}
-                      >
-                        <Pin className={cn("size-4", p.kept && "fill-current")} aria-hidden="true" />
-                      </Button>
+                        >
+                          <p className="truncate text-[13px]">{p.name}</p>
+                          {/* Size and date side by side, each its own fact. */}
+                          <p className="flex gap-3 truncate text-[12px] text-muted-foreground tabular-nums">
+                            <span>{formatBytes(p.bytes)}</span>
+                            {p.kept ? (
+                              <span className="truncate">{t("keptCopy")}</span>
+                            ) : savedCopy ? (
+                              <Hint label={savedCopy.path}>
+                                <span className="truncate">{t("savedElsewhere")}</span>
+                              </Hint>
+                            ) : (
+                              date(p.modified) && <span className="truncate">{date(p.modified)}</span>
+                            )}
+                            {left && <span className="shrink-0">{left}</span>}
+                          </p>
+                        </button>
+                      </Hint>
+                      <Hint label={t(p.kept ? "stopKeeping" : "keepCopy")}>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          aria-label={`${t("keepCopy")}: ${p.name}`}
+                          aria-pressed={!!p.kept}
+                          className={cn(
+                            "size-8 shrink-0 p-0 hover:text-foreground",
+                            p.kept ? "text-foreground" : "text-muted-foreground",
+                          )}
+                          onClick={() => toggleKept(p)}
+                        >
+                          <Pin className={cn("size-4", p.kept && "fill-current")} aria-hidden="true" />
+                        </Button>
+                      </Hint>
                       {copying ? (
                         <span
                           role="status"
@@ -282,17 +287,18 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
                         </span>
                       ) : (
                         !inSession(p) && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            title={t("saveCopyAs")}
-                            aria-label={`${t("saveCopyAs")}: ${p.name}`}
-                            disabled={!!running}
-                            className="size-8 shrink-0 p-0 text-muted-foreground hover:text-foreground"
-                            onClick={() => void saveCopyAs(p.dir)}
-                          >
-                            <FolderDown className="size-4" aria-hidden="true" />
-                          </Button>
+                          <Hint label={t("saveCopyAs")}>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              aria-label={`${t("saveCopyAs")}: ${p.name}`}
+                              disabled={!!running}
+                              className="size-8 shrink-0 p-0 text-muted-foreground hover:text-foreground"
+                              onClick={() => void saveCopyAs(p.dir)}
+                            >
+                              <FolderDown className="size-4" aria-hidden="true" />
+                            </Button>
+                          </Hint>
                         )
                       )}
                       {used ? (
@@ -300,17 +306,18 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
                           {t("joinedInUse")}
                         </span>
                       ) : (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          title={trashLabel}
-                          aria-label={`${trashLabel}: ${p.name}`}
-                          disabled={!!copying}
-                          className="size-8 shrink-0 p-0 text-muted-foreground hover:text-destructive"
-                          onClick={() => setTarget(p)}
-                        >
-                          <Trash2 className="size-4" aria-hidden="true" />
-                        </Button>
+                        <Hint label={trashLabel}>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            aria-label={`${trashLabel}: ${p.name}`}
+                            disabled={!!copying}
+                            className="size-8 shrink-0 p-0 text-muted-foreground hover:text-destructive"
+                            onClick={() => setTarget(p)}
+                          >
+                            <Trash2 className="size-4" aria-hidden="true" />
+                          </Button>
+                        </Hint>
                       )}
                     </div>
                   </div>

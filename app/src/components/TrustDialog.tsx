@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { SwapText } from "@/components/Swap";
+import { Hint } from "@/components/Hint";
 import { useActiveInstance } from "@/lib/connection";
 import { findLink, joinInto, linkLabel, linkStateOf, type LinkedCopy, type LinkState } from "@/lib/copyLink";
 import { formatBytes, reaperVersionKey } from "@/lib/format";
@@ -44,25 +45,27 @@ export function PluginBox({ children, className }: { children: React.ReactNode; 
 export function PluginRow({ raw, status }: { raw: string; status?: PluginStatus }) {
   const p = parseFxName(raw);
   return (
-    <div className="flex min-h-6 items-center gap-2.5 px-1 py-[3px] text-[12px]" title={raw}>
-      <span className="min-w-0 flex-1 truncate">{p.name || raw}</span>
-      {p.vendor && (
-        <span className="max-w-[120px] shrink-0 truncate text-muted-foreground">{p.vendor}</span>
-      )}
-      {/* A fixed column on every row, so the vendors line up whether or not
-          the row says "missing". */}
-      {status && (
-        <span className="w-10 shrink-0 text-right text-[11px] text-amber-500">
-          {status === "missing" ? (
-            t("pluginMissingShort")
-          ) : (
-            <span className="sr-only">
-              {status === "have" ? t("pluginInstalled") : t("pluginUnknown")}
-            </span>
-          )}
-        </span>
-      )}
-    </div>
+    <Hint label={raw} slow>
+      <div className="flex min-h-6 items-center gap-2.5 px-1 py-[3px] text-[12px]">
+        <span className="min-w-0 flex-1 truncate">{p.name || raw}</span>
+        {p.vendor && (
+          <span className="max-w-[120px] shrink-0 truncate text-muted-foreground">{p.vendor}</span>
+        )}
+        {/* A fixed column on every row, so the vendors line up whether or not
+            the row says "missing". */}
+        {status && (
+          <span className="w-10 shrink-0 text-right text-[11px] text-amber-500">
+            {status === "missing" ? (
+              t("pluginMissingShort")
+            ) : (
+              <span className="sr-only">
+                {status === "have" ? t("pluginInstalled") : t("pluginUnknown")}
+              </span>
+            )}
+          </span>
+        )}
+      </div>
+    </Hint>
   );
 }
 
@@ -152,29 +155,29 @@ function Choice({
   return (
     <div role="radiogroup" aria-label={label} className="flex gap-1 rounded-[10px] bg-white/[0.04] p-1">
       {[false, true].map((v) => (
-        <button
-          key={String(v)}
-          type="button"
-          role="radio"
-          aria-checked={value === v}
-          title={options[v ? 1 : 0].title}
-          onClick={() => onChange(v)}
-          className={cn(
-            "relative h-7 flex-1 rounded-md text-[12px] font-medium transition-colors duration-200",
-            value === v ? "text-foreground" : "text-muted-foreground hover:text-foreground",
-            focusRing,
-          )}
-        >
-          {/* bg-secondary sat almost on the dialog's own colour. */}
-          {value === v && (
-            <motion.span
-              layoutId={layoutId}
-              className="absolute inset-0 rounded-md bg-foreground/[0.14]"
-              transition={FOLD}
-            />
-          )}
-          <span className="relative">{options[v ? 1 : 0].label}</span>
-        </button>
+        <Hint key={String(v)} label={options[v ? 1 : 0].title}>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={value === v}
+            onClick={() => onChange(v)}
+            className={cn(
+              "relative h-7 flex-1 rounded-md text-[12px] font-medium transition-colors duration-200",
+              value === v ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+              focusRing,
+            )}
+          >
+            {/* bg-secondary sat almost on the dialog's own colour. */}
+            {value === v && (
+              <motion.span
+                layoutId={layoutId}
+                className="absolute inset-0 rounded-md bg-foreground/[0.14]"
+                transition={FOLD}
+              />
+            )}
+            <span className="relative">{options[v ? 1 : 0].label}</span>
+          </button>
+        </Hint>
       ))}
     </div>
   );
@@ -299,9 +302,11 @@ export function TrustDialog({
             )}
             {found && !nofx && (
               <DialogFact label={t("yourCopy")}>
-                <span className="min-w-0 truncate" title={found.copy.path}>
-                  {linkLabel(found.copy)}
-                </span>
+                <Hint label={found.copy.path}>
+                  <span className="min-w-0 truncate">
+                    {linkLabel(found.copy)}
+                  </span>
+                </Hint>
                 <span
                   className={cn(
                     "shrink-0 font-normal",
@@ -314,17 +319,18 @@ export function TrustDialog({
             )}
             {mismatch && (
               <DialogFact label="REAPER">
-                <span
-                  className="tabular-nums text-amber-500"
-                  title={t(
+                <Hint
+                  label={t(
                     reaperVersionKey(hostReaper) > reaperVersionKey(localReaper)
                       ? "reaperMismatchHostNewer"
                       : "reaperMismatchHostOlder",
                     { host: hostReaper, local: localReaper },
                   )}
                 >
-                  {t("reaperYou", { host: hostReaper, local: localReaper })}
-                </span>
+                  <span className="tabular-nums text-amber-500">
+                    {t("reaperYou", { host: hostReaper, local: localReaper })}
+                  </span>
+                </Hint>
               </DialogFact>
             )}
           </DialogFacts>

@@ -31,6 +31,7 @@ import { FirewallBlocked } from "@/components/FirewallNotice";
 import { ListSlot } from "@/components/ListSlot";
 import { TrustDialog } from "@/components/TrustDialog";
 import { SwapText } from "@/components/Swap";
+import { Hint } from "@/components/Hint";
 import { FOUND_COLOR, inkFor } from "@/lib/colors";
 import { send, useActiveInstance } from "@/lib/connection";
 import { stageHostPass } from "@/lib/hostPass";
@@ -239,10 +240,12 @@ function ErrorFold({ children, gap }: { children: React.ReactNode; gap: string }
 /** Add accessible text to the otherwise decorative lock icon. */
 function LockIcon() {
   return (
-    <span className="flex shrink-0 items-center" title={t("passwordProtected")}>
-      <LockKeyhole className="size-3.5 text-muted-foreground" aria-hidden="true" />
-      <span className="sr-only">{t("passwordProtected")}</span>
-    </span>
+    <Hint label={t("passwordProtected")}>
+      <span className="flex shrink-0 items-center">
+        <LockKeyhole className="size-3.5 text-muted-foreground" aria-hidden="true" />
+        <span className="sr-only">{t("passwordProtected")}</span>
+      </span>
+    </Hint>
   );
 }
 
@@ -322,41 +325,42 @@ function NameCard() {
   }, []);
   return (
     <div className={cn("shrink-0 rounded-xl transition-colors duration-300", open && "bg-card")}>
-      <button
-        type="button"
-        aria-expanded={open}
-        title={open ? undefined : t("editProfile")}
-        onClick={() => setOpen((v) => !v)}
-        className={cn(
-          "flex w-full items-center gap-2.5 rounded-xl px-1 py-1.5 text-left transition-[padding] duration-300",
-          open && "px-3 pt-2.5",
-          focusRing,
-        )}
-      >
-        <span
-          aria-hidden="true"
-          className="flex size-6 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold transition-colors duration-300"
-          style={{ backgroundColor: profile.color, color: inkFor(profile.color) }}
-        >
-          {initials(profile.name)}
-        </span>
-        <span
+      <Hint label={open ? undefined : t("editProfile")}>
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
           className={cn(
-            "min-w-0 truncate text-[13px]",
-            named ? "font-semibold" : "text-muted-foreground",
+            "flex w-full items-center gap-2.5 rounded-xl px-1 py-1.5 text-left transition-[padding] duration-300",
+            open && "px-3 pt-2.5",
+            focusRing,
           )}
         >
-          {named ? profile.name : t("yourName")}
-        </span>
-        <motion.span
-          className="ml-auto flex shrink-0 text-muted-foreground"
-          initial={false}
-          animate={{ rotate: open ? 180 : 0 }}
-          transition={FOLD}
-        >
-          <ChevronDown className="size-4" aria-hidden="true" />
-        </motion.span>
-      </button>
+          <span
+            aria-hidden="true"
+            className="flex size-6 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold transition-colors duration-300"
+            style={{ backgroundColor: profile.color, color: inkFor(profile.color) }}
+          >
+            {initials(profile.name)}
+          </span>
+          <span
+            className={cn(
+              "min-w-0 truncate text-[13px]",
+              named ? "font-semibold" : "text-muted-foreground",
+            )}
+          >
+            {named ? profile.name : t("yourName")}
+          </span>
+          <motion.span
+            className="ml-auto flex shrink-0 text-muted-foreground"
+            initial={false}
+            animate={{ rotate: open ? 180 : 0 }}
+            transition={FOLD}
+          >
+            <ChevronDown className="size-4" aria-hidden="true" />
+          </motion.span>
+        </button>
+      </Hint>
       <AnimatePresence initial={false}>
         {open && (
           <motion.div
@@ -577,9 +581,11 @@ function SessionCard({
         <div className="flex min-h-8 items-center gap-3">
           <div className="min-w-0 flex-1">
             <div className={cn("flex items-center gap-1.5", skew !== "same" && "opacity-45")}>
-              <span className="truncate text-[13px] font-semibold" title={session.session_name}>
-                {session.session_name}
-              </span>
+              <Hint label={session.session_name} overflowOnly>
+                <span className="truncate text-[13px] font-semibold">
+                  {session.session_name}
+                </span>
+              </Hint>
               {session.auth && <LockIcon />}
             </div>
             {/* One line: who hosts it. A second device claiming the same
@@ -594,9 +600,11 @@ function SessionCard({
               </p>
             ) : (
               <p className="flex gap-3 text-[12px] tabular-nums text-muted-foreground">
-                <span className="truncate" title={session.project_file}>
-                  {session.owner_name || session.project_file}
-                </span>
+                <Hint label={session.project_file} overflowOnly={!session.owner_name}>
+                  <span className="truncate">
+                    {session.owner_name || session.project_file}
+                  </span>
+                </Hint>
                 {(session.bytes ?? 0) > 0 && (
                   <span className="shrink-0">{formatBytes(session.bytes ?? 0)}</span>
                 )}
@@ -775,19 +783,20 @@ function InviteCard({
           open && "p-2 pb-1",
         )}
       >
-        <button
-          type="button"
-          aria-expanded={open}
-          onClick={() => (open ? close() : setOpen(true))}
-          title={open ? undefined : t("ticketJoinHint")}
-          className={cn(
-            "flex min-w-0 items-center gap-1.5 rounded px-1 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground",
-            focusRing,
-          )}
-        >
-          <Ticket className="size-3 shrink-0" aria-hidden="true" />
-          <span className="truncate">{t("haveInviteCode")}</span>
-        </button>
+        <Hint label={open ? undefined : t("ticketJoinHint")}>
+          <button
+            type="button"
+            aria-expanded={open}
+            onClick={() => (open ? close() : setOpen(true))}
+            className={cn(
+              "flex min-w-0 items-center gap-1.5 rounded px-1 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground",
+              focusRing,
+            )}
+          >
+            <Ticket className="size-3 shrink-0" aria-hidden="true" />
+            <span className="truncate">{t("haveInviteCode")}</span>
+          </button>
+        </Hint>
         <AnimatePresence initial={false}>
           {open && (
             <motion.button
@@ -827,9 +836,11 @@ function InviteCard({
                   // as the list above would show it.
                   <div className="flex min-h-7 items-center gap-3 px-0.5">
                     <div className="flex min-w-0 flex-1 items-center gap-1.5">
-                      <span className="truncate text-[13px] font-semibold" title={name}>
-                        {name}
-                      </span>
+                      <Hint label={name} overflowOnly>
+                        <span className="truncate text-[13px] font-semibold">
+                          {name}
+                        </span>
+                      </Hint>
                       {ticket.auth && <LockIcon />}
                     </div>
                     {!ticket.auth && (
@@ -859,24 +870,25 @@ function InviteCard({
                         setError("");
                       }}
                     />
-                    <button
-                      type="button"
-                      title={t("pasteInvite")}
-                      aria-label={t("pasteInvite")}
-                      className={cn(
-                        "absolute top-1/2 right-1 grid size-6 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:bg-background/60 hover:text-foreground",
-                        focusRing,
-                      )}
-                      onClick={async () => {
-                        const text = await readClipboard();
-                        if (text) {
-                          setRaw(text);
-                          setError("");
-                        }
-                      }}
-                    >
-                      <ClipboardPaste className="size-3.5" aria-hidden="true" />
-                    </button>
+                    <Hint label={t("pasteInvite")}>
+                      <button
+                        type="button"
+                        aria-label={t("pasteInvite")}
+                        className={cn(
+                          "absolute top-1/2 right-1 grid size-6 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:bg-background/60 hover:text-foreground",
+                          focusRing,
+                        )}
+                        onClick={async () => {
+                          const text = await readClipboard();
+                          if (text) {
+                            setRaw(text);
+                            setError("");
+                          }
+                        }}
+                      >
+                        <ClipboardPaste className="size-3.5" aria-hidden="true" />
+                      </button>
+                    </Hint>
                   </div>
                 )}
                 {invalid && <ErrorLine>{t("invalidTicket")}</ErrorLine>}
@@ -1001,12 +1013,13 @@ function HostCard({
   return (
     <div className="flex shrink-0 flex-col gap-2.5 rounded-xl bg-card p-3">
       <div className="flex min-h-7 items-center gap-3">
-        <span
-          className="min-w-0 flex-1 truncate text-[13px] font-semibold"
-          title={project || undefined}
-        >
-          {project || t("untitledProject")}
-        </span>
+        <Hint label={project || undefined} overflowOnly>
+          <span
+            className="min-w-0 flex-1 truncate text-[13px] font-semibold"
+          >
+            {project || t("untitledProject")}
+          </span>
+        </Hint>
         <PendingButton
           size="sm"
           className="h-7 min-w-[68px] px-3 text-[12px]"
@@ -1130,18 +1143,19 @@ function NearbySearch({ empty }: { empty: boolean }) {
           transition={FOLD}
           className="overflow-hidden pb-0.5"
         >
-          <button
-            type="button"
-            title={t("nearbyHostHint")}
-            onClick={() => setNearby(true)}
-            className={cn(
-              "mt-2 inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground",
-              focusRing,
-            )}
-          >
-            <Bluetooth className="size-3 shrink-0" aria-hidden="true" />
-            {t("nearbySearchToo")}
-          </button>
+          <Hint label={t("nearbyHostHint")}>
+            <button
+              type="button"
+              onClick={() => setNearby(true)}
+              className={cn(
+                "mt-2 inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground",
+                focusRing,
+              )}
+            >
+              <Bluetooth className="size-3 shrink-0" aria-hidden="true" />
+              {t("nearbySearchToo")}
+            </button>
+          </Hint>
         </motion.div>
       )}
     </AnimatePresence>
@@ -1282,12 +1296,13 @@ function LastSessionBlock({
               <div className="flex min-h-[52px] items-center gap-3 py-2 pr-2 pl-3">
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-[13px]">{t("yourCopy")}</p>
-                  <p
-                    className="truncate text-[12px] text-muted-foreground"
-                    title={linkedDir ?? undefined}
-                  >
-                    {!linkedDir ? t("yourCopyKept") : kept && !saved ? t("keptCopy") : folderName(linkedDir)}
-                  </p>
+                  <Hint label={linkedDir ?? undefined}>
+                    <p
+                      className="truncate text-[12px] text-muted-foreground"
+                    >
+                      {!linkedDir ? t("yourCopyKept") : kept && !saved ? t("keptCopy") : folderName(linkedDir)}
+                    </p>
+                  </Hint>
                 </div>
                 {linkedDir ? (
                   <Button

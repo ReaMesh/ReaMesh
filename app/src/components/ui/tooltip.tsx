@@ -43,8 +43,15 @@ function TooltipContent({
         sideOffset={sideOffset}
         className={cn(
           // Dark like the surfaces around it, set apart by its border and
-          // shadow; it grows from the trigger instead of sliding in.
-          "z-50 w-fit origin-(--radix-tooltip-content-transform-origin) animate-in rounded-lg border border-border bg-background px-3 py-1.5 text-xs text-balance text-foreground shadow-lg duration-180 ease-[cubic-bezier(0.16,1,0.3,1)] fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:duration-120 data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95",
+          // shadow. After the wait it settles out of the trigger's direction;
+          // moving on to the next tooltip within the skip window (instant-open)
+          // has nothing to announce, so that one just appears. It leaves the
+          // way it came, a little quicker.
+          "z-50 w-fit origin-(--radix-tooltip-content-transform-origin) rounded-lg border border-border bg-background px-3 py-1.5 text-xs text-balance text-foreground shadow-lg motion-reduce:animate-none",
+          "data-[state=delayed-open]:animate-in data-[state=delayed-open]:duration-220 data-[state=delayed-open]:ease-[cubic-bezier(0.16,1,0.3,1)] data-[state=delayed-open]:fade-in-0 data-[state=delayed-open]:zoom-in-[0.97]",
+          "data-[side=bottom]:slide-in-from-top-1 data-[side=top]:slide-in-from-bottom-1 data-[side=left]:slide-in-from-right-1 data-[side=right]:slide-in-from-left-1",
+          "data-[state=closed]:animate-out data-[state=closed]:duration-160 data-[state=closed]:ease-[cubic-bezier(0.4,0,1,1)] data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-[0.97]",
+          "data-[side=bottom]:slide-out-to-top-[3px] data-[side=top]:slide-out-to-bottom-[3px] data-[side=left]:slide-out-to-right-[3px] data-[side=right]:slide-out-to-left-[3px]",
           className
         )}
         {...props}

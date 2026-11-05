@@ -2,6 +2,7 @@ import { ArrowLeft } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
 import { Divider, Group, SectionLabel } from "@/components/Group";
+import { Hint } from "@/components/Hint";
 import { t } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
 import { cn, focusRing } from "@/lib/utils";
@@ -43,11 +44,15 @@ const licence = (l: string) => l.replace(/\s+OR\s+/g, " / ").replace(/[()]/g, ""
 function CreditRow({ label, c }: { label: string; c?: Credit }) {
   const body = (
     <div className="flex min-h-9 items-center gap-3 px-3 py-1.5">
-      <span className="min-w-0 flex-1 truncate text-[13px]">{label}</span>
+      <Hint label={c?.u} slow>
+        <span className="min-w-0 flex-1 truncate text-[13px]">{label}</span>
+      </Hint>
       {c && (
-        <span className="max-w-[55%] shrink-0 truncate text-[12px] text-muted-foreground" title={c.l}>
-          {licence(c.l)}
-        </span>
+        <Hint label={c.l} overflowOnly>
+          <span className="max-w-[55%] shrink-0 truncate text-[12px] text-muted-foreground">
+            {licence(c.l)}
+          </span>
+        </Hint>
       )}
     </div>
   );
@@ -56,7 +61,6 @@ function CreditRow({ label, c }: { label: string; c?: Credit }) {
   return (
     <button
       type="button"
-      title={url}
       onClick={() => openUrl(url).catch(() => {})}
       className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
     >
