@@ -46,4 +46,10 @@ describe("parseRelayCode", () => {
       expect(parseRelayCode(bad), bad).toBeNull();
     }
   });
+
+  it("reads whether the relay keeps a session list", () => {
+    expect(parseRelayCode(code(`a=203.0.113.5&t=4001&k=${KEY}`))?.list).toBe(false);
+    expect(parseRelayCode(code(`a=203.0.113.5&t=4001&k=${KEY}&l=1`))?.list).toBe(true);
+    expect(parseRelayCode(code(`a=203.0.113.5&t=4001&k=${KEY}&l=0`))?.list).toBe(false);
+  });
 });

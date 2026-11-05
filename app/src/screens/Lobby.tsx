@@ -37,7 +37,6 @@ import { FOUND_COLOR, inkFor } from "@/lib/colors";
 import { send, useActiveInstance } from "@/lib/connection";
 import { stageHostPass } from "@/lib/hostPass";
 import { offerInvite, takeInvite, useInviteSeq } from "@/lib/invite";
-import { useRelays } from "@/lib/relays";
 import {
   hostListNote,
   hostVisibleText,

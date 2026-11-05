@@ -58,20 +58,13 @@ pub fn relay_status_json() -> String {
 /// (see `relay::run_test` for the outcomes). Blocks; for tests.
 #[doc(hidden)]
 pub fn relay_test_blocking(code: &str) -> (String, String) {
-    let (outcome, label, _) = relay_test_list_blocking(code);
-    (outcome, label)
-}
-
-/// The same test, and whether the relay keeps a session list.
-#[doc(hidden)]
-pub fn relay_test_list_blocking(code: &str) -> (String, String, Option<bool>) {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     rt.block_on(async {
         match relay::parse_relay_code(code) {
-            None => ("invalid".to_string(), String::new(), None),
+            None => ("invalid".to_string(), String::new()),
             Some(c) => match tokio::time::timeout(Duration::from_secs(10), relay::test_relay(&c)).await {
-                Ok(p) => (p.outcome.to_string(), p.label, p.list),
-                Err(_) => ("timeout".to_string(), String::new(), None),
+                Ok((o, l)) => (o.to_string(), l),
+                Err(_) => ("timeout".to_string(), String::new()),
             },
         }
     })

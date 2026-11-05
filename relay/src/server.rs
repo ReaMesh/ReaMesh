@@ -1785,6 +1785,7 @@ impl Relay {
             },
             key: self.cfg.key(label)?,
             label: label.to_owned(),
+            list: self.cfg.session_list,
         })
     }
 

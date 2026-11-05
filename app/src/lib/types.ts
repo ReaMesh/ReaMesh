@@ -275,8 +275,6 @@ export interface RelayTest {
   label?: string;
   /** How long the relay took to answer, in ms (0 = not measured). */
   rtt?: number;
-  /** Whether the relay keeps a session list (null: it didn't get to say). */
-  list?: boolean | null;
 }
 
 /** One session on a relay's list, already checked by the extension. */

@@ -681,6 +681,7 @@ fn relay_code(dir: &Path, cfg: &Config, name: &str) -> anyhow::Result<RelayCode>
         },
         key: cfg.key(name).ok_or_else(|| config::no_such_key(name))?,
         label: name.to_owned(),
+        list: cfg.session_list,
     })
 }
 

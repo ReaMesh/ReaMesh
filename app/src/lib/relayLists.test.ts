@@ -12,6 +12,7 @@ const relay = (peer: string, label: string): RelayCode => ({
   tcp: 4001,
   quic: 4001,
   label,
+  list: false,
 });
 
 const entry = (over: Partial<RelayListEntry> = {}): RelayListEntry => ({

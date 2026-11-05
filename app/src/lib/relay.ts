@@ -3,7 +3,9 @@
 // stores a code the extension would refuse.
 //
 //   reamesh://relay/<relay peer id>?a=<ip>,<ip>&d=<dns name>&t=<tcp>&q=<quic>
-//     &k=<64 hex access key>&n=<percent-encoded label>
+//     &k=<64 hex access key>&n=<percent-encoded label>[&l=1]
+//
+// `l=1`: the relay kept a session list when it printed the code.
 //
 // The key stays on this machine: it is sent to the local extension (which
 // proves it to the relay while hosting) and never goes into an invite link.
@@ -27,6 +29,9 @@ export interface RelayCode {
   quic: number;
   /** The operator's name for this relay ("" when the code has none). */
   label: string;
+  /** The relay kept a session list when it printed this code. Only a hint, for
+   *  what to say before the relay is added and may be dialed. */
+  list: boolean;
 }
 
 export function isRelayCode(s: string): boolean {
@@ -46,6 +51,7 @@ export function parseRelayCode(raw: string): RelayCode | null {
   let quic = 0;
   let key = false;
   let label = "";
+  let list = false;
   for (const pair of (q < 0 ? "" : rest.slice(q + 1)).split("&")) {
     if (!pair) continue;
     const eq = pair.indexOf("=");
@@ -84,12 +90,15 @@ export function parseRelayCode(raw: string): RelayCode | null {
         }
         label = [...label].slice(0, LABEL_MAX).join("");
         break;
+      case "l":
+        list = v === "1";
+        break;
       default:
         break;
     }
   }
   if (!key || (ips.length === 0 && !dns) || (tcp === 0 && quic === 0)) return null;
-  return { code, peer, ips, dns, tcp, quic, label };
+  return { code, peer, ips, dns, tcp, quic, label, list };
 }
 
 /** Where the relay is, for display: its DNS name, else its first IP. */

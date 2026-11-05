@@ -11,7 +11,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { send, useActiveInstance } from "@/lib/connection";
 import { t } from "@/lib/i18n";
 import { MAX_RELAYS, parseRelayCode, relayHost } from "@/lib/relay";
 import { clearRelayLink, useRelayLink } from "@/lib/relayLink";
@@ -40,17 +39,7 @@ export function RelayLinkDialog({ hosting }: { hosting: boolean }) {
     clearRelayLink();
   }, [refusal]);
 
-  // Whether it keeps a session list is its own to say, so the question names
-  // that consequence only once the relay answered. Nothing is added by asking.
   const open = !!relay && !refusal;
-  const code = open ? relay.code : "";
-  const testId = code ? `link-${relay?.peer.slice(-8)}` : "";
-  const instance = useActiveInstance();
-  useEffect(() => {
-    if (code) send({ cmd: "relay_test", code, id: testId }, instance?.port);
-  }, [code, testId, instance?.port]);
-  const test = instance?.relay?.test;
-  const hasList = !!testId && test?.id === testId && test.list === true;
 
   const add = async () => {
     clearRelayLink();
@@ -74,7 +63,9 @@ export function RelayLinkDialog({ hosting }: { hosting: boolean }) {
             </DialogFact>
           </DialogFacts>
         )}
-        {hasList && (
+        {/* Said by the code itself: asking the relay would mean dialing it, and
+            a link alone must not make the app contact anyone. */}
+        {relay?.list && (
           <p className="text-[12.5px] leading-normal text-muted-foreground">{t("relayLinkList")}</p>
         )}
         <DialogFooter>

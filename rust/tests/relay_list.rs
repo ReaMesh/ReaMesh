@@ -87,6 +87,7 @@ impl Relay {
             },
             key,
             label: label.to_owned(),
+            list: false,
         }
         .encode()
     }
@@ -263,8 +264,8 @@ fn a_stranger_without_a_key_sees_nothing_and_cannot_get_in() {
     assert!(wait_until(WAIT, || list(&relay.peer)["state"] == "refused"), "{}", reamesh::relay_lists_json());
     assert_eq!(list(&relay.peer)["reason"], "bad_key");
     assert!(entries(&relay.peer).is_empty());
-    let (outcome, _, has_list) = reamesh::relay_test_list_blocking(&wrong);
-    assert_eq!((outcome.as_str(), has_list), ("bad_key", None));
+    let (outcome, _) = reamesh::relay_test_blocking(&wrong);
+    assert_eq!(outcome, "bad_key");
 
     drop(owner);
     stop_watching();
@@ -311,9 +312,6 @@ fn switching_the_relays_list_on_reaches_a_running_session() {
     let project = temp_dir("proj");
     make_project(&project);
     let code = relay.code("sam");
-    let (outcome, label, has_list) = reamesh::relay_test_list_blocking(&code);
-    assert_eq!((outcome.as_str(), label.as_str(), has_list), ("ok", "sam", Some(false)));
-
     let owner = host(&code, &project, "", &[]);
     assert!(wait_until(WAIT, || reserved(&relay.peer)));
     assert!(wait_until(WAIT, || list(&relay.peer)["enabled"] == false), "{}", reamesh::relay_lists_json());
@@ -325,8 +323,6 @@ fn switching_the_relays_list_on_reaches_a_running_session() {
     config::set_session_list(relay.dir.path(), true).unwrap();
     assert!(wait_until(WAIT, || entries(&relay.peer).len() == 1), "{}", reamesh::relay_lists_json());
     assert_eq!(list(&relay.peer)["enabled"], true);
-    let (_, _, has_list) = reamesh::relay_test_list_blocking(&code);
-    assert_eq!(has_list, Some(true));
 
     config::set_session_list(relay.dir.path(), false).unwrap();
     assert!(wait_until(WAIT, || entries(&relay.peer).is_empty() && list(&relay.peer)["enabled"] == false));
@@ -408,6 +404,7 @@ fn a_relay_from_before_the_list_is_no_error() {
         addr: RelayAddr { peer, ips: vec!["127.0.0.1".parse().unwrap()], dns: String::new(), tcp: port, quic: 0 },
         key: [1; 32],
         label: "Old".into(),
+        list: false,
     }
     .encode();
     assert_eq!(reamesh::set_relays(&[code]), 1);

@@ -8,9 +8,11 @@
 //! parser. The optional session list is in [`sessions`].
 //!
 //! Relay code:
-//! `reamesh://relay/<relay peer id>?a=<ip>,<ip>&d=<dns name>&t=<tcp>&q=<quic>&k=<key>&n=<label>`
+//! `reamesh://relay/<relay peer id>?a=<ip>,<ip>&d=<dns name>&t=<tcp>&q=<quic>&k=<key>&n=<label>[&l=1]`
 //! with `k` the 32-byte access key as 64 lowercase hex characters and `n` the
-//! operator's label, percent-encoded. Each IP and the DNS name expand to
+//! operator's label, percent-encoded. `l=1` says the relay keeps a session list
+//! (`sessions`), as of when the code was printed: the app can say so before it
+//! adds a relay from a link, which it must not dial to ask. Each IP and the DNS name expand to
 //! `/tcp/<t>` and `/udp/<q>/quic-v1`, followed by `/p2p/<relay peer id>`.
 //!
 //! Auth (request-response, CBOR): request `{ "proof": bytes(32) }`, response
@@ -56,7 +58,7 @@ pub const REASON_EXPIRED: &str = "expired";
 /// What this relay build can do, as one number: raised when a relay learns
 /// something an app may come to rely on. Relays stay compatible with older apps
 /// by only ever adding: nothing here or in the auth exchange is removed.
-pub const RELAY_LEVEL: u32 = 1;
+pub const RELAY_LEVEL: u32 = 2;
 /// The level this app needs from a relay. Raise it (to at most `RELAY_LEVEL`)
 /// only when the app stops working properly with less; below it the app says the
 /// relay is outdated. A relay without the info protocol counts as level 0.
@@ -94,6 +96,9 @@ pub struct RelayCode {
     pub addr: RelayAddr,
     pub key: [u8; 32],
     pub label: String,
+    /// The relay kept a session list when it printed this code. Only a hint for
+    /// what the app tells the user: anything that matters is asked of the relay.
+    pub list: bool,
 }
 
 impl RelayAddr {
@@ -165,6 +170,9 @@ impl RelayCode {
             let _ = write!(s, "{b:02x}");
         }
         let _ = write!(s, "&n={}", percent_encode(&self.label));
+        if self.list {
+            s.push_str("&l=1");
+        }
         s
     }
 }
@@ -229,7 +237,7 @@ pub fn parse_relay_code(code: &str, allow_loopback: bool) -> Option<RelayCode> {
     let (peer, query) = rest.split_once('?').unwrap_or((rest, ""));
     let peer: PeerId = peer.trim_end_matches('/').parse().ok()?;
     let (mut ips, mut dns, mut tcp, mut quic) = (Vec::new(), String::new(), 0u16, 0u16);
-    let (mut key, mut label) = (None, String::new());
+    let (mut key, mut label, mut list) = (None, String::new(), false);
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         match k {
@@ -246,6 +254,7 @@ pub fn parse_relay_code(code: &str, allow_loopback: bool) -> Option<RelayCode> {
             "k" => key = Some(parse_key(v)?),
             // A garbled label is cosmetic: show none rather than refuse.
             "n" => label = percent_decode(v).unwrap_or_default().chars().take(RELAY_LABEL_MAX).collect(),
+            "l" => list = v == "1",
             _ => {}
         }
     }
@@ -253,7 +262,7 @@ pub fn parse_relay_code(code: &str, allow_loopback: bool) -> Option<RelayCode> {
     if !addr.is_usable() {
         return None;
     }
-    Some(RelayCode { addr, key: key?, label })
+    Some(RelayCode { addr, key: key?, label, list })
 }
 
 /// 64 lowercase hex characters → 32 bytes.
@@ -675,6 +684,17 @@ mod tests {
     }
 
     #[test]
+    fn relay_code_says_whether_the_relay_keeps_a_list() {
+        let plain = format!("reamesh://relay/{PEER}?a=203.0.113.5&t=4001&k={KEY}&n=");
+        let c = parse(&plain).unwrap();
+        assert!(!c.list);
+        assert_eq!(c.encode(), plain);
+        let with = RelayCode { list: true, ..c };
+        assert!(with.encode().ends_with("&l=1"));
+        assert_eq!(parse(&with.encode()), Some(with));
+    }
+
+    #[test]
     fn relay_code_refuses_malformed_input() {
         let ok = format!("reamesh://relay/{PEER}?a=203.0.113.5&t=4001&k={KEY}");
         assert!(parse(&ok).is_some());
@@ -737,6 +757,7 @@ mod tests {
             },
             key: [0xab; 32],
             label: "Bens Band & Co/ü".into(),
+            list: false,
         };
         let text = c.encode();
         assert!(text.contains("a=203.0.113.7,2001:db8::1&"));
