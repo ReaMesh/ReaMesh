@@ -238,8 +238,9 @@ fn a_member_with_another_key_sees_the_session_and_joins_through_the_relay_alone(
     assert!(seen, "the host's roster never showed the member: {}", owner.peers_json());
 
     // Watching ended with the Lobby: nothing is kept but whether there's a list.
-    assert!(wait_until(WAIT, || list(&relay.peer)["state"] == "idle"));
-    assert!(entries(&relay.peer).is_empty());
+    // Not a check on `state`: the host in this process reads the same list, and
+    // an answer of its own can turn `idle` back into `ok`. It never adds entries.
+    assert!(wait_until(WAIT, || entries(&relay.peer).is_empty()), "{}", reamesh::relay_lists_json());
     assert_eq!(list(&relay.peer)["enabled"], true);
 
     drop(guest);
