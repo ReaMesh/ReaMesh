@@ -19,7 +19,7 @@
  * `app/src-tauri/src/lib.rs`); app/src/lib/version.test.ts checks the copies
  * agree.
  */
-#define PROTO 5
+#define PROTO 6
 
 typedef struct ReameshHandle ReameshHandle;
 
@@ -104,6 +104,13 @@ bool reamesh_join_ticket(struct ReameshHandle *handle, const char *ticket, const
  * the join replaces is moved to `.reamesh-backup` inside that folder.
  */
 void reamesh_set_join_dest(struct ReameshHandle *handle, const char *dest, bool overwrite);
+
+/**
+ * Put a finished join (status `commit_pending`) into its linked folder, which
+ * stays untouched until this call. False when there is nothing to commit or it
+ * was refused; the status then reports `failed` with the reason.
+ */
+bool reamesh_commit_join(struct ReameshHandle *handle);
 
 /**
  * The session is over and the project file on disk holds what it ended with:

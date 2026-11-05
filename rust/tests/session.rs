@@ -1852,6 +1852,20 @@ fn join_outcome(client: &Reamesh) -> Value {
     last
 }
 
+/// `join_outcome`, plus the step the extension takes for a join into a linked
+/// folder once it accepts the download.
+fn commit_outcome(client: &Reamesh) -> Value {
+    let done = join_outcome(client);
+    if done["commit_pending"] != true {
+        return done;
+    }
+    let committed = client.commit_join();
+    let done = status_of(client);
+    assert_eq!(committed, done["state"] == "ready", "{done}");
+    assert_eq!(done["commit_pending"], false, "{done}");
+    done
+}
+
 /// Everything in a folder, dotfiles included, as (relative path, bytes).
 fn snapshot_tree(dir: &Path) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
@@ -1955,8 +1969,26 @@ impl Linked {
         let (client, sid) = discover(&self.owner, &self.staging);
         client.set_join_dest(self.saved.to_str().unwrap(), overwrite);
         assert!(client.join_session(&sid, ""), "join_session refused");
-        let done = join_outcome(&client);
+        let done = commit_outcome(&client);
         (client, done)
+    }
+
+    /// A join into the linked folder up to the point where it waits for its commit.
+    fn hold_update(&self) -> (Box<Reamesh>, Value) {
+        let (client, sid) = discover(&self.owner, &self.staging);
+        client.set_join_dest(self.saved.to_str().unwrap(), false);
+        assert!(client.join_session(&sid, ""), "join_session refused");
+        let done = join_outcome(&client);
+        assert_eq!(done["state"], "ready", "{done}");
+        assert_eq!(done["commit_pending"], true, "{done}");
+        (client, done)
+    }
+
+    /// The folder without the temp files of a download waiting for its commit.
+    fn saved_without_temp_files(&self) -> Vec<(String, Vec<u8>)> {
+        let mut tree = snapshot_tree(&self.saved);
+        tree.retain(|(rel, _)| !rel.contains(".reamesh-part-"));
+        tree
     }
 
     fn backups(&self) -> Vec<PathBuf> {
@@ -2000,12 +2032,11 @@ fn an_update_lands_in_the_linked_folder() {
     assert_eq!(fs::read(t.saved.join("Audio/kick.wav")).unwrap(), b"a new kick");
     assert_eq!(t.link_hash(), new_hash, "the link moved on with the project file");
 
-    // The project file was what the session already knew; a wav can't be told
-    // from a host's change, so it is kept. The user's own things stay put.
+    // Whatever got replaced is kept. The user's own things stay put.
     let backups = t.backups();
     assert_eq!(backups.len(), 1, "one backup folder");
     assert_eq!(fs::read(backups[0].join("Audio/kick.wav")).unwrap(), old_kick);
-    assert!(!backups[0].join("Song.rpp").exists(), "a plain update backs up no project file");
+    assert!(backups[0].join("Song.rpp").exists(), "a plain update keeps the project file too");
     assert_eq!(fs::read(t.saved.join("Private/secret.txt")).unwrap(), mine);
     t.assert_no_temp_files();
 
@@ -2016,12 +2047,21 @@ fn an_update_lands_in_the_linked_folder() {
     assert_eq!(t.link_hash(), blake3_of(&t.saved.join("Song.rpp")));
     drop(client);
 
-    // Host and copy agree on the media: nothing is replaced but the project file,
-    // again without a backup.
+    // Host and copy agree on the media: nothing is replaced but the project file.
+    // A host can come back with less than this copy holds, so the session's last
+    // state is kept.
     let (client, done) = t.join_dest(false);
     assert_eq!(done["state"], "ready", "{done}");
     assert_eq!(blake3_of(&t.saved.join("Song.rpp")), new_hash);
-    assert_eq!(t.backups().len(), 1, "no new backup");
+    let backups = t.backups();
+    assert_eq!(backups.len(), 2, "one new backup");
+    assert!(
+        backups.iter().any(|b| {
+            fs::read(b.join("Song.rpp")).is_ok_and(|bytes| bytes == b"<REAPER_PROJECT session end\n>\n")
+                && !b.join("Audio").exists()
+        }),
+        "the session's last state is in a backup of its own"
+    );
     drop(client);
 
     // Same state on both sides: nothing at all happens.
@@ -2159,6 +2199,65 @@ fn a_file_in_use_fails_the_join_with_every_old_file_in_place() {
     drop(client);
 }
 
+/// The extension gets to read the new project (its plugins) and to look for
+/// unsaved edits before anything in the folder changes.
+#[test]
+fn a_finished_update_changes_nothing_until_it_is_committed() {
+    let t = Linked::new("held");
+    let old_hash = t.link_hash();
+    let before = snapshot_tree(&t.saved);
+    let new_hash = t.host_changes();
+
+    let (client, done) = t.hold_update();
+    assert_eq!(PathBuf::from(done["project_path"].as_str().unwrap()), t.saved.join("Song.rpp"));
+    let verify = PathBuf::from(done["verify_path"].as_str().unwrap());
+    assert_ne!(verify, t.saved.join("Song.rpp"));
+    assert_eq!(blake3_of(&verify), new_hash, "what gets checked is the new project");
+    assert_eq!(t.saved_without_temp_files(), before);
+    assert_eq!(t.link_hash(), old_hash);
+
+    assert!(client.commit_join());
+    let done = status_of(&client);
+    assert_eq!(done["state"], "ready", "{done}");
+    assert_eq!(done["commit_pending"], false, "{done}");
+    assert!(done["verify_path"].is_null(), "{done}");
+    assert_eq!(blake3_of(&t.saved.join("Song.rpp")), new_hash);
+    assert_eq!(fs::read(t.saved.join("Audio/kick.wav")).unwrap(), b"a new kick");
+    assert_eq!(t.link_hash(), new_hash);
+    t.assert_no_temp_files();
+    assert!(!client.commit_join(), "nothing left to commit");
+    drop(client);
+}
+
+/// Saying no to the plugin warning is leaving at this point.
+#[test]
+fn leaving_before_the_commit_leaves_the_copy_as_it_was() {
+    let t = Linked::new("held-leave");
+    let before = snapshot_tree(&t.saved);
+    t.host_changes();
+    let (client, _) = t.hold_update();
+    drop(client);
+    assert_eq!(snapshot_tree(&t.saved), before, "the old project stays whole, its link too");
+}
+
+#[test]
+fn a_save_before_the_commit_stops_the_update() {
+    let t = Linked::new("held-save");
+    t.host_changes();
+    let (client, _) = t.hold_update();
+    fs::write(t.saved.join("Song.rpp"), b"saved in REAPER meanwhile").unwrap();
+    let before = t.saved_without_temp_files();
+
+    assert!(!client.commit_join());
+    let done = status_of(&client);
+    assert_eq!(done["state"], "failed", "{done}");
+    assert!(done["message"].as_str().unwrap().contains("your copy of the project has changed"), "{done}");
+    assert_eq!(done["commit_pending"], false, "{done}");
+    assert_eq!(snapshot_tree(&t.saved), before, "nothing replaced, no temp files left");
+    assert!(t.backups().is_empty());
+    drop(client);
+}
+
 #[test]
 fn an_update_that_breaks_off_leaves_the_copy_as_it_was() {
     let t = Linked::new("interrupted");
@@ -2247,7 +2346,7 @@ fn an_invite_link_goes_into_the_linked_folder() {
     let client = join(t.staging.to_str().unwrap()).expect("join failed");
     client.set_join_dest(t.saved.to_str().unwrap(), false);
     assert!(client.join_ticket(&ticket, ""));
-    let done = join_outcome(&client);
+    let done = commit_outcome(&client);
     assert_eq!(done["state"], "ready", "{done}");
     assert_eq!(PathBuf::from(done["dir"].as_str().unwrap()), t.saved);
     assert_eq!(blake3_of(&t.saved.join("Song.rpp")), new_hash);
@@ -2289,7 +2388,7 @@ fn a_join_into_a_linked_folder_waits_for_the_hosts_hashes() {
     fs::write(saved.join(LINK_FILE), link.to_string()).unwrap();
     client.set_join_dest(saved.to_str().unwrap(), false);
     assert!(client.join_session(&sid, ""));
-    let done = join_outcome(&client);
+    let done = commit_outcome(&client);
     assert_eq!(done["state"], "ready", "{done}");
     assert!(!saved.join(BACKUP_DIR).exists(), "the same files were replaced anyway");
     drop(client);

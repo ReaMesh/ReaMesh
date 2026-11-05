@@ -614,6 +614,7 @@ static bool jsonBool(const json& j, const char* key, bool dflt);
 static double jsonNum(const json& j, const char* key, double dflt);
 static json handleJson(char* (*fn)(ReameshHandle*), const json& fallback);
 static void openDownloadedProject(std::string path);
+static void finishDownload(std::string path);
 
 // A session this client lost the connection to: what going back takes. Stays
 // after a failed or cancelled auto-rejoin for the Lobby's reconnect button, until
@@ -6383,7 +6384,7 @@ static void ctlDispatch(const json& cmd) {
     // The user read the "loads plugins that weren't listed" warning and chose
     // to continue: open the held-back download now.
     if (!g_pendingOpenPath.empty() && g_mode == Mode::Downloading)
-      openDownloadedProject(g_pendingOpenPath);
+      finishDownload(g_pendingOpenPath);
   } else if (c == "retry_media") {
     retryMissingMedia();
   } else if (c == "share_marker") {
@@ -6892,6 +6893,27 @@ static void openDownloadedProject(std::string path) {
   noteHostReaperMismatch();
 }
 
+// A download is whole and its plugins are accepted. A linked copy changes only
+// here, right before it opens: the old project stayed usable during the download,
+// and opening over unsaved edits would have REAPER offer to save them on top of
+// the new file. Saved edits are the core's to refuse.
+static void finishDownload(std::string path) {
+  const json st = handleJson(reamesh_status, json::object());
+  if (jsonBool(st, "commit_pending", false)) {
+    g_pendingVerify = json();
+    g_pendingOpenPath.clear();
+    if (hasUnsavedEdits(g_joinDest)) {
+      if (g_lastSession) g_lastSession->refused = true;
+      leaveSession("linked_copy_unsaved", json::object(),
+                   "your copy has unsaved changes. Save them in REAPER first");
+      return;
+    }
+    // A refusal reaches pollDownload as a failed status on the next tick.
+    if (!reamesh_commit_join(g_handle)) return;
+  }
+  openDownloadedProject(std::move(path));
+}
+
 static void pollDownload() {
   char* raw = reamesh_status(g_handle);
   std::string payload = raw ? raw : "{}";
@@ -6908,7 +6930,9 @@ static void pollDownload() {
     // In no-FX mode every chain is stripped before the open: nothing
     // third-party loads, so there is nothing to verify against the claim.
     if (!g_noFx) {
-      json verify = verifyDownloadedPlugins(path);
+      // A linked copy's new project file still waits under its temp name.
+      const std::string held = jsonStr(st, "verify_path");
+      json verify = verifyDownloadedPlugins(held.empty() ? path : held);
       if (!verify.is_null()) {
         g_pendingOpenPath = path;
         g_pendingVerify = std::move(verify);
@@ -6917,7 +6941,7 @@ static void pollDownload() {
         return;
       }
     }
-    openDownloadedProject(path);
+    finishDownload(path);
   } else if (state == "failed") {
     std::string msg = st.value("message", std::string("unknown error"));
     // Every routine failure gets a stable code so the app can render it in the

@@ -468,6 +468,12 @@ struct StatusState {
     /// keep moving meanwhile; it drops to false when the last file lands.
     background: bool,
     project_path: Option<String>,
+    /// A finished join into a linked folder waits for `Reamesh::commit_join`:
+    /// `ready`, but the folder is still as it was.
+    commit_pending: bool,
+    /// While `commit_pending`: the downloaded project file, which until then
+    /// sits under its temp name unless it was unchanged.
+    verify_path: Option<String>,
     /// The folder a join downloads into (set when it starts), so the app
     /// can tell that copy is in use before the project is open.
     dir: Option<String>,
@@ -501,6 +507,8 @@ impl StatusState {
             "fetch_done": fetch.0,
             "fetch_total": fetch.1,
             "project_path": self.project_path,
+            "commit_pending": self.commit_pending,
+            "verify_path": self.verify_path,
             "dir": self.dir,
             "session_id": self.session_id,
             "session_name": self.session_name,
@@ -637,6 +645,9 @@ struct Shared {
     /// The folder the next join goes into instead of the staging folder, if
     /// any: a linked copy of the project. `start_join` takes it, once.
     join_dest: Mutex<Option<JoinDest>>,
+    /// A finished download whose linked folder hasn't changed yet (see
+    /// `Reamesh::commit_join`).
+    held_commit: Mutex<Option<Download>>,
     /// This session's copy is a folder of the user's (see `JoinDest`): it may
     /// hold other things of theirs, so it serves less (see `may_serve`).
     dest_join: AtomicBool,
@@ -2066,6 +2077,8 @@ impl Reamesh {
             files_total: 0,
             current_file: String::new(),
             background: false,
+            commit_pending: false,
+            verify_path: None,
             project_path: None,
             dir: None,
             session_id: Some(session_id),
@@ -2129,6 +2142,8 @@ impl Reamesh {
             files_total: 0,
             current_file: String::new(),
             background: false,
+            commit_pending: false,
+            verify_path: None,
             project_path: None,
             dir: None,
             session_id: None,
@@ -2175,6 +2190,7 @@ impl Reamesh {
             status: Mutex::new(status),
             serve_dir: Mutex::new(None),
             join_dest: Mutex::new(None),
+            held_commit: Mutex::new(None),
             dest_join: AtomicBool::new(false),
             own_media: Mutex::new(HashSet::new()),
             fetch_progress: Mutex::new(FetchProgress::default()),
@@ -2593,6 +2609,16 @@ impl Reamesh {
     pub fn set_join_dest(&self, dest: &str, overwrite: bool) {
         *self.shared.join_dest.lock().unwrap() =
             (!dest.is_empty()).then(|| JoinDest { dir: PathBuf::from(dest), overwrite });
+    }
+
+    /// Put a finished download into its linked folder, which until now is
+    /// untouched: the caller has checked the project's plugins and that REAPER
+    /// holds no unsaved edits to it, and opens the project right after. Runs on
+    /// the caller's thread so that nothing can come between those steps. False
+    /// when there is nothing to commit or it was refused, which the status reports
+    /// as `failed`.
+    pub fn commit_join(&self) -> bool {
+        commit_held(&self.shared)
     }
 
     /// The session is over and the copy on disk holds what it ended with: the
@@ -3179,6 +3205,8 @@ impl Drop for Reamesh {
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_timeout(Duration::from_secs(2));
         }
+        // The network task clears this on its way out; it may not have got there.
+        drop_held_commit(&self.shared);
     }
 }
 
@@ -4044,9 +4072,8 @@ fn new_backup_root(dir: &Path) -> std::io::Result<PathBuf> {
 /// as it was and reads as a pending update. Here the old files go to the backup
 /// folder and the new ones take their place, the project file last: until it has
 /// landed the link still names the old state. A failure on the way puts everything
-/// back and fails the join. The project file of a plain update needs no backup,
-/// it is what the session already knows; any other file does, since a re-rendered
-/// wav can't be told from a host's change.
+/// back and fails the join. Every replaced file is kept, the project file too:
+/// after a host lost its unsaved work, this copy may be the only one with it.
 fn commit_dest(dl: &Download, dest: &DestJoin) -> Result<(), String> {
     // The user may have saved in REAPER while this downloaded.
     if !dest.overwrite
@@ -4065,9 +4092,8 @@ fn commit_dest(dl: &Download, dest: &DestJoin) -> Result<(), String> {
     let mut landed: Vec<(&FileDl, Option<PathBuf>)> = Vec::new();
     let result = (|| -> Result<(), String> {
         for f in &pending {
-            let exists = f.dest.symlink_metadata().is_ok();
             let mut backup = None;
-            if exists && (dest.overwrite || f.meta.path != dl.project_file) {
+            if f.dest.symlink_metadata().is_ok() {
                 if root.is_none() {
                     root = Some(new_backup_root(&dl.dir).map_err(|e| busy_message(&f.dest, &e))?);
                 }
@@ -6400,6 +6426,7 @@ async fn run_network(
                     // Leaving mid-download: no temp files left behind, least of
                     // all in a folder of the user's.
                     download_cleanup(&mut download);
+                    drop_held_commit(&shared);
                     // Close the connections instead of leaving them to time out
                     // (QUIC has no FIN): gossipsub tells a peer its subscriptions
                     // on the first connection only, so a peer still counting an
@@ -6622,6 +6649,7 @@ async fn run_network(
                         if st == "ready" || st == "downloading" {
                             eprintln!("[reamesh] the owner disappeared; ending the session");
                             download_cleanup(&mut download);
+                            drop_held_commit(&shared);
                             set_status(&shared, |s| {
                                 s.state = "ended".into();
                                 s.message = Some("lost the connection to the host".into());
@@ -7218,6 +7246,7 @@ async fn run_network(
                                     // abort it rather than pumping requests at
                                     // a host that is gone.
                                     download_cleanup(&mut download);
+                                    drop_held_commit(&shared);
                                     set_status(&shared, |s| {
                                         s.state = "ended".into();
                                         s.message = Some("the host ended the session".into());
@@ -7267,6 +7296,7 @@ async fn run_network(
                                             if ban { "banned" } else { "removed" }
                                         );
                                         download_cleanup(&mut download);
+                                        drop_held_commit(&shared);
                                         // Leave the topic now (no more beacons,
                                         // off every roster at once) rather than
                                         // waiting for the extension's shutdown;
@@ -8082,7 +8112,7 @@ mod transfer_safety_tests {
     }
 
     #[test]
-    fn committing_a_plain_update_backs_up_all_but_the_project_file() {
+    fn committing_a_plain_update_backs_up_everything_it_replaces() {
         let dl = finished_download("commit-plain", false);
         commit_dest(&dl, dl.dest.as_ref().unwrap()).unwrap();
         assert_eq!(fs::read(dl.dir.join("Song.rpp")).unwrap(), b"new project");
@@ -8090,7 +8120,7 @@ mod transfer_safety_tests {
         let roots = backup_roots(&dl.dir);
         assert_eq!(roots.len(), 1);
         assert_eq!(fs::read(roots[0].join("Audio/a.wav")).unwrap(), b"old a");
-        assert!(!roots[0].join("Song.rpp").exists());
+        assert_eq!(fs::read(roots[0].join("Song.rpp")).unwrap(), b"old project");
         let _ = fs::remove_dir_all(&dl.dir);
     }
 
@@ -8260,22 +8290,37 @@ fn download_fail(download: &mut Option<Download>, shared: &Shared, msg: String) 
 }
 
 fn download_finalize(shared: &Shared, download: &mut Option<Download>) {
-    let Some(dl) = download.as_ref() else { return };
-    if let Some(dest) = &dl.dest {
-        if let Err(message) = commit_dest(dl, dest) {
-            return download_fail(download, shared, message);
-        }
-        // The project file is in place: only now does the link move on.
-        if let Some(link) = &dl.link {
-            let mut link = link.clone();
-            if link.hash.is_empty() {
-                link.hash = blake3_file(&dl.dir.join(&dl.project_file)).unwrap_or_default();
-            }
-            if let Err(e) = write_link(&dl.dir, &link) {
-                eprintln!("[reamesh] couldn't update {LINK_FILE}: {e}");
-            }
-        }
+    let Some(dl) = download.take() else { return };
+    if dl.dest.is_none() {
+        return report_ready(shared, &dl);
     }
+    // A linked folder changes only once the extension has had its say. What it
+    // has to read until then is the new project file, wherever that is now.
+    let verify = dl
+        .files
+        .iter()
+        .find(|f| f.meta.path == dl.project_file)
+        .map_or_else(|| dl.dir.join(&dl.project_file), |f| f.tmp.clone());
+    let path = dl.dir.join(&dl.project_file);
+    let (total, files) = (dl.total, dl.files.len() as u64);
+    *shared.held_commit.lock().unwrap() = Some(dl);
+    set_status(shared, |s| {
+        s.state = "ready".into();
+        s.progress = 1.0;
+        s.done_bytes = total;
+        s.total_bytes = total;
+        s.files_done = files;
+        s.files_total = files;
+        s.current_file = String::new();
+        s.background = false;
+        s.project_path = Some(path.to_string_lossy().into_owned());
+        s.commit_pending = true;
+        s.verify_path = Some(verify.to_string_lossy().into_owned());
+    });
+}
+
+/// The download is whole and in place.
+fn report_ready(shared: &Shared, dl: &Download) {
     let path = dl.dir.join(&dl.project_file);
     eprintln!("[reamesh] download complete: {}", path.display());
     // This copy is now what we serve to (and fetch from) other peers.
@@ -8292,8 +8337,50 @@ fn download_finalize(shared: &Shared, download: &mut Option<Download>) {
         s.current_file = String::new();
         s.background = false;
         s.project_path = Some(path.to_string_lossy().into_owned());
+        s.commit_pending = false;
+        s.verify_path = None;
     });
-    *download = None;
+}
+
+/// See `Reamesh::commit_join`.
+fn commit_held(shared: &Shared) -> bool {
+    let mut held = shared.held_commit.lock().unwrap().take();
+    let Some(dl) = held.as_ref() else { return false };
+    if let Some(dest) = &dl.dest {
+        if let Err(message) = commit_dest(dl, dest) {
+            set_status(shared, |s| {
+                s.commit_pending = false;
+                s.verify_path = None;
+            });
+            download_fail(&mut held, shared, message);
+            return false;
+        }
+        // The project file is in place: only now does the link move on.
+        if let Some(link) = &dl.link {
+            let mut link = link.clone();
+            if link.hash.is_empty() {
+                link.hash = blake3_file(&dl.dir.join(&dl.project_file)).unwrap_or_default();
+            }
+            if let Err(e) = write_link(&dl.dir, &link) {
+                eprintln!("[reamesh] couldn't update {LINK_FILE}: {e}");
+            }
+        }
+    }
+    report_ready(shared, dl);
+    true
+}
+
+/// Give up a download that is waiting for its commit, leaving the folder as it
+/// was and no temp files in it.
+fn drop_held_commit(shared: &Shared) {
+    let mut held = shared.held_commit.lock().unwrap().take();
+    if held.is_some() {
+        download_cleanup(&mut held);
+        set_status(shared, |s| {
+            s.commit_pending = false;
+            s.verify_path = None;
+        });
+    }
 }
 
 /// Audio/video by extension. Only decides *ordering* within the download
@@ -9049,6 +9136,18 @@ pub extern "C" fn reamesh_set_join_dest(handle: *mut Reamesh, dest: *const c_cha
     let dest = cstr_arg(dest).unwrap_or_default();
     let r = unsafe { &*handle };
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.set_join_dest(&dest, overwrite)));
+}
+
+/// Put a finished join (status `commit_pending`) into its linked folder, which
+/// stays untouched until this call. False when there is nothing to commit or it
+/// was refused; the status then reports `failed` with the reason.
+#[unsafe(no_mangle)]
+pub extern "C" fn reamesh_commit_join(handle: *mut Reamesh) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    let r = unsafe { &*handle };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.commit_join())).unwrap_or(false)
 }
 
 /// The session is over and the project file on disk holds what it ended with:
