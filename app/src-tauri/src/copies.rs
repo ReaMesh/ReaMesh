@@ -36,6 +36,11 @@ fn skip_in_copy(name: &str) -> bool {
     name.starts_with(".reamesh-part-") || name == ".reamesh-nofx.rpp" || name == ".reamesh-keep"
 }
 
+/// What a join into a linked folder replaced belongs to that folder.
+fn skip_dir_in_copy(name: &str) -> bool {
+    name == ".reamesh-backup"
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum Partial {
     /// Nothing was written.
@@ -91,8 +96,10 @@ fn plan(source: &Path) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>, u64)> {
             let kind = entry.file_type()?;
             let child = rel.join(entry.file_name());
             if kind.is_dir() {
-                dirs.push(child.clone());
-                stack.push(child);
+                if !entry.file_name().to_str().is_some_and(skip_dir_in_copy) {
+                    dirs.push(child.clone());
+                    stack.push(child);
+                }
             } else if kind.is_file() && !entry.file_name().to_str().is_some_and(skip_in_copy) {
                 total = total.saturating_add(entry.metadata()?.len());
                 files.push(child);
@@ -402,6 +409,8 @@ mod tests {
             fs::write(source.join(".reamesh-nofx.rpp"), b"stripped").unwrap();
             fs::write(source.join(".reamesh-link.json"), b"{}").unwrap();
             fs::write(source.join(".reamesh-keep"), b"").unwrap();
+            fs::create_dir_all(source.join(".reamesh-backup/170/Audio")).unwrap();
+            fs::write(source.join(".reamesh-backup/170/Audio/old.wav"), b"old").unwrap();
             Tree { root, source, staging, out }
         }
 
@@ -448,6 +457,9 @@ mod tests {
         assert!(!path.join(".reamesh-keep").exists());
         assert!(!path.join(".reamesh-part-1234").exists());
         assert!(!path.join(".reamesh-nofx.rpp").exists());
+        // What a join replaced stays with the folder it was replaced in.
+        assert!(!path.join(".reamesh-backup").exists());
+        assert!(t.source.join(".reamesh-backup/170/Audio/old.wav").is_file());
         assert_eq!(t.out_names(), ["Song"]);
     }
 

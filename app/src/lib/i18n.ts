@@ -233,12 +233,17 @@ const en = {
   logMediaTimeout: "Media never arrived: {file}",
   logCopyNotSaved: "Couldn’t update your copy of the project: the file is read-only or in use.",
   logCopyOpened: "REAPER now has your saved copy open.",
-  logCopyNotOpened: "REAPER keeps the temporary copy open: it has unsaved changes.",
+  logCopyNotOpened:
+    "REAPER stays on the temporary copy: it may hold changes your saved copy doesn’t have. Save it as a copy again to keep them.",
+  logCopyNotOpenedPlaying:
+    "REAPER stays on the temporary copy because playback or recording is under way. Your saved copy is ready to open.",
   logLocalCopyChanged: "Your copy changed since the last session.",
   logLinkedCopyMissing: "Couldn’t find the folder of your copy.",
   logLinkedCopyForeign: "The folder of your copy holds a different project.",
   logLinkedCopyBusy: "{file} is still open. Close the project in REAPER and join again.",
   logLinkedCopyUnsaved: "Your copy has unsaved changes. Save them in REAPER first.",
+  logLinkedCopyOpen:
+    "With undo turned off REAPER can’t tell whether your copy has unsaved changes. Save it and close its tab first.",
   logReconnecting: "Connection to the host lost. Reconnecting to “{name}”…",
   reconnectFailed: "Couldn’t restore the connection to “{name}”.",
   logBadTicket: "That invite code doesn’t look valid. Copy it again from the host.",
@@ -724,12 +729,17 @@ const de: Record<MsgKey, string> = {
   logMediaTimeout: "Mediendatei nicht erhalten: {file}",
   logCopyNotSaved: "Deine Kopie des Projekts wurde nicht aktualisiert: Die Datei ist schreibgeschützt oder in Benutzung.",
   logCopyOpened: "REAPER hat jetzt deine gespeicherte Kopie offen.",
-  logCopyNotOpened: "REAPER bleibt auf der temporären Kopie: Sie hat ungespeicherte Änderungen.",
+  logCopyNotOpened:
+    "REAPER bleibt auf der temporären Kopie: Sie könnte Änderungen enthalten, die deine gespeicherte Kopie nicht hat. Speichere sie noch einmal als Kopie, um sie zu behalten.",
+  logCopyNotOpenedPlaying:
+    "REAPER bleibt auf der temporären Kopie, weil gerade Wiedergabe oder Aufnahme läuft. Deine gespeicherte Kopie liegt zum Öffnen bereit.",
   logLocalCopyChanged: "Deine Kopie wurde seit der letzten Session geändert.",
   logLinkedCopyMissing: "Der Ordner deiner Kopie wurde nicht gefunden.",
   logLinkedCopyForeign: "Der Ordner deiner Kopie enthält ein anderes Projekt.",
   logLinkedCopyBusy: "{file} ist noch geöffnet. Schließ das Projekt in REAPER und tritt erneut bei.",
   logLinkedCopyUnsaved: "Deine Kopie hat ungespeicherte Änderungen. Speichere sie zuerst in REAPER.",
+  logLinkedCopyOpen:
+    "Mit ausgeschaltetem Undo kann REAPER nicht erkennen, ob deine Kopie ungespeicherte Änderungen hat. Speichere sie zuerst und schließ ihren Tab.",
   logReconnecting: "Verbindung zum Host verloren. ReaMesh verbindet sich erneut mit „{name}“…",
   reconnectFailed: "ReaMesh konnte die Verbindung zu „{name}“ nicht wiederherstellen.",
   logBadTicket: "Dieser Einladungscode scheint ungültig zu sein. Lass ihn dir vom Host noch einmal schicken.",

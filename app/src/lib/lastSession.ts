@@ -23,6 +23,7 @@ const RETRY_ENDINGS = new Set([
   "host_lost",
   "linked_copy_busy",
   "linked_copy_unsaved",
+  "linked_copy_open",
   ...COPY_REFUSALS,
 ]);
 

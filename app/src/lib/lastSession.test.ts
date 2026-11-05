@@ -75,8 +75,8 @@ describe("lastSessionAfter", () => {
       expect(after?.reason).toBe(refused);
       expect(isCopyRefusal(after?.reason ?? null)).toBe(true);
     }
-    // These two pass once the user has done something: the way back stays.
-    for (const code of ["linked_copy_busy", "linked_copy_unsaved"]) {
+    // These pass once the user has done something: the way back stays.
+    for (const code of ["linked_copy_busy", "linked_copy_unsaved", "linked_copy_open"]) {
       const after = lastSessionAfter(frame({ reconnecting: true }), frame({ error: entry(code) }), block);
       expect(after?.reason?.code).toBe(code);
       expect(isCopyRefusal(after?.reason ?? null)).toBe(false);

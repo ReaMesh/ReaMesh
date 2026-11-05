@@ -2018,6 +2018,161 @@ impl Drop for Linked {
     }
 }
 
+const KEEP_FILE: &str = ".reamesh-keep";
+
+impl Linked {
+    /// A join naming no folder: what the extension sends after a declined
+    /// overwrite (`false`) or for a join without effects, which carries the
+    /// dialog's overwrite along but no folder (`true`).
+    fn join_plain(&self, overwrite: bool) -> (Box<Reamesh>, Value) {
+        let (client, sid) = discover(&self.owner, &self.staging);
+        client.set_join_dest("", overwrite);
+        assert!(client.join_session(&sid, ""), "join_session refused");
+        let done = join_outcome(&client);
+        (client, done)
+    }
+
+    /// The session's own staging folder, kept. The session goes on: a rejoin from
+    /// here is one of the same hosting run.
+    fn kept_copy(&self) -> PathBuf {
+        let (client, done) = self.join_plain(false);
+        assert_eq!(done["state"], "ready", "{done}");
+        drop(client);
+        let kept = PathBuf::from(done["dir"].as_str().unwrap());
+        fs::write(kept.join(KEEP_FILE), b"").unwrap();
+        kept
+    }
+
+    fn assert_went_past(&self, kept: &Path, done: &Value) -> PathBuf {
+        assert_eq!(done["state"], "ready", "{done}");
+        assert_eq!(done["commit_pending"], false, "nothing to accept in a staging folder: {done}");
+        let dir = PathBuf::from(done["dir"].as_str().unwrap());
+        assert_ne!(dir, kept, "the kept folder took the download");
+        assert_eq!(dir.parent(), kept.parent(), "beside it");
+        assert!(!dir.join(KEEP_FILE).exists());
+        let project = PathBuf::from(done["project_path"].as_str().unwrap());
+        assert!(project.starts_with(&dir), "{done}");
+        assert_eq!(fs::read(&project).unwrap(), fs::read(self.project.join("Song.rpp")).unwrap());
+        dir
+    }
+}
+
+#[test]
+fn a_declined_overwrite_goes_past_a_kept_copy_and_keeps_every_byte() {
+    let t = Linked::new("kept-declined");
+    let kept = t.kept_copy();
+    fs::write(kept.join("Song.rpp"), b"<REAPER_PROJECT my own edit\n>\n").unwrap();
+    t.host_changes();
+    let before = snapshot_tree(&kept);
+
+    let (client, done) = t.join_plain(false);
+    let beside = t.assert_went_past(&kept, &done);
+    drop(client);
+    assert_eq!(snapshot_tree(&kept), before);
+
+    // The next rejoin finds that folder again instead of leaving another.
+    let (client, done) = t.join_plain(false);
+    assert_eq!(t.assert_went_past(&kept, &done), beside);
+    drop(client);
+    assert_eq!(snapshot_tree(&kept), before);
+
+    // Until that one is kept too.
+    fs::write(beside.join(KEEP_FILE), b"").unwrap();
+    let before_beside = snapshot_tree(&beside);
+    let (client, done) = t.join_plain(false);
+    let third = t.assert_went_past(&kept, &done);
+    assert_ne!(third, beside);
+    drop(client);
+    assert_eq!(snapshot_tree(&kept), before);
+    assert_eq!(snapshot_tree(&beside), before_beside);
+}
+
+#[test]
+fn a_join_without_effects_goes_past_a_kept_copy_and_keeps_every_byte() {
+    let t = Linked::new("kept-nofx");
+    let kept = t.kept_copy();
+    let before = snapshot_tree(&kept);
+
+    // The extension drops the stripped project beside `project_path`.
+    let (client, done) = t.join_plain(true);
+    t.assert_went_past(&kept, &done);
+    drop(client);
+    assert_eq!(snapshot_tree(&kept), before);
+}
+
+#[test]
+fn the_way_back_into_a_kept_copy_goes_through_the_checks_of_a_linked_folder() {
+    let t = Linked::new("kept-way-back");
+    let kept = t.kept_copy();
+    let original = fs::read(kept.join("Song.rpp")).unwrap();
+    let way_back = || {
+        let (client, sid) = discover(&t.owner, &t.staging);
+        client.set_join_dest(kept.to_str().unwrap(), false);
+        assert!(client.join_session(&sid, ""), "join_session refused");
+        client
+    };
+
+    // A local change: refused, for the dialog to ask about.
+    fs::write(kept.join("Song.rpp"), b"<REAPER_PROJECT my own edit\n>\n").unwrap();
+    let before = snapshot_tree(&kept);
+    let client = way_back();
+    let done = commit_outcome(&client);
+    assert_eq!(done["state"], "failed", "{done}");
+    assert!(done["message"].as_str().unwrap().contains("your copy of the project has changed"), "{done}");
+    drop(client);
+    assert_eq!(snapshot_tree(&kept), before);
+
+    // No change, and the host moved on: held back until accepted.
+    fs::write(kept.join("Song.rpp"), &original).unwrap();
+    let before = snapshot_tree(&kept);
+    t.host_changes();
+    let client = way_back();
+    let done = join_outcome(&client);
+    assert_eq!(done["state"], "ready", "{done}");
+    assert_eq!(done["commit_pending"], true, "{done}");
+    drop(client);
+    let mut after = snapshot_tree(&kept);
+    after.retain(|(rel, _)| !rel.contains(".reamesh-part-"));
+    assert_eq!(after, before, "leaving before the commit changes nothing");
+
+    // Accepted: the folder takes the update, and what it replaced is kept.
+    let client = way_back();
+    let done = commit_outcome(&client);
+    assert_eq!(done["state"], "ready", "{done}");
+    assert_eq!(PathBuf::from(done["dir"].as_str().unwrap()), kept);
+    drop(client);
+    assert_eq!(fs::read(kept.join("Song.rpp")).unwrap(), fs::read(t.project.join("Song.rpp")).unwrap());
+    assert!(kept.join(KEEP_FILE).exists());
+    let backups: Vec<_> = fs::read_dir(kept.join(BACKUP_DIR)).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(fs::read(backups[0].join("Song.rpp")).unwrap(), original);
+}
+
+#[test]
+fn a_kept_copy_without_a_link_is_never_written_to() {
+    let t = Linked::new("kept-no-link");
+    let kept = t.kept_copy();
+    fs::remove_file(kept.join(LINK_FILE)).unwrap();
+    t.host_changes();
+    let before = snapshot_tree(&kept);
+
+    // What the extension sends for it.
+    let (client, done) = t.join_plain(false);
+    t.assert_went_past(&kept, &done);
+    drop(client);
+    assert_eq!(snapshot_tree(&kept), before);
+
+    // And named as a folder after all, it isn't one the core can check.
+    let (client, sid) = discover(&t.owner, &t.staging);
+    client.set_join_dest(kept.to_str().unwrap(), false);
+    assert!(client.join_session(&sid, ""), "join_session refused");
+    let done = commit_outcome(&client);
+    assert_eq!(done["state"], "failed", "{done}");
+    assert!(done["message"].as_str().unwrap().contains("linked folder holds something else"), "{done}");
+    drop(client);
+    assert_eq!(snapshot_tree(&kept), before);
+}
+
 #[test]
 fn an_update_lands_in_the_linked_folder() {
     let t = Linked::new("update");

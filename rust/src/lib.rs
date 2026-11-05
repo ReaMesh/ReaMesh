@@ -3923,8 +3923,9 @@ fn prune_older_than(root: &Path, keep: &[PathBuf], max_age: Duration) {
 /// "Save as" takes it along, which is what links the saved folder.
 const LINK_FILE: &str = ".reamesh-link.json";
 /// A copy in the staging root the user chose to keep has this beside the project:
-/// the sweep leaves that folder alone. The app writes and removes it, and being a
-/// dotfile it is outside every manifest too.
+/// the sweep leaves that folder alone and a join that names no folder goes past it
+/// (`staging_dir_for`). The app writes and removes it, and being a dotfile it is
+/// outside every manifest too.
 const KEEP_FILE: &str = ".reamesh-keep";
 /// Where a join into a linked folder keeps what it replaced, as
 /// `<unix seconds>/<project-relative path>`. Also outside every manifest. Nothing
@@ -4161,22 +4162,37 @@ fn remove_empty_tree(dir: &Path) {
 /// host's peer id, so it can't aim its download at a folder an earlier join
 /// of someone else's session left behind and overwrite files there. (Copies
 /// from before carried the session id's first 8 characters instead.)
-fn staging_dir_name(session_name: &str, session_id: &str, owner: &PeerId) -> String {
+///
+/// `nth` counts the folders of one session: past 0 only with the ones before it
+/// kept (`staging_dir_for`).
+fn staging_dir_name(session_name: &str, session_id: &str, owner: &PeerId, nth: u32) -> String {
     let mut h = blake3::Hasher::new();
     h.update(b"reamesh/staging\0");
     h.update(session_id.as_bytes());
     h.update(b"\0");
     h.update(&owner.to_bytes());
+    if nth > 0 {
+        h.update(b"\0");
+        h.update(&nth.to_le_bytes());
+    }
     let tag = h.finalize().to_hex();
     format!("{}-{}", sanitize_dir_name(session_name), &tag.as_str()[..16])
 }
 
-/// The folder a join of this session downloads into.
+/// The folder a join of this session downloads into when it names none: the
+/// session's own, or with that one kept the next one beside it. A rejoin of the
+/// same hosting run would otherwise replace a kept copy in place, with no check
+/// and no backup. The way into a kept folder is as a `JoinDest`.
 fn staging_dir_for(staging_root: Option<&Path>, session_name: &str, session_id: &str, owner: &PeerId) -> PathBuf {
-    staging_root
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(staging_dir_name(session_name, session_id, owner))
+    let root = staging_root.map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir);
+    let mut nth = 0;
+    loop {
+        let dir = root.join(staging_dir_name(session_name, session_id, owner, nth));
+        if !dir.join(KEEP_FILE).exists() {
+            return dir;
+        }
+        nth += 1;
+    }
 }
 
 fn sanitize_dir_name(name: &str) -> String {
@@ -7867,13 +7883,16 @@ mod transfer_safety_tests {
     #[test]
     fn staging_folders_are_bound_to_the_owner() {
         let (a, b) = (PeerId::random(), PeerId::random());
-        let name = staging_dir_name("My Song", "18c2f9a0-abcd", &a);
+        let name = staging_dir_name("My Song", "18c2f9a0-abcd", &a, 0);
         assert!(name.starts_with("My Song-"));
         let tag = &name["My Song-".len()..];
         assert!(tag.len() == 16 && tag.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
-        assert_eq!(name, staging_dir_name("My Song", "18c2f9a0-abcd", &a), "stable for a rejoin");
-        assert_ne!(name, staging_dir_name("My Song", "18c2f9a0-abcd", &b), "another host can't reuse it");
-        assert_ne!(name, staging_dir_name("My Song", "18c2f9a0-abce", &a));
+        assert_eq!(name, staging_dir_name("My Song", "18c2f9a0-abcd", &a, 0), "stable for a rejoin");
+        assert_ne!(name, staging_dir_name("My Song", "18c2f9a0-abcd", &b, 0), "another host can't reuse it");
+        let next = staging_dir_name("My Song", "18c2f9a0-abcd", &a, 1);
+        assert_ne!(name, next, "a kept folder gets a neighbor");
+        assert!(next.starts_with("My Song-") && next.len() == name.len(), "named like any other");
+        assert_ne!(name, staging_dir_name("My Song", "18c2f9a0-abce", &a, 0));
     }
 
     fn test_download(dir: PathBuf) -> Download {

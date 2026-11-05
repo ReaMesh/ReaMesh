@@ -630,6 +630,74 @@ int main() {
     assert(copyTabTarget("/Other/Song.rpp", "/R/ReaMesh/Song-1", "/Music/Song").empty());
     assert(copyTabTarget("/R/ReaMesh/Song-1/.reamesh-nofx.rpp", "/R/ReaMesh/Song-1", "/Music/Song").empty());
     assert(copyTabTarget("/R/ReaMesh/Song-1/Song.rpp", "/R/ReaMesh/Song-1", "").empty());
+
+    // Only a clean tab with exactly the copy's bytes moves, and only at a standstill.
+    assert(copyTabMove(TabEdits::None, true, 0) == CopyTabMove::Move);
+    assert(copyTabMove(TabEdits::None, false, 0) == CopyTabMove::Differs);
+    assert(copyTabMove(TabEdits::Unsaved, true, 0) == CopyTabMove::Differs);
+    assert(copyTabMove(TabEdits::Unknown, true, 0) == CopyTabMove::Differs);
+    for (int playState : {1, 2, 4, 5, 6}) {
+      assert(copyTabMove(TabEdits::None, true, playState) == CopyTabMove::Playing);
+      assert(copyTabMove(TabEdits::None, false, playState) == CopyTabMove::Differs);
+    }
+
+    // With the undo memory at 0 a tab reads clean whatever it holds, and so does
+    // one whose setting can't be read.
+    const int undoOn = 256, undoOff = 0;
+    const double undoOnD = 256, undoOffD = 0;
+    assert(!undoPromptOff(&undoOn, sizeof(int)));
+    assert(undoPromptOff(&undoOff, sizeof(int)));
+    assert(!undoPromptOff(&undoOnD, sizeof(double)));
+    assert(undoPromptOff(&undoOffD, sizeof(double)));
+    assert(undoPromptOff(nullptr, 0));
+    assert(undoPromptOff(&undoOn, 1));
+    assert(tabEditsFrom(true, false) == TabEdits::Unsaved);
+    assert(tabEditsFrom(true, true) == TabEdits::Unsaved);
+    assert(tabEditsFrom(false, false) == TabEdits::None);
+    assert(tabEditsFrom(false, true) == TabEdits::Unknown);
+    assert(std::string(editsRefusal(TabEdits::Unsaved).code) == "linked_copy_unsaved");
+    assert(std::string(editsRefusal(TabEdits::Unknown).code) == "linked_copy_open");
+
+    {
+      const fs::path tmp = fs::temp_directory_path() / ("reamesh-chunk-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+      fs::create_directories(tmp);
+      const auto put = [&](const char* name, const std::string& bytes) {
+        std::ofstream(tmp / name, std::ios::binary) << bytes;
+        return (tmp / name).string();
+      };
+      const std::string big(200000, 'x');
+      const std::string a = put("a", big + "end"), same = put("same", big + "end");
+      const std::string other = put("other", big + "eNd"), shorter = put("shorter", big);
+      const std::string none = put("none", ""), none2 = put("none2", "");
+      assert(filesIdentical(a, same));
+      assert(!filesIdentical(a, other));
+      assert(!filesIdentical(a, shorter));
+      assert(filesIdentical(none, none2));
+      assert(!filesIdentical(a, (tmp / "gone").string()));
+      assert(!filesIdentical((tmp / "gone").string(), (tmp / "gone").string()));
+
+      // A way back goes where the session was, unless that is a kept copy with a
+      // link, which it treats as a linked folder.
+      const fs::path kept = tmp / "kept";
+      fs::create_directories(kept);
+      LastSession way;
+      way.dir = kept.string();
+      assert(wayBackDest(way, false).empty());
+      std::ofstream(kept / ".reamesh-keep");
+      assert(wayBackDest(way, false).empty());  // kept, no link: the core goes past it
+      std::ofstream(kept / ".reamesh-link.json");
+      assert(wayBackDest(way, false) == kept.string());
+      assert(wayBackDest(way, true).empty());  // without effects: never a user's folder
+      way.dest = "/Songs/Saved";
+      assert(wayBackDest(way, false) == "/Songs/Saved");
+      assert(wayBackDest(way, true).empty());
+      fs::remove(kept / ".reamesh-keep");
+      way.dest.clear();
+      assert(wayBackDest(way, false).empty());  // a link alone: any staging folder
+      way.dir.clear();
+      assert(wayBackDest(way, false).empty());
+      fs::remove_all(tmp);
+    }
     assert(pathInsideDir("/Songs/Nightfall/Audio/Kick_01.wav", "/Songs/Nightfall") ==
            "Audio/Kick_01.wav");
     assert(pathInsideDir("/Songs/Nightfall/Kick.wav", "/Songs/Nightfall/") == "Kick.wav");

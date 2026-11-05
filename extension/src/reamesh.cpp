@@ -70,6 +70,7 @@
 #define REAPERAPI_WANT_GetProjExtState
 #define REAPERAPI_WANT_SetProjExtState
 #define REAPERAPI_WANT_IsProjectDirty
+#define REAPERAPI_WANT_get_config_var
 #define REAPERAPI_WANT_Main_openProject
 #define REAPERAPI_WANT_SelectProjectInstance
 #define REAPERAPI_WANT_GetResourcePath
@@ -115,6 +116,7 @@
 #define REAPERAPI_WANT_GetMediaItemInfo_Value
 #define REAPERAPI_WANT_SetMediaItemInfo_Value
 #define REAPERAPI_WANT_GetPlayState
+#define REAPERAPI_WANT_GetPlayStateEx
 #define REAPERAPI_WANT_GetPlayPosition
 #define REAPERAPI_WANT_GetCursorPosition
 #define REAPERAPI_WANT_GetSet_ArrangeView2
@@ -630,7 +632,8 @@ struct LastSession {
   std::string ticket;
   // The linked folder the session was joined into ("" = a staging folder). A way
   // back never overwrites: the core refuses it when the copy has changed since,
-  // and only the trust dialog can ask about that.
+  // and only the trust dialog can ask about that. A staging folder kept since
+  // counts as one too (see wayBackDest).
   std::string dest;
   // The core refused that folder, and would again: only the dialog can go on.
   bool refused = false;
@@ -5921,16 +5924,78 @@ static bool startBrowse() {
   return true;
 }
 
-// Whether REAPER holds edits to a project in this folder that never reached the
-// disk. The core can only compare files: opening the session's project in that
-// tab would make REAPER offer to save those edits over what was just downloaded.
-static bool hasUnsavedEdits(const std::string& dir) {
+// What REAPER can say about the edits in a tab that never reached the disk.
+enum class TabEdits { None, Unsaved, Unknown };
+
+// IsProjectDirty answers 0 for every tab with 'undo/prompt to save' off, which is
+// the undo memory preference at 0 MB. A setting that can't be read counts as off.
+static bool undoPromptOff(const void* undoMaxMem, int size) {
+  if (undoMaxMem && size == (int)sizeof(int)) return *static_cast<const int*>(undoMaxMem) <= 0;
+  if (undoMaxMem && size == (int)sizeof(double)) return *static_cast<const double*>(undoMaxMem) <= 0;
+  return true;
+}
+
+// With that off nothing tells an edited tab from an untouched one: the change
+// count also moves on a mere click, and whether it moves at all then is not
+// documented. So such a tab is treated as holding edits, and every path that asks
+// has a way out: saving, staying where it is, or closing the tab.
+static TabEdits tabEditsFrom(bool dirty, bool promptOff) {
+  if (dirty) return TabEdits::Unsaved;
+  return promptOff ? TabEdits::Unknown : TabEdits::None;
+}
+
+static TabEdits tabEdits(ReaProject* proj) {
+  int size = 0;
+  const void* undoMaxMem = get_config_var("undomaxmem", &size);
+  return tabEditsFrom(IsProjectDirty(proj) != 0, undoPromptOff(undoMaxMem, size));
+}
+
+// What REAPER may hold of a project in this folder that never reached the disk.
+// The core can only compare files: opening the session's project in that tab would
+// have REAPER offer to save those edits over what was just downloaded, or drop
+// them without asking with the prompt off.
+static TabEdits editsInFolder(const std::string& dir) {
+  TabEdits found = TabEdits::None;
   for (int i = 0;; ++i) {
     char buf[4096] = {0};
     ReaProject* proj = EnumProjects(i, buf, sizeof(buf));
-    if (!proj) return false;
-    if (!pathInsideDir(buf, dir).empty() && IsProjectDirty(proj)) return true;
+    if (!proj) return found;
+    if (pathInsideDir(buf, dir).empty()) continue;
+    const TabEdits edits = tabEdits(proj);
+    if (edits == TabEdits::Unsaved) return edits;
+    if (edits == TabEdits::Unknown) found = edits;
   }
+}
+
+// Why a linked folder can't change while one of its tabs may hold edits.
+struct EditsRefusal {
+  const char* code;
+  const char* text;
+};
+static EditsRefusal editsRefusal(TabEdits edits) {
+  if (edits == TabEdits::Unknown)
+    return {"linked_copy_open",
+            "with undo turned off REAPER can't tell whether your copy has unsaved changes. "
+            "Save it and close its tab first"};
+  return {"linked_copy_unsaved", "your copy has unsaved changes. Save them in REAPER first"};
+}
+
+// Whether two files hold the same bytes. One that can't be read matches nothing.
+static bool filesIdentical(const std::string& a, const std::string& b) {
+  std::error_code ea, eb;
+  const auto sizeA = fs::file_size(fsPath(a), ea);
+  const auto sizeB = fs::file_size(fsPath(b), eb);
+  if (ea || eb || sizeA != sizeB) return false;
+  std::ifstream fa(fsPath(a), std::ios::binary), fb(fsPath(b), std::ios::binary);
+  if (!fa || !fb) return false;
+  std::vector<char> ba(1 << 16), bb(1 << 16);
+  while (fa && fb) {
+    fa.read(ba.data(), (std::streamsize)ba.size());
+    fb.read(bb.data(), (std::streamsize)bb.size());
+    if (fa.gcount() != fb.gcount() || memcmp(ba.data(), bb.data(), (size_t)fa.gcount()) != 0)
+      return false;
+  }
+  return fa.eof() && fb.eof() && !fa.bad() && !fb.bad();
 }
 
 // The folder of a joined copy by its name: a bare name, nothing else.
@@ -5967,23 +6032,34 @@ static void flushCopyTabs(const std::string& name) {
     ReaProject* proj = EnumProjects(i, buf, sizeof(buf));
     if (!proj) return;
     if (copyTabTarget(buf, from, "/").empty() || !movableCopyTab(buf)) continue;
-    if (!IsProjectDirty(proj) || !fileRewritable(buf)) continue;
+    if (tabEdits(proj) == TabEdits::None || !fileRewritable(buf)) continue;
     g_applyingRemote = true;  // same guard as saveSessionCopy
     Main_SaveProject(proj, false);
     g_applyingRemote = false;
   }
 }
 
+// What a finished "save as" means for one tab of the old folder. Reloading drops
+// whatever the tab holds, so it goes over only with nothing on screen beyond its
+// file and that file exactly what the copy has: the copy may have started before
+// a save in REAPER, or before a flush held up by a dialog. A running transport is
+// the user's to stop.
+enum class CopyTabMove { Move, Differs, Playing };
+static CopyTabMove copyTabMove(TabEdits edits, bool sameBytes, int playState) {
+  if (edits != TabEdits::None || !sameBytes) return CopyTabMove::Differs;
+  return playState != 0 ? CopyTabMove::Playing : CopyTabMove::Move;
+}
+
 // A "save as" of a joined copy is done: tabs of the old folder go over to the new
-// one, so what the user does next ends up in the copy that stays. A tab with edits
-// that aren't in that copy stays put, and the user hears why. The active tab stays
-// active.
+// one, so what the user does next ends up in the copy that stays. A tab that may
+// hold something that copy doesn't, or that is playing, stays put and the user
+// hears why. The active tab stays active.
 static void moveTabsToCopy(const std::string& name, const std::string& to, bool linked) {
   const std::string from = joinedCopyFolder(name);
   if (from.empty() || to.empty()) return;
   ReaProject* active = EnumProjects(-1, nullptr, 0);
   int activeIndex = -1, moved = 0;
-  bool dirty = false;
+  bool differs = false, playing = false;
   for (int i = 0;; ++i) {
     char buf[4096] = {0};
     ReaProject* proj = EnumProjects(i, buf, sizeof(buf));
@@ -5992,8 +6068,9 @@ static void moveTabsToCopy(const std::string& name, const std::string& to, bool 
     const std::string target = copyTabTarget(buf, from, to);
     std::error_code ec;
     if (target.empty() || !movableCopyTab(buf) || !fs::is_regular_file(fsPath(target), ec)) continue;
-    if (IsProjectDirty(proj)) {
-      dirty = true;
+    const CopyTabMove move = copyTabMove(tabEdits(proj), filesIdentical(buf, target), GetPlayStateEx(proj));
+    if (move != CopyTabMove::Move) {
+      (move == CopyTabMove::Differs ? differs : playing) = true;
       continue;
     }
     g_applyingRemote = true;  // same guard as around every other open
@@ -6011,9 +6088,15 @@ static void moveTabsToCopy(const std::string& name, const std::string& to, bool 
     g_groupNamesAt = -1;  // different project: the cached group names are stale
     logEvent("copy_opened", json::object(), "REAPER now has your saved copy open");
   }
-  if (dirty)
+  if (playing)
+    g_lastError = logEvent("copy_not_opened_playing", json::object(),
+                           "REAPER stays on the temporary copy because playback or recording is "
+                           "under way. Your saved copy is ready to open");
+  // Last: of the two, this is the one the user has to act on.
+  if (differs)
     g_lastError = logEvent("copy_not_opened", json::object(),
-                           "REAPER keeps the temporary copy open: it has unsaved changes");
+                           "REAPER stays on the temporary copy: it may hold changes your saved "
+                           "copy doesn't have. Save it as a copy again to keep them");
   // A way back into that session goes to the copy that stays from now on.
   const auto repoint = [&](LastSession& s) {
     if (linked && s.dest.empty() && !pathInsideDir(s.dir + "/x", from).empty()) s.dest = to;
@@ -6032,10 +6115,13 @@ static bool joinSession(const std::string& sid, const std::string& ticket,
                         const std::string& sname, const std::string& passphrase,
                         const std::string& dest, bool overwrite) {
   if (g_mode != Mode::Browsing || !g_handle) return false;
-  if (!dest.empty() && hasUnsavedEdits(dest)) {
-    g_lastError = logEvent("linked_copy_unsaved", json::object(),
-                           "your copy has unsaved changes. Save them in REAPER first");
-    return false;
+  if (!dest.empty()) {
+    const TabEdits edits = editsInFolder(dest);
+    if (edits != TabEdits::None) {
+      const EditsRefusal why = editsRefusal(edits);
+      g_lastError = logEvent(why.code, json::object(), why.text);
+      return false;
+    }
   }
   reamesh_set_join_dest(g_handle, dest.c_str(), overwrite);
   const bool ok = ticket.empty()
@@ -6066,6 +6152,22 @@ static bool joinSession(const std::string& sid, const std::string& ticket,
   g_joinDest = dest;
   logEvent("joining", {{"name", sname}}, "joining \"" + sname + "\". The project is downloading");
   return true;
+}
+
+// Where a way back into a session goes. A session's staging folder stays the same
+// for the whole hosting run, so one the user kept since is where it would land, and
+// that goes through the checks of a linked folder. Asked at the moment of the join:
+// the keep mark is the app's, and may be set at any time. A kept folder that knows
+// nothing of its project can't be checked: the core goes past it, as it does for
+// any join that names no folder. So does a join without effects, a view-only copy
+// that stays out of the user's folders, the one a "save as" repointed this to too.
+static std::string wayBackDest(const LastSession& s, bool noFx) {
+  if (noFx) return "";
+  if (!s.dest.empty() || s.dir.empty()) return s.dest;
+  std::error_code ec;
+  const fs::path dir = fsPath(s.dir);
+  if (!fs::exists(dir / ".reamesh-keep", ec) || !fs::exists(dir / ".reamesh-link.json", ec)) return "";
+  return s.dir;
 }
 
 // Watch for that session again for a bounded window (Browsing only).
@@ -6134,7 +6236,7 @@ static void reconnectTick() {
   if (!g_reconnect->ticket.empty()) {
     Reconnect rc = *g_reconnect;
     g_reconnect.reset();
-    joinSession("", rc.ticket, rc.sessionName, rc.passphrase, rc.dest, false);
+    joinSession("", rc.ticket, rc.sessionName, rc.passphrase, wayBackDest(rc, g_noFx), false);
     return;
   }
   json sessions = handleJson(reamesh_sessions, json::array());
@@ -6143,7 +6245,7 @@ static void reconnectTick() {
     if (s.is_object() && jsonStr(s, "session_id") == g_reconnect->sessionId) {
       Reconnect rc = *g_reconnect;
       g_reconnect.reset();
-      joinSession(rc.sessionId, "", rc.sessionName, rc.passphrase, rc.dest, false);
+      joinSession(rc.sessionId, "", rc.sessionName, rc.passphrase, wayBackDest(rc, g_noFx), false);
       return;
     }
   }
@@ -7014,10 +7116,11 @@ static void finishDownload(std::string path) {
   if (jsonBool(st, "commit_pending", false)) {
     g_pendingVerify = json();
     g_pendingOpenPath.clear();
-    if (hasUnsavedEdits(g_joinDest)) {
-      if (g_lastSession) g_lastSession->refused = true;
-      leaveSession("linked_copy_unsaved", json::object(),
-                   "your copy has unsaved changes. Save them in REAPER first");
+    const TabEdits edits = editsInFolder(g_joinDest);
+    if (edits != TabEdits::None) {
+      // The way back stays: once the user has dealt with it, the same check passes.
+      const EditsRefusal why = editsRefusal(edits);
+      leaveSession(why.code, json::object(), why.text);
       return;
     }
     // A refusal reaches pollDownload as a failed status on the next tick.

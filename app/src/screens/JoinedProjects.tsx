@@ -118,6 +118,15 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
     );
   };
 
+  // A download going into a folder: too late to keep what it held.
+  const downloadingInto = (p: JoinedProject) => {
+    const dir = normPath(p.path);
+    return instances.some(
+      ({ state }) =>
+        state?.mode === "downloading" && !!state.session_dir && normPath(state.session_dir) === dir,
+    );
+  };
+
   const trash = async () => {
     if (!target) return;
     setBusy(true);
@@ -268,6 +277,7 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
                           size="sm"
                           aria-label={`${t("keepCopy")}: ${p.name}`}
                           aria-pressed={!!p.kept}
+                          disabled={downloadingInto(p)}
                           className={cn(
                             "size-8 shrink-0 p-0 hover:text-foreground",
                             p.kept ? "text-foreground" : "text-muted-foreground",

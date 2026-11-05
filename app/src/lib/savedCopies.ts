@@ -32,7 +32,9 @@ interface CopyFinished {
 }
 
 /** How long a copy waits for REAPER to save what is on screen. A REAPER showing a
- *  dialog doesn't answer: the copy goes ahead, and that tab stays where it is. */
+ *  dialog doesn't answer: its commands wait in a queue and its timer stands still,
+ *  so the copy goes ahead without those edits and the save comes later. Only the
+ *  extension can then tell, because the tab's file no longer matches the copy. */
 const FLUSH_WAIT_MS = 4000;
 
 let running: RunningCopy | null = null;
