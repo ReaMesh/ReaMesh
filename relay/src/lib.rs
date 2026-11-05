@@ -6,6 +6,7 @@ pub mod addrs;
 pub mod alert;
 pub mod auth;
 pub mod config;
+pub mod list;
 pub mod seen;
 pub mod server;
 pub mod status;

@@ -2823,6 +2823,7 @@ dependencies = [
  "libp2p",
  "serde",
  "serde_bytes",
+ "serde_json",
 ]
 
 [[package]]

@@ -22,6 +22,10 @@
 //! carrying the `rev` of the last answer is held until the answer changes, so
 //! hosts hear about a notice, a used-up budget or a shutdown right away without
 //! the relay ever opening anything towards them.
+//!
+//! The optional session list (`list.rs`) answers two more request-response
+//! protocols. It lives in memory and hangs on the reservations: when one ends,
+//! the host's entry goes with it.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -50,6 +54,7 @@ use crate::addrs;
 use crate::alert::{self, HostsWatch};
 use crate::auth::AuthState;
 use crate::config::{self, Config, Mode};
+use crate::list::{Access, SessionList};
 use crate::seen::Seen;
 use crate::status::{self, HostStatus, Inbound, KeyUsage, Status};
 use crate::term::{self, Style, problem};
@@ -58,6 +63,10 @@ use crate::update::{self, Checked};
 use reamesh_relay_proto::{
     self as proto, AuthRequest, AuthResponse, InfoRequest, InfoResponse, Notice, RelayAddr,
     RelayCode,
+};
+use reamesh_relay_proto::sessions::{
+    PublishRequest, PublishResponse, RELAY_PUBLISH_PROTOCOL, RELAY_SESSIONS_PROTOCOL,
+    SESSIONS_TIMEOUT_SECS, SessionsRequest, SessionsResponse,
 };
 
 /// Per-circuit limits in coordination mode: plenty for identify and a DCUtR
@@ -85,6 +94,11 @@ const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 const UPDATE_FIRST_CHECK: Duration = Duration::from_secs(60);
 /// How often a running relay looks for a downloaded update to restart into.
 const UPDATE_RESTART_POLL: Duration = Duration::from_secs(30);
+/// Pings in a row a listed host may miss before its connection is dropped: a
+/// host that vanished without a word can look connected for many minutes over
+/// TCP, and its session would stay on the list that long. It comes back on its
+/// own when it is still there.
+const LISTED_PING_MISSES: u32 = 3;
 
 pub struct Options {
     pub data_dir: PathBuf,
@@ -128,6 +142,8 @@ struct Behaviour {
     relay: relay::Behaviour,
     auth: request_response::cbor::Behaviour<AuthRequest, AuthResponse>,
     info: request_response::cbor::Behaviour<InfoRequest, InfoResponse>,
+    sessions: request_response::cbor::Behaviour<SessionsRequest, SessionsResponse>,
+    publish: request_response::cbor::Behaviour<PublishRequest, PublishResponse>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     autonat: autonat::v1::Behaviour,
@@ -349,6 +365,9 @@ struct Relay {
     /// A newer version the channel named, not downloaded (yet).
     update_available: Arc<Mutex<Option<String>>>,
     update_polled: Instant,
+    list: SessionList<ResponseChannel<SessionsResponse>>,
+    /// Pings in a row each listed host missed.
+    ping_misses: HashMap<PeerId, u32>,
     _lock: std::fs::File,
 }
 
@@ -367,6 +386,8 @@ async fn run(
         peer_id: key.public().to_peer_id(),
         cfg_stamp: config_stamp(&opts.data_dir),
         key,
+        list: SessionList::new(cfg.session_list),
+        ping_misses: HashMap::new(),
         cfg,
         gate,
         counters: Arc::default(),
@@ -441,6 +462,8 @@ async fn run(
         relay.held_info.clear();
         relay.peers.clear();
         relay.reserved_since.clear();
+        relay.list.all_disconnected();
+        relay.ping_misses.clear();
         relay.bound_tcp = None;
         relay.bound_quic = None;
         relay.families = (false, false);
@@ -602,6 +625,23 @@ impl Relay {
                         request_response::Config::default()
                             .with_request_timeout(Duration::from_secs(proto::INFO_TIMEOUT_SECS)),
                     ),
+                    sessions: request_response::cbor::Behaviour::new(
+                        [(
+                            StreamProtocol::new(RELAY_SESSIONS_PROTOCOL),
+                            ProtocolSupport::Inbound,
+                        )],
+                        // A held request is a stream waiting for its answer.
+                        request_response::Config::default()
+                            .with_request_timeout(Duration::from_secs(SESSIONS_TIMEOUT_SECS)),
+                    ),
+                    publish: request_response::cbor::Behaviour::new(
+                        [(
+                            StreamProtocol::new(RELAY_PUBLISH_PROTOCOL),
+                            ProtocolSupport::Inbound,
+                        )],
+                        request_response::Config::default()
+                            .with_request_timeout(Duration::from_secs(20)),
+                    ),
                     identify: identify::Behaviour::new(
                         identify::Config::new("/reamesh-relay/1".into(), key.public())
                             .with_agent_version(format!(
@@ -762,6 +802,7 @@ impl Relay {
                         self.farewell(swarm).await;
                         return Outcome::Rebuild;
                     }
+                    self.answer_list(swarm);
                 }
                 _ = reload.tick() => {
                     if config_stamp(&self.opts.data_dir) != self.cfg_stamp && self.reload(swarm) {
@@ -1040,8 +1081,10 @@ impl Relay {
         let revoked = self.gate.lock().unwrap().auth.revoke(&active);
         for peer in &revoked {
             self.reserved_since.remove(peer);
+            self.list.withdraw(peer);
             let _ = swarm.disconnect_peer_id(*peer);
         }
+        self.recheck_list(swarm);
         let command = self.cfg.alerts.command.clone();
         let expired: Vec<(String, jiff::civil::Date)> = self
             .cfg
@@ -1249,8 +1292,11 @@ impl Relay {
         };
         for peer in &revoked {
             self.reserved_since.remove(peer);
+            self.list.withdraw(peer);
             let _ = swarm.disconnect_peer_id(*peer);
         }
+        self.list.set_enabled(self.cfg.session_list);
+        self.recheck_list(swarm);
         let mut added: Vec<&String> = labels.difference(&old_labels).collect();
         let mut removed: Vec<&String> = old_labels.difference(&labels).collect();
         added.sort();
@@ -1357,6 +1403,11 @@ impl Relay {
                 } else if let Some(e) = self.peers.get_mut(&peer_id) {
                     e.0 = n;
                 }
+                if n == 0 {
+                    // Its reservation, and with it any list entry, ends here.
+                    self.list.withdraw(&peer_id);
+                    self.ping_misses.remove(&peer_id);
+                }
                 let mut gate = self.gate.lock().unwrap();
                 // The reservation dies with the last connection.
                 let was_host = n == 0 && gate.auth.reserved.contains(&peer_id);
@@ -1380,6 +1431,65 @@ impl Relay {
             })) => {
                 let response = self.authenticate(&peer, &request);
                 let _ = swarm.behaviour_mut().auth.send_response(channel, response);
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Sessions(request_response::Event::Message {
+                peer,
+                connection_id,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+            })) => {
+                let keys = self.cfg.keys();
+                let banned = self.gate.lock().unwrap().auth.banned.clone();
+                let who = access(&self.cfg, &keys, &banned, &self.peer_id, &peer, &request.proof);
+                let answers = self.list.query(
+                    peer,
+                    connection_id,
+                    who,
+                    &request.proof,
+                    request.rev,
+                    channel,
+                    Instant::now(),
+                );
+                for (channel, response) in answers {
+                    let _ = swarm.behaviour_mut().sessions.send_response(channel, response);
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Publish(request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            })) => {
+                let keys = self.cfg.keys();
+                let (banned, reserved) = {
+                    let gate = self.gate.lock().unwrap();
+                    (gate.auth.banned.clone(), gate.auth.reserved.contains(&peer))
+                };
+                let who = access(&self.cfg, &keys, &banned, &self.peer_id, &peer, &request.proof);
+                let response =
+                    self.list
+                        .publish(peer, who, &request.proof, request.envelope, reserved);
+                if let Some(reason) = response.reason.as_deref() {
+                    debug!(reason, "publish refused");
+                }
+                let _ = swarm.behaviour_mut().publish.send_response(channel, response);
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { peer, result, .. })) => {
+                if result.is_ok() || !self.list.is_listed(&peer) {
+                    self.ping_misses.remove(&peer);
+                } else {
+                    let misses = self.ping_misses.entry(peer).or_default();
+                    *misses += 1;
+                    if *misses >= LISTED_PING_MISSES {
+                        self.ping_misses.remove(&peer);
+                        self.list.withdraw(&peer);
+                        let _ = swarm.disconnect_peer_id(peer);
+                    }
+                }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Info(request_response::Event::Message {
                 peer,
@@ -1474,6 +1584,29 @@ impl Relay {
         response
     }
 
+    /// Keys, bans or the date changed: whoever relies on them finds out now.
+    fn recheck_list(&mut self, swarm: &mut Swarm<Behaviour>) {
+        let keys = self.cfg.keys();
+        let banned = self.gate.lock().unwrap().auth.banned.clone();
+        let relay_id = self.peer_id;
+        let cfg = &self.cfg;
+        let refused = self
+            .list
+            .recheck(|peer, proof| access(cfg, &keys, &banned, &relay_id, peer, proof));
+        for (channel, response) in refused {
+            let _ = swarm.behaviour_mut().sessions.send_response(channel, response);
+        }
+    }
+
+    /// This tick's answers to viewers: the list changed, or their wait is over.
+    fn answer_list(&mut self, swarm: &mut Swarm<Behaviour>) {
+        self.list
+            .set_budget_used(self.ledger.exhausted(self.cfg.budget_bytes()));
+        for (channel, response) in self.list.due(Instant::now(), ResponseChannel::is_open) {
+            let _ = swarm.behaviour_mut().sessions.send_response(channel, response);
+        }
+    }
+
     fn on_relay_event(&mut self, swarm: &mut Swarm<Behaviour>, e: relay::Event) {
         let gate = self.gate.clone();
         let mut gate = gate.lock().unwrap();
@@ -1502,6 +1635,7 @@ impl Relay {
                 let name = host_name(&gate.auth, &src_peer_id);
                 if gate.auth.reserved.remove(&src_peer_id) {
                     self.reserved_since.remove(&src_peer_id);
+                    self.list.withdraw(&src_peer_id);
                     info!(
                         key = gate.auth.label(&src_peer_id).unwrap_or_default(),
                         "host {name} disconnected"
@@ -1786,6 +1920,7 @@ impl Relay {
                         .unwrap_or_default(),
                     since: self.reserved_since.get(&p).map_or(unix_now(), |t| unix(*t)),
                     guests: gate.circuits.iter().filter(|c| c.dst == p).count(),
+                    listed: self.list.is_listed(&p),
                     label,
                     peer_id: p.to_string(),
                 })
@@ -1809,6 +1944,9 @@ impl Relay {
                 .collect(),
             notice: self.active_notice().map(|n| term::notice_line(&n)),
             update: self.update_line(),
+            session_list: self.list.enabled(),
+            listed: self.list.len(),
+            watching: self.list.watching(),
         };
         drop(gate);
         if let Err(e) = status.write(&self.opts.data_dir) {
@@ -1831,6 +1969,34 @@ fn guests_over_budget(gate: &Gate, used_up: &HashSet<&str>, now: Instant) -> Vec
             used_up.contains(label).then(|| (c.src, label.to_owned()))
         })
         .collect()
+}
+
+/// What a proof sent with a list request is worth right now. Checked on every
+/// request, again when the keys change and again when a day begins, so a key
+/// that was removed or ran out stops working at once, without any login to end.
+fn access<'a>(
+    cfg: &Config,
+    keys: &'a [(String, proto::AccessKey)],
+    banned: &HashSet<PeerId>,
+    relay: &PeerId,
+    peer: &PeerId,
+    proof: &[u8],
+) -> Access<'a> {
+    if banned.contains(peer) {
+        return Access::Banned;
+    }
+    let keys = keys.iter().map(|(l, k)| (l.as_str(), k));
+    match proto::verify_proof(keys, relay, peer, proof) {
+        Some(label)
+            if cfg
+                .entry(label)
+                .is_some_and(|k| k.is_expired(config::local_today())) =>
+        {
+            Access::Expired
+        }
+        Some(label) => Access::Key(label),
+        None => Access::BadKey,
+    }
 }
 
 fn connections(n: usize) -> String {
@@ -1916,6 +2082,11 @@ fn config_changes(old: &Config, new: &Config) -> Vec<String> {
         "alert_budget_percent",
         old.alerts.budget_percent.to_string(),
         new.alerts.budget_percent.to_string(),
+    );
+    diff(
+        "session_list",
+        old.session_list.to_string(),
+        new.session_list.to_string(),
     );
     let (a, b) = (&old.limits, &new.limits);
     diff(

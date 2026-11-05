@@ -32,6 +32,7 @@ const HELP: &str = concat!(
     "  \x1b[1mkey list\x1b[0m               List the keys and when each was last used\n",
     "  \x1b[1mkey expires\x1b[0m <name> <when>  Change a key's last day (a date, 30d, never)\n",
     "  \x1b[1mkey remove\x1b[0m <name>      Delete a key; hosts using it lose access within a few seconds\n",
+    "  \x1b[1mlist\x1b[0m [on|off]          Whether everyone with a key sees the sessions hosted here\n",
     "  \x1b[1mnotice\x1b[0m [set|clear]     Show, set or clear the announcement hosts see in ReaMesh\n",
     "  \x1b[1malert test\x1b[0m             Try the alert command from config.toml\n",
     "  \x1b[1mupdate\x1b[0m                 Get the newest version now\n\n",
@@ -112,6 +113,11 @@ enum Command {
         #[command(subcommand)]
         command: KeyCommand,
     },
+    /// Whether everyone with a key sees the sessions hosted here.
+    List {
+        #[arg(value_enum)]
+        state: Option<ListState>,
+    },
     /// Show, set or clear the announcement hosts see in ReaMesh.
     Notice {
         #[command(subcommand)]
@@ -125,6 +131,12 @@ enum Command {
     /// Get the newest version now; a running relay restarts into it once nothing
     /// is being relayed.
     Update,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ListState {
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -180,6 +192,7 @@ fn main() -> ExitCode {
             code(&dir, name.as_deref(), copy).map(|()| ExitCode::SUCCESS)
         }
         Command::Key { command } => key(&dir, command).map(|()| ExitCode::SUCCESS),
+        Command::List { state } => list(&dir, state).map(|()| ExitCode::SUCCESS),
         Command::Notice { command } => notice(&dir, command).map(|()| ExitCode::SUCCESS),
         Command::Alert {
             command: AlertCommand::Test,
@@ -424,6 +437,37 @@ fn key(dir: &Path, command: KeyCommand) -> anyhow::Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Sets `session_list`; a running relay picks it up within a few seconds.
+fn list(dir: &Path, state: Option<ListState>) -> anyhow::Result<()> {
+    config::init(dir)?;
+    let s = Style::stdout();
+    let on = match state {
+        Some(state) => {
+            config::set_session_list(dir, state == ListState::On)?;
+            state == ListState::On
+        }
+        None => Config::load(dir)?.session_list,
+    };
+    let (head, tail) = if on {
+        (
+            "Session list on.",
+            "Everyone with a key sees the sessions hosted here. Hosts choose per session.",
+        )
+    } else {
+        (
+            "Session list off.",
+            "This relay keeps no list and sees no session names.",
+        )
+    };
+    let head = if state.is_some() {
+        s.done(head)
+    } else {
+        s.strong(head)
+    };
+    anstream::println!("{head} {tail}");
     Ok(())
 }
 

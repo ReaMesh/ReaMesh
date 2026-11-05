@@ -47,6 +47,7 @@ pub struct Config {
     pub dns_name: Option<String>,
     pub mode: Mode,
     pub log_addresses: bool,
+    pub session_list: bool,
     pub banned_peers: Vec<String>,
     /// Who runs this relay. Optional, and ReaMesh only shows them when
     /// something is wrong with the relay.
@@ -205,6 +206,7 @@ impl Default for Config {
             dns_name: None,
             mode: Mode::Full,
             log_addresses: false,
+            session_list: false,
             banned_peers: Vec::new(),
             name: None,
             contact: None,
@@ -748,6 +750,25 @@ pub fn remove_key(dir: &Path, label: &str) -> anyhow::Result<()> {
     })
 }
 
+/// `reamesh-relay list on|off`. A config from before the setting gets it with
+/// its explanation, like the template has it.
+pub fn set_session_list(dir: &Path, on: bool) -> anyhow::Result<()> {
+    edit_config(dir, |doc| {
+        let new = doc.get("session_list").is_none();
+        doc["session_list"] = toml_edit::value(on);
+        if new
+            && let Some(mut key) = doc.as_table_mut().key_mut("session_list")
+        {
+            key.leaf_decor_mut().set_prefix(
+                "\n# Everyone with a key sees the sessions hosted through this relay, and can join\n\
+                 # open ones with one click. false: the relay keeps no list and sees no session\n\
+                 # names. Switch it with `reamesh-relay list on|off`.\n",
+            );
+        }
+        Ok(())
+    })
+}
+
 fn edit_config(
     dir: &Path,
     f: impl FnOnce(&mut toml_edit::DocumentMut) -> anyhow::Result<()>,
@@ -807,6 +828,11 @@ mode = "full"
 
 # Client IP addresses are never logged unless this is true.
 log_addresses = false
+
+# Everyone with a key sees the sessions hosted through this relay, and can join
+# open ones with one click. false: the relay keeps no list and sees no session
+# names. Switch it with `reamesh-relay list on|off`.
+session_list = false
 
 # Peer IDs that may not use this relay.
 banned_peers = []
@@ -909,6 +935,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Lena"]
         );
+    }
+
+    #[test]
+    fn session_list_is_off_until_switched_and_keeps_the_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path()).unwrap();
+        assert!(!Config::load(dir.path()).unwrap().session_list);
+        set_session_list(dir.path(), true).unwrap();
+        assert!(Config::load(dir.path()).unwrap().session_list);
+        let text = fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(text.contains("session_list = true"));
+        assert!(text.contains("# Access keys."));
+        set_session_list(dir.path(), false).unwrap();
+        assert!(!Config::load(dir.path()).unwrap().session_list);
+    }
+
+    #[test]
+    fn a_config_from_before_the_list_loads_and_can_turn_it_on() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path()).unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        // The setting and its comment as an older relay wrote the file.
+        let old: String = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| {
+                !l.starts_with("session_list")
+                    && !l.starts_with("# Everyone with a key")
+                    && !l.starts_with("# open ones with")
+                    && !l.starts_with("# names. Switch it")
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        fs::write(&path, old).unwrap();
+        assert!(!Config::load(dir.path()).unwrap().session_list);
+        set_session_list(dir.path(), true).unwrap();
+        let cfg = Config::load(dir.path()).unwrap();
+        assert!(cfg.session_list);
+        assert_eq!(cfg.limits, Limits::default());
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# Everyone with a key sees"));
+        assert!(text.find("session_list").unwrap() < text.find("[limits]").unwrap());
     }
 
     #[test]

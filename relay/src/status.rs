@@ -45,6 +45,14 @@ pub struct Status {
     pub inbound_tcp: Inbound,
     #[serde(default)]
     pub inbound_quic: Inbound,
+    /// The session list: whether it is on, how many sessions are on it, how
+    /// many viewers wait for changes. Counts only, never a session name.
+    #[serde(default)]
+    pub session_list: bool,
+    #[serde(default)]
+    pub listed: usize,
+    #[serde(default)]
+    pub watching: usize,
     /// This month's traffic per key.
     #[serde(default)]
     pub keys: Vec<KeyUsage>,
@@ -92,6 +100,9 @@ pub struct HostStatus {
     pub since: u64,
     /// Relayed connections to it right now.
     pub guests: usize,
+    /// Whether it has an entry on the session list.
+    #[serde(default)]
+    pub listed: bool,
 }
 
 /// A status older than this means the relay is gone (it writes every 5s).
@@ -182,6 +193,7 @@ impl Status {
             out += &s.field("budget", &format!("{line}\n"));
         }
         out += &s.field("inbound", &format!("{}\n", self.inbound_line(now, s)));
+        out += &s.field("list", &format!("{}\n", self.list_line()));
         if let Some(notice) = &self.notice {
             out += &s.field("notice", &format!("{notice}\n"));
         }
@@ -209,15 +221,24 @@ impl Status {
                     1 => "1 guest".to_owned(),
                     n => format!("{n} guests"),
                 };
-                vec![
+                let mut row = vec![
                     name,
                     h.fingerprint.clone(),
                     term::duration(Duration::from_secs(now.saturating_sub(h.since))),
                     guests,
-                ]
+                ];
+                if self.session_list {
+                    row.push(if h.listed { "yes" } else { "no" }.to_owned());
+                }
+                row
             })
             .collect();
-        out + &term::table(s, &["HOST", "KEY", "ONLINE", "RELAYED"], &rows) + &self.keys_table(s)
+        let head: &[&str] = if self.session_list {
+            &["HOST", "KEY", "ONLINE", "RELAYED", "LISTED"]
+        } else {
+            &["HOST", "KEY", "ONLINE", "RELAYED"]
+        };
+        out + &term::table(s, head, &rows) + &self.keys_table(s)
     }
 
     /// Who used how much of this month's traffic: only once there is
@@ -292,6 +313,25 @@ impl Status {
         format!("TCP {}   {quic}", when(self.inbound_tcp))
     }
 
+    /// "on, 2 sessions, 3 watching", or "off".
+    fn list_line(&self) -> String {
+        if !self.session_list {
+            return "off".to_owned();
+        }
+        let plural = |n: usize, one: &str| {
+            if n == 1 {
+                format!("1 {one}")
+            } else {
+                format!("{n} {one}s")
+            }
+        };
+        let mut line = format!("on, {}", plural(self.listed, "session"));
+        if self.watching > 0 {
+            line += &format!(", {} watching", self.watching);
+        }
+        line
+    }
+
     pub fn quic_suspect(&self) -> bool {
         self.inbound_tcp.count >= QUIC_SUSPECT_AFTER && self.inbound_quic.count == 0
     }
@@ -308,6 +348,7 @@ mod tests {
             fingerprint: "ec24d153".into(),
             since: 1000,
             guests,
+            listed: false,
         }
     }
 
@@ -337,6 +378,9 @@ mod tests {
             keys: Vec::new(),
             notice: None,
             update: None,
+            session_list: false,
+            listed: 0,
+            watching: 0,
         }
     }
 
@@ -409,6 +453,26 @@ mod tests {
             ..st.clone()
         };
         assert!(!tcp_only.quic_suspect());
+    }
+
+    #[test]
+    fn the_list_shows_as_counts_and_a_column_only_when_on() {
+        let mut st = status();
+        st.hosts = vec![host("lena", "x", 1)];
+        let off = st.render(9000, Style::plain());
+        assert!(off.contains("list      off\n"));
+        assert!(!off.contains("LISTED"));
+        st.session_list = true;
+        st.listed = 2;
+        st.watching = 3;
+        st.hosts[0].listed = true;
+        let on = st.render(9000, Style::plain());
+        assert!(on.contains("list      on, 2 sessions, 3 watching\n"));
+        assert!(on.contains("LISTED"));
+        assert!(on.contains("1 guest   yes"));
+        st.listed = 1;
+        st.watching = 0;
+        assert!(st.render(9000, Style::plain()).contains("list      on, 1 session\n"));
     }
 
     #[test]

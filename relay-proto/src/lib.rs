@@ -4,7 +4,8 @@
 //!
 //! Its own crate so the core (`rust/`) and the relay server (`relay/`) build
 //! it from one source and can't drift apart; it needs only libp2p, serde,
-//! serde_bytes and blake3. `app/src/lib/relay.ts` mirrors the parser.
+//! serde_bytes, serde_json and blake3. `app/src/lib/relay.ts` mirrors the
+//! parser. The optional session list is in [`sessions`].
 //!
 //! Relay code:
 //! `reamesh://relay/<relay peer id>?a=<ip>,<ip>&d=<dns name>&t=<tcp>&q=<quic>&k=<key>&n=<label>`
@@ -29,6 +30,8 @@ use std::net::IpAddr;
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
+
+pub mod sessions;
 
 pub const RELAY_CODE_PREFIX: &str = "reamesh://relay/";
 pub const RELAY_AUTH_PROTOCOL: &str = "/reamesh/relay-auth/1";
