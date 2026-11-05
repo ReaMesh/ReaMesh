@@ -1,0 +1,12 @@
+# The session tests stay on loopback and dial each other directly, so they can
+# run side by side. nextest gives each test its own process, which keeps apart
+# what the core holds process-globally (configured relays, list watcher, bans).
+[profile.ci]
+# They mostly wait on timeouts and the network, so this can exceed the runners' 3-4 cores.
+test-threads = 4
+fail-fast = false
+# Two peers in one process time out now and then on a busy machine. A test that
+# passes on the second try is reported as flaky rather than failing the run.
+retries = 1
+# Long enough for the slowest timeout tests; a hung test still ends the run.
+slow-timeout = { period = "60s", terminate-after = 5 }

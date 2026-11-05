@@ -1,0 +1,61 @@
+name: Restore Cargo caches
+description: >
+  Restores Cargo's downloads and build output, cached apart. Pair it with
+  cargo-cache-save at the end of the job, which saves them on main only.
+inputs:
+  registry-prefix:
+    description: Key of the downloads cache, up to the lockfile hash.
+    required: true
+  target-prefix:
+    description: Key of the build output cache, up to the rustc commit.
+    required: true
+  lockfile-hash:
+    description: Hash of the lockfiles this job builds from.
+    required: true
+  target-path:
+    description: What to cache as build output, one path per line.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Rust toolchain
+      id: rust
+      shell: bash
+      run: |
+        echo "commit=$(rustc -vV | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
+    # The paths are also part of the entry's identity: release.yml restores these
+    # downloads by the same key, and has to list the same three.
+    - id: registry
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: ${{ inputs.registry-prefix }}-${{ inputs.lockfile-hash }}
+        restore-keys: ${{ inputs.registry-prefix }}-
+    - id: target
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ inputs.target-path }}
+        key: ${{ inputs.target-prefix }}-${{ steps.rust.outputs.commit }}-${{ inputs.lockfile-hash }}
+        restore-keys: ${{ inputs.target-prefix }}-${{ steps.rust.outputs.commit }}-
+    # For cargo-cache-save, so a job only says this once.
+    - name: Remember the keys
+      shell: bash
+      env:
+        REGISTRY_KEY: ${{ steps.registry.outputs.cache-primary-key }}
+        REGISTRY_HIT: ${{ steps.registry.outputs.cache-hit }}
+        TARGET_KEY: ${{ steps.target.outputs.cache-primary-key }}
+        TARGET_HIT: ${{ steps.target.outputs.cache-hit }}
+        TARGET_PATH: ${{ inputs.target-path }}
+      run: |
+        {
+          echo "CARGO_CACHE_REGISTRY_KEY=$REGISTRY_KEY"
+          echo "CARGO_CACHE_REGISTRY_HIT=$REGISTRY_HIT"
+          echo "CARGO_CACHE_TARGET_KEY=$TARGET_KEY"
+          echo "CARGO_CACHE_TARGET_HIT=$TARGET_HIT"
+          echo "CARGO_CACHE_TARGET_PATH<<CARGO_CACHE_EOF"
+          echo "$TARGET_PATH"
+          echo "CARGO_CACHE_EOF"
+        } >> "$GITHUB_ENV"

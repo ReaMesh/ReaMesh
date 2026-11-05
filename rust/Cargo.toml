@@ -56,3 +56,13 @@ libc = "0.2"
 # The session list's tests run against the real relay server.
 reamesh-relay = { path = "../relay" }
 tempfile = "3"
+
+# What CI tests with: dependencies as in a release (Argon2 needs the speed), this
+# crate unoptimized, because it is what recompiles on every run.
+[profile.ci-test]
+inherits = "release"
+opt-level = 0
+codegen-units = 256
+
+[profile.ci-test.package."*"]
+opt-level = 3

@@ -33,8 +33,10 @@ quietly. Read the comments around what you change, especially in
 | Live app | `cd app && bun run tauri dev` (needs REAPER with the extension) |
 | Two instances | `cd app && bun run dev:ab` (start two REAPER instances first) |
 
-The Rust tests must run serially; in parallel they fail spuriously. The app
-uses **bun**, never npm or pnpm.
+Under plain `cargo test` the Rust tests must run serially, because they share
+process-wide state. `cargo nextest run` gives each test its own process and runs
+them side by side, which is what CI does. The app uses **bun**, never npm or
+pnpm.
 
 ## Reporting bugs
 

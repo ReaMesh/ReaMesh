@@ -1,0 +1,21 @@
+name: Save Cargo caches
+description: >
+  Saves what cargo-cache-restore looked up, on main only. Every branch can read
+  main's entries, but an entry saved on a branch serves that branch alone, while
+  it counts against the repository's cache limit like any other.
+runs:
+  using: composite
+  steps:
+    - if: github.ref == 'refs/heads/main' && env.CARGO_CACHE_REGISTRY_HIT != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: ${{ env.CARGO_CACHE_REGISTRY_KEY }}
+    - if: github.ref == 'refs/heads/main' && env.CARGO_CACHE_TARGET_HIT != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ env.CARGO_CACHE_TARGET_PATH }}
+        key: ${{ env.CARGO_CACHE_TARGET_KEY }}

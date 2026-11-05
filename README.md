@@ -192,7 +192,8 @@ bun run build
 bun run test
 ```
 
-Rust session tests use real sockets and must run serially. There are also
+Rust session tests use real sockets and, under `cargo test`, must run serially
+(`cargo nextest run` runs them side by side). There are also
 [C ABI smoke tests](tools/ffi_smoke.cpp) and
 [state-chunk tests](tools/chunk_test.cpp).
 
