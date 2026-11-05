@@ -58,10 +58,11 @@ reamesh-relay = { path = "../relay" }
 tempfile = "3"
 
 # What CI tests with: dependencies as in a release (Argon2 needs the speed), this
-# crate unoptimized, because it is what recompiles on every run.
+# crate barely optimized, because it is what recompiles on every run. Not level 0:
+# libp2p's generics are compiled here, and transfers get ten times slower.
 [profile.ci-test]
 inherits = "release"
-opt-level = 0
+opt-level = 1
 codegen-units = 256
 
 [profile.ci-test.package."*"]

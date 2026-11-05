@@ -165,7 +165,7 @@ jobs:
         run: tools/check-intel.sh --quick
 
   # The Rust tests of each platform, natively (the Intel runner covers x86_64).
-  # With the core itself unoptimized (profile ci-test), since it is what
+  # With the core itself barely optimized (profile ci-test), since it is what
   # recompiles every run, and side by side (rust/.config/nextest.toml). nextest
   # comes straight from its release, pinned by hash.
   tests:
@@ -207,9 +207,14 @@ jobs:
           curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/nextest.tar.gz" \
             "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/$archive"
           cd "$RUNNER_TEMP"
-          echo "${{ matrix.nextest-sha256 }}  nextest.tar.gz" | shasum -a 256 -c -
-          # From stdin: tar would take the drive letter of a Windows path for a host.
-          tar xzf - -C "${CARGO_HOME:-$HOME/.cargo}/bin" < nextest.tar.gz
+          # Git Bash on Windows has only sha256sum, older macOS only shasum.
+          if command -v sha256sum >/dev/null; then sum=sha256sum; else sum="shasum -a 256"; fi
+          echo "${{ matrix.nextest-sha256 }}  nextest.tar.gz" | $sum -c -
+          # Its own folder: not every runner image has ~/.cargo/bin. Relative, since
+          # tar would take the drive letter of a Windows path for a host.
+          mkdir nextest-bin
+          tar xzf nextest.tar.gz -C nextest-bin
+          echo "$RUNNER_TEMP/nextest-bin" >> "$GITHUB_PATH"
       - name: Rust tests
         run: cargo nextest run --cargo-profile ci-test --profile ci
         working-directory: rust

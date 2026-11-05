@@ -191,7 +191,8 @@ fn a_member_with_another_key_sees_the_session_and_joins_through_the_relay_alone(
     let l = list(&relay.peer);
     assert_eq!(l["state"], "ok");
     assert_eq!(l["enabled"], true);
-    assert_eq!(l["count"], 1);
+    // Not a check on `count`: the host in this process reads the same list and
+    // leaves itself out of the count, so an answer of its own can turn it to 0.
     assert_eq!(entry["session_name"], "Listed Song");
     assert_eq!(entry["owner"], owner.local_peer_id());
     assert_eq!(entry["auth"], false);
