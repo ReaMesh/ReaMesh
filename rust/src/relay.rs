@@ -44,6 +44,7 @@ use reamesh_relay_proto::{
     INFO_TIMEOUT_SECS, RELAY_AUTH_PROTOCOL, RELAY_INFO_PROTOCOL, RELAY_LABEL_MAX, RELAY_MAX_IPS,
     RELAY_REQUIRED_LEVEL, valid_dns_name,
 };
+use reamesh_relay_proto::sessions::SessionsRequest;
 
 /// Most relays a user can configure. The host reserves on all of them and the
 /// invite link names all of them.
@@ -252,6 +253,12 @@ pub fn meta_with_notices(meta: &str, relays: &[RelayCode]) -> String {
     }
     v["relay_notices"] = JsonValue::Array(notices);
     v.to_string()
+
+}
+
+/// Something in the `relay` message changed elsewhere (the session lists).
+pub(crate) fn bump_generation() {
+    GEN.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn set_status(v: JsonValue) {
@@ -276,6 +283,7 @@ pub fn ctl_message() -> (u64, String) {
         "status": STATUS.lock().unwrap().clone(),
         "test": TEST_RESULT.lock().unwrap().clone(),
         "info": JsonValue::Object(INFO.lock().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        "lists": crate::relay_list::lists_json(),
     });
     (generation, msg.to_string())
 }
@@ -286,6 +294,7 @@ pub fn ctl_message() -> (u64, String) {
 struct TestBehaviour {
     auth: AuthBehaviour,
     info: InfoBehaviour,
+    sessions: crate::relay_list::SessionsBehaviour,
 }
 
 fn test_swarm() -> anyhow::Result<libp2p::Swarm<TestBehaviour>> {
@@ -295,7 +304,11 @@ fn test_swarm() -> anyhow::Result<libp2p::Swarm<TestBehaviour>> {
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
         .with_quic()
         .with_dns_config(dns_cfg, dns_opts)
-        .with_behaviour(|_| TestBehaviour { auth: auth_behaviour(), info: info_behaviour() })
+        .with_behaviour(|_| TestBehaviour {
+            auth: auth_behaviour(),
+            info: info_behaviour(),
+            sessions: crate::relay_list::sessions_behaviour(),
+        })
         .map_err(|e| anyhow::anyhow!("behaviour: {e}"))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(5)))
         .build())
@@ -307,7 +320,8 @@ fn test_swarm() -> anyhow::Result<libp2p::Swarm<TestBehaviour>> {
 /// host's own. Outcomes: `ok` (reachable, key accepted), `bad_key`,
 /// `banned`, `expired`, `full`, `not_relay` (answers, but not the auth
 /// protocol), `unreachable`, `timeout`, `invalid` (the code doesn't parse).
-/// `rtt` is how long the auth round trip took, in ms.
+/// `rtt` is how long the auth round trip took, in ms; `list` says whether the
+/// relay keeps a session list, null when that stayed unknown.
 pub async fn run_test(code: String, id: String) {
     let parsed = parse_relay_code(&code);
     let peer = parsed.as_ref().map(|c| c.addr.peer.to_string()).unwrap_or_default();
@@ -321,7 +335,7 @@ pub async fn run_test(code: String, id: String) {
         },
     };
     *TEST_RESULT.lock().unwrap() =
-        json!({ "id": id, "peer": peer, "outcome": probe.outcome, "label": probe.label, "rtt": probe.rtt });
+        json!({ "id": id, "peer": peer, "outcome": probe.outcome, "label": probe.label, "rtt": probe.rtt, "list": probe.list });
     GEN.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -351,18 +365,19 @@ pub struct Probe {
     pub outcome: &'static str,
     pub label: String,
     pub rtt: u64,
+    /// Whether it keeps a session list, if it got to say.
+    pub list: Option<bool>,
 }
 
 impl Probe {
     fn failed(outcome: &'static str) -> Self {
-        Self { outcome, label: String::new(), rtt: 0 }
+        Self { outcome, label: String::new(), rtt: 0, list: None }
     }
 }
 
 /// The test itself (see `run_test`), unbounded in time.
-pub async fn test_relay(code: &RelayCode) -> (&'static str, String) {
-    let p = probe_relay(code, true).await;
-    (p.outcome, p.label)
+pub async fn test_relay(code: &RelayCode) -> Probe {
+    probe_relay(code, true).await
 }
 
 /// Connects, proves the key (with `auth`: over the auth exchange too) and files
@@ -380,7 +395,9 @@ async fn probe_relay(code: &RelayCode, auth: bool) -> Probe {
     let proof = auth_proof(&code.key, &relay, &me).to_vec();
     let mut connected = None;
     let mut sent_auth = Instant::now();
-    let mut result = Probe { outcome: "ok", label: String::new(), rtt: 0 };
+    let mut result = Probe { outcome: "ok", label: String::new(), rtt: 0, list: None };
+    // Both answers count, and the last one to arrive ends the probe.
+    let (mut info_done, mut list_done) = (false, false);
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } if peer_id == relay => {
@@ -390,6 +407,8 @@ async fn probe_relay(code: &RelayCode, auth: bool) -> Probe {
                     sent_auth = Instant::now();
                     swarm.behaviour_mut().auth.send_request(&relay, AuthRequest { proof: proof.clone() });
                 } else {
+                    // Only the test wants to know about the list.
+                    list_done = true;
                     swarm.behaviour_mut().info.send_request(&relay, info);
                 }
             }
@@ -412,6 +431,9 @@ async fn probe_relay(code: &RelayCode, auth: bool) -> Probe {
                 }
                 let info = InfoRequest { proof: proof.clone(), rev: 0 };
                 swarm.behaviour_mut().info.send_request(&relay, info);
+                // `rev` 0 is answered at once.
+                let list = SessionsRequest { proof: proof.clone(), rev: 0 };
+                swarm.behaviour_mut().sessions.send_request(&relay, list);
             }
             SwarmEvent::Behaviour(TestBehaviourEvent::Auth(
                 request_response::Event::OutboundFailure { error, .. },
@@ -430,7 +452,10 @@ async fn probe_relay(code: &RelayCode, auth: bool) -> Probe {
                 let new = r.ok.then(|| r.updated_addr(&code.addr, connected.as_ref(), crate::loopback_only())).flatten();
                 let new_code = new.map(|addr| RelayCode { addr, ..code.clone() }.encode());
                 set_info(&relay, info_json(&r, new_code));
-                return result;
+                info_done = true;
+                if list_done {
+                    return result;
+                }
             }
             SwarmEvent::Behaviour(TestBehaviourEvent::Info(
                 request_response::Event::OutboundFailure { error, .. },
@@ -438,7 +463,34 @@ async fn probe_relay(code: &RelayCode, auth: bool) -> Probe {
                 if matches!(error, request_response::OutboundFailure::UnsupportedProtocols) {
                     set_info_outdated(&relay);
                 }
-                return result;
+                info_done = true;
+                if list_done {
+                    return result;
+                }
+            }
+            SwarmEvent::Behaviour(TestBehaviourEvent::Sessions(
+                request_response::Event::Message {
+                    message: request_response::Message::Response { response, .. },
+                    ..
+                },
+            )) => {
+                result.list = response.ok.then_some(response.enabled);
+                list_done = true;
+                if info_done {
+                    return result;
+                }
+            }
+            SwarmEvent::Behaviour(TestBehaviourEvent::Sessions(
+                request_response::Event::OutboundFailure { error, .. },
+            )) => {
+                // A relay from before the list simply has none.
+                if matches!(error, request_response::OutboundFailure::UnsupportedProtocols) {
+                    result.list = Some(false);
+                }
+                list_done = true;
+                if info_done {
+                    return result;
+                }
             }
             _ => {}
         }

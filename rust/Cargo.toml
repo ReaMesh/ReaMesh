@@ -51,3 +51,8 @@ reamesh-relay-proto = { path = "../relay-proto" }
 # calls kernel32 directly). Already in the tree through libp2p.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# The session list's tests run against the real relay server.
+reamesh-relay = { path = "../relay" }
+tempfile = "3"

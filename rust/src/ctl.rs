@@ -8,15 +8,17 @@
 //! out through `reamesh_ctl_publish`, which this server broadcasts to every
 //! connected app. Nothing here ever touches REAPER or the session directly.
 //!
-//! Three commands are handled server-side, because they need no session handle
+//! A few commands are handled server-side, because they need no session handle
 //! and must work before one exists: `set_profile` (display name + color for
 //! presence beacons), `set_relays` (`{codes:[relay code…]}`, taken by the next
-//! hosting run) and `relay_test` (`{code,id}`: dial the relay and run its auth
+//! hosting run), `relay_test` (`{code,id}`: dial the relay and run its auth
 //! exchange), `relay_info` (ask the relays how they stand, at most once a
-//! minute). The server also sends `{"type":"relay", status, test, info}` whenever
-//! the hosting run's relay status, a test result or what a relay said changes,
-//! and to every new
-//! client.
+//! minute), `relay_watch` (`{id,on}`: a lease on reading the relays' session
+//! lists, renewed while a screen shows them) and `relay_listing`
+//! (`{hidden:[relay peer id…]}`: the relays whose lists this install's sessions
+//! stay off). The server also sends `{"type":"relay", status, test, info, lists}`
+//! whenever the hosting run's relay status, a test result, what a relay said or
+//! a session list changes, and to every new client.
 //!
 //! Multiple REAPER instances on one machine (the documented dev setup) each
 //! bind the first free port in `CTL_PORTS`; the app scans the whole range and
@@ -542,6 +544,26 @@ fn handle_inbound(shared: &CtlShared, msg: String) {
             }
             Some("relay_info") => {
                 crate::relay::refresh_info();
+                return;
+            }
+            Some("relay_watch") => {
+                let on = v.get("on").and_then(|x| x.as_bool()).unwrap_or(false);
+                crate::relay_list::watch(&crate::limits::clip(get("id"), 32), on);
+                return;
+            }
+            Some("relay_listing") => {
+                let hidden: Vec<String> = v
+                    .get("hidden")
+                    .and_then(|c| c.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|c| c.as_str())
+                            .take(SET_RELAYS_MAX)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                crate::relay_list::set_listing(&hidden);
                 return;
             }
             _ => {}

@@ -33,8 +33,15 @@
 mod ctl;
 mod limits;
 mod relay;
+mod relay_list;
 
 pub use relay::set_relays;
+pub use relay_list::{set_listing as set_relay_listing, watch as relay_watch};
+
+/// The relays' session lists as the `relay` control message carries them.
+pub fn relay_lists_json() -> String {
+    relay_list::lists_json().to_string()
+}
 
 /// The hosting run's relays as `[{peer,label,host,state,reason}]` (`state`:
 /// connecting | reserved | retrying | refused), `[]` when not hosting.
@@ -51,13 +58,20 @@ pub fn relay_status_json() -> String {
 /// (see `relay::run_test` for the outcomes). Blocks; for tests.
 #[doc(hidden)]
 pub fn relay_test_blocking(code: &str) -> (String, String) {
+    let (outcome, label, _) = relay_test_list_blocking(code);
+    (outcome, label)
+}
+
+/// The same test, and whether the relay keeps a session list.
+#[doc(hidden)]
+pub fn relay_test_list_blocking(code: &str) -> (String, String, Option<bool>) {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     rt.block_on(async {
         match relay::parse_relay_code(code) {
-            None => ("invalid".to_string(), String::new()),
+            None => ("invalid".to_string(), String::new(), None),
             Some(c) => match tokio::time::timeout(Duration::from_secs(10), relay::test_relay(&c)).await {
-                Ok((o, l)) => (o.to_string(), l),
-                Err(_) => ("timeout".to_string(), String::new()),
+                Ok(p) => (p.outcome.to_string(), p.label, p.list),
+                Err(_) => ("timeout".to_string(), String::new(), None),
             },
         }
     })
@@ -1830,6 +1844,19 @@ fn encode_ticket(
     format!("{TICKET_PREFIX}{sid}?{}", params.join("&"))
 }
 
+/// The invite link for a checked list entry: the session's name and secret
+/// from the entry, and our own record of where the relay is. No other way to
+/// reach the host ends up in it.
+fn relay_only_ticket(entry: &reamesh_relay_proto::sessions::SessionEntry, addr: &relay::RelayAddr) -> Option<String> {
+    let info = parse_ticket(&entry.ticket)?;
+    if !valid_session_id(&entry.session_id) || info.peer.to_string() != entry.owner {
+        return None;
+    }
+    let extra = TicketExtra { auth: entry.auth, secret: info.secret, relays: vec![addr.clone()] };
+    let name = limits::clip(&entry.session_name, 128);
+    Some(encode_ticket(&entry.session_id, &name, &entry.owner, &[], 0, 0, &extra))
+}
+
 /// A link secret as the host mints it: 32 lowercase hex characters.
 fn valid_link_secret(v: &str) -> bool {
     v.len() == 32 && v.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -2233,7 +2260,7 @@ impl Reamesh {
         {
             let shared = shared.clone();
             runtime.spawn(async move {
-                let swarm = match build_swarm() {
+                let (swarm, identity) = match build_swarm() {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = init_tx.send(Err(e.to_string()));
@@ -2241,7 +2268,7 @@ impl Reamesh {
                     }
                 };
                 let _ = init_tx.send(Ok(swarm.local_peer_id().to_string()));
-                run_network(swarm, cfg, shared, cmd_rx).await;
+                run_network(swarm, identity, cfg, shared, cmd_rx).await;
                 let _ = done_tx.send(());
             });
         }
@@ -4308,6 +4335,9 @@ struct Behaviour {
     /// The host's `/reamesh/relay-auth/1` proof before it reserves.
     relay_auth: relay::AuthBehaviour,
     relay_info: relay::InfoBehaviour,
+    /// The relay's session list: asking whether it keeps one, and our entry.
+    relay_sessions: relay_list::SessionsBehaviour,
+    relay_publish: relay_list::PublishBehaviour,
 }
 
 /// Gossipsub protocol prefix for session topics. The lobby keeps the default
@@ -4327,12 +4357,15 @@ fn session_topic(session_id: &str) -> gossipsub::IdentTopic {
     gossipsub::IdentTopic::new(format!("reamesh/v2/session/{session_id}"))
 }
 
-fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
+/// The swarm, and the identity it runs under (a relay list entry is signed
+/// with it).
+fn build_swarm() -> anyhow::Result<(Swarm<Behaviour>, libp2p::identity::Keypair)> {
     // The per-install persisted keypair when the extension registered one
     // (lasting identity: remembered hosts, tickets that survive a restart), a
     // fresh ephemeral one otherwise (tests spin many peers per process).
+    let identity = identity_keypair();
     let (dns_cfg, dns_opts) = dns_config();
-    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity_keypair())
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity.clone())
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -4423,6 +4456,8 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
                 identify,
                 relay_auth: relay::auth_behaviour(),
                 relay_info: relay::info_behaviour(),
+                relay_sessions: relay_list::sessions_behaviour(),
+                relay_publish: relay_list::publish_behaviour(),
             })
         })
         .map_err(|e| anyhow::anyhow!("behaviour: {e}"))?
@@ -4437,7 +4472,7 @@ fn build_swarm() -> anyhow::Result<Swarm<Behaviour>> {
     let host = if loopback_only() { "127.0.0.1" } else { "0.0.0.0" };
     swarm.listen_on(format!("/ip4/{host}/tcp/0").parse()?)?;
     swarm.listen_on(format!("/ip4/{host}/udp/0/quic-v1").parse()?)?;
-    Ok(swarm)
+    Ok((swarm, identity))
 }
 
 /// One file in an in-progress download. Written to a hidden temp at chunk
@@ -5492,6 +5527,8 @@ struct RelaySlot {
     connected: Option<Multiaddr>,
     /// When the relay said it is going away.
     stopping_at: Option<Instant>,
+    /// This relay's session list, and our entry on it.
+    listing: relay_list::HostListing,
 }
 
 const RELAY_BACKOFF_MIN: Duration = Duration::from_secs(2);
@@ -5526,6 +5563,7 @@ impl RelaySlot {
             info_unsupported: false,
             connected: None,
             stopping_at: None,
+            listing: relay_list::HostListing::new(),
         }
     }
 
@@ -5658,6 +5696,75 @@ fn relay_tick(swarm: &mut Swarm<Behaviour>, slots: &mut [RelaySlot]) {
                 slot.fail("timeout");
             }
             _ => {}
+        }
+    }
+}
+
+/// Our session's entry for one relay, unsigned: what the host says about it.
+/// No file name (it doesn't belong on a list) and no direct address: the ticket
+/// names only this relay, so the host's IP stays hidden until someone joins.
+fn relay_entry(
+    announce: &JsonValue,
+    h: &Hosting,
+    relay_addr: &relay::RelayAddr,
+) -> Option<String> {
+    let get = |k: &str| announce.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let extra = TicketExtra { auth: h.auth, secret: h.open_secret.clone(), relays: vec![relay_addr.clone()] };
+    let owner = get("owner");
+    let entry = reamesh_relay_proto::sessions::SessionEntry {
+        v: reamesh_relay_proto::sessions::SessionEntry::VERSION,
+        relay: relay_addr.peer.to_string(),
+        session_id: h.session_id.clone(),
+        session_name: h.session_name.clone(),
+        owner_name: get("owner_name"),
+        owner_color: get("owner_color"),
+        auth: h.auth,
+        salt: h.salt.clone(),
+        files: announce.get("files").and_then(|x| x.as_u64()).unwrap_or(0),
+        bytes: announce.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0),
+        proto: PROTO,
+        ver: VERSION.to_string(),
+        ticket: encode_ticket(&h.session_id, &h.session_name, &owner, &[], 0, 0, &extra),
+        owner,
+        extra: Default::default(),
+    };
+    relay_list::entry_json(&entry)
+}
+
+/// The session list side of each reservation: ask whether the relay keeps a
+/// list (and keep asking, so `reamesh-relay list on` reaches a running session),
+/// and bring our entry in line with what the user chose.
+fn relay_list_tick(
+    swarm: &mut Swarm<Behaviour>,
+    identity: &libp2p::identity::Keypair,
+    slots: &mut [RelaySlot],
+    announce: Option<&JsonValue>,
+    hosting: Option<&Hosting>,
+) {
+    let me = *swarm.local_peer_id();
+    let now = Instant::now();
+    for slot in slots.iter_mut() {
+        if !matches!(slot.phase, RelayPhase::Reserved { .. }) {
+            slot.listing.reservation_lost();
+            continue;
+        }
+        if slot.listing.query_due(now) {
+            let proof = relay::auth_proof(&slot.code.key, &slot.peer(), &me).to_vec();
+            let req = reamesh_relay_proto::sessions::SessionsRequest { proof, rev: slot.listing.rev() };
+            let id = swarm.behaviour_mut().relay_sessions.send_request(&slot.peer(), req);
+            slot.listing.query_sent(id, now);
+        }
+        let entry = match (announce, hosting) {
+            (Some(a), Some(h)) => relay_entry(a, h, &slot.code.addr),
+            _ => None,
+        };
+        let Some(what) = slot.listing.publish_due(&slot.peer(), entry, now) else { continue };
+        match relay_list::publish_request(identity, &slot.code, &me, what.as_deref()) {
+            Some(req) => {
+                let id = swarm.behaviour_mut().relay_publish.send_request(&slot.peer(), req);
+                slot.listing.publish_sent(id, what);
+            }
+            None => slot.listing.publish_too_large(),
         }
     }
 }
@@ -6173,6 +6280,7 @@ fn ingest_announce(
 
 async fn run_network(
     mut swarm: Swarm<Behaviour>,
+    identity: libp2p::identity::Keypair,
     cfg: NetConfig,
     shared: Arc<Shared>,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>,
@@ -6805,6 +6913,8 @@ async fn run_network(
                     }
                     relay_tick(&mut swarm, &mut relay_slots);
                     publish_relay_status(&relay_slots);
+                    let announce = announce_base.as_ref().map(|b| announce_now(b, hosting.as_ref()));
+                    relay_list_tick(&mut swarm, &identity, &mut relay_slots, announce.as_ref(), hosting.as_ref());
                 }
                 // (The presence beacon has its own timer below: it needs a
                 // finer cadence than this tick while someone follows us.)
@@ -7019,6 +7129,40 @@ async fn run_network(
                     // An older relay, which just doesn't say anything: not a failure.
                     let older = matches!(error, request_response::OutboundFailure::UnsupportedProtocols);
                     relay_on_info(&mut relay_slots, request_id, Err(older));
+                    publish_relay_status(&relay_slots);
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::RelaySessions(request_response::Event::Message {
+                    peer,
+                    message: request_response::Message::Response { request_id, response },
+                    ..
+                })) => {
+                    let me = swarm.local_peer_id().to_string();
+                    for slot in relay_slots.iter_mut().filter(|s| s.listing.is_query(request_id)) {
+                        slot.listing.on_query(peer, response.clone(), &me);
+                    }
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::RelaySessions(request_response::Event::OutboundFailure {
+                    peer, request_id, error, ..
+                })) => {
+                    let unsupported = matches!(error, request_response::OutboundFailure::UnsupportedProtocols);
+                    for slot in relay_slots.iter_mut().filter(|s| s.listing.is_query(request_id)) {
+                        slot.listing.on_query_failed(peer, unsupported);
+                    }
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::RelayPublish(request_response::Event::Message {
+                    message: request_response::Message::Response { request_id, response },
+                    ..
+                })) => {
+                    for slot in relay_slots.iter_mut().filter(|s| s.listing.is_publish(request_id)) {
+                        slot.listing.on_publish(Ok(response.clone()), Instant::now());
+                    }
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::RelayPublish(request_response::Event::OutboundFailure {
+                    request_id, ..
+                })) => {
+                    for slot in relay_slots.iter_mut().filter(|s| s.listing.is_publish(request_id)) {
+                        slot.listing.on_publish(Err(()), Instant::now());
+                    }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Dcutr(libp2p::dcutr::Event { remote_peer_id, result })) => {
                     let failed = result.is_err();
