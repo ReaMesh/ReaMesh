@@ -53,7 +53,7 @@ const en = {
   pasteInvite: "Paste",
   invalidTicket: "This doesn't look like a ReaMesh invite code.",
   ticketJoinHint:
-    "Invite codes also work outside this network, for example over a VPN such as Tailscale.",
+    "Outside this network, an invite code needs a shared VPN such as Tailscale, or a relay set up by the host.",
 
   // Join preview / trust dialog
   joinNoFxHint: "View-only copy, all effect chains removed. No third-party code runs.",
@@ -96,7 +96,7 @@ const en = {
   stopHostingBodyOne: "One person will be disconnected.",
   stopHostingBodyMany: "{count} people will be disconnected.",
   inviteTicketHint:
-    "Send this code to anyone you want to invite. They can paste it in their lobby to join, even over a VPN such as Tailscale. The code works while you host this session.",
+    "Send this code to anyone you want to invite. They can paste it in their lobby to join. Outside your network that takes a shared VPN such as Tailscale, or a relay. The code works while you host this session.",
 
   // Moderation (host only): kick = they may rejoin at once; block = their
   // device is kept out for 30 minutes, revocable from the blocked list.
@@ -560,7 +560,7 @@ const de: Record<MsgKey, string> = {
   pasteInvite: "Einfügen",
   invalidTicket: "Das sieht nicht nach einem ReaMesh-Einladungscode aus.",
   ticketJoinHint:
-    "Einladungscodes funktionieren auch außerhalb dieses Netzwerks, zum Beispiel über ein VPN wie Tailscale.",
+    "Außerhalb dieses Netzwerks braucht ein Einladungscode ein gemeinsames VPN wie Tailscale oder ein Relay, das der Host eingerichtet hat.",
 
   joinNoFxHint: "Schreibgeschützte Kopie ohne Effektketten. Es läuft kein Code von Drittanbietern.",
   pluginsAllInstalled: "Alle {total} Plugins installiert",
@@ -597,7 +597,7 @@ const de: Record<MsgKey, string> = {
   stopHostingBodyOne: "Eine Person wird getrennt.",
   stopHostingBodyMany: "{count} Personen werden getrennt.",
   inviteTicketHint:
-    "Schick diesen Code an alle, die du einladen möchtest. Sie können ihn in ihrer Lobby einfügen und auch über ein VPN wie Tailscale beitreten. Der Code gilt, solange du diese Session hostest.",
+    "Schick diesen Code an alle, die du einladen möchtest. Sie können ihn in ihrer Lobby einfügen und beitreten. Außerhalb deines Netzwerks braucht es dafür ein gemeinsames VPN wie Tailscale oder ein Relay. Der Code gilt, solange du diese Session hostest.",
 
   banTitle: "{name} blockieren?",
   banBody: "{name} wird entfernt und kann 30 Minuten nicht beitreten.",
