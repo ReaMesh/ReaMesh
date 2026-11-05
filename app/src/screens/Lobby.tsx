@@ -40,7 +40,16 @@ import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
 import { localizeLogEntry, reconnectingText } from "@/lib/log";
 import { isCopyRefusal, setLastSession, useLastSession, type LastSession } from "@/lib/lastSession";
-import { copyDirName, copyPercent, folderName, saveCopyAs, useRunningCopy, useSavedAs } from "@/lib/savedCopies";
+import {
+  copyDirName,
+  copyPercent,
+  folderName,
+  refreshLinkedCopies,
+  saveCopyAs,
+  useLinkedCopies,
+  useRunningCopy,
+  useSavedAs,
+} from "@/lib/savedCopies";
 import { getProfile, useProfile } from "@/lib/profile";
 import { nearbyBlocked, setNearby, useNearby } from "@/lib/nearby";
 import { decodeTicket, normalizeTicket } from "@/lib/ticket";
@@ -1191,7 +1200,13 @@ function LastSessionBlock({
   // A folder of the user's stays where it is, and "save as" of a temporary copy
   // leaves one behind.
   const saved = useSavedAs(copyDir);
-  const linkedDir = last.linked ? last.dir : saved;
+  // Kept where it is: it stays too, and its folder name is no name to show.
+  const copies = useLinkedCopies();
+  useEffect(() => {
+    void refreshLinkedCopies();
+  }, []);
+  const kept = !!copyDir && !!copies?.some((c) => c.kept && copyDirName(c.path) === copyDir);
+  const linkedDir = saved ?? (last.linked || kept ? last.dir : null);
   // The folder itself is what's in the way: from here on the dialog has to ask.
   // Through the session's own card, or for a host beyond this network through
   // the invite card, with the code that led here.
@@ -1271,7 +1286,7 @@ function LastSessionBlock({
                     className="truncate text-[12px] text-muted-foreground"
                     title={linkedDir ?? undefined}
                   >
-                    {linkedDir ? folderName(linkedDir) : t("yourCopyKept")}
+                    {!linkedDir ? t("yourCopyKept") : kept && !saved ? t("keptCopy") : folderName(linkedDir)}
                   </p>
                 </div>
                 {linkedDir ? (

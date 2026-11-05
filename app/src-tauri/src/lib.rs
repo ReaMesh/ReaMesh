@@ -1229,6 +1229,11 @@ struct JoinedProject {
     bytes: u64,
     /// Newest modification anywhere inside, unix ms.
     modified: u64,
+    /// The user keeps it: no sweep removes it.
+    kept: bool,
+    /// What it is a copy of, if it knows (see links.rs).
+    project: Option<String>,
+    owner: Option<String>,
     /// Stems of the project files inside, as REAPER reports an open project.
     projects: Vec<String>,
 }
@@ -1291,7 +1296,11 @@ fn scan_joined(path: &Path, dir: String) -> JoinedProject {
             }
         }
     }
+    let link = links::read_link(path);
     JoinedProject {
+        kept: links::is_kept(path),
+        project: link.as_ref().map(|l| l.project.clone()),
+        owner: link.map(|l| l.owner),
         name: joined_name(&dir),
         path: path.to_string_lossy().into_owned(),
         dir,
@@ -1362,7 +1371,20 @@ fn move_to_trash(path: &Path) -> Result<(), String> {
 #[tauri::command]
 async fn trash_joined_project(app: AppHandle, dir: String) -> Result<(), String> {
     let path = joined_folder(&staging_root(&app)?, &dir)?;
-    tauri::async_runtime::spawn_blocking(move || move_to_trash(&path))
+    let trashed = path.clone();
+    tauri::async_runtime::spawn_blocking(move || move_to_trash(&trashed))
+        .await
+        .map_err(|e| e.to_string())??;
+    links::forget(&app, &path);
+    Ok(())
+}
+
+/// Keep one downloaded copy where it is, out of the sweep's reach and linked to its
+/// project, or stop keeping it.
+#[tauri::command]
+async fn keep_joined_project(app: AppHandle, dir: String, keep: bool) -> Result<(), String> {
+    let path = joined_folder(&staging_root(&app)?, &dir)?;
+    tauri::async_runtime::spawn_blocking(move || links::keep(&app, &path, keep))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -1930,6 +1952,7 @@ pub fn run() {
             joined_projects,
             trash_joined_project,
             save_joined_copy,
+            keep_joined_project,
             links::linked_projects,
             links::unlink_project,
             links::link_state,

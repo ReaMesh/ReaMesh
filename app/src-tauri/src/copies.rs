@@ -29,10 +29,11 @@ const NAME_ATTEMPTS: u32 = 1000;
 const PUBLISH_ATTEMPTS: u32 = 40;
 const PUBLISH_PAUSE: Duration = Duration::from_millis(250);
 
-/// Not worth keeping in a copy: transfer temp files and the stripped sibling a
-/// join without effects opens. Other dotfiles travel along.
+/// Not worth keeping in a copy: transfer temp files, the stripped sibling a join
+/// without effects opens, and the mark that keeps a folder in the staging root,
+/// which means nothing anywhere else. Other dotfiles travel along.
 fn skip_in_copy(name: &str) -> bool {
-    name.starts_with(".reamesh-part-") || name == ".reamesh-nofx.rpp"
+    name.starts_with(".reamesh-part-") || name == ".reamesh-nofx.rpp" || name == ".reamesh-keep"
 }
 
 #[derive(Debug, PartialEq)]
@@ -400,6 +401,7 @@ mod tests {
             fs::write(source.join(".reamesh-part-1234"), b"half").unwrap();
             fs::write(source.join(".reamesh-nofx.rpp"), b"stripped").unwrap();
             fs::write(source.join(".reamesh-link.json"), b"{}").unwrap();
+            fs::write(source.join(".reamesh-keep"), b"").unwrap();
             Tree { root, source, staging, out }
         }
 
@@ -441,8 +443,9 @@ mod tests {
         assert_eq!(fs::read(path.join("Song.rpp")).unwrap(), b"<REAPER_PROJECT\n>\n");
         assert_eq!(fs::read(path.join("Audio/a.wav")).unwrap(), vec![7u8; 300_000]);
         assert_eq!(fs::read(path.join("Audio/Takes/b.wav")).unwrap().len(), 1000);
-        // A folder's own dotfile travels along; the two kinds of temp file don't.
+        // A folder's own record travels along; temp files and the keep mark don't.
         assert!(path.join(".reamesh-link.json").is_file());
+        assert!(!path.join(".reamesh-keep").exists());
         assert!(!path.join(".reamesh-part-1234").exists());
         assert!(!path.join(".reamesh-nofx.rpp").exists());
         assert_eq!(t.out_names(), ["Song"]);

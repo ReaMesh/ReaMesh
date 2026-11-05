@@ -17,12 +17,12 @@ import {
 } from "@/components/ui/dialog";
 import { SwapText } from "@/components/Swap";
 import { useActiveInstance } from "@/lib/connection";
-import { findLink, joinInto, linkStateOf, type LinkedCopy, type LinkState } from "@/lib/copyLink";
+import { findLink, joinInto, linkLabel, linkStateOf, type LinkedCopy, type LinkState } from "@/lib/copyLink";
 import { formatBytes, reaperVersionKey } from "@/lib/format";
 import { t } from "@/lib/i18n";
 import { hostSeenCount } from "@/lib/knownHosts";
 import { parseFxName, pluginStatus, useInstalledPlugins, type PluginStatus } from "@/lib/plugins";
-import { folderName, refreshLinkedCopies } from "@/lib/savedCopies";
+import { refreshLinkedCopies } from "@/lib/savedCopies";
 import type { SessionPreview } from "@/lib/types";
 import { cn, focusRing } from "@/lib/utils";
 
@@ -300,7 +300,7 @@ export function TrustDialog({
             {found && !nofx && (
               <DialogFact label={t("yourCopy")}>
                 <span className="min-w-0 truncate" title={found.copy.path}>
-                  {folderName(found.copy.path)}
+                  {linkLabel(found.copy)}
                 </span>
                 <span
                   className={cn(

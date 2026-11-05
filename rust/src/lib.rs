@@ -3891,20 +3891,25 @@ fn newest_mtime(dir: &Path) -> Option<SystemTime> {
 /// gigabytes behind with no way for the user to find or clear them.
 ///
 /// Age is the newest mtime found anywhere inside. Never remove a live session,
-/// a directory served by another local REAPER instance, or a project in `keep`.
+/// a directory served by another local REAPER instance, a project in `keep`, or
+/// a copy the user chose to keep (`KEEP_FILE`).
 fn prune_staging(root: &Path, keep: &[PathBuf]) {
+    prune_older_than(root, keep, STAGING_MAX_AGE);
+}
+
+fn prune_older_than(root: &Path, keep: &[PathBuf], max_age: Duration) {
     let Ok(rd) = fs::read_dir(root) else { return };
     for entry in rd.flatten() {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
         let path = entry.path();
-        if keep.iter().any(|k| k.starts_with(&path)) {
+        if keep.iter().any(|k| k.starts_with(&path)) || path.join(KEEP_FILE).exists() {
             continue;
         }
         let stale = newest_mtime(&path)
             .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > STAGING_MAX_AGE);
+            .is_some_and(|age| age > max_age);
         if stale {
             eprintln!("[reamesh] pruning stale staging copy {}", path.display());
             let _ = fs::remove_dir_all(&path);
@@ -3917,6 +3922,10 @@ fn prune_staging(root: &Path, keep: &[PathBuf]) {
 /// with that host. A dotfile, so it is outside every manifest and never served.
 /// "Save as" takes it along, which is what links the saved folder.
 const LINK_FILE: &str = ".reamesh-link.json";
+/// A copy in the staging root the user chose to keep has this beside the project:
+/// the sweep leaves that folder alone. The app writes and removes it, and being a
+/// dotfile it is outside every manifest too.
+const KEEP_FILE: &str = ".reamesh-keep";
 /// Where a join into a linked folder keeps what it replaced, as
 /// `<unix seconds>/<project-relative path>`. Also outside every manifest. Nothing
 /// ever empties it.
@@ -8035,6 +8044,22 @@ mod transfer_safety_tests {
             assert_eq!(project_id_of(bad), None, "{bad}");
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sweep_leaves_a_kept_copy_alone() {
+        let root = std::env::temp_dir().join(format!("reamesh-prune-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for name in ["Kept-1", "Stale-2"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+            fs::write(root.join(name).join("Song.rpp"), b"x").unwrap();
+        }
+        fs::write(root.join("Kept-1").join(KEEP_FILE), b"").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        prune_older_than(&root, &[], Duration::ZERO);
+        assert!(root.join("Kept-1/Song.rpp").exists(), "kept, however old");
+        assert!(!root.join("Stale-2").exists(), "old and not kept");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

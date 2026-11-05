@@ -620,6 +620,16 @@ int main() {
   // absolute, and an absolute path from a peer on the same machine resolves to
   // that peer's file (which the receiver then copied into its project root).
   {
+    // A joined copy's tab goes to the same place in its saved copy, unless it is
+    // outside the copy's folder or the stripped sibling of a no-FX join.
+    assert(copyTabTarget("/R/ReaMesh/Song-1/Song.rpp", "/R/ReaMesh/Song-1", "/Music/Song") ==
+           "/Music/Song/Song.rpp");
+    assert(copyTabTarget("C:\\R\\ReaMesh\\Song-1\\sub\\Song.rpp", "C:/R/ReaMesh/Song-1", "D:/Song") ==
+           "D:/Song/sub/Song.rpp");
+    assert(copyTabTarget("/R/ReaMesh/Song-12/Song.rpp", "/R/ReaMesh/Song-1", "/Music/Song").empty());
+    assert(copyTabTarget("/Other/Song.rpp", "/R/ReaMesh/Song-1", "/Music/Song").empty());
+    assert(copyTabTarget("/R/ReaMesh/Song-1/.reamesh-nofx.rpp", "/R/ReaMesh/Song-1", "/Music/Song").empty());
+    assert(copyTabTarget("/R/ReaMesh/Song-1/Song.rpp", "/R/ReaMesh/Song-1", "").empty());
     assert(pathInsideDir("/Songs/Nightfall/Audio/Kick_01.wav", "/Songs/Nightfall") ==
            "Audio/Kick_01.wav");
     assert(pathInsideDir("/Songs/Nightfall/Kick.wav", "/Songs/Nightfall/") == "Kick.wav");

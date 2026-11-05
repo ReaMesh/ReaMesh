@@ -315,7 +315,7 @@ function usePluginToasts(state: ExtState | undefined, port: number | undefined) 
     const log = state.log ?? [];
     const samePort = prev.current.port === port;
     const newEntries: LogEntry[] = [];
-    if (samePort && inSession && prev.current.lastKey) {
+    if (samePort && prev.current.lastKey) {
       let idx = -1;
       for (let i = log.length - 1; i >= 0; i--) {
         if (JSON.stringify(log[i]) === prev.current.lastKey) {
@@ -332,6 +332,12 @@ function usePluginToasts(state: ExtState | undefined, port: number | undefined) 
       len: log.length,
     };
     for (const e of newEntries) {
+      // The one entry of these that comes from outside a session.
+      if (e.code === "copy_opened") {
+        toast(localizeLogEntry(e));
+        continue;
+      }
+      if (!inSession) continue;
       // Progressive join: a snapped-back edit while loading, and the moment
       // editing unlocks. The extension rate-limits the former. An item's media
       // not arriving is in the HUD as well, which may be off.

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { findLink, joinInto, linkStateOf, type LinkedCopy } from "./copyLink";
+import { copyDaysLeft, findLink, joinInto, linkLabel, linkStateOf, type LinkedCopy } from "./copyLink";
 
 const copy = (over: Partial<LinkedCopy> = {}): LinkedCopy => ({
   path: "D:/Songs/Nightfall",
@@ -9,6 +9,30 @@ const copy = (over: Partial<LinkedCopy> = {}): LinkedCopy => ({
   project_file: "Nightfall.rpp",
   hash: "base",
   ...over,
+});
+
+describe("copyDaysLeft", () => {
+  const day = 864e5;
+  const now = 100 * day;
+  it("counts down from seven, a started day as a whole one", () => {
+    expect(copyDaysLeft(now, now)).toBe(7);
+    expect(copyDaysLeft(now - 1, now)).toBe(7);
+    expect(copyDaysLeft(now - day, now)).toBe(6);
+    expect(copyDaysLeft(now - 6.5 * day, now)).toBe(1);
+  });
+  it("stops at zero, and doesn't guess", () => {
+    expect(copyDaysLeft(now - 7 * day, now)).toBe(0);
+    expect(copyDaysLeft(now - 30 * day, now)).toBe(0);
+    expect(copyDaysLeft(now + 5 * day, now)).toBe(7);
+    expect(copyDaysLeft(0, now)).toBeNull();
+  });
+});
+
+describe("linkLabel", () => {
+  it("names a saved copy by its folder and a kept one by its session", () => {
+    expect(linkLabel(copy({ path: "D:\\Songs\\Mein Mix" }))).toBe("Mein Mix");
+    expect(linkLabel(copy({ path: "/R/ReaMesh/Nightfall-a1b2", kept: true }))).toBe("Nightfall");
+  });
 });
 
 describe("findLink", () => {

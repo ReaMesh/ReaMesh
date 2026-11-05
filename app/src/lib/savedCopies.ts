@@ -10,6 +10,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
+import { sendAll, waitForInstances } from "./connection";
 import type { LinkedCopy } from "./copyLink";
 import { t } from "./i18n";
 import { isWindows } from "./platform";
@@ -29,6 +30,10 @@ interface CopyFinished {
   kept: string | null;
   linked: boolean;
 }
+
+/** How long a copy waits for REAPER to save what is on screen. A REAPER showing a
+ *  dialog doesn't answer: the copy goes ahead, and that tab stays where it is. */
+const FLUSH_WAIT_MS = 4000;
 
 let running: RunningCopy | null = null;
 let linkedCopies: LinkedCopy[] | null = null;
@@ -97,6 +102,8 @@ function wire() {
     const { dir, path, linked } = e.payload;
     if (path && linked) savedAs.set(dir, path);
     setRunning(null);
+    // One window speaks for the copy, or REAPER would hear this once per window.
+    if (asked && path) sendAll({ cmd: "copy_saved", dir, to: path, linked });
     if (asked) report(e.payload);
     asked = false;
   }).catch(() => {});
@@ -115,6 +122,12 @@ export async function refreshLinkedCopies(): Promise<LinkedCopy[]> {
 /** Take a folder off the list; nothing on the disk changes. */
 export async function unlinkCopy(path: string) {
   await invoke("unlink_project", { path });
+  await refreshLinkedCopies();
+}
+
+/** Keep a joined copy where it is, or stop keeping it. `dir` is its folder name. */
+export async function setCopyKept(dir: string, keep: boolean) {
+  await invoke("keep_joined_project", { dir, keep });
   await refreshLinkedCopies();
 }
 
@@ -139,6 +152,10 @@ export async function saveCopyAs(dir: string) {
   asked = true;
   setRunning({ dir, done: 0, total: 0 });
   try {
+    // What is on screen goes along, and the copy starts from what is on disk.
+    const seq = Date.now();
+    sendAll({ cmd: "copy_flush", dir, seq });
+    await waitForInstances((state) => (state.copy_flushed ?? 0) >= seq, FLUSH_WAIT_MS);
     await invoke("save_joined_copy", { dir, dest });
   } catch (e) {
     asked = false;

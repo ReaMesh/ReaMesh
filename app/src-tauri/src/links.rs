@@ -11,6 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 
 const LINK_FILE: &str = ".reamesh-link.json";
+/// A copy in the staging root that stays: the core's sweep passes over a folder
+/// with this file. It is on the list as well, so it is linked like a saved copy.
+const KEEP_FILE: &str = ".reamesh-keep";
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CopyLink {
@@ -24,6 +27,8 @@ pub(crate) struct CopyLink {
 #[derive(Debug, PartialEq, serde::Serialize)]
 pub(crate) struct LinkedCopy {
     pub path: String,
+    /// Kept where it is in the staging root, not saved to a folder of the user's.
+    pub kept: bool,
     #[serde(flatten)]
     pub link: CopyLink,
 }
@@ -73,10 +78,38 @@ fn remove_line(list: &Path, path: &str) -> io::Result<()> {
 fn read_list(list: &Path) -> Vec<LinkedCopy> {
     let mut out: Vec<LinkedCopy> = read_lines(list)
         .into_iter()
-        .filter_map(|path| Some(LinkedCopy { link: read_link(Path::new(&path))?, path }))
+        .filter_map(|path| {
+            let dir = Path::new(&path);
+            Some(LinkedCopy { link: read_link(dir)?, kept: is_kept(dir), path })
+        })
         .collect();
     out.reverse();
     out
+}
+
+pub(crate) fn is_kept(dir: &Path) -> bool {
+    dir.join(KEEP_FILE).exists()
+}
+
+/// Keep a copy in the staging root or stop keeping it. The marker is what the
+/// sweep goes by, so it goes first and comes off last: a failure on the way leaves
+/// a copy that stays. A copy without a record of what it is stays unlinked.
+fn set_kept(list: &Path, dir: &Path, keep: bool) -> io::Result<()> {
+    let path = dir.to_str().filter(|p| !p.contains('\n'));
+    if keep {
+        fs::write(dir.join(KEEP_FILE), b"")?;
+        if let (Some(path), true) = (path, read_link(dir).is_some()) {
+            add_line(list, path)?;
+        }
+        return Ok(());
+    }
+    if let Some(path) = path {
+        remove_line(list, path)?;
+    }
+    match fs::remove_file(dir.join(KEEP_FILE)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// blake3 of a file, in the core's hex format. `None` when there is no such file.
@@ -143,6 +176,21 @@ pub(crate) async fn unlink_project(app: AppHandle, path: String) -> Result<(), S
     remove_line(&list, &path).map_err(|e| e.to_string())?;
     let _ = app.emit("linked-projects-changed", ());
     Ok(())
+}
+
+/// See `set_kept`. `dir` was checked by the caller to lie in the staging root.
+pub(crate) fn keep(app: &AppHandle, dir: &Path, keep: bool) -> Result<(), String> {
+    set_kept(&list_file(app)?, dir, keep).map_err(|e| e.to_string())?;
+    let _ = app.emit("linked-projects-changed", ());
+    Ok(())
+}
+
+/// A folder that went to the Trash needs no line on the list any more.
+pub(crate) fn forget(app: &AppHandle, dir: &Path) {
+    let Some(path) = dir.to_str() else { return };
+    if list_file(app).and_then(|l| remove_line(&l, path).map_err(|e| e.to_string())).is_ok() {
+        let _ = app.emit("linked-projects-changed", ());
+    }
 }
 
 /// The blake3 of a linked copy's project file, `null` when it has none by that name.
@@ -229,6 +277,41 @@ mod tests {
         assert_eq!(read_lines(&s.list()), [a.clone(), b.clone()]);
         fs::rename(s.0.join("elsewhere"), &a).unwrap();
         assert_eq!(paths(read_list(&s.list())), [b, a]);
+    }
+
+    #[test]
+    fn a_kept_copy_is_linked_and_marked_until_it_stops_being_kept() {
+        let s = Scratch::new();
+        let a = s.folder("A", "p1");
+        let dir = Path::new(&a);
+        set_kept(&s.list(), dir, true).unwrap();
+        let listed = read_list(&s.list());
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].kept && is_kept(dir));
+
+        set_kept(&s.list(), dir, false).unwrap();
+        assert!(read_list(&s.list()).is_empty());
+        assert!(!is_kept(dir));
+        assert!(dir.join(LINK_FILE).exists(), "the copy's own record stays");
+        set_kept(&s.list(), dir, false).expect("twice is fine");
+    }
+
+    #[test]
+    fn a_copy_without_a_record_can_be_kept_but_not_linked() {
+        let s = Scratch::new();
+        let dir = s.0.join("Old");
+        fs::create_dir_all(&dir).unwrap();
+        set_kept(&s.list(), &dir, true).unwrap();
+        assert!(is_kept(&dir));
+        assert!(read_lines(&s.list()).is_empty());
+    }
+
+    #[test]
+    fn a_saved_copy_is_not_a_kept_one() {
+        let s = Scratch::new();
+        let a = s.folder("A", "p1");
+        add_line(&s.list(), &a).unwrap();
+        assert!(!read_list(&s.list())[0].kept);
     }
 
     #[test]

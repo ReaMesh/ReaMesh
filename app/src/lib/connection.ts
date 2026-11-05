@@ -7,7 +7,7 @@
 // the extension streams back one `state` message whenever anything changes.
 
 import { useSyncExternalStore } from "react";
-import { normalizeRelay, normalizeState, type Instance } from "./types";
+import { normalizeRelay, normalizeState, type ExtState, type Instance } from "./types";
 import { getProfile } from "./profile";
 import { getOverlaySettings, subscribeOverlaySettings } from "./overlaySettings";
 import { openCtlSocket } from "./ctlSocket";
@@ -206,6 +206,28 @@ export function send(cmd: Record<string, unknown>, port?: number) {
   if (target === null) return;
   const ws = sockets.get(target);
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(cmd));
+}
+
+/** To every REAPER this window is connected to. */
+export function sendAll(cmd: Record<string, unknown>) {
+  for (const p of sockets.keys()) send(cmd, p);
+}
+
+/** Until every connected REAPER's state says it is `done`, or the time is up. */
+export function waitForInstances(done: (state: ExtState) => boolean, timeoutMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    const check = () => {
+      if ([...live.values()].every((i) => !i.state || done(i.state))) finish();
+    };
+    const finish = () => {
+      clearTimeout(timer);
+      listeners.delete(check);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    listeners.add(check);
+    check();
+  });
 }
 
 export function sendProfile(port?: number) {

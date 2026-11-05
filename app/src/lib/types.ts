@@ -126,6 +126,8 @@ export interface ExtState {
   session_dir?: string;
   /** That folder is a linked copy of the user's, not a temporary one. */
   session_linked?: boolean;
+  /** The `seq` of the newest `copy_flush` this REAPER has carried out. */
+  copy_flushed?: number;
   /** Last session-ending event; null when there is none. */
   error: LogEntry | null;
   log: LogEntry[];

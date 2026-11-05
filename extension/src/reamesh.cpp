@@ -71,6 +71,7 @@
 #define REAPERAPI_WANT_SetProjExtState
 #define REAPERAPI_WANT_IsProjectDirty
 #define REAPERAPI_WANT_Main_openProject
+#define REAPERAPI_WANT_SelectProjectInstance
 #define REAPERAPI_WANT_GetResourcePath
 #define REAPERAPI_WANT_GetSetObjectState
 #define REAPERAPI_WANT_FreeHeapPtr
@@ -633,6 +634,8 @@ struct LastSession {
   std::string dest;
   // The core refused that folder, and would again: only the dialog can go on.
   bool refused = false;
+  // The folder the session's copy was in, whichever kind.
+  std::string dir;
 };
 static std::optional<LastSession> g_lastSession;
 
@@ -648,6 +651,8 @@ static std::string g_joinPassphrase;
 // Invite ticket the current session was joined with ("" = discovered on the
 // LAN), kept for auto-rejoin like the passphrase.
 static std::string g_joinTicket;
+// The newest "save as" this REAPER has written its open edits out for.
+static double g_copyFlushed = 0;
 // Linked folder the current session was joined into ("" = a staging folder),
 // kept for auto-rejoin like the ticket.
 static std::string g_joinDest;
@@ -5835,6 +5840,9 @@ static void saveSessionCopy() {
   g_applyingRemote = false;
 }
 
+// Project files a session was left in before all of its media had landed.
+static std::set<std::string> g_incompleteTabs;
+
 // Tear the session down. `code`/`params`/`text` describe why as a structured
 // log event (also flagged to the app as the error); empty text = silent.
 static void leaveSession(const char* code, json params, const std::string& text) {
@@ -5844,6 +5852,14 @@ static void leaveSession(const char* code, json params, const std::string& text)
   // the suppress + re-baseline is correct; it's a no-op when nothing is tinted.
   restoreAllItemTints();
   saveSessionCopy();  // after the tints: the real colors go to disk
+  // Left while media was still landing: that tab holds empty stand-ins, and its
+  // folder lacks files. It stays what it is (see `movableCopyTab`).
+  if (g_mode == Mode::ClientActive) {
+    if (!g_placeholders.empty() || g_mediaLoading)
+      g_incompleteTabs.insert(g_sessionProjectPath);
+    else
+      g_incompleteTabs.erase(g_sessionProjectPath);
+  }
   // What is on disk now is what this copy last agreed on with the session. Not on
   // the way in: a download that broke off agreed on nothing.
   if (g_handle && g_mode == Mode::ClientActive) reamesh_note_local_project(g_handle);
@@ -5917,6 +5933,95 @@ static bool hasUnsavedEdits(const std::string& dir) {
   }
 }
 
+// The folder of a joined copy by its name: a bare name, nothing else.
+static std::string joinedCopyFolder(const std::string& name) {
+  if (name.empty() || name[0] == '.' || name.find_first_of("/\\") != std::string::npos) return "";
+  return std::string(GetResourcePath()) + "/ReaMesh/" + name;
+}
+
+// Where a project open from a joined copy's folder is in a "save as" of that
+// folder, "" when it isn't in there or stays behind: the stripped sibling of a
+// join without effects isn't copied, and opening the real project would load the
+// plugins that join refused.
+static std::string copyTabTarget(const std::string& tab, const std::string& from,
+                                 const std::string& to) {
+  const std::string rel = pathInsideDir(tab, from);
+  if (rel.empty() || rel == ".reamesh-nofx.rpp" || to.empty()) return "";
+  return to + "/" + rel;
+}
+
+// A joined copy's tab may be saved or moved only with no session running here,
+// which has its own claims on the open project, and if it isn't holding stand-ins
+// for media that never landed: saving those would put empty sources in the file.
+static bool movableCopyTab(const std::string& tab) {
+  return (g_mode == Mode::Idle || g_mode == Mode::Browsing) && !g_incompleteTabs.count(tab);
+}
+
+// "Save as" takes along what is on screen: edits made in a joined copy's tab since
+// the session have to reach its folder before that is copied.
+static void flushCopyTabs(const std::string& name) {
+  const std::string from = joinedCopyFolder(name);
+  if (from.empty()) return;
+  for (int i = 0;; ++i) {
+    char buf[4096] = {0};
+    ReaProject* proj = EnumProjects(i, buf, sizeof(buf));
+    if (!proj) return;
+    if (copyTabTarget(buf, from, "/").empty() || !movableCopyTab(buf)) continue;
+    if (!IsProjectDirty(proj) || !fileRewritable(buf)) continue;
+    g_applyingRemote = true;  // same guard as saveSessionCopy
+    Main_SaveProject(proj, false);
+    g_applyingRemote = false;
+  }
+}
+
+// A "save as" of a joined copy is done: tabs of the old folder go over to the new
+// one, so what the user does next ends up in the copy that stays. A tab with edits
+// that aren't in that copy stays put, and the user hears why. The active tab stays
+// active.
+static void moveTabsToCopy(const std::string& name, const std::string& to, bool linked) {
+  const std::string from = joinedCopyFolder(name);
+  if (from.empty() || to.empty()) return;
+  ReaProject* active = EnumProjects(-1, nullptr, 0);
+  int activeIndex = -1, moved = 0;
+  bool dirty = false;
+  for (int i = 0;; ++i) {
+    char buf[4096] = {0};
+    ReaProject* proj = EnumProjects(i, buf, sizeof(buf));
+    if (!proj) break;
+    if (proj == active) activeIndex = i;
+    const std::string target = copyTabTarget(buf, from, to);
+    std::error_code ec;
+    if (target.empty() || !movableCopyTab(buf) || !fs::is_regular_file(fsPath(target), ec)) continue;
+    if (IsProjectDirty(proj)) {
+      dirty = true;
+      continue;
+    }
+    g_applyingRemote = true;  // same guard as around every other open
+    SelectProjectInstance(proj);
+    Main_openProject(target.c_str());
+    g_applyingRemote = false;
+    char now[4096] = {0};
+    if (ReaProject* tab = EnumProjects(i, now, sizeof(now))) {
+      if (tab == EnumProjects(-1, nullptr, 0) && !pathInsideDir(now, to).empty()) ++moved;
+    }
+  }
+  if (moved) {
+    if (ReaProject* tab = activeIndex >= 0 ? EnumProjects(activeIndex, nullptr, 0) : nullptr)
+      SelectProjectInstance(tab);
+    g_groupNamesAt = -1;  // different project: the cached group names are stale
+    logEvent("copy_opened", json::object(), "REAPER now has your saved copy open");
+  }
+  if (dirty)
+    g_lastError = logEvent("copy_not_opened", json::object(),
+                           "REAPER keeps the temporary copy open: it has unsaved changes");
+  // A way back into that session goes to the copy that stays from now on.
+  const auto repoint = [&](LastSession& s) {
+    if (linked && s.dest.empty() && !pathInsideDir(s.dir + "/x", from).empty()) s.dest = to;
+  };
+  if (g_lastSession) repoint(*g_lastSession);
+  if (g_reconnect) repoint(*g_reconnect);
+}
+
 // Join a session (Browsing -> Downloading): one of the announced sessions by
 // id, or (with a non-empty `ticket`) through a pasted invite ticket. For a
 // ticket the Rust side dials the ticket's addresses and joins once the host's
@@ -5984,6 +6089,7 @@ static void beginReconnect(const json& st) {
   session.passphrase = g_joinPassphrase;
   session.ticket = g_joinTicket;
   session.dest = g_joinDest;
+  session.dir = jsonStr(st, "dir");
   leaveSession("", json::object(), "");  // silent: this is not (yet) an error
   if (!session.sessionId.empty()) g_lastSession = session;
   if (session.sessionId.empty() || !startBrowse()) {
@@ -6368,6 +6474,11 @@ static void ctlDispatch(const json& cmd) {
       g_noFx = nofx;
       g_lastSession.reset();
     }
+  } else if (c == "copy_flush") {
+    flushCopyTabs(jsonStr(cmd, "dir"));
+    g_copyFlushed = jsonNum(cmd, "seq", 0);  // answered in the next state frame
+  } else if (c == "copy_saved") {
+    moveTabsToCopy(jsonStr(cmd, "dir"), jsonStr(cmd, "to"), cmdBool("linked"));
   } else if (c == "reconnect_cancel") {
     // Stop retrying, stay in the Lobby; the session can still be retried by hand.
     if (g_reconnect) {
@@ -6580,6 +6691,7 @@ static void ctlPublishState() {
   }
   // This REAPER's version, for the app's host-version mismatch warning.
   state["reaper"] = g_reaperVersion;
+  state["copy_flushed"] = g_copyFlushed;
   state["error"] = g_lastError;
   state["log"] = g_log;
   state["overridden"] = reverts;

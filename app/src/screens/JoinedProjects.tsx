@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ArrowLeft, FolderDown, LoaderCircle, Trash2, Unlink } from "lucide-react";
+import { ArrowLeft, FolderDown, LoaderCircle, Pin, Trash2, Unlink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/dialog";
 import { Divider, Group, SectionLabel } from "@/components/Group";
 import { useConnections } from "@/lib/connection";
+import { copyDaysLeft } from "@/lib/copyLink";
 import { formatBytes } from "@/lib/format";
 import { resolveLang, t, useLang } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
@@ -21,6 +22,7 @@ import {
   copyPercent,
   refreshLinkedCopies,
   saveCopyAs,
+  setCopyKept,
   unlinkCopy,
   useLinkedCopies,
   useRunningCopy,
@@ -29,10 +31,11 @@ import { cn, focusRing } from "@/lib/utils";
 
 // The downloaded copies of joined sessions (one folder each under REAPER's
 // resource dir), with their size, so a big one can go to the Trash before the
-// extension's own seven-day sweep gets to it, or be saved somewhere for good.
-// A saved one is listed above them: it is linked to its project from then on, and
-// being the user's own folder it can be unlinked but never trashed. Reached from
-// Settings.
+// extension's own seven-day sweep gets to it, be kept where it is, or be saved
+// somewhere for good. A saved one is listed above them: it is linked to its project
+// from then on, and being the user's own folder it can be unlinked but never
+// trashed. A kept one is linked just the same and stays in this list, where the
+// same button lets it go again. Reached from Settings.
 
 export interface JoinedProject {
   dir: string;
@@ -41,6 +44,10 @@ export interface JoinedProject {
   bytes: number;
   modified: number;
   projects: string[];
+  kept?: boolean;
+  /** What it is a copy of, if it knows. */
+  project?: string | null;
+  owner?: string | null;
 }
 
 export const listJoinedProjects = () => invoke<JoinedProject[]>("joined_projects");
@@ -126,10 +133,31 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
     }
   };
 
+  const toggleKept = (p: JoinedProject) => {
+    const keep = !p.kept;
+    setCopyKept(p.dir, keep).then(
+      () => setList((l) => l?.map((x) => (x.dir === p.dir ? { ...x, kept: keep } : x)) ?? l),
+      (e) => toast.error(String(e)),
+    );
+  };
+
+  const saved = linked?.filter((c) => !c.kept) ?? [];
+  // The folder this copy was saved to, which makes this one of no further use.
+  const savedTo = (p: JoinedProject) =>
+    p.project ? saved.find((c) => c.project === p.project && c.owner === p.owner) : undefined;
+
   const total = list?.reduce((n, p) => n + p.bytes, 0) ?? 0;
   const date = (ms: number) =>
     ms > 0 ? new Date(ms).toLocaleDateString(resolveLang(), { dateStyle: "medium" }) : "";
   const trashLabel = t(isWindows ? "moveToTrashWin" : "moveToTrash");
+  // Only where it applies: the sweep passes over a kept copy and one in use.
+  const daysLeft = (p: JoinedProject, used: boolean) => {
+    if (p.kept || used) return "";
+    const days = copyDaysLeft(p.modified, Date.now());
+    if (days === null) return "";
+    if (days === 0) return t("daysLeftNone");
+    return days === 1 ? t("daysLeftOne") : t("daysLeft", { count: days });
+  };
 
   return (
     <div className={cn("flex flex-1 flex-col overflow-y-auto", isWindows && "scroll-slim")}>
@@ -149,11 +177,11 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
           </h1>
         </div>
 
-        {linked && linked.length > 0 && (
+        {saved.length > 0 && (
           <section className="space-y-2">
             <SectionLabel>{t("savedCopies")}</SectionLabel>
             <Group>
-              {linked.map((copy, i) => (
+              {saved.map((copy, i) => (
                 <div key={copy.path} className="flex flex-col">
                   {i > 0 && <Divider inset={false} />}
                   <div className="flex min-h-11 items-center gap-2 pr-2">
@@ -199,6 +227,8 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
               list.map((p, i) => {
                 const used = inUse(p);
                 const copying = running?.dir === p.dir ? running : null;
+                const savedCopy = savedTo(p);
+                const left = daysLeft(p, used);
                 return (
                   <div key={p.dir} className="flex flex-col">
                     {i > 0 && <Divider inset={false} />}
@@ -216,9 +246,32 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
                         {/* Size and date side by side, each its own fact. */}
                         <p className="flex gap-3 truncate text-[12px] text-muted-foreground tabular-nums">
                           <span>{formatBytes(p.bytes)}</span>
-                          {date(p.modified) && <span className="truncate">{date(p.modified)}</span>}
+                          {p.kept ? (
+                            <span className="truncate">{t("keptCopy")}</span>
+                          ) : savedCopy ? (
+                            <span className="truncate" title={savedCopy.path}>
+                              {t("savedElsewhere")}
+                            </span>
+                          ) : (
+                            date(p.modified) && <span className="truncate">{date(p.modified)}</span>
+                          )}
+                          {left && <span className="shrink-0">{left}</span>}
                         </p>
                       </button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title={t(p.kept ? "stopKeeping" : "keepCopy")}
+                        aria-label={`${t("keepCopy")}: ${p.name}`}
+                        aria-pressed={!!p.kept}
+                        className={cn(
+                          "size-8 shrink-0 p-0 hover:text-foreground",
+                          p.kept ? "text-foreground" : "text-muted-foreground",
+                        )}
+                        onClick={() => toggleKept(p)}
+                      >
+                        <Pin className={cn("size-4", p.kept && "fill-current")} aria-hidden="true" />
+                      </Button>
                       {copying ? (
                         <span
                           role="status"
@@ -281,6 +334,7 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
               {t(isWindows ? "trashBodyWin" : "trashBody", {
                 size: formatBytes(target?.bytes ?? 0),
               })}
+              {target?.kept && ` ${t("trashKeptNote")}`}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
