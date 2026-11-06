@@ -460,17 +460,25 @@ const joinAsks = new Map<string, () => void>();
 // What the relays this install hosts through announce, before anyone hosts:
 // the one moment it can still change a plan. The relays are asked when the
 // Lobby opens; their last answer stands in while one can't be reached.
+
+// Closed notices stay closed until the app restarts, never for good: a notice
+// that changes (new text or time) is a new one and shows again.
+const closedNotices = new Set<string>();
+
 function RelayNotices({ port, info }: { port: number | null; info?: Record<string, RelayAbout> }) {
   const relays = useRelays();
+  const [, rerender] = useState(0);
   useEffect(() => {
     if (port !== null && relays.length > 0) send({ cmd: "relay_info" }, port);
   }, [port, relays.length]);
   const lines = relays.flatMap((r) => {
     const notice = relayAbout(info, r.peer)?.notice;
     if (!noticeApplies(notice)) return [];
+    const key = `${r.peer}|${notice.from}|${notice.until}|${notice.text}`;
+    if (closedNotices.has(key)) return [];
     return [
       {
-        peer: r.peer,
+        key,
         name: r.label || relayHost(r),
         text: notice.text,
         when: noticeWhen(notice),
@@ -478,29 +486,52 @@ function RelayNotices({ port, info }: { port: number | null; info?: Record<strin
       },
     ];
   });
-  if (lines.length === 0) return null;
-  // Neutral while it's only announced; amber once its window has begun.
+  const close = (key: string) => {
+    closedNotices.add(key);
+    rerender((n) => n + 1);
+  };
+  // Neutral while it's only announced; amber once its window has begun. The
+  // wrapper hides itself once the last card has folded away.
   return (
-    <div className="flex flex-col gap-2">
-      {lines.map((l) => (
-        <div
-          key={l.peer}
-          className={cn(
-            "flex gap-2.5 rounded-xl px-3 py-2.5",
-            l.active ? "bg-amber-500/10" : "bg-sky-500/[0.07]",
-          )}
-        >
-          <Megaphone
-            aria-hidden="true"
-            className={cn("mt-px size-4 shrink-0", l.active ? "text-amber-500" : "text-sky-400")}
-          />
-          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-            <p className="truncate text-[12px] leading-snug font-semibold">{l.name}</p>
-            <p className="text-pretty text-[12px] leading-snug text-foreground/75">{l.text}</p>
-            {l.when && <p className="text-[11px] leading-snug text-muted-foreground">{l.when}</p>}
-          </div>
-        </div>
-      ))}
+    <div className="flex shrink-0 flex-col empty:hidden">
+      <AnimatePresence initial={false}>
+        {lines.map((l, i) => (
+          <motion.div
+            key={l.key}
+            exit={{ height: 0, opacity: 0, marginTop: 0 }}
+            transition={FOLD}
+            className={cn("overflow-hidden", i > 0 && "mt-2")}
+          >
+            <div
+              className={cn(
+                "flex gap-2.5 rounded-xl py-2.5 pr-2 pl-3",
+                l.active ? "bg-amber-500/10" : "bg-sky-500/[0.07]",
+              )}
+            >
+              <Megaphone
+                aria-hidden="true"
+                className={cn("mt-px size-4 shrink-0", l.active ? "text-amber-500" : "text-sky-400")}
+              />
+              <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                <p className="truncate text-[12px] leading-snug font-semibold">{l.name}</p>
+                <p className="text-pretty text-[12px] leading-snug text-foreground/75">{l.text}</p>
+                {l.when && <p className="text-[11px] leading-snug text-muted-foreground">{l.when}</p>}
+              </div>
+              <button
+                type="button"
+                aria-label={t("close")}
+                onClick={() => close(l.key)}
+                className={cn(
+                  "grid size-5 shrink-0 place-items-center rounded text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground",
+                  focusRing,
+                )}
+              >
+                <X className="size-3.5" aria-hidden="true" />
+              </button>
+            </div>
+          </motion.div>
+        ))}
+      </AnimatePresence>
     </div>
   );
 }
@@ -1536,11 +1567,7 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
       {/* Show a repair path for an active Windows Firewall block rule. */}
       <FirewallBlocked />
 
-      {/* What the relays announce sits with who you are, before any plan. */}
-      <div className="flex shrink-0 flex-col gap-2">
-        <NameCard />
-        <RelayNotices port={port} info={relay?.info} />
-      </div>
+      <NameCard />
 
       <AnimatePresence initial={false}>
         {last && !state.reconnecting && (
@@ -1557,6 +1584,9 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
       {/* Everything scrolls together; the host card below stays put. A pixel
           of room on the sides keeps the focus rings unclipped. */}
       <div className="scroll-slim -mx-1 flex min-h-0 flex-1 flex-col gap-[18px] overflow-y-auto px-1">
+        {/* What the relays announce comes first, before any plan. It scrolls
+            with the list, so several notices never squeeze it. */}
+        <RelayNotices port={port} info={relay?.info} />
         {showLan && (
           <section className="flex shrink-0 flex-col gap-2">
             <SectionLabel>{t("sessionsOnNetwork")}</SectionLabel>
