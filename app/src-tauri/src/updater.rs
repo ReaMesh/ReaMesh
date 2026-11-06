@@ -422,7 +422,64 @@ pub fn restart(app: &AppHandle) -> Result<(), String> {
         });
         return Err(e.to_string());
     }
+    #[cfg(target_os = "macos")]
+    if relaunch_after_exit() {
+        app.exit(0);
+        // `exit` only asks the event loop to stop; this thread waits for it.
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
     app.restart();
+}
+
+/// macOS: start the updated app only once this process has ended. Tauri's own
+/// restart runs `open -n` while the old instance is still alive, and a second
+/// instance of a running app gets a Dock icon of its own: when the old one is
+/// slow to quit, the updated app shows up as an extra, unpinned icon next to
+/// the pinned one. A detached shell waits for our pid to go away (at most
+/// ~10s, then `-n` as before) and opens the bundle through LaunchServices.
+/// Returns false when the bundle can't be located; the caller then falls back
+/// to Tauri's restart.
+#[cfg(target_os = "macos")]
+fn relaunch_after_exit() -> bool {
+    use std::os::unix::process::CommandExt;
+    use std::path::Component;
+    use std::process::{Command, Stdio};
+
+    let Ok(exe) = tauri::utils::platform::current_exe() else {
+        return false;
+    };
+    let named = |p: Option<&std::path::Path>, name: &str| {
+        p.and_then(|p| p.components().next_back()) == Some(Component::Normal(name.as_ref()))
+    };
+    let macos = exe.parent();
+    let contents = macos.and_then(|p| p.parent());
+    let Some(bundle) = contents.and_then(|p| p.parent()) else {
+        return false;
+    };
+    if !named(macos, "MacOS")
+        || !named(contents, "Contents")
+        || bundle.extension().is_none_or(|e| e != "app")
+    {
+        return false;
+    }
+    const SCRIPT: &str = r#"i=0
+while kill -0 "$1" 2>/dev/null && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i+1)); done
+if kill -0 "$1" 2>/dev/null; then exec /usr/bin/open -n "$2"; fi
+exec /usr/bin/open "$2""#;
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(SCRIPT)
+        .arg("sh")
+        .arg(std::process::id().to_string())
+        .arg(bundle)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .is_ok()
 }
 
 // ---------- webview commands ----------
