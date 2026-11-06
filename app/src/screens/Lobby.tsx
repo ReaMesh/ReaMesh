@@ -470,13 +470,13 @@ function RelayNotices({ port, info }: { port: number | null; info?: Record<strin
   });
   if (lines.length === 0) return null;
   return (
-    <>
+    <div className="flex flex-col gap-1 px-1">
       {lines.map((l) => (
         <p key={l.peer} className="text-pretty text-[12px] leading-snug text-muted-foreground">
           {l.name}: {l.text}
         </p>
       ))}
-    </>
+    </div>
   );
 }
 
@@ -1103,7 +1103,6 @@ function HostCard({
         onKeyDown={(e) => e.key === "Enter" && host(false)}
       />
       {tooShort && <ErrorLine>{t("passwordTooShort", { min: MIN_PASSPHRASE })}</ErrorLine>}
-      <RelayNotices port={port} info={instance?.relay?.info} />
 
       {/* Confirm media size, free space, and cloud-folder warnings. The row
           labels say what the numbers mean. */}
@@ -1495,7 +1494,8 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
   // The relays' lists are read as long as this screen is up, and no longer.
   useRelayWatch("lobby", true, port, send);
   const relays = useRelays();
-  const relayLists = useActiveInstance()?.relay?.lists ?? {};
+  const relay = useActiveInstance()?.relay;
+  const relayLists = relay?.lists ?? {};
   const { sections, contested } = relaySections(relays, relayLists, state.sessions);
   const sessions = contested.size
     ? state.sessions.map((s) => (contested.has(s.session_id) ? { ...s, contested: true } : s))
@@ -1511,7 +1511,11 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
       {/* Show a repair path for an active Windows Firewall block rule. */}
       <FirewallBlocked />
 
-      <NameCard />
+      {/* What the relays announce sits with who you are, before any plan. */}
+      <div className="flex shrink-0 flex-col gap-2">
+        <NameCard />
+        <RelayNotices port={port} info={relay?.info} />
+      </div>
 
       <AnimatePresence initial={false}>
         {last && !state.reconnecting && (

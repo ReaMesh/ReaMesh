@@ -157,7 +157,7 @@ describe("the host card's line", () => {
     expect(hostVisibleText([band], [])).toBe("Sichtbar in Bandrelay");
     expect(hostVisibleText([band, studio], [])).toBe("Sichtbar in Bandrelay und Studio");
     expect(hostVisibleText([band, studio], ["band"])).toBe("Sichtbar in Studio");
-    expect(hostVisibleText([band, studio], ["band", "studio"])).toBe("In keiner Relay-Liste");
+    expect(hostVisibleText([band, studio], ["band", "studio"])).toBe("Nur im lokalen Netzwerk sichtbar");
     expect(hostVisibleText([band, studio, relay("x", "Proberaum")], [])).toBe(
       "Sichtbar in Bandrelay, Studio und Proberaum",
     );
@@ -165,7 +165,7 @@ describe("the host card's line", () => {
     setLangPref("en");
     expect(hostVisibleText([band], [])).toBe("Visible on Bandrelay");
     expect(hostVisibleText([band, studio], [])).toBe("Visible on Bandrelay and Studio");
-    expect(hostVisibleText([band, studio], ["band", "studio"])).toBe("Not on any relay list");
+    expect(hostVisibleText([band, studio], ["band", "studio"])).toBe("Only visible on your local network");
     expect(viaNames(["Bandrelay", "Studio"])).toBe("Bandrelay and Studio");
   });
 
