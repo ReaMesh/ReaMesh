@@ -6,6 +6,7 @@ import {
   ClipboardPaste,
   LoaderCircle,
   LockKeyhole,
+  Megaphone,
   Ticket,
   X,
 } from "lucide-react";
@@ -52,7 +53,7 @@ import { recordHostJoin } from "@/lib/knownHosts";
 import { formatBytes } from "@/lib/format";
 import { t } from "@/lib/i18n";
 import { relayHost } from "@/lib/relay";
-import { noticeApplies, noticeLine, type RelayAbout } from "@/lib/relayInfo";
+import { noticeActive, noticeApplies, noticeWhen, type RelayAbout } from "@/lib/relayInfo";
 import { relayAbout, useRelays } from "@/lib/relays";
 import { localizeLogEntry, reconnectingText } from "@/lib/log";
 import { isCopyRefusal, setLastSession, useLastSession, type LastSession } from "@/lib/lastSession";
@@ -466,15 +467,39 @@ function RelayNotices({ port, info }: { port: number | null; info?: Record<strin
   }, [port, relays.length]);
   const lines = relays.flatMap((r) => {
     const notice = relayAbout(info, r.peer)?.notice;
-    return noticeApplies(notice) ? [{ peer: r.peer, name: r.label || relayHost(r), text: noticeLine(notice) }] : [];
+    if (!noticeApplies(notice)) return [];
+    return [
+      {
+        peer: r.peer,
+        name: r.label || relayHost(r),
+        text: notice.text,
+        when: noticeWhen(notice),
+        active: noticeActive(notice),
+      },
+    ];
   });
   if (lines.length === 0) return null;
+  // Neutral while it's only announced; amber once its window has begun.
   return (
-    <div className="flex flex-col gap-1 px-1">
+    <div className="flex flex-col gap-2">
       {lines.map((l) => (
-        <p key={l.peer} className="text-pretty text-[12px] leading-snug text-muted-foreground">
-          {l.name}: {l.text}
-        </p>
+        <div
+          key={l.peer}
+          className={cn(
+            "flex gap-2.5 rounded-xl px-3 py-2.5",
+            l.active ? "bg-amber-500/10" : "bg-sky-500/[0.07]",
+          )}
+        >
+          <Megaphone
+            aria-hidden="true"
+            className={cn("mt-px size-4 shrink-0", l.active ? "text-amber-500" : "text-sky-400")}
+          />
+          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+            <p className="truncate text-[12px] leading-snug font-semibold">{l.name}</p>
+            <p className="text-pretty text-[12px] leading-snug text-foreground/75">{l.text}</p>
+            {l.when && <p className="text-[11px] leading-snug text-muted-foreground">{l.when}</p>}
+          </div>
+        </div>
       ))}
     </div>
   );

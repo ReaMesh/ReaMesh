@@ -78,6 +78,11 @@ export function noticeWhen(n: RelayNotice, lang: string = resolveLang()): string
   return "";
 }
 
+/** A scheduled window that has begun: whatever it announces is happening now. */
+export function noticeActive(n: RelayNotice, now = nowSecs()): boolean {
+  return n.from !== 0 && n.from <= now;
+}
+
 export function noticeLine(n: RelayNotice, lang: string = resolveLang()): string {
   const when = noticeWhen(n, lang);
   return when ? `${n.text}, ${when}` : n.text;
