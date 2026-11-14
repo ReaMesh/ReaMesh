@@ -18,7 +18,7 @@ import { useConnections } from "@/lib/connection";
 import { copyDaysLeft } from "@/lib/copyLink";
 import { formatBytes } from "@/lib/format";
 import { resolveLang, t, useLang } from "@/lib/i18n";
-import { isWindows } from "@/lib/platform";
+import { isMac, isWindows, revealLabel } from "@/lib/platform";
 import {
   copyPercent,
   refreshLinkedCopies,
@@ -170,7 +170,7 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
   };
 
   return (
-    <div className={cn("flex flex-1 flex-col overflow-y-auto", isWindows && "scroll-slim")}>
+    <div className={cn("flex flex-1 flex-col overflow-y-auto", !isMac && "scroll-slim")}>
       <div className="w-full space-y-[18px] px-4 pt-1 pb-5">
         <div className="relative flex h-8 items-center">
           <Button
@@ -195,7 +195,7 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
                 <div key={copy.path} className="flex flex-col">
                   {i > 0 && <Divider inset={false} />}
                   <div className="flex min-h-11 items-center gap-2 pr-2">
-                    <Hint label={t(isWindows ? "showInExplorer" : "showInFinder")} slow>
+                    <Hint label={t(revealLabel)} slow>
                       <button
                         type="button"
                         onClick={() => revealItemInDir(copy.path).catch(() => {})}
@@ -245,7 +245,7 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
                   <div key={p.dir} className="flex flex-col">
                     {i > 0 && <Divider inset={false} />}
                     <div className="flex min-h-11 items-center gap-2 pr-2">
-                      <Hint label={t(isWindows ? "showInExplorer" : "showInFinder")} slow>
+                      <Hint label={t(revealLabel)} slow>
                         <button
                           type="button"
                           onClick={() => revealItemInDir(p.path).catch(() => {})}

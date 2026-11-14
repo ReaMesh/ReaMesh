@@ -59,8 +59,15 @@ blake3 = "1.5"
 trash = { version = "5", default-features = false, features = ["coinit_apartmentthreaded"] }
 
 # Free space on the disk a saved copy goes to (src/copies.rs); Windows asks kernel32.
+# On Linux also the clock tick length, for a process's start time.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# The presence overlay's native behaviour on Linux (src/overlay_panel_linux.rs):
+# reads REAPER's window (active or not, where it is) from the X server over a
+# connection of its own, in plain Rust: no Xlib, no extra system library.
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+x11rb = "0.13"
 
 # The presence overlay's native behaviour on Windows (src/overlay_panel_win.rs):
 # a non-activating topmost window that follows REAPER's and hides when REAPER

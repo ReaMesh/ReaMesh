@@ -13,6 +13,8 @@ use tauri::{AppHandle, Manager};
 
 #[cfg(target_os = "windows")]
 mod overlay_panel_win;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+mod overlay_panel_linux;
 mod copies;
 mod links;
 mod locales;
@@ -274,7 +276,8 @@ fn sync_overlay_remember(app: &AppHandle, mask: u8) {
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = (app, on);
+        let path = app.path().app_config_dir().ok().map(|d| d.join("overlay-pos"));
+        overlay_panel_linux::set_remember(path, on);
     }
 }
 
@@ -672,8 +675,9 @@ fn sweep_displaced(user_plugins: &Path) {
 /// ignores, then install the new file under the expected name. REAPER keeps
 /// using the old code until restart, and stale copies are removed later.
 ///
-/// No-op on macOS: replacing a loaded dylib there is just a normal rename.
-/// Returns where the old copy was parked, so a failed install can put it back.
+/// No-op on macOS and Linux: replacing a loaded library there is just a normal
+/// rename. Returns where the old copy was parked, so a failed install can put
+/// it back.
 #[cfg(target_os = "windows")]
 fn displace_loaded_plugin(user_plugins: &Path, dest: &Path) -> Option<PathBuf> {
     sweep_displaced(user_plugins);
@@ -692,7 +696,8 @@ fn displace_loaded_plugin(user_plugins: &Path, dest: &Path) -> Option<PathBuf> {
 
 #[cfg(not(target_os = "windows"))]
 fn displace_loaded_plugin(_user_plugins: &Path, dest: &Path) -> Option<PathBuf> {
-    // Replacing a loaded dylib on macOS is a plain rename; nothing to displace.
+    // Replacing a loaded library is a plain rename here: the running REAPER
+    // keeps the file it mapped. Nothing to displace.
     let _ = dest;
     None
 }
@@ -749,9 +754,34 @@ fn process_started(pid: u32) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::from_nanos(unix * 100))
 }
 
+/// Linux: the start time in `/proc/<pid>/stat` counts clock ticks since boot,
+/// and `/proc/stat` has the boot time.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn process_started(_pid: u32) -> Option<SystemTime> {
-    None
+fn process_started(pid: u32) -> Option<SystemTime> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let boot = fs::read_to_string("/proc/stat").ok()?;
+    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    process_started_from(&stat, &boot, u64::try_from(ticks_per_sec).ok()?)
+}
+
+/// `stat`: field 22 is the start time in ticks. The process name (field 2)
+/// may itself contain spaces and parentheses, so fields count from the last
+/// `)`. `boot`: the `btime <unix seconds>` line.
+#[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
+fn process_started_from(stat: &str, boot: &str, ticks_per_sec: u64) -> Option<SystemTime> {
+    let after_name = &stat[stat.rfind(')')? + 1..];
+    let ticks: u64 = after_name.split_ascii_whitespace().nth(19)?.parse().ok()?;
+    let btime: u64 = boot
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    if ticks_per_sec == 0 {
+        return None;
+    }
+    let since_boot = Duration::from_millis(ticks.checked_mul(1000)? / ticks_per_sec);
+    Some(UNIX_EPOCH + Duration::from_secs(btime) + since_boot)
 }
 
 /// The REAPER running as `pid` loaded its extension before the installed file
@@ -802,8 +832,55 @@ fn reaper_executable(app: &AppHandle) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
-/// Launch REAPER from the "waiting for REAPER" screen. Windows only: macOS
-/// opens the bundle straight from the webview through the opener plugin.
+/// Locate the `reaper` binary on Linux: a portable install keeps it next to
+/// its resource folder, REAPER's installer puts it in `~/opt/REAPER` or
+/// `/opt/REAPER` (with an optional link on the PATH), distribution packages
+/// put it on the PATH.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn reaper_executable(app: &AppHandle) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(dir) = resource_dir(&load_custom_path(app)) {
+        candidates.push(dir.join("reaper"));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|d| d.join("reaper")));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join("opt/REAPER/reaper"));
+    }
+    candidates.push(PathBuf::from("/opt/REAPER/reaper"));
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// The environment a program started from here should see. An AppImage runs
+/// with variables that point the loader and GTK at the libraries it carries;
+/// handed on, they would make REAPER load those instead of the system's. Every
+/// entry inside the mounted image is dropped from every variable, and so is
+/// the X11 choice this app made for itself.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn outside_env() -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
+    let mut out = vec![("GDK_BACKEND".into(), linux_env_before("GDK_BACKEND"))];
+    let Some(appdir) = std::env::var_os("APPDIR").filter(|d| !d.is_empty()) else {
+        return out;
+    };
+    let appdir = PathBuf::from(appdir);
+    for (key, value) in std::env::vars_os() {
+        if key == "APPDIR" || key == "APPIMAGE" || key == "OWD" || key == "ARGV0" {
+            out.push((key, None));
+            continue;
+        }
+        let kept: Vec<PathBuf> = std::env::split_paths(&value).filter(|p| !p.starts_with(&appdir)).collect();
+        if kept.len() == std::env::split_paths(&value).count() {
+            continue;
+        }
+        let joined = std::env::join_paths(kept).ok().filter(|v| !v.is_empty());
+        out.push((key, joined));
+    }
+    out
+}
+
+/// Launch REAPER from the "waiting for REAPER" screen. macOS opens the bundle
+/// straight from the webview through the opener plugin instead.
 #[tauri::command]
 fn launch_reaper(app: AppHandle) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -814,10 +891,31 @@ fn launch_reaper(app: AppHandle) -> Result<(), String> {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
         let _ = &app;
-        Err("launch_reaper is only used on Windows".into())
+        Err("launch_reaper is not used on macOS".into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let exe = reaper_executable(&app).ok_or("could not find the reaper program")?;
+        let mut cmd = std::process::Command::new(exe);
+        for (key, value) in outside_env() {
+            match value {
+                Some(v) => cmd.env(key, v),
+                None => cmd.env_remove(key),
+            };
+        }
+        let mut child = cmd
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        // Collect its exit status whenever it comes, or it stays a zombie
+        // for as long as this app runs.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
     }
 }
 
@@ -838,7 +936,7 @@ fn reaper_running() -> bool {
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        false
+        overlay_panel_linux::reaper_running()
     }
 }
 
@@ -872,8 +970,7 @@ fn focus_reaper(pid: u32) -> bool {
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = pid;
-        false
+        overlay_panel_linux::activate_reaper(pid)
     }
 }
 
@@ -918,18 +1015,28 @@ fn vst_cache_names_from(text: &str, out: &mut Vec<String>) {
 }
 
 /// Names from REAPER's CLAP cache (`reaper-clap-*.ini`) as `CLAP: Name
-/// (Vendor)`: value lines are `flags,Display Name`.
+/// (Vendor)`, or `CLAPi:` for an instrument.
 fn clap_cache_names(path: &Path, out: &mut Vec<String>) {
     let Ok(text) = fs::read_to_string(path) else { return };
+    clap_cache_names_from(&text, out);
+}
+
+/// Value lines are `plugin.id=flags|Display Name (Vendor)`, the flags a
+/// number whose lowest bit marks an instrument. A `[module.clap]` header and
+/// the `_=<hash>` line under it have no name and are skipped. A comma is
+/// accepted for the separator as well.
+fn clap_cache_names_from(text: &str, out: &mut Vec<String>) {
     for line in text.lines() {
         let Some((_, value)) = line.split_once('=') else { continue };
-        if let Some((_, name)) = value.split_once(',') {
-            let name = name.trim();
-            if name.starts_with("CLAP: ") || name.starts_with("CLAPi: ") {
-                out.push(name.to_string());
-            } else if !name.is_empty() {
-                out.push(format!("CLAP: {name}"));
-            }
+        let Some((flags, name)) = value.split_once('|').or_else(|| value.split_once(',')) else {
+            continue;
+        };
+        let name = name.trim();
+        if name.starts_with("CLAP: ") || name.starts_with("CLAPi: ") {
+            out.push(name.to_string());
+        } else if !name.is_empty() {
+            let instrument = flags.trim().parse::<u32>().is_ok_and(|f| f & 1 != 0);
+            out.push(format!("CLAP{}: {name}", if instrument { "i" } else { "" }));
         }
     }
 }
@@ -1005,10 +1112,13 @@ fn installed_plugins(app: AppHandle) -> Vec<String> {
         "reaper-clap-win64.ini",
         "reaper-clap-macos-arm64.ini",
         "reaper-clap-macos-x64.ini",
-        "reaper-clap-linux-x64.ini",
+        "reaper-clap-linux-x86_64.ini",
+        "reaper-clap-linux-aarch64.ini",
     ] {
         clap_cache_names(&dir.join(name), &mut out);
     }
+    // LV2 has no cache to read: REAPER asks the LV2 library for its plugins
+    // at every start. The webview reports those as "can't tell".
     // Intel REAPER writes `reaper-auplugins64.ini`, Apple Silicon
     // `reaper-auplugins_arm64.ini` (underscore, like the VST cache). The
     // `-bc.ini` sibling is a different, space-separated format and is skipped.
@@ -1488,7 +1598,13 @@ fn ensure_hud_overlay(app: &AppHandle, port: u16, pid: u32) -> Result<(), String
     }
     sync_overlay_remember(app, load_overlay(app));
     let url = format!("index.html?overlay=1&port={port}");
-    let win = tauri::WebviewWindowBuilder::new(app, "overlay", tauri::WebviewUrl::App(url.into()))
+    let builder = tauri::WebviewWindowBuilder::new(app, "overlay", tauri::WebviewUrl::App(url.into()));
+    // X11: a window that takes no keyboard focus, so a click on the roster
+    // leaves REAPER the active window. (macOS and Windows get the same from
+    // their native panel code.)
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let builder = builder.focusable(false);
+    let win = builder
         .title("ReaMesh overlay")
         .inner_size(OVERLAY_WIDTH, 120.0)
         // Resizable so the webview can fit the window to the card. It must
@@ -1525,10 +1641,9 @@ fn ensure_hud_overlay(app: &AppHandle, port: u16, pid: u32) -> Result<(), String
             overlay_panel_win::attach(hwnd.0 as isize, win.scale_factor().unwrap_or(1.0), pid);
         }
     }
+    // Tauri's window calls hop to the GTK thread themselves.
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = (&win, pid);
-    }
+    overlay_panel_linux::attach(win, pid);
     OVERLAY_PORT.store(port, Ordering::SeqCst);
     Ok(())
 }
@@ -1558,6 +1673,8 @@ fn close_hud_overlay(app: &AppHandle) {
     {
         #[cfg(target_os = "windows")]
         overlay_panel_win::detach();
+        #[cfg(not(target_os = "windows"))]
+        overlay_panel_linux::detach();
         if let Some(w) = hud {
             let _ = w.close();
         }
@@ -1591,9 +1708,11 @@ fn frontmost_is_reaper() -> bool {
     overlay_panel_win::any_reaper_is_foreground()
 }
 
+/// As on Windows: any REAPER, not only the selected instance. False where the
+/// desktop doesn't say which window is active.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn frontmost_is_reaper() -> bool {
-    false
+    overlay_panel_linux::any_reaper_is_foreground()
 }
 
 /// A peer joined while the main window was unfocused. Returns whether the user
@@ -1880,8 +1999,41 @@ fn confirm_leave_then_exit(app: AppHandle, hosting: bool, port: u16) {
     });
 }
 
+/// `GDK_BACKEND` as this app was started with it, before `prepare_linux_env`.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+static GDK_BACKEND_BEFORE: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn linux_env_before(key: &str) -> Option<std::ffi::OsString> {
+    debug_assert_eq!(key, "GDK_BACKEND");
+    GDK_BACKEND_BEFORE.get().cloned().flatten()
+}
+
+/// Linux: choices that have to be in the environment before GTK starts. Call
+/// first thing, while this is the only thread.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn prepare_linux_env() {
+    let set = |key: &str| std::env::var_os(key).is_some_and(|v| !v.is_empty());
+    let _ = GDK_BACKEND_BEFORE.set(std::env::var_os("GDK_BACKEND"));
+    // The HUD has to find REAPER's window, follow it and stay above it. Only
+    // X11 lets one application do that with another's window, and REAPER is
+    // an X11 client everywhere (through XWayland on a Wayland desktop). So
+    // run on X11 too wherever an X server answers; a `GDK_BACKEND` the user
+    // set wins.
+    if !set("GDK_BACKEND") && set("DISPLAY") {
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
+    // WebKitGTK's DMA-BUF renderer leaves the window blank with NVIDIA's
+    // driver.
+    if !set("WEBKIT_DISABLE_DMABUF_RENDERER") && Path::new("/proc/driver/nvidia/version").exists() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    prepare_linux_env();
     let builder = tauri::Builder::default();
     // Single-instance goes first (plugins run in registration order). A
     // second launch, which is how Windows delivers a clicked `reamesh://`
@@ -1976,9 +2128,11 @@ pub fn run() {
             build_menu(app.handle())?;
             // Windows: point the `reamesh://` scheme at this executable so a
             // dev build or an unpackaged run handles invite links too (the
-            // installer registers it as well). macOS registers through the
-            // bundle's Info.plist, which the bundler writes from tauri.conf.json.
-            #[cfg(windows)]
+            // installer registers it as well). Linux likewise: a .deb brings
+            // a desktop entry naming the scheme, an AppImage has none until
+            // this writes one. macOS registers through the bundle's
+            // Info.plist, which the bundler writes from tauri.conf.json.
+            #[cfg(not(target_os = "macos"))]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 if let Err(e) = app.deep_link().register_all() {
@@ -2267,6 +2421,40 @@ mod tests {
                 "AU: OddOne".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn clap_cache_lines_become_rpp_display_names() {
+        let text = "[lsp-plugins-clap.clap]\n\
+            _=80E6DCBADB35DA0180E3F1EB6574DD01\n\
+            in.lsp-plug.comp_mono=0|Compressor Mono (LSP CLAP)\n\
+            in.lsp-plug.multisampler_x12=1|Multi-Sampler x12 Stereo (LSP CLAP)\n\
+            com.example.named=0|CLAPi: Already Named (Vendor)\n\
+            com.example.comma=2,Older, Separator (Vendor)\n\
+            com.example.empty=0|\n";
+        let mut out = Vec::new();
+        clap_cache_names_from(text, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                "CLAP: Compressor Mono (LSP CLAP)".to_string(),
+                "CLAPi: Multi-Sampler x12 Stereo (LSP CLAP)".to_string(),
+                "CLAPi: Already Named (Vendor)".to_string(),
+                "CLAP: Older, Separator (Vendor)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_linux_process_start_is_boot_time_plus_ticks() {
+        // The name holds spaces and a ")": fields count from the last one.
+        let stat = "4242 (re) aper (x)) S 1 4242 4242 0 -1 4194304 100 0 0 0 5 6 0 0 20 0 9 0 123456 1000 200 18446744073709551615";
+        let boot = "cpu  1 2 3\nbtime 1700000000\nprocesses 99\n";
+        let started = process_started_from(stat, boot, 100).unwrap();
+        assert_eq!(started, UNIX_EPOCH + Duration::from_millis(1_700_000_000_000 + 1_234_560));
+        assert!(process_started_from("no parenthesis", boot, 100).is_none());
+        assert!(process_started_from(stat, "cpu 1\n", 100).is_none());
+        assert!(process_started_from(stat, boot, 0).is_none());
     }
 
     #[test]

@@ -104,6 +104,11 @@ export function pluginStatus(claimed: string, index: InstalledIndex | null): Plu
     return index.js.has(claimed.toLowerCase().trim()) || index.js.has(`js: ${name}`) ? "have" : "missing";
   }
   const formats = index.formats.get(name);
+  // REAPER keeps no cache of its LV2 plugins (it asks the LV2 library at every
+  // start), so without a single LV2 entry there is nothing to judge one by.
+  if (format === "LV2" && !formats?.has("LV2") && ![...index.formats.values()].some((f) => f.has("LV2"))) {
+    return "unknown";
+  }
   if (!formats) {
     // REAPER's own bundled plugins are always present, whatever the caches say.
     return p.vendor.toLowerCase() === "cockos" ? "have" : "missing";

@@ -5,23 +5,23 @@ import { UpdateIndicator } from "@/components/UpdateIndicator";
 import { Hint } from "@/components/Hint";
 import { useConnections, setActivePort } from "@/lib/connection";
 import { t } from "@/lib/i18n";
-import { isWindows } from "@/lib/platform";
+import { ownTitleBar } from "@/lib/platform";
 import { cn, focusRing } from "@/lib/utils";
 
-// Title bar: a 44px draggable strip at the top of the window on both
-// platforms.
+// Title bar: a 44px draggable strip at the top of the window on every
+// platform.
 //
 // On macOS the native traffic lights sit over its left end (titleBarStyle
 // Overlay), the mark + wordmark sit centred, and the right end carries the
 // REAPER instance tabs (when several run). Settings lives in the application
 // menu. Name and colour are edited in the Lobby and in Settings.
 //
-// On Windows the window is undecorated (tauri.windows.conf.json), so this strip
-// IS the title bar: app name at the left, instance tabs, the Settings gear,
+// On Windows and Linux the window is undecorated (tauri.windows.conf.json,
+// tauri.linux.conf.json), so this strip IS the title bar: app name at the left, instance tabs, the Settings gear,
 // and our own minimize / close buttons at the right, the layout Windows
 // Terminal, Spotify and the Windows Settings app use. There is no maximize:
-// the window is a narrow companion beside REAPER, capped in width
-// (tauri.windows.conf.json), and every row is laid out for that.
+// the window is a narrow companion beside REAPER, capped in width (same
+// files), and every row is laid out for that.
 export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
   const { instances, activePort } = useConnections();
 
@@ -55,7 +55,7 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
     </nav>
   );
 
-  if (isWindows) {
+  if (ownTitleBar) {
     return (
       <header
         data-tauri-drag-region
@@ -115,7 +115,7 @@ function Wordmark() {
   return <Lockup height={18} className="pointer-events-none select-none text-muted-foreground" />;
 }
 
-// Windows caption buttons. Full-height, 46px wide, square (no rounding) like
+// Caption buttons of the undecorated window. Full-height, 46px wide, square (no rounding) like
 // the native ones; close turns Windows' signature red on hover. Every window
 // call is wrapped so the plain-browser dev harness (no Tauri) stays usable.
 function WindowControls() {

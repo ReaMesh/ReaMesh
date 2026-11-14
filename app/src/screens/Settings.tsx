@@ -49,7 +49,7 @@ import {
   setOverlaySetting,
   useOverlaySettings,
 } from "@/lib/overlaySettings";
-import { isMac, isWindows } from "@/lib/platform";
+import { isMac } from "@/lib/platform";
 import { formatBytes } from "@/lib/format";
 import { listJoinedProjects } from "@/screens/JoinedProjects";
 import { PROTO } from "@/lib/version";
@@ -581,7 +581,7 @@ export function Settings({
     // Style WebView2's scrollbar on Windows; keep the native macOS overlay.
     <div
       ref={scroller}
-      className={cn("flex flex-1 flex-col overflow-y-auto", isWindows && "scroll-slim")}
+      className={cn("flex flex-1 flex-col overflow-y-auto", !isMac && "scroll-slim")}
     >
       <div className="w-full space-y-[18px] px-4 pt-1 pb-5">
         {onBack && (

@@ -13,7 +13,7 @@ import { toast } from "sonner";
 import { sendAll, waitForInstances } from "./connection";
 import type { LinkedCopy } from "./copyLink";
 import { t } from "./i18n";
-import { isWindows } from "./platform";
+import { isWindows, revealLabel } from "./platform";
 
 export interface RunningCopy {
   /** Folder name inside the staging root. */
@@ -68,7 +68,7 @@ export const copyDirName = lastPart;
 
 function reveal(path: string) {
   return {
-    label: t(isWindows ? "showInExplorer" : "showInFinder"),
+    label: t(revealLabel),
     onClick: () => void revealItemInDir(path).catch(() => {}),
   };
 }

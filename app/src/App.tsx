@@ -24,7 +24,7 @@ import { openOverlay, closeOverlay, setSessionState } from "@/lib/overlay";
 import { useOverlaySettings } from "@/lib/overlaySettings";
 import { loadReaperPath, refreshStatus, useExtensionStale, useReaperStatus } from "@/lib/install";
 import { t, useLang } from "@/lib/i18n";
-import { isWindows } from "@/lib/platform";
+import { ownTitleBar } from "@/lib/platform";
 import { localizeLogEntry } from "@/lib/log";
 import { getLastSession, lastSessionAfter, setLastSession } from "@/lib/lastSession";
 import { pluginStatus, useInstalledPlugins } from "@/lib/plugins";
@@ -368,12 +368,12 @@ export default function App() {
   const instance = useActiveInstance();
   const state = instance?.state;
   const reaper = useReaperStatus();
-  // Settings is a screen of this window on Windows only (macOS has its own
+  // Settings is a screen of this window on Windows and Linux (macOS has its own
   // Settings window), so the acknowledgements and joined projects return to it
   // only there.
   const [settingsOpen, setSettingsOpen] = useState(
     resumed?.screen === "settings" ||
-      ((resumed?.screen === "credits" || resumed?.screen === "joined") && isWindows),
+      ((resumed?.screen === "credits" || resumed?.screen === "joined") && ownTitleBar),
   );
   const [creditsOpen, setCreditsOpen] = useState(resumed?.screen === "credits");
   const [joinedOpen, setJoinedOpen] = useState(resumed?.screen === "joined");
@@ -547,10 +547,10 @@ export default function App() {
     };
   }, []);
 
-  // Windows has no application menu, so Ctrl+, opens Settings from the keyboard
+  // Windows and Linux have no application menu, so Ctrl+, opens Settings from the keyboard
   // (the macOS menu item already carries Cmd+,).
   useEffect(() => {
-    if (!isWindows) return;
+    if (!ownTitleBar) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.ctrlKey && !e.altKey && !e.shiftKey && e.key === ",") {
         e.preventDefault();

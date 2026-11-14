@@ -73,7 +73,7 @@ import { decodeTicket, normalizeTicket } from "@/lib/ticket";
 import { initials, type ExtState, type LogEntry, type SessionAd } from "@/lib/types";
 import { checkForUpdate, restartToUpdate, useUpdate } from "@/lib/updater";
 import { protoSkew } from "@/lib/version";
-import { isWindows } from "@/lib/platform";
+import { revealLabel } from "@/lib/platform";
 import { cn, focusRing } from "@/lib/utils";
 
 /// Shortest passphrase accepted by the host form. This is only a minimum for
@@ -1432,7 +1432,7 @@ function LastSessionBlock({
                     className="h-7 shrink-0 px-2.5 text-[12px] text-foreground/80"
                     onClick={() => revealItemInDir(linkedDir).catch(() => {})}
                   >
-                    {t(isWindows ? "showInExplorer" : "showInFinder")}
+                    {t(revealLabel)}
                   </Button>
                 ) : (
                   <Button

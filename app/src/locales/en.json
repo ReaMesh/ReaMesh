@@ -449,6 +449,7 @@
   "trashedToastWin": "Moved to the Recycle Bin",
   "showInFinder": "Show in Finder",
   "showInExplorer": "Show in Explorer",
+  "showInFileManager": "Show in file manager",
   "lastSession": "Last session",
   "lastSessionLeft": "You left the session",
   "lastSessionRetryFailed": "Couldn’t restore the connection",

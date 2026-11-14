@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Divider, Group, SectionLabel } from "@/components/Group";
 import { Hint } from "@/components/Hint";
 import { t } from "@/lib/i18n";
-import { isWindows } from "@/lib/platform";
+import { isMac } from "@/lib/platform";
 import { cn, focusRing } from "@/lib/utils";
 import credits from "@/assets/credits.json";
 
@@ -71,7 +71,7 @@ function CreditRow({ label, c }: { label: string; c?: Credit }) {
 
 export function Credits({ onBack }: { onBack: () => void }) {
   return (
-    <div className={cn("flex flex-1 flex-col overflow-y-auto", isWindows && "scroll-slim")}>
+    <div className={cn("flex flex-1 flex-col overflow-y-auto", !isMac && "scroll-slim")}>
       <div className="w-full space-y-[18px] px-4 pt-1 pb-5">
         <div className="relative flex h-8 items-center">
           <Button

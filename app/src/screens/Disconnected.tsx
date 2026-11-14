@@ -7,16 +7,16 @@ import { Button } from "@/components/ui/button";
 import { ArcRing } from "@/components/ArcRing";
 import { RMarkFill } from "@/components/RMark";
 import { FirewallNotice } from "@/components/FirewallNotice";
-import { isWindows } from "@/lib/platform";
+import { isMac } from "@/lib/platform";
 import { FG_COLOR } from "@/lib/colors";
 import { t } from "@/lib/i18n";
 
 async function launchReaper() {
   try {
-    // macOS has one canonical bundle path; on Windows the .exe location
-    // varies by install, so the backend resolves it (the webview can't).
-    if (isWindows) await invoke("launch_reaper");
-    else await openPath("/Applications/REAPER.app");
+    // macOS has one canonical bundle path; on Windows and Linux the program's
+    // location varies by install, so the backend resolves it (the webview can't).
+    if (isMac) await openPath("/Applications/REAPER.app");
+    else await invoke("launch_reaper");
   } catch {
     toast.error(t("couldntOpenReaper"));
   }
