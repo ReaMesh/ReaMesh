@@ -53,7 +53,14 @@ jobs:
               echo "$1 stays on $CUR (newer than $NEW)"
               return
             fi
-            cp new/latest.json "$1.json"
+            # Linux is Beta only for now (updater::STABLE_AVAILABLE): keep its
+            # platforms out of Stable. `relay` has linux keys too and stays.
+            if [ "$1" = stable ]; then
+              jq 'del(.platforms["linux-x86_64", "linux-x86_64-appimage", "linux-x86_64-deb", "linux-aarch64"])' \
+                new/latest.json > "$1.json"
+            else
+              cp new/latest.json "$1.json"
+            fi
             gh release upload updater "$1.json" --repo "$REPO" --clobber
             echo "$1 → $NEW"
             # A release from before the relay was released has no image.

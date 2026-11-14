@@ -1,4 +1,4 @@
-# Release: builds the signed app for both platforms (the extension rides
+# Release: builds the signed app for macOS, Windows and Linux (the extension rides
 # inside it, and is also published on its own, signed, so a downloaded update
 # can install it before the app restarts) plus the macOS installer DMG, and
 # publishes them, with the updater manifests, as a draft release of this
@@ -263,6 +263,75 @@ jobs:
           name: macos
           path: release-macos/*
 
+  # Linux (Beta): AppImage and .deb, built on Ubuntu 22.04 so they run on
+  # glibc 2.35 and newer. The AppImage updates itself; a .deb install updates
+  # through dpkg (the updater picks the artifact by the bundle type stamped into
+  # the binary). channel.yml keeps both out of stable.json.
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake file patchelf libssl-dev libxdo-dev librsvg2-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libcairo2-dev libpango1.0-dev \
+            libx11-dev libxext-dev libxfixes-dev
+      # Same cache scheme as windows: downloads only.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ github.job }}-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'app/src-tauri/Cargo.lock') }}
+          restore-keys: cargo-registry-${{ github.job }}-${{ runner.os }}-
+      - name: Rust tests
+        run: cargo test --release -- --test-threads=1
+        working-directory: rust
+      - name: Build extension .so
+        run: ./build.sh --no-app
+      - name: C++ tests
+        run: |
+          LIB=rust/target/release/libreamesh.a
+          g++ -std=c++20 -Iextension/include -Iextension/sdk tools/chunk_test.cpp "$LIB" \
+            -lpthread -ldl -lm -o "$RUNNER_TEMP/chunk_test"
+          "$RUNNER_TEMP/chunk_test"
+      - name: App checks
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+          bun run test
+        working-directory: app
+      - name: Build the app
+        run: bun run tauri build --no-bundle --config src-tauri/tauri.release.conf.json
+        working-directory: app
+      - name: Bundle AppImage + .deb and signed updater artifacts
+        run: bun run tauri bundle --config src-tauri/tauri.release.conf.json
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # The same .so the bundles carry, byte for byte.
+      - name: Sign the extension for pre-install
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          B=src-tauri/target/release/bundle
+          mkdir -p ../release-linux
+          cp ../extension/build/reaper_reamesh.so ../release-linux/
+          bun run tauri signer sign --app-version "$(bun -p 'require("./package.json").version')" \
+            ../release-linux/reaper_reamesh.so
+          cp "$B"/appimage/*.AppImage "$B"/appimage/*.AppImage.sig "$B"/deb/*.deb "$B"/deb/*.deb.sig ../release-linux/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux
+          path: release-linux/*
+
   # The macOS build is universal; this runs its Intel half natively on an
   # Intel Mac (binaries, x86_64 load, C++ tests, Rust tests) before anything
   # is published.
@@ -285,7 +354,7 @@ jobs:
         run: tools/check-intel.sh
 
   publish:
-    needs: [relay, windows, macos, macos-intel]
+    needs: [relay, windows, macos, macos-intel, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
