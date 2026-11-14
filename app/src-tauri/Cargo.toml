@@ -69,6 +69,14 @@ libc = "0.2"
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
 x11rb = "0.13"
 
+# Nearby sessions over Bluetooth on Linux (src/ble_linux.rs): BlueZ is driven
+# over D-Bus. Both crates are in the tree already, at these versions: the
+# single-instance and opener plugins talk D-Bus through zbus, and zbus runs on
+# async-io, whose timer is what bounds every call here.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+async-io = "2"
+
 # The presence overlay's native behaviour on Windows (src/overlay_panel_win.rs):
 # a non-activating topmost window that follows REAPER's and hides when REAPER
 # is not in front. macOS does the same job in Objective-C (src/overlay_panel.m),

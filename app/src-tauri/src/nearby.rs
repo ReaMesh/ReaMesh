@@ -13,7 +13,8 @@
 //! gates everything: the CoreBluetooth managers, and with them the system's
 //! permission prompt, only exist once the user turned it on. macOS runs on
 //! CoreBluetooth (src/ble.m), Windows on the WinRT Bluetooth APIs
-//! (src/ble_win.rs); elsewhere it reports `supported: false`.
+//! (src/ble_win.rs), Linux on BlueZ over D-Bus (src/ble_linux.rs); elsewhere
+//! it reports `supported: false`.
 
 use serde::Serialize;
 use std::fs;
@@ -58,8 +59,8 @@ pub fn store_pref(app: &AppHandle, on: bool) {
     let _ = app.emit("nearby-changed", ());
 }
 
-/// macOS always (the permission is asked for on first use); Windows once an
-/// adapter with the LE central and peripheral roles was found.
+/// macOS always (the permission is asked for on first use); Windows and Linux
+/// once an adapter with the LE central and peripheral roles was found.
 pub fn supported() -> bool {
     ble::supported()
 }
@@ -110,7 +111,7 @@ static APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
 
 /// A payload read from a nearby host: validated, then handed to the main
 /// window, which owns the connection to the extension.
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows, target_os = "linux")), allow(dead_code))]
 fn on_found(raw: &str) {
     let (Some(app), Some(clean)) = (APP.get(), clean_payload(raw)) else { return };
     let _ = app.emit_to("main", "nearby:found", clean);
@@ -119,7 +120,7 @@ fn on_found(raw: &str) {
 /// Support or permission changed behind the webview's back (Windows finds
 /// its adapter after startup, macOS reports the answer to its permission
 /// prompt): it reads the state again.
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows, target_os = "linux")), allow(dead_code))]
 fn changed() {
     if let Some(app) = APP.get() {
         let _ = app.emit("nearby-changed", ());
@@ -219,7 +220,11 @@ mod ble {
 #[path = "ble_win.rs"]
 mod ble;
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(target_os = "linux")]
+#[path = "ble_linux.rs"]
+mod ble;
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 mod ble {
     pub fn init() {}
     pub fn supported() -> bool {
