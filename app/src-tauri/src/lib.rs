@@ -15,6 +15,7 @@ use tauri::{AppHandle, Manager};
 mod overlay_panel_win;
 mod copies;
 mod links;
+mod locales;
 mod nearby;
 mod updater;
 
@@ -141,31 +142,28 @@ fn files_equal(a: &Path, b: &Path) -> bool {
 
 // ---------- language ----------
 //
-// The app speaks English and German. The preference ("system" | "en" | "de")
-// is persisted backend-side (like the REAPER folder) so the webview and the
-// backend share one source of truth; "system" resolves
-// through the device locale, anything that isn't German falls back to English.
+// The languages are the JSON files in ../src/locales (see locales.rs). The
+// preference ("system" or a language code) is persisted backend-side (like the
+// REAPER folder) so the webview and the backend share one source of truth;
+// "system" resolves through the device locale and falls back to English.
 
-#[derive(Clone, Copy, PartialEq)]
-enum Lang {
-    En,
-    De,
-}
+/// The code of a shipped language.
+type Lang = &'static str;
 
 fn lang_file(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_config_dir().ok().map(|d| d.join("language"))
 }
 
-/// The stored preference: "system" (default), "en" or "de".
+/// The stored preference: "system" (default) or a shipped language's code.
 fn load_lang_pref(app: &AppHandle) -> String {
     let stored = lang_file(app)
         .and_then(|p| fs::read_to_string(p).ok())
         .map(|s| s.trim().to_string());
-    match stored.as_deref() {
-        Some("en") => "en".into(),
-        Some("de") => "de".into(),
-        _ => "system".into(),
-    }
+    stored
+        .as_deref()
+        .and_then(locales::code)
+        .unwrap_or("system")
+        .into()
 }
 
 fn store_lang_pref(app: &AppHandle, pref: &str) {
@@ -402,26 +400,19 @@ pub(crate) fn maybe_auto_install(app: &AppHandle) {
 }
 
 fn device_lang() -> Lang {
-    match sys_locale::get_locale() {
-        Some(l) if l.to_lowercase().starts_with("de") => Lang::De,
-        _ => Lang::En,
-    }
+    sys_locale::get_locales()
+        .find_map(|l| locales::match_tag(&l))
+        .unwrap_or(locales::FALLBACK)
 }
 
 fn resolved_lang(app: &AppHandle) -> Lang {
-    match load_lang_pref(app).as_str() {
-        "en" => Lang::En,
-        "de" => Lang::De,
-        _ => device_lang(),
-    }
+    locales::code(&load_lang_pref(app)).unwrap_or_else(device_lang)
 }
 
-/// Two-language string table for the native side (menu, quit dialog).
-fn tr(lang: Lang, en: &'static str, de: &'static str) -> &'static str {
-    match lang {
-        Lang::En => en,
-        Lang::De => de,
-    }
+/// A message of the shared string tables, for the native side (menu, quit
+/// dialog, About window).
+fn tr(lang: Lang, key: &str) -> &'static str {
+    locales::text(lang, key)
 }
 
 #[tauri::command]
@@ -437,10 +428,7 @@ fn set_language(app: AppHandle, pref: String) {
 /// Persist the preference, rebuild the (localized) native menu, and tell every
 /// webview window so the UI re-renders.
 fn apply_language(app: &AppHandle, pref: &str) {
-    let pref = match pref {
-        "en" | "de" => pref,
-        _ => "system",
-    };
+    let pref = locales::code(pref).unwrap_or("system");
     store_lang_pref(app, pref);
     #[cfg(target_os = "macos")]
     {
@@ -1711,16 +1699,12 @@ fn confirm_quit_while_hosting(app: &AppHandle, hosting: bool) -> bool {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     let lang = resolved_lang(app);
     app.dialog()
-        .message(tr(
-            lang,
-            "If you quit, the session ends and everyone connected to you is disconnected.",
-            "Wenn du ReaMesh beendest, endet die Session und alle Teilnehmenden verlieren die Verbindung.",
-        ))
-        .title(tr(lang, "Stop hosting and quit?", "Hosting beenden und ReaMesh schließen?"))
+        .message(tr(lang, "nativeQuitHostingBody"))
+        .title(tr(lang, "nativeQuitHostingTitle"))
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::OkCancelCustom(
-            tr(lang, "Stop hosting", "Hosting beenden").into(),
-            tr(lang, "Cancel", "Abbrechen").into(),
+            tr(lang, "nativeQuitHostingConfirm").into(),
+            tr(lang, "cancel").into(),
         ))
         .blocking_show()
 }
@@ -1730,16 +1714,12 @@ fn confirm_quit_as_client(app: &AppHandle) -> bool {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     let lang = resolved_lang(app);
     app.dialog()
-        .message(tr(
-            lang,
-            "If you quit, you leave the session. The project stays open in REAPER, but changes will no longer sync.",
-            "Wenn du ReaMesh beendest, verlässt du die Session. Das Projekt bleibt in REAPER geöffnet, aber Änderungen werden nicht mehr synchronisiert.",
-        ))
-        .title(tr(lang, "Leave the session and quit?", "Session verlassen und ReaMesh schließen?"))
+        .message(tr(lang, "nativeQuitClientBody"))
+        .title(tr(lang, "nativeQuitClientTitle"))
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::OkCancelCustom(
-            tr(lang, "Leave session", "Session verlassen").into(),
-            tr(lang, "Cancel", "Abbrechen").into(),
+            tr(lang, "nativeQuitClientConfirm").into(),
+            tr(lang, "cancel").into(),
         ))
         .blocking_show()
 }
@@ -1752,18 +1732,18 @@ fn confirm_quit_as_client(app: &AppHandle) -> bool {
 fn build_menu(app: &AppHandle) -> tauri::Result<()> {
     use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
     let lang = resolved_lang(app);
-    let settings = MenuItemBuilder::with_id("settings", tr(lang, "Settings…", "Einstellungen…"))
+    let settings = MenuItemBuilder::with_id("settings", tr(lang, "menuSettings"))
         .accelerator("Cmd+,")
         .build(app)?;
     // Custom Quit (instead of the predefined item) so it routes through
     // on_menu_event → app.exit(0) → our ExitRequested handler, which stops
     // hosting before the app dies.
-    let quit = MenuItemBuilder::with_id("quit", tr(lang, "Quit ReaMesh", "ReaMesh beenden"))
+    let quit = MenuItemBuilder::with_id("quit", tr(lang, "menuQuit"))
         .accelerator("Cmd+Q")
         .build(app)?;
     // Custom About (instead of the predefined item) so it opens the native
     // about_window.m with build details, links and the app's own language.
-    let about = MenuItemBuilder::with_id("about", tr(lang, "About ReaMesh", "Über ReaMesh"))
+    let about = MenuItemBuilder::with_id("about", tr(lang, "aboutTitle"))
         .build(app)?;
     let app_menu = SubmenuBuilder::new(app, "ReaMesh")
         .item(&about)
@@ -1772,60 +1752,60 @@ fn build_menu(app: &AppHandle) -> tauri::Result<()> {
         .separator()
         .item(&PredefinedMenuItem::services(
             app,
-            Some(tr(lang, "Services", "Dienste")),
+            Some(tr(lang, "menuServices")),
         )?)
         .separator()
         .item(&PredefinedMenuItem::hide(
             app,
-            Some(tr(lang, "Hide ReaMesh", "ReaMesh ausblenden")),
+            Some(tr(lang, "menuHide")),
         )?)
         .item(&PredefinedMenuItem::hide_others(
             app,
-            Some(tr(lang, "Hide Others", "Andere ausblenden")),
+            Some(tr(lang, "menuHideOthers")),
         )?)
         .item(&PredefinedMenuItem::show_all(
             app,
-            Some(tr(lang, "Show All", "Alle einblenden")),
+            Some(tr(lang, "menuShowAll")),
         )?)
         .separator()
         .item(&quit)
         .build()?;
-    let edit = SubmenuBuilder::new(app, tr(lang, "Edit", "Bearbeiten"))
+    let edit = SubmenuBuilder::new(app, tr(lang, "menuEdit"))
         .item(&PredefinedMenuItem::undo(
             app,
-            Some(tr(lang, "Undo", "Widerrufen")),
+            Some(tr(lang, "menuUndo")),
         )?)
         .item(&PredefinedMenuItem::redo(
             app,
-            Some(tr(lang, "Redo", "Wiederholen")),
+            Some(tr(lang, "menuRedo")),
         )?)
         .separator()
         .item(&PredefinedMenuItem::cut(
             app,
-            Some(tr(lang, "Cut", "Ausschneiden")),
+            Some(tr(lang, "menuCut")),
         )?)
         .item(&PredefinedMenuItem::copy(
             app,
-            Some(tr(lang, "Copy", "Kopieren")),
+            Some(tr(lang, "menuCopy")),
         )?)
         .item(&PredefinedMenuItem::paste(
             app,
-            Some(tr(lang, "Paste", "Einsetzen")),
+            Some(tr(lang, "menuPaste")),
         )?)
         .item(&PredefinedMenuItem::select_all(
             app,
-            Some(tr(lang, "Select All", "Alles auswählen")),
+            Some(tr(lang, "menuSelectAll")),
         )?)
         .build()?;
-    let window = SubmenuBuilder::new(app, tr(lang, "Window", "Fenster"))
+    let window = SubmenuBuilder::new(app, tr(lang, "menuWindow"))
         .item(&PredefinedMenuItem::minimize(
             app,
-            Some(tr(lang, "Minimize", "Im Dock ablegen")),
+            Some(tr(lang, "menuMinimize")),
         )?)
         .separator()
         .item(&PredefinedMenuItem::close_window(
             app,
-            Some(tr(lang, "Close Window", "Fenster schließen")),
+            Some(tr(lang, "menuCloseWindow")),
         )?)
         .build()?;
     let menu = MenuBuilder::new(app)
@@ -1837,7 +1817,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn settings_title(lang: Lang) -> &'static str {
-    tr(lang, "Settings", "Einstellungen")
+    tr(lang, "settings")
 }
 
 /// Settings on macOS (ReaMesh → Settings…, Cmd+,): the webview screen Windows
@@ -2095,10 +2075,23 @@ pub fn run() {
 /// Bridge to the native About window (src/about_window.m).
 #[cfg(target_os = "macos")]
 mod native_about {
-    use super::{resolved_lang, Lang, PROTO};
+    use super::{resolved_lang, tr, PROTO};
     use std::ffi::{c_char, c_void, CString};
     use std::sync::OnceLock;
     use tauri::{AppHandle, Emitter, Manager};
+
+    /// The window's strings in the app's language (about_window.h).
+    #[repr(C)]
+    struct AboutText {
+        title: *const c_char,
+        version: *const c_char,
+        tagline: *const c_char,
+        build: *const c_char,
+        protocol: *const c_char,
+        source: *const c_char,
+        credits: *const c_char,
+        notice: *const c_char,
+    }
 
     #[repr(C)]
     struct AboutInfo {
@@ -2108,7 +2101,8 @@ mod native_about {
         build_time: i64,
         release: i32,
         proto: u32,
-        german: i32,
+        locale: *const c_char,
+        text: AboutText,
         icon_png: *const u8,
         icon_png_len: usize,
         show_credits: extern "C" fn(*mut c_void),
@@ -2147,14 +2141,36 @@ mod native_about {
         ))
         .unwrap_or_default();
         let commit = CString::new(env!("REAMESH_COMMIT")).unwrap_or_default();
+        let lang = resolved_lang(app);
+        let text = |key: &str| CString::new(tr(lang, key)).unwrap_or_default();
+        let locale = CString::new(lang).unwrap_or_default();
+        let release = !cfg!(debug_assertions);
+        let title = text("aboutTitle");
+        let version_label = text("aboutVersion");
+        let tagline = text("aboutTagline");
+        let build = text(if release { "releaseBuild" } else { "devBuild" });
+        let protocol = text("aboutProtocol");
+        let source = text("sourceCode");
+        let credits = text("credits");
+        let notice = text("cockosNotice");
         let info = AboutInfo {
             ctx: ptr as *mut c_void,
             version: version.as_ptr(),
             commit: commit.as_ptr(),
             build_time: env!("REAMESH_BUILD_TIME").parse().unwrap_or(0),
-            release: !cfg!(debug_assertions) as i32,
+            release: release as i32,
             proto: PROTO,
-            german: matches!(resolved_lang(app), Lang::De) as i32,
+            locale: locale.as_ptr(),
+            text: AboutText {
+                title: title.as_ptr(),
+                version: version_label.as_ptr(),
+                tagline: tagline.as_ptr(),
+                build: build.as_ptr(),
+                protocol: protocol.as_ptr(),
+                source: source.as_ptr(),
+                credits: credits.as_ptr(),
+                notice: notice.as_ptr(),
+            },
             icon_png: ICON.as_ptr(),
             icon_png_len: ICON.len(),
             show_credits,

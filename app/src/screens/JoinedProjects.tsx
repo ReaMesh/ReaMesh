@@ -166,7 +166,7 @@ export function JoinedProjects({ onBack }: { onBack: () => void }) {
     const days = copyDaysLeft(p.modified, Date.now());
     if (days === null) return "";
     if (days === 0) return t("daysLeftNone");
-    return days === 1 ? t("daysLeftOne") : t("daysLeft", { count: days });
+    return t("daysLeft", { count: days });
   };
 
   return (

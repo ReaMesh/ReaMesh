@@ -8,10 +8,8 @@
 static NSString *const kSourceURL = @"https://github.com/ReaMesh/ReaMesh";
 static const CGFloat kAboutWidth = 360;
 
-static BOOL gAboutGerman = NO;
-
-static NSString *AL(NSString *en, NSString *de) {
-    return gAboutGerman ? de : en;
+static NSString *AS(const char *s) {
+    return [NSString stringWithUTF8String:s ?: ""] ?: @"";
 }
 
 // Esc closes, like the standard panel.
@@ -77,16 +75,15 @@ static NSTextField *aboutLabel(NSString *text, NSFont *font, NSColor *color) {
 
 - (NSString *)buildLine {
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
-    [parts addObject:_info.release ? AL(@"Release build", @"Release-Build")
-                                   : AL(@"Dev build", @"Dev-Build")];
+    [parts addObject:AS(_info.text.build)];
     if (_info.build_time > 0) {
         NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-        fmt.locale = [NSLocale localeWithLocaleIdentifier:gAboutGerman ? @"de_AT" : @"en_US"];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:AS(_info.locale)];
         fmt.dateStyle = NSDateFormatterMediumStyle;
         fmt.timeStyle = NSDateFormatterShortStyle;
         [parts addObject:[fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:_info.build_time]]];
     }
-    [parts addObject:[NSString stringWithFormat:AL(@"Protocol %u", @"Protokoll %u"), _info.proto]];
+    [parts addObject:[NSString stringWithFormat:@"%@ %u", AS(_info.text.protocol), _info.proto]];
     return [parts componentsJoinedByString:@" · "];
 }
 
@@ -126,9 +123,10 @@ static NSTextField *aboutLabel(NSString *text, NSFont *font, NSColor *color) {
 
     NSString *version = [NSString stringWithUTF8String:_info.version ?: ""];
     NSString *commit = [NSString stringWithUTF8String:_info.commit ?: ""];
+    NSString *versionLabel = AS(_info.text.version);
     NSString *versionText = commit.length
-        ? [NSString stringWithFormat:@"Version %@ (%@)", version, commit]
-        : [NSString stringWithFormat:@"Version %@", version];
+        ? [NSString stringWithFormat:@"%@ %@ (%@)", versionLabel, version, commit]
+        : [NSString stringWithFormat:@"%@ %@", versionLabel, version];
 
     _commit = commit;
 
@@ -137,7 +135,7 @@ static NSTextField *aboutLabel(NSString *text, NSFont *font, NSColor *color) {
     if (_info.release && commit.length) {
         // A release build's commit is on GitHub: the hash links to it. A dev
         // build's may exist only locally, so it stays plain text there.
-        NSString *pre = [NSString stringWithFormat:@"Version %@ (", version];
+        NSString *pre = [NSString stringWithFormat:@"%@ %@ (", versionLabel, version];
         NSMutableAttributedString *title = [[NSMutableAttributedString alloc]
             initWithString:[NSString stringWithFormat:@"%@%@)", pre, commit]
                 attributes:@{
@@ -158,27 +156,19 @@ static NSTextField *aboutLabel(NSString *text, NSFont *font, NSColor *color) {
         plain.selectable = YES; // so the commit can be copied for a bug report
         ver = plain;
     }
-    NSTextField *subtitle = aboutLabel(
-        AL(@"Realtime, peer-to-peer collaboration for REAPER",
-           @"Zusammenarbeit in Echtzeit für REAPER, Peer-to-Peer"),
-        small, NSColor.labelColor);
+    NSTextField *subtitle = aboutLabel(AS(_info.text.tagline), small, NSColor.labelColor);
     NSTextField *build = aboutLabel([self buildLine], small, NSColor.secondaryLabelColor);
 
     NSTextField *dot = aboutLabel(@"·", small, NSColor.tertiaryLabelColor);
     NSStackView *links = [NSStackView stackViewWithViews:@[
-        [self linkButton:AL(@"Source code", @"Quellcode") action:@selector(openSource:)],
+        [self linkButton:AS(_info.text.source) action:@selector(openSource:)],
         dot,
-        [self linkButton:AL(@"Acknowledgements", @"Danksagungen") action:@selector(openCredits:)],
+        [self linkButton:AS(_info.text.credits) action:@selector(openCredits:)],
     ]];
     links.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     links.spacing = 6;
 
-    NSTextField *cockos = aboutLabel(
-        AL(@"REAPER is a trademark of Cockos Incorporated.\n"
-           @"ReaMesh is not affiliated with or endorsed by Cockos.",
-           @"REAPER ist eine Marke von Cockos Incorporated.\n"
-           @"ReaMesh ist unabhängig und nicht mit Cockos verbunden."),
-        tiny, NSColor.tertiaryLabelColor);
+    NSTextField *cockos = aboutLabel(AS(_info.text.notice), tiny, NSColor.tertiaryLabelColor);
     NSTextField *copyright = aboutLabel(@"© 2026 tiszu · GPL-3.0", tiny,
                                         NSColor.secondaryLabelColor);
 
@@ -206,7 +196,7 @@ static NSTextField *aboutLabel(NSString *text, NSFont *font, NSColor *color) {
         [content.widthAnchor constraintEqualToConstant:kAboutWidth],
     ]];
 
-    _window.title = AL(@"About ReaMesh", @"Über ReaMesh");
+    _window.title = AS(_info.text.title);
     _window.contentView = content;
     [content layoutSubtreeIfNeeded];
     [_window setContentSize:content.fittingSize];
@@ -215,7 +205,6 @@ static NSTextField *aboutLabel(NSString *text, NSFont *font, NSColor *color) {
 @end
 
 void reamesh_about_open(AboutInfo info) {
-    gAboutGerman = info.german != 0;
     BOOL fresh = gAbout == nil;
     if (fresh) gAbout = [[ReaMeshAboutController alloc] init];
     gAbout.info = info;
@@ -225,6 +214,8 @@ void reamesh_about_open(AboutInfo info) {
     AboutInfo kept = gAbout.info;
     kept.version = NULL;
     kept.commit = NULL;
+    kept.locale = NULL;
+    kept.text = (AboutText){0};
     gAbout.info = kept;
     if (fresh || !gAbout.window.visible) [gAbout.window center];
     [NSApp activateIgnoringOtherApps:YES];

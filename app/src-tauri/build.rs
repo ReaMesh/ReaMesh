@@ -25,8 +25,32 @@ fn main() {
     }
 
     build_info();
+    locales();
 
     tauri_build::build()
+}
+
+/// Embeds the string tables: writes $OUT_DIR/locales.rs, a list of every
+/// ../src/locales/<code>.json as (code, JSON text), which src/locales.rs
+/// includes. A new language file is picked up without touching any code.
+fn locales() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/locales");
+    println!("cargo:rerun-if-changed={}", dir.display());
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("src/locales is missing")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    files.sort();
+    let mut out = String::from("static LOCALES: &[(&str, &str)] = &[\n");
+    for p in &files {
+        let code = p.file_stem().and_then(|s| s.to_str()).expect("locale file name");
+        let path = p.canonicalize().expect("locale path").display().to_string();
+        out.push_str(&format!("    ({code:?}, include_str!({path:?})),\n"));
+    }
+    out.push_str("];\n");
+    let dest = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("locales.rs");
+    std::fs::write(dest, out).expect("writing locales.rs");
 }
 
 /// The commit and build time the About window shows. Reruns whenever the

@@ -605,7 +605,7 @@ export function Session({
           <DialogHeader>
             <DialogTitle>{t("stopHostingTitle")}</DialogTitle>
             <DialogDescription>
-              {others === 1 ? t("stopHostingBodyOne") : t("stopHostingBodyMany", { count: others })}
+              {t("stopHostingBody", { count: others })}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

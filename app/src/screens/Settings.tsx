@@ -22,7 +22,7 @@ import { ProfileEditor } from "@/components/ProfileEditor";
 import { DrawnCheck, SwapIcon } from "@/components/Swap";
 import { Hint } from "@/components/Hint";
 import { buildDiagnostics } from "@/lib/diagnostics";
-import { getLangPref, resolveLang, setLangPref, t, useLang, type LangPref } from "@/lib/i18n";
+import { LANGUAGES, getLangPref, resolveLang, setLangPref, t, useLang, type LangPref } from "@/lib/i18n";
 import {
   getReaperPath,
   installExtension,
@@ -527,8 +527,7 @@ export function Settings({
 
   const langOptions: { value: LangPref; label: string }[] = [
     { value: "system", label: t("languageSystem") },
-    { value: "en", label: "English" },
-    { value: "de", label: "Deutsch" },
+    ...LANGUAGES.map((l) => ({ value: l.code, label: l.name })),
   ];
 
   // Repeated clicks only extend the checkmark's stay, so spamming the row can't

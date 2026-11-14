@@ -38,6 +38,11 @@ process-wide state. `cargo nextest run` gives each test its own process and runs
 them side by side, which is what CI does. The app uses **bun**, never npm or
 pnpm.
 
+## Translating
+
+The app's text is one JSON file per language; adding a language needs no code.
+See [TRANSLATING.md](TRANSLATING.md).
+
 ## Reporting bugs
 
 Open a GitHub issue with your REAPER version, OS, whether you hosted or
