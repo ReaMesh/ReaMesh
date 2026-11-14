@@ -114,12 +114,40 @@ impl X {
         Some((at.dst_x as i32, at.dst_y as i32, geo.width as i32, geo.height as i32))
     }
 
+    /// The applications' top-level windows. The window manager's client list
+    /// when it keeps one; otherwise (Weston's XWayland, some minimal window
+    /// managers) the root's children and, under a reparenting window manager,
+    /// their children: whichever of those carry a pid.
+    fn client_windows(&self) -> Vec<Window> {
+        let listed = self.window_list(self.root, self.atoms._NET_CLIENT_LIST, 4096);
+        if !listed.is_empty() {
+            return listed;
+        }
+        let children = |w: Window| -> Vec<Window> {
+            self.conn
+                .query_tree(w)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|t| t.children)
+                .unwrap_or_default()
+        };
+        let mut out = Vec::new();
+        for top in children(self.root) {
+            if self.pid_of(top) != 0 {
+                out.push(top);
+            } else {
+                out.extend(children(top).into_iter().filter(|&w| self.pid_of(w) != 0));
+            }
+        }
+        out
+    }
+
     /// The main window of the REAPER with this pid (0 = any REAPER): its
     /// largest top-level window. `minimised` also counts windows that are not
     /// on screen, which is what bringing REAPER back needs.
     fn reaper_window(&self, pid: u32, minimised: bool) -> Option<Window> {
         let mut best: Option<(i64, Window)> = None;
-        for window in self.window_list(self.root, self.atoms._NET_CLIENT_LIST, 4096) {
+        for window in self.client_windows() {
             if !is_reaper(self.pid_of(window), pid) {
                 continue;
             }
