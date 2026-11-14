@@ -4804,7 +4804,8 @@ fn start_fetch(
     }
     let Some(dir) = shared.serve_dir.lock().unwrap().clone() else { return };
     let Some(rel_path) = safe_relative_path(&rel) else { return };
-    let dest = dir.join(&rel_path);
+    // Already here under another spelling counts as here.
+    let dest = on_disk_path(&dir, &rel_path);
     if dest.exists() {
         return;
     }
@@ -5046,6 +5047,47 @@ enum ServeScope {
     Contained,
 }
 
+/// `rel` under `dir` as the disk spells it. A peer whose file system ignores
+/// case (macOS, Windows) can name a file in another case than its folder
+/// holds, since its own disk answers either way; on a file system that
+/// doesn't, such a path names nothing. So each part that doesn't exist as
+/// written is looked up among its folder's entries ignoring case. From the
+/// first part nothing matches, the rest is kept as written: a file about to be
+/// created lands in the folder that is there, not in a second one that
+/// differs only in case. A path that exists as written costs one `lstat`.
+fn on_disk_path(dir: &Path, rel: &Path) -> PathBuf {
+    let direct = dir.join(rel);
+    if direct.symlink_metadata().is_ok() {
+        return direct;
+    }
+    let mut out = dir.to_path_buf();
+    let mut parts = rel.components();
+    while let Some(part) = parts.next() {
+        let exact = out.join(part);
+        if exact.symlink_metadata().is_ok() {
+            out = exact;
+            continue;
+        }
+        let want = part.as_os_str().to_string_lossy().to_lowercase();
+        // The smallest match, so every call picks the same one of several.
+        let found = fs::read_dir(&out).ok().and_then(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name())
+                .filter(|name| name.to_string_lossy().to_lowercase() == want)
+                .min()
+        });
+        match found {
+            Some(name) => out.push(name),
+            None => {
+                out.push(part);
+                out.extend(parts.by_ref());
+            }
+        }
+    }
+    out
+}
+
 /// Open `full` for serving: a regular file (never a device, pipe or folder),
 /// and for `contained`, one whose real location is inside `dir`.
 fn open_served(dir: &Path, full: &Path, contained: bool) -> std::io::Result<fs::File> {
@@ -5126,7 +5168,7 @@ fn serve_xfer(
                     message: format!("not part of this session: {path}"),
                 };
             }
-            let full = dir.join(rel);
+            let full = on_disk_path(dir, &rel);
             let compress = is_compressible(path);
             let read = || -> std::io::Result<(u64, bool, Vec<u8>)> {
                 let mut f = open_served(dir, &full, scope == ServeScope::Contained)?;
@@ -8470,6 +8512,33 @@ mod transfer_safety_tests {
             assert!(backup_roots(&dl.dir).is_empty(), "no empty backup left behind");
             let _ = fs::remove_dir_all(&dl.dir);
         }
+    }
+
+    #[test]
+    fn on_disk_path_finds_a_file_named_in_another_case() {
+        let dir = std::env::temp_dir().join(format!("reamesh-case-{}", std::process::id()));
+        fs::create_dir_all(dir.join("audio/Takes")).unwrap();
+        fs::write(dir.join("audio/Takes/kick.wav"), b"kick").unwrap();
+        fs::write(dir.join("audio/Übung.wav"), b"u").unwrap();
+
+        // As written: no lookup.
+        assert_eq!(on_disk_path(&dir, Path::new("audio/Takes/kick.wav")), dir.join("audio/Takes/kick.wav"));
+        // Another case in every part still reaches the file, on any file system.
+        let found = on_disk_path(&dir, Path::new("Audio/takes/Kick.WAV"));
+        assert_eq!(fs::read(&found).unwrap(), b"kick");
+        assert_eq!(fs::canonicalize(&found).unwrap(), fs::canonicalize(dir.join("audio/Takes/kick.wav")).unwrap());
+        assert_eq!(fs::read(on_disk_path(&dir, Path::new("AUDIO/übung.wav"))).unwrap(), b"u");
+        // A file that isn't there yet goes into the folder that is.
+        let fresh = on_disk_path(&dir, Path::new("AUDIO/TAKES/New.wav"));
+        assert!(!fresh.exists());
+        assert_eq!(fresh.file_name().unwrap(), "New.wav");
+        assert_eq!(
+            fs::canonicalize(fresh.parent().unwrap()).unwrap(),
+            fs::canonicalize(dir.join("audio/Takes")).unwrap()
+        );
+        // Nothing matches from the first part on: kept as written.
+        assert_eq!(on_disk_path(&dir, Path::new("Samples/New/hit.wav")), dir.join("Samples/New/hit.wav"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

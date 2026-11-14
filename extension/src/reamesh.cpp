@@ -1272,6 +1272,207 @@ static std::string absolutizeChunkFiles(const std::string& chunk, std::string di
   return out;
 }
 
+// ---------- media paths spelled in another case ----------
+//
+// macOS and Windows ignore case in file names, Linux does not. A project made
+// on one of the former can name `Audio/Kick.wav` while its folder holds
+// `audio/kick.wav`: there both reach the file, on Linux the item's media is
+// missing. The wire keeps the spelling it has (changing it would be an edit by
+// whoever happens to run Linux). Instead REAPER is handed each path as this
+// disk spells it, and capture maps that spelling back, so the round trip stays
+// byte-stable. A path that exists as written is left alone, which on a file
+// system that ignores case is every path. Unit-tested by tools/chunk_test.cpp.
+
+// Lower case of one code point, for the scripts file names are commonly
+// written in: Latin with its accented letters, Greek, Cyrillic.
+static char32_t lowerCodePoint(char32_t c) {
+  if (c < 0x80) return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+  if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return c + 32;
+  if ((c >= 0x100 && c <= 0x137) || (c >= 0x14A && c <= 0x177)) return c | 1;
+  if ((c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17E)) return (c & 1) ? c + 1 : c;
+  if (c == 0x178) return 0xFF;
+  if (c >= 0x391 && c <= 0x3A9 && c != 0x3A2) return c + 32;
+  if (c >= 0x400 && c <= 0x40F) return c + 80;
+  if (c >= 0x410 && c <= 0x42F) return c + 32;
+  return c;
+}
+
+// A file name's comparison key: UTF-8 in, lower-cased UTF-8 out. Bytes that
+// are not UTF-8 pass through.
+static std::string foldFileName(std::string_view s) {
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size();) {
+    const unsigned char b = (unsigned char)s[i];
+    const int n = b < 0x80 ? 1 : (b >> 5) == 6 ? 2 : (b >> 4) == 14 ? 3 : (b >> 3) == 30 ? 4 : 0;
+    bool ok = n > 0 && i + n <= s.size();
+    char32_t c = n == 1 ? b : n == 2 ? (b & 0x1F) : n == 3 ? (b & 0x0F) : (b & 0x07);
+    for (int k = 1; ok && k < n; ++k) {
+      const unsigned char cb = (unsigned char)s[i + k];
+      if ((cb & 0xC0) != 0x80) ok = false;
+      else c = (c << 6) | (cb & 0x3F);
+    }
+    if (!ok) {
+      out.push_back((char)b);
+      ++i;
+      continue;
+    }
+    c = lowerCodePoint(c);
+    if (c < 0x80) {
+      out.push_back((char)c);
+    } else if (c < 0x800) {
+      out.push_back((char)(0xC0 | (c >> 6)));
+      out.push_back((char)(0x80 | (c & 0x3F)));
+    } else if (c < 0x10000) {
+      out.push_back((char)(0xE0 | (c >> 12)));
+      out.push_back((char)(0x80 | ((c >> 6) & 0x3F)));
+      out.push_back((char)(0x80 | (c & 0x3F)));
+    } else {
+      out.push_back((char)(0xF0 | (c >> 18)));
+      out.push_back((char)(0x80 | ((c >> 12) & 0x3F)));
+      out.push_back((char)(0x80 | ((c >> 6) & 0x3F)));
+      out.push_back((char)(0x80 | (c & 0x3F)));
+    }
+    i += n;
+  }
+  return out;
+}
+
+// A folder's entries by comparison key (the smallest name where several share
+// one). Listed at most once a second per folder: items waiting for their media
+// ask on every tick.
+static const std::map<std::string, std::string>& folderNamesFolded(const fs::path& dir) {
+  struct Listing {
+    std::chrono::steady_clock::time_point at;
+    std::map<std::string, std::string> names;
+  };
+  static std::map<std::string, Listing> cache;
+  const auto now = std::chrono::steady_clock::now();
+  const std::string key = fsUtf8(dir);
+  if (auto it = cache.find(key); it != cache.end() && now - it->second.at < std::chrono::seconds(1))
+    return it->second.names;
+  if (cache.size() > 64) cache.clear();
+  Listing& l = cache[key];
+  l.at = now;
+  l.names.clear();
+  std::error_code ec;
+  for (fs::directory_iterator d(dir, ec), end; !ec && d != end; d.increment(ec)) {
+    std::string name = fsUtf8(d->path().filename());
+    auto [slot, fresh] = l.names.emplace(foldFileName(name), name);
+    if (!fresh && name < slot->second) slot->second = std::move(name);
+  }
+  return l.names;
+}
+
+// `rel` (project-relative, '/'-separated) as the disk under `root` spells it:
+// `rel` itself when it exists as written, another spelling when only that
+// exists, "" when there is no such file.
+static std::string pathOnDisk(const fs::path& root, const std::string& rel) {
+  std::error_code ec;
+  if (fs::exists(root / fsPath(rel), ec)) return rel;
+  fs::path dir = root;
+  std::string out;
+  for (size_t start = 0; start <= rel.size();) {
+    size_t end = rel.find('/', start);
+    if (end == std::string::npos) end = rel.size();
+    const std::string part = rel.substr(start, end - start);
+    if (part.empty() || part == "." || part == "..") return "";
+    std::string actual = part;
+    if (!fs::exists(dir / fsPath(part), ec)) {
+      const auto& names = folderNamesFolded(dir);
+      const auto hit = names.find(foldFileName(part));
+      if (hit == names.end()) return "";
+      actual = hit->second;
+    }
+    if (!out.empty()) out += '/';
+    out += actual;
+    dir /= fsPath(actual);
+    start = end + 1;
+  }
+  return out;
+}
+
+// Rewrites the project-relative double-quoted FILE paths of an item chunk, or
+// of a whole project text, through `respell(item GUID, path)`: the path with
+// '/' separators in, its replacement out ("" keeps the line as it is). The
+// GUID is the IGUID of the item the line belongs to. Every other byte is kept.
+static std::string respellChunkFiles(
+    const std::string& text,
+    const std::function<std::string(const std::string&, const std::string&)>& respell,
+    bool* changed = nullptr) {
+  std::string out;
+  out.reserve(text.size() + 64);
+  std::string guid;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t eol = text.find('\n', pos);
+    const bool hasEol = eol != std::string::npos;
+    if (!hasEol) eol = text.size();
+    const std::string_view line(text.data() + pos, eol - pos);
+    const std::string_view t = ltrim(line);
+    std::string to;
+    size_t q1 = std::string_view::npos, q2 = std::string_view::npos;
+    if (t.rfind("<ITEM", 0) == 0) {
+      guid.clear();
+    } else if (t.rfind("IGUID ", 0) == 0) {
+      std::string_view g = t.substr(6);
+      while (!g.empty() && (g.back() == '\r' || g.back() == ' ')) g.remove_suffix(1);
+      guid.assign(g);
+    } else if (t.rfind("FILE \"", 0) == 0) {
+      q1 = line.find('"');
+      q2 = line.find('"', q1 + 1);
+      if (q2 != std::string_view::npos) {
+        std::string rel(line.substr(q1 + 1, q2 - q1 - 1));
+        std::replace(rel.begin(), rel.end(), '\\', '/');
+        if (isRelativePath(rel)) to = respell(guid, rel);
+        if (to == rel) to.clear();
+      }
+    }
+    if (to.empty()) {
+      out.append(line);
+    } else {
+      out.append(line.substr(0, q1 + 1));
+      out.append(to);
+      out.append(line.substr(q2));
+      if (changed) *changed = true;
+    }
+    if (hasEol) out.push_back('\n');
+    pos = eol + 1;
+  }
+  return out;
+}
+
+// Per item: the paths REAPER was handed in this disk's spelling, by that
+// spelling, with the one the session uses. Emptied when a project is joined;
+// an item's entry is replaced whenever its chunk is applied.
+static std::map<std::string, std::map<std::string, std::string>> g_caseAlias;
+
+// An incoming chunk (or the project text about to be opened) with each path in
+// the spelling `root` holds, remembering what the session calls it.
+static std::string spellPathsForDisk(const std::string& text, const fs::path& root,
+                                     bool* changed = nullptr) {
+  return respellChunkFiles(
+      text,
+      [&](const std::string& guid, const std::string& rel) -> std::string {
+        const std::string disk = pathOnDisk(root, rel);
+        if (disk.empty() || disk == rel) return "";
+        g_caseAlias[guid][disk] = rel;
+        return disk;
+      },
+      changed);
+}
+
+// A captured chunk with each path back in the session's spelling.
+static std::string spellPathsForSession(const std::string& chunk) {
+  if (g_caseAlias.empty()) return chunk;
+  return respellChunkFiles(chunk, [](const std::string& guid, const std::string& rel) -> std::string {
+    const auto item = g_caseAlias.find(guid);
+    if (item == g_caseAlias.end()) return "";
+    const auto alias = item->second.find(rel);
+    return alias == item->second.end() ? "" : alias->second;
+  });
+}
+
 // ---------- plugin inventory / FX stripping (pure text helpers) ----------
 //
 // Both sides of the join-preview story parse RPP text with the same helper:
@@ -2698,7 +2899,8 @@ static ItemState readItem(MediaItem* item, const std::string& track,
                           const std::vector<std::string>& mediaDirs) {
   ItemState is;
   is.track = track;
-  is.chunk = relativizeChunkFiles(normalizeChunk(objectStateChunk(item)), mediaDirs);
+  is.chunk = spellPathsForSession(
+      relativizeChunkFiles(normalizeChunk(objectStateChunk(item)), mediaDirs));
   return is;
 }
 
@@ -4223,8 +4425,7 @@ static std::vector<std::string> missingMediaIn(const json& fields) {
   for (std::string p : chunkFilePaths(fields["chunk"].get<std::string>())) {
     if (!isRelativePath(p)) continue;  // absolute: nothing we can fetch
     std::replace(p.begin(), p.end(), '\\', '/');
-    std::error_code ec;
-    if (!fs::exists(projDir / fsPath(p), ec)) missing.push_back(p);
+    if (pathOnDisk(projDir, p).empty()) missing.push_back(p);
   }
   return missing;
 }
@@ -4273,7 +4474,9 @@ static void applyItem(const std::string& guid, const json& fields, bool freshMed
     // onto newly created items as a side effect.
     const std::string& chunk = fields["chunk"].get_ref<const std::string&>();
     const std::vector<std::string>& dirs = mediaPathDirs();
-    setObjectStateChunk(item, absolutizeChunkFiles(chunk, dirs.empty() ? "" : dirs.front()));
+    g_caseAlias.erase(guid);
+    const std::string local = dirs.empty() ? chunk : spellPathsForDisk(chunk, fsPath(dirs.front()));
+    setObjectStateChunk(item, absolutizeChunkFiles(local, dirs.empty() ? "" : dirs.front()));
     if (!itemChunkHasColor(chunk)) SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", 0.0);
     fileBacked = chunkHasFileSource(chunk);
     // A file-backed chunk landing on a progressive-join placeholder is its
@@ -4924,9 +5127,8 @@ static std::vector<DeferredItem> collectReadyItems() {
   const fs::path projDir = projectDir();
   const auto now = std::chrono::steady_clock::now();
   const auto allHere = [&](DeferredItem& d) {
-    std::error_code ec;
     std::erase_if(d.missing,
-                  [&](const std::string& rel) { return fs::exists(projDir / fsPath(rel), ec); });
+                  [&](const std::string& rel) { return !pathOnDisk(projDir, rel).empty(); });
     return d.missing.empty();
   };
 
@@ -5934,6 +6136,7 @@ static void leaveSession(const char* code, json params, const std::string& text)
   g_failedItems.clear();
   g_deferredRecv.clear();
   g_placeholders.clear();
+  g_caseAlias.clear();
   g_foreignSources.clear();
   g_peakJobs.clear();  // REAPER builds whatever is left on demand
   g_mediaLoading = false;
@@ -7061,9 +7264,19 @@ static void openDownloadedProject(std::string path) {
   g_placeholders.clear();
   g_placeholdersGivenUp = false;
   g_placeholderGraceSince = {};
-  std::string text;
+  g_caseAlias.clear();
+  std::string text = readFileText(path);
   bool rewritten = false;
-  if (g_noFx || progressive) text = readFileText(path);
+  if (!text.empty()) {
+    // Media the project names in another case than the folder holds: REAPER
+    // gets the folder's spelling, or it would report those files missing.
+    bool respelled = false;
+    std::string local = spellPathsForDisk(text, fsPath(path).parent_path(), &respelled);
+    if (respelled) {
+      text = std::move(local);
+      rewritten = true;
+    }
+  }
   if (g_noFx && !text.empty()) {
     text = blankCodeSources(stripFxBlocks(text, /*takeFxOnly=*/false));
     rewritten = true;
@@ -7087,10 +7300,10 @@ static void openDownloadedProject(std::string path) {
   // What REAPER opens vs. what we keep on disk. The downloaded original must
   // stay byte-identical (this copy is served to other joiners and has to match
   // the manifest hashes), so a rewritten text goes to a sibling in no-FX mode
-  // (where the project deliberately stays a view-only copy), and for a
-  // progressive open is written over the real path just for the duration of
-  // Main_openProject and restored right after: REAPER reads the file once,
-  // and the project keeps its real name.
+  // (where the project deliberately stays a view-only copy), and otherwise
+  // (a progressive open, respelled media paths) is written over the real path
+  // just for the duration of Main_openProject and restored right after:
+  // REAPER reads the file once, and the project keeps its real name.
   std::string original;
   bool restore = false;
   if (rewritten && g_noFx) {

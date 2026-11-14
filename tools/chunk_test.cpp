@@ -1368,6 +1368,75 @@ int main() {
     fs::remove_all(dir, ec);
   }
 
+  // ---- media paths spelled in another case (pathOnDisk, spellPathsFor*) ----
+  {
+    assert(foldFileName("Kick.WAV") == "kick.wav");
+    assert(foldFileName("ÜBUNG Ärger Çé") == "übung ärger çé");
+    assert(foldFileName("ŁÓDŹ Ždár") == "łódź ždár");
+    assert(foldFileName("ΑΒΓ Привет") == "αβγ привет");
+    assert(foldFileName("\xff\xfe" "A") == "\xff\xfe" "a");  // not UTF-8: bytes kept
+
+    std::error_code ec;
+    const fs::path dir = fs::temp_directory_path(ec) / "reamesh_chunk_test_case";
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir / "audio" / "Takes", ec);
+    std::ofstream(dir / "audio" / "Takes" / "kick.wav", std::ios::binary) << "k";
+    std::ofstream(dir / "audio" / fsPath("Übung.wav"), std::ios::binary) << "u";
+    std::ofstream(dir / "Snare.wav", std::ios::binary) << "s";
+
+    // As written: returned unchanged, on every file system.
+    assert(pathOnDisk(dir, "audio/Takes/kick.wav") == "audio/Takes/kick.wav");
+    assert(pathOnDisk(dir, "Snare.wav") == "Snare.wav");
+    // Nothing there under any spelling.
+    assert(pathOnDisk(dir, "audio/Takes/hat.wav").empty());
+    assert(pathOnDisk(dir, "Loops/kick.wav").empty());
+    assert(pathOnDisk(dir, "AUDIO/../Snare.wav").empty() || fs::exists(dir / "AUDIO", ec));
+    // Another case reaches the file. Where the file system ignores case the
+    // path exists as written and comes back as it is; where it doesn't, in
+    // the folder's spelling.
+    const bool ignoresCase = fs::exists(dir / "SNARE.WAV", ec);
+    const std::string kick = pathOnDisk(dir, "Audio/takes/Kick.WAV");
+    assert(kick == (ignoresCase ? "Audio/takes/Kick.WAV" : "audio/Takes/kick.wav"));
+    assert(pathOnDisk(dir, "AUDIO/übung.WAV") == (ignoresCase ? "AUDIO/übung.WAV" : "audio/Übung.wav"));
+
+    const std::string wire =
+        "<ITEM\nPOSITION 1\nIGUID {I-1}\nNAME kick\n<SOURCE WAVE\nFILE \"Audio/takes/Kick.WAV\"\n>\n"
+        "<SOURCE WAVE\nFILE \"Snare.wav\"\n>\n<SOURCE WAVE\nFILE \"gone/Missing.wav\"\n>\n"
+        "<SOURCE WAVE\nFILE \"/abs/Else.wav\"\n>\n>\n";
+    g_caseAlias.clear();
+    bool changed = false;
+    const std::string local = spellPathsForDisk(wire, dir, &changed);
+    if (ignoresCase) {
+      assert(local == wire && !changed && g_caseAlias.empty());
+    } else {
+      assert(changed);
+      assert(local.find("FILE \"audio/Takes/kick.wav\"") != std::string::npos);
+      // Paths that exist as written, that exist nowhere and absolute ones stay.
+      assert(local.find("FILE \"Snare.wav\"") != std::string::npos);
+      assert(local.find("FILE \"gone/Missing.wav\"") != std::string::npos);
+      assert(local.find("FILE \"/abs/Else.wav\"") != std::string::npos);
+      assert(g_caseAlias.size() == 1 && g_caseAlias["{I-1}"].size() == 1);
+      // Capture hands the session its own spelling back, byte for byte.
+      assert(spellPathsForSession(local) == wire);
+      // Only the item that was respelled: another item naming the folder's
+      // spelling itself keeps it.
+      std::string other = local;
+      other.replace(other.find("{I-1}"), 5, "{I-2}");
+      assert(spellPathsForSession(other) == other);
+      // A whole project text: each item under its own IGUID, CRLF kept.
+      g_caseAlias.clear();
+      const std::string proj =
+          "<REAPER_PROJECT 0.1\r\n<TRACK\r\n<ITEM\r\nIGUID {A}\r\n<SOURCE WAVE\r\nFILE \"AUDIO\\Takes\\KICK.wav\"\r\n>\r\n>\r\n"
+          "<ITEM\r\nIGUID {B}\r\n<SOURCE WAVE\r\nFILE \"audio/Takes/kick.wav\"\r\n>\r\n>\r\n>\r\n>\r\n";
+      const std::string opened = spellPathsForDisk(proj, dir);
+      assert(opened.find("IGUID {A}\r\n<SOURCE WAVE\r\nFILE \"audio/Takes/kick.wav\"\r\n") != std::string::npos);
+      assert(g_caseAlias.size() == 1 && g_caseAlias["{A}"]["audio/Takes/kick.wav"] == "AUDIO/Takes/KICK.wav");
+    }
+    g_caseAlias.clear();
+    assert(spellPathsForSession(wire) == wire);
+    fs::remove_all(dir, ec);
+  }
+
   printf("chunk_test: all assertions passed\n");
   return 0;
 }
