@@ -1643,7 +1643,8 @@ fn presence_selection_and_fx_propagate() {
     // selection + FX window from the wire, sanitized, not from local state.
     let fx = serde_json::json!({"track": "{T-1}", "item": "{I-1}", "take": 0, "fx": 2, "float": true});
     reamesh::set_presence(
-        &serde_json::json!({ "sel": ["{I-1}", "{I-2}"], "fx": fx, "focus": "{T-1}" }).to_string(),
+        &serde_json::json!({ "sel": ["{I-1}", "{I-2}"], "fx": fx, "focus": "{T-1}", "view": true })
+            .to_string(),
     );
     let seen = wait_until(Duration::from_secs(10), || {
         let check = |peer: &Reamesh| {
@@ -1652,6 +1653,7 @@ fn presence_selection_and_fx_propagate() {
                 p["is_self"] == false
                     && p["sel"] == serde_json::json!(["{I-1}", "{I-2}"])
                     && p["fx"] == fx
+                    && p["view"] == true
             })
         };
         check(&owner) && check(&client)
@@ -1664,7 +1666,10 @@ fn presence_selection_and_fx_propagate() {
     let cleared = wait_until(Duration::from_secs(10), || {
         let v: Value = serde_json::from_str(&client.peers_json()).unwrap();
         v.as_array().unwrap().iter().any(|p| {
-            p["is_self"] == false && p["sel"] == serde_json::json!([]) && p["fx"].is_null()
+            p["is_self"] == false
+                && p["sel"] == serde_json::json!([])
+                && p["fx"].is_null()
+                && p["view"] == false
         })
     });
     assert!(cleared, "cleared detail never propagated: {}", client.peers_json());

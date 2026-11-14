@@ -841,6 +841,9 @@ struct PeerPresence {
     /// This peer's REAPER main thread has stopped feeding presence while its
     /// network thread still beacons: i.e. their REAPER isn't responding.
     frozen: bool,
+    /// This peer joined without effects: it watches and never proposes an
+    /// edit. Rosters say so; nothing else depends on it.
+    view: bool,
     last_seen: Instant,
     /// Verified beacons received from this peer so far (tests read the rate
     /// through `Reamesh::beacon_count`; nothing on the wire depends on it).
@@ -955,6 +958,8 @@ struct LivePresence {
     /// A follower opens (and switches) the same window. The extension composes
     /// it from REAPER's focused-FX state; `sanitize_fx` bounds what is kept.
     fx: JsonValue,
+    /// This user joined without effects, i.e. view-only.
+    view: bool,
 }
 
 static LIVE: Mutex<LivePresence> = Mutex::new(LivePresence {
@@ -966,6 +971,7 @@ static LIVE: Mutex<LivePresence> = Mutex::new(LivePresence {
     follow: String::new(),
     sel: Vec::new(),
     fx: JsonValue::Null,
+    view: false,
 });
 
 /// Most selected-item GUIDs a presence beacon carries. A followed peer beacons
@@ -1159,6 +1165,7 @@ pub fn set_presence(json: &str) {
         .collect();
     p.sel = sanitize_sel(v.get("sel"));
     p.fx = sanitize_fx(v.get("fx"));
+    p.view = v.get("view").and_then(|x| x.as_bool()).unwrap_or(false);
 }
 
 // ---------- persistent network identity ----------
@@ -3049,6 +3056,7 @@ impl Reamesh {
             0,     // our own presence is never stale
             true,
         )];
+        arr[0]["view"] = json!(me.view);
         let mut rtts = self.shared.peer_rtt.lock().unwrap();
         rtts.retain(|_, (_, at)| at.elapsed() < RTT_STALE);
         let mut infos = self.shared.peers_info.lock().unwrap();
@@ -3103,6 +3111,7 @@ impl Reamesh {
                     false,
                 );
                 let (link, punch_failed) = links.get(&id).copied().unwrap_or(("", false));
+                e["view"] = json!(info.view);
                 e["link"] = json!(link);
                 e["relay_only"] = json!(link == "relay" && punch_failed);
                 arr.push(e);
@@ -5010,6 +5019,7 @@ fn publish_presence(swarm: &mut Swarm<Behaviour>, shared: &Shared, topic: &gossi
             // presence feed going quiet while it still runs is exactly
             // "REAPER isn't responding".
             "frozen": main_thread_stale(),
+            "view": live.view,
             "mac": mac,
         })
         .to_string()
@@ -7374,6 +7384,7 @@ async fn run_network(
                                             sel: sanitize_sel(v.get("sel")),
                                             fx: sanitize_fx(v.get("fx")),
                                             frozen: v.get("frozen").and_then(|x| x.as_bool()).unwrap_or(false),
+                                            view: v.get("view").and_then(|x| x.as_bool()).unwrap_or(false),
                                             last_seen: Instant::now(),
                                             beacons,
                                         },

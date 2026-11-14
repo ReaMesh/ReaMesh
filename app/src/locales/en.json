@@ -287,6 +287,7 @@
   "followsYou": "follows you",
   "followsName": "follows {name}",
   "followingShort": "Following",
+  "viewOnly": "View only",
   "actionsFor": "Actions for {name}",
   "followAction": "Follow",
   "jumpToTrack": "Jump to track",

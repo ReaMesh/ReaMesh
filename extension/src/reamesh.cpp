@@ -6747,8 +6747,8 @@ static void ctlPublishState() {
       // keeping them would republish the whole state on every presence beacon
       // (ten a second for a followed peer) while someone scrolls or plays
       // (click-to-follow asks the extension directly via `reveal_peer`).
-      // `follow` and `frozen` stay: the roster paints the "following you" and
-      // "REAPER isn't responding" indicators from them.
+      // `follow`, `frozen` and `view` stay: the roster paints the "following
+      // you", "REAPER isn't responding" and "view only" lines from them.
       p.erase("play");
       p.erase("v0");
       p.erase("v1");
@@ -7031,7 +7031,9 @@ static void pushLocalPresence() {
   }
   json p = {{"focus", focus}, {"play", play},          {"v0", v0},
             {"v1", v1},       {"playing", playing},    {"follow", g_followPeer},
-            {"sel", g_presSel}, {"fx", g_presFx}};
+            {"sel", g_presSel}, {"fx", g_presFx},
+            // Joined without effects: rosters say this person only watches.
+            {"view", g_noFx && g_mode == Mode::ClientActive}};
   // Deliberately UNCONDITIONAL (no change-gate): every call also proves the
   // main thread is alive, which is what keeps this peer's beacon from
   // reporting "frozen" while the user simply sits still.

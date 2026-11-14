@@ -27,6 +27,8 @@ export interface Peer {
   /** This peer's REAPER main thread stopped responding (their network thread
    *  still beacons, so we can tell the difference from them leaving). */
   frozen?: boolean;
+  /** This peer joined without effects: they watch and can't edit. */
+  view?: boolean;
   /** Smoothed ping round trip to this peer in ms (0 / absent = not measured,
    *  and always 0 on the self entry). Drives the "slow connection" notice. */
   rtt?: number;

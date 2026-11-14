@@ -72,6 +72,7 @@ function PeerMeta({
       if (target.is_self) tone = "text-found";
     }
   }
+  if (!text && peer.view) text = t("viewOnly");
   // Least urgent, and only once a relay was involved.
   if (!text && (hosting || peer.is_owner)) {
     if (peer.link === "relay" && peer.relay_only) {
