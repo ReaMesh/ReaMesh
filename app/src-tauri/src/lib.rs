@@ -898,35 +898,49 @@ fn focus_reaper(pid: u32) -> bool {
 // matching against the host's claimed list happens in the frontend (it also
 // owns the parsing of "VST3: Serum (Xfer Records)"-style display names).
 
-/// Display names from REAPER's VST cache (`reaper-vstplugins*.ini`): each
-/// value line is `hash,timestamp,Display Name` (the name may contain commas,
-/// so only the first two are separators). Instruments carry a `!!!VSTi`
-/// prefix, stripped here.
+/// Names from REAPER's VST cache (`reaper-vstplugins*.ini`), spelled the way
+/// an .rpp spells them: `VST3: Name (Vendor)` for a `.vst3` module and `VST:`
+/// for anything else, with an `i` on the format for an instrument. A project
+/// saved with one format doesn't load the other, so the format has to survive
+/// the scan.
 fn vst_cache_names(path: &Path, out: &mut Vec<String>) {
     let Ok(text) = fs::read_to_string(path) else { return };
+    vst_cache_names_from(&text, out);
+}
+
+/// Each line is `module=hash,id,Display Name`: the name may contain commas, so
+/// only the first two are separators, and an instrument's name ends in
+/// `!!!VSTi`. A module that failed its scan has no name and is skipped.
+fn vst_cache_names_from(text: &str, out: &mut Vec<String>) {
     for line in text.lines() {
-        let Some((_, value)) = line.split_once('=') else { continue };
-        let mut parts = value.splitn(3, ',');
-        let (_, _, name) = (parts.next(), parts.next(), parts.next());
-        if let Some(name) = name {
-            let name = name.trim().trim_start_matches("!!!VSTi").trim();
-            if !name.is_empty() {
-                out.push(name.to_string());
-            }
+        let Some((module, value)) = line.split_once('=') else { continue };
+        let Some(name) = value.splitn(3, ',').nth(2) else { continue };
+        let name = name.trim();
+        let (name, instrument) = match name.strip_suffix("!!!VSTi") {
+            Some(rest) => (rest.trim(), true),
+            None => (name, false),
+        };
+        if name.is_empty() {
+            continue;
         }
+        // A shell's sub-plugins are keyed `module.vst3<id`.
+        let format = if module.to_ascii_lowercase().contains(".vst3") { "VST3" } else { "VST" };
+        out.push(format!("{format}{}: {name}", if instrument { "i" } else { "" }));
     }
 }
 
-/// Display names from REAPER's CLAP cache (`reaper-clap-*.ini`): value lines
-/// are `flags,Display Name`.
+/// Names from REAPER's CLAP cache (`reaper-clap-*.ini`) as `CLAP: Name
+/// (Vendor)`: value lines are `flags,Display Name`.
 fn clap_cache_names(path: &Path, out: &mut Vec<String>) {
     let Ok(text) = fs::read_to_string(path) else { return };
     for line in text.lines() {
         let Some((_, value)) = line.split_once('=') else { continue };
         if let Some((_, name)) = value.split_once(',') {
             let name = name.trim();
-            if !name.is_empty() {
+            if name.starts_with("CLAP: ") || name.starts_with("CLAPi: ") {
                 out.push(name.to_string());
+            } else if !name.is_empty() {
+                out.push(format!("CLAP: {name}"));
             }
         }
     }
@@ -2200,6 +2214,28 @@ mod tests {
             assert!(joined_folder(&root, bad).is_err(), "{bad}");
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn vst_cache_lines_become_rpp_display_names() {
+        let text = "[vstcache]\n\
+            reacomp.dll=00C4E8BC8743DD01,1919247213,ReaComp (Cockos)\n\
+            reasyndr.dll=00A89AAE8743DD01,1919251300,ReaSynDr (Cockos) (4 out)!!!VSTi\n\
+            Serum.vst3=80AE3D4F99B4DB01,789468119{ABCDEF01,Serum (Xfer Records)!!!VSTi\n\
+            Odd.VST3<5653=000AAB789AB4DB01,1261872463{ABCD,Comma, Name (Vendor)\n\
+            broken.dll=0011223344556677,0,\n\
+            nothing\n";
+        let mut out = Vec::new();
+        vst_cache_names_from(text, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                "VST: ReaComp (Cockos)".to_string(),
+                "VSTi: ReaSynDr (Cockos) (4 out)".to_string(),
+                "VST3i: Serum (Xfer Records)".to_string(),
+                "VST3: Comma, Name (Vendor)".to_string(),
+            ]
+        );
     }
 
     #[test]

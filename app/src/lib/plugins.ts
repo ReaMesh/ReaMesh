@@ -1,6 +1,8 @@
 // Match manifest plugin names against the local REAPER cache. Compare core
-// names without case or vendor differences; report unsupported or unavailable
-// checks as unknown, since they cannot establish that a plugin is missing.
+// names without case or vendor differences, but keep the format: a project
+// saved with the VST3 of a plugin doesn't load its VST2 or AU. Report
+// unsupported or unavailable checks as unknown, since they cannot establish
+// that a plugin is missing.
 
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -16,6 +18,9 @@ export interface FxRef {
   raw: string;
 }
 
+// REAPER appends the channel layout to some names: "ReaSynDr (Cockos) (4 out)".
+const CHANNELS = /\s*\((?:mono|\d+\s*out|\d+\s*ch|\d+->\d+\s*ch)\)\s*$/i;
+
 /** Parse an RPP FX display name into format / name / vendor. */
 export function parseFxName(raw: string): FxRef {
   let fmt = "";
@@ -25,6 +30,7 @@ export function parseFxName(raw: string): FxRef {
     fmt = m[1];
     rest = m[2];
   }
+  rest = rest.replace(CHANNELS, "");
   let name = rest;
   let vendor = "";
   const v = rest.match(/^(.*?)\s*\(([^()]*)\)\s*$/);
@@ -35,55 +41,96 @@ export function parseFxName(raw: string): FxRef {
   return { fmt, name: name.trim(), vendor, raw };
 }
 
-export type PluginStatus = "have" | "missing" | "unknown";
+/** The format without the instrument marker: "VST3i" and "VST3" are one
+ *  plugin format, "VSTi" and "VST" another. "" when the name carries none. */
+export function fxFormat(fmt: string): string {
+  const up = fmt.toUpperCase();
+  return up.length > 2 && up.endsWith("I") ? up.slice(0, -1) : up;
+}
 
-/** Lower-cased lookup keys for everything the local REAPER knows: the raw
- *  cache names, the core names, and "name (vendor)" pairs. */
-export function buildInstalledIndex(installed: string[]): Set<string> {
-  const set = new Set<string>();
+/** A format as people say it: REAPER's bare "VST" is VST2. */
+export function formatLabel(format: string): string {
+  return format === "VST" ? "VST2" : format;
+}
+
+/** `format`: installed, but only in another plugin format. */
+export type PluginStatus = "have" | "format" | "missing" | "unknown";
+
+/** Everything the local REAPER knows, keyed in lower case. */
+export interface InstalledIndex {
+  /** JS effects as "js: path". */
+  js: Set<string>;
+  /** Core plugin name → the formats it is installed in. "" stands for an
+   *  entry whose format is not known, which then matches any. */
+  formats: Map<string, Set<string>>;
+}
+
+export function buildInstalledIndex(installed: string[]): InstalledIndex {
+  const index: InstalledIndex = { js: new Set(), formats: new Map() };
   for (let s of installed) {
-    // REAPER's VST cache marks instruments with a "!!!VSTi" prefix on the
-    // display name. The backend strips it, but be tolerant of a raw one.
-    if (s.startsWith("!!!VSTi")) s = s.slice("!!!VSTi".length);
-    const low = s.toLowerCase().trim();
-    if (!low) continue;
-    set.add(low);
+    // The VST cache marks instruments with "!!!VSTi". The backend turns that
+    // into the format prefix, but be tolerant of a raw one on either end.
+    s = s.replace("!!!VSTi", "").trim();
+    if (!s) continue;
     const p = parseFxName(s);
-    if (p.name) set.add(p.name.toLowerCase());
-    if (p.name && p.vendor) set.add(`${p.name.toLowerCase()} (${p.vendor.toLowerCase()})`);
+    const format = fxFormat(p.fmt);
+    if (format === "JS") {
+      index.js.add(s.toLowerCase());
+      continue;
+    }
+    const key = p.name.toLowerCase();
+    if (!key) continue;
+    let formats = index.formats.get(key);
+    if (!formats) index.formats.set(key, (formats = new Set()));
+    formats.add(format);
   }
-  return set;
+  return index;
+}
+
+function isEmpty(index: InstalledIndex | null): index is null {
+  return !index || (index.js.size === 0 && index.formats.size === 0);
 }
 
 /** Whether a host-claimed plugin is installed on this machine. `index` null
  *  (or empty) means the scan yielded nothing usable → "unknown", never
  *  "missing". */
-export function pluginStatus(claimed: string, index: Set<string> | null): PluginStatus {
-  if (!index || index.size === 0) return "unknown";
+export function pluginStatus(claimed: string, index: InstalledIndex | null): PluginStatus {
+  if (isEmpty(index)) return "unknown";
   const p = parseFxName(claimed);
   const name = p.name.toLowerCase();
-  if (p.fmt.toUpperCase() === "JS") {
+  const format = fxFormat(p.fmt);
+  if (format === "JS") {
     // JS entries index as exact "js: path" from the Effects-dir walk.
-    return index.has(claimed.toLowerCase().trim()) || index.has(`js: ${name}`)
-      ? "have"
-      : "missing";
+    return index.js.has(claimed.toLowerCase().trim()) || index.js.has(`js: ${name}`) ? "have" : "missing";
   }
-  if (index.has(claimed.toLowerCase().trim())) return "have";
-  if (p.vendor && index.has(`${name} (${p.vendor.toLowerCase()})`)) return "have";
-  if (index.has(name)) return "have";
-  // REAPER's own bundled plugins are always present, whatever the caches say.
-  if (p.vendor.toLowerCase() === "cockos") return "have";
-  return "missing";
+  const formats = index.formats.get(name);
+  if (!formats) {
+    // REAPER's own bundled plugins are always present, whatever the caches say.
+    return p.vendor.toLowerCase() === "cockos" ? "have" : "missing";
+  }
+  return !format || formats.has(format) || formats.has("") ? "have" : "format";
+}
+
+/** For a plugin installed only in another format: the format the project
+ *  needs and the ones this machine has, as labels. Null in every other case. */
+export function formatMismatch(
+  claimed: string,
+  index: InstalledIndex | null,
+): { need: string; have: string } | null {
+  if (isEmpty(index) || pluginStatus(claimed, index) !== "format") return null;
+  const p = parseFxName(claimed);
+  const have = [...(index.formats.get(p.name.toLowerCase()) ?? [])].filter(Boolean).sort();
+  return { need: formatLabel(fxFormat(p.fmt)), have: have.map(formatLabel).join(", ") };
 }
 
 // Module-level cache: the installed set changes only when plugins are
 // (un)installed, which involves restarting REAPER anyway: once per app run
 // is plenty. `undefined` = not fetched yet, `null` = fetch failed (no backend
 // or unreadable caches) → everything renders as "unknown".
-let cachedIndex: Set<string> | null | undefined;
+let cachedIndex: InstalledIndex | null | undefined;
 let inflight: Promise<void> | null = null;
 
-export function fetchInstalledIndex(): Promise<Set<string> | null> {
+export function fetchInstalledIndex(): Promise<InstalledIndex | null> {
   if (cachedIndex !== undefined) return Promise.resolve(cachedIndex);
   inflight ??= invoke<string[]>("installed_plugins")
     .then((list) => {
@@ -100,8 +147,8 @@ export function fetchInstalledIndex(): Promise<Set<string> | null> {
 
 /** The installed-plugin index, fetched once per run. Null until known (and
  *  forever when there is no backend): callers treat null as "can't tell". */
-export function useInstalledPlugins(): Set<string> | null {
-  const [idx, setIdx] = useState<Set<string> | null>(cachedIndex ?? null);
+export function useInstalledPlugins(): InstalledIndex | null {
+  const [idx, setIdx] = useState<InstalledIndex | null>(cachedIndex ?? null);
   useEffect(() => {
     let alive = true;
     fetchInstalledIndex().then((v) => {

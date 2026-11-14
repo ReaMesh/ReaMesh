@@ -347,7 +347,8 @@ function usePluginToasts(state: ExtState | undefined, port: number | undefined) 
       }
       if (e.code !== "plugin_added" && e.code !== "plugins_added") continue;
       const plugin = e.code === "plugin_added" ? String(e.params?.plugin ?? "") : "";
-      const missing = plugin ? pluginStatus(plugin, installed) === "missing" : false;
+      const status = plugin ? pluginStatus(plugin, installed) : "unknown";
+      const missing = status === "missing" || status === "format";
       const text = localizeLogEntry(e);
       toast(
         missing ? (

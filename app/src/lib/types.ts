@@ -50,6 +50,8 @@ export interface SessionPreview {
     v?: number;
     tracks?: number;
     plugins?: string[];
+    /** Tracks using each of `plugins`, in its order (absent from an older host). */
+    plugin_tracks?: number[];
     reaper?: string;
     project?: string;
     /** What the host's relays announce: a guest can't ask them itself. */

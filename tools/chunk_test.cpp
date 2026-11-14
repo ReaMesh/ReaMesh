@@ -470,6 +470,44 @@ int main() {
     assert(collectPlugins(crlfProj) == want);
     // No FX, no findings.
     assert(collectPlugins("<TRACK\n  NAME \"x\"\n>\n").empty());
+
+    // Tracks per plugin (collectPluginTracks), one count per inventory entry.
+    // Serum sits in the track's chain and in a take FX of the same track: one
+    // track. The master chain counts as one.
+    assert(collectPluginTracks(kProject) == std::vector<int>(want.size(), 1));
+    assert(collectPluginTracks(crlfProj) == std::vector<int>(want.size(), 1));
+    const std::string kTwoTracks =
+        "<REAPER_PROJECT 0.1\n"
+        "  <MASTERFXLIST\n"
+        "    <VST \"VST: ReaComp (Cockos)\" reacomp.dll 0\n"
+        "    >\n"
+        "  >\n"
+        "  <TRACK {AAAAAAAA-0000-0000-0000-000000000000}\n"
+        "    <FXCHAIN\n"
+        "      <VST \"VST3: Serum (Xfer Records)\" Serum.vst3 0\n"
+        "      >\n"
+        "      <VST \"VST: ReaComp (Cockos)\" reacomp.dll 0\n"
+        "      >\n"
+        "    >\n"
+        "  >\n"
+        "  <TRACK {BBBBBBBB-0000-0000-0000-000000000000}\n"
+        "    <ITEM\n"
+        "      <TAKEFX\n"
+        "        <VST \"VST3: Serum (Xfer Records)\" Serum.vst3 0\n"
+        "        >\n"
+        "      >\n"
+        "    >\n"
+        "    <FXCHAIN\n"
+        "      <JS loser/waveShapingDstr \"\"\n"
+        "      >\n"
+        "    >\n"
+        "  >\n"
+        ">\n";
+    assert(collectPlugins(kTwoTracks) ==
+           (std::vector<std::string>{"VST: ReaComp (Cockos)", "VST3: Serum (Xfer Records)",
+                                     "JS: loser/waveShapingDstr"}));
+    assert(collectPluginTracks(kTwoTracks) == (std::vector<int>{2, 2, 1}));
+    assert(collectPluginTracks("<TRACK\n  NAME \"x\"\n>\n").empty());
   }
 
   // ---- FX stripping (stripFxBlocks) ----

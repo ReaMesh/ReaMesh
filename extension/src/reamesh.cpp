@@ -1290,16 +1290,32 @@ static std::string rppQuotedToken(std::string_view line, size_t from) {
   return "";
 }
 
+// The plugin a trimmed RPP line instantiates, "" when it opens no FX block:
+// the display name of a <VST/<CLAP/<AU/<DX/<LV2 block (e.g. "VST3: Serum
+// (Xfer Records)") and "JS: <path>" for a JS effect.
+static std::string fxNameOfLine(std::string_view t) {
+  const std::string_view tag = blockTag(t);
+  if (tag == "VST" || tag == "CLAP" || tag == "AU" || tag == "DX" || tag == "LV2")
+    return rppQuotedToken(t, 1 + tag.size());
+  if (tag != "JS") return "";
+  // JS lines carry the effect path, quoted only when it has spaces.
+  std::string_view rest = ltrim(t.substr(1 + tag.size()));
+  std::string name;
+  if (!rest.empty() && (rest.front() == '"' || rest.front() == '\'' || rest.front() == '`')) {
+    name = rppQuotedToken(rest, 0);
+  } else {
+    const size_t sp = rest.find_first_of(" \t");
+    name = std::string(rest.substr(0, sp == std::string_view::npos ? rest.size() : sp));
+  }
+  return name.empty() ? "" : "JS: " + name;
+}
+
 // Every plugin an RPP-syntax text would instantiate, in document order,
-// de-duplicated: the display name of each <VST/<CLAP/<AU/<DX/<LV2 block
-// (e.g. "VST3: Serum (Xfer Records)") and "JS: <path>" for JS effects. Works
-// on whole project files and on single chunks/blocks alike.
+// de-duplicated. Works on whole project files and on single chunks/blocks
+// alike.
 static std::vector<std::string> collectPlugins(const std::string& text) {
   std::vector<std::string> out;
   std::set<std::string> seen;
-  auto push = [&](std::string name) {
-    if (!name.empty() && seen.insert(name).second) out.push_back(std::move(name));
-  };
   size_t pos = 0;
   while (pos < text.size()) {
     size_t eol = text.find('\n', pos);
@@ -1308,24 +1324,57 @@ static std::vector<std::string> collectPlugins(const std::string& text) {
     if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
     std::string_view t = ltrim(line);
     if (!t.empty() && t.front() == '<') {
-      const std::string_view tag = blockTag(t);
-      if (tag == "VST" || tag == "CLAP" || tag == "AU" || tag == "DX" || tag == "LV2") {
-        push(rppQuotedToken(t, 1 + tag.size()));
-      } else if (tag == "JS") {
-        // JS lines carry the effect path, quoted only when it has spaces.
-        std::string_view rest = ltrim(t.substr(1 + tag.size()));
-        std::string name;
-        if (!rest.empty() && (rest.front() == '"' || rest.front() == '\'' || rest.front() == '`')) {
-          name = rppQuotedToken(rest, 0);
-        } else {
-          const size_t sp = rest.find_first_of(" \t");
-          name = std::string(rest.substr(0, sp == std::string_view::npos ? rest.size() : sp));
+      std::string name = fxNameOfLine(t);
+      if (!name.empty() && seen.insert(name).second) out.push_back(std::move(name));
+    }
+    pos = eol + 1;
+  }
+  return out;
+}
+
+// How many tracks use each plugin, one count per entry of collectPlugins(text)
+// and in its order. A track counts once however often it loads the plugin
+// (track FX, input FX, take FX of its items); everything outside a <TRACK>
+// (the master chain) counts as one more.
+static std::vector<int> collectPluginTracks(const std::string& text) {
+  std::vector<std::string> order;
+  std::map<std::string, std::set<int>> use;
+  int depth = 0;
+  int track = 0;  // 0 = outside every track
+  int trackDepth = -1;
+  int tracks = 0;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t eol = text.find('\n', pos);
+    if (eol == std::string::npos) eol = text.size();
+    std::string_view line(text.data() + pos, eol - pos);
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    std::string_view t = ltrim(line);
+    if (!t.empty() && t.front() == '<') {
+      if (trackDepth < 0 && blockTag(t) == "TRACK") {
+        track = ++tracks;
+        trackDepth = depth;
+      } else {
+        std::string name = fxNameOfLine(t);
+        if (!name.empty()) {
+          const auto [it, fresh] = use.try_emplace(name);
+          if (fresh) order.push_back(name);
+          it->second.insert(track);
         }
-        if (!name.empty()) push("JS: " + name);
+      }
+      ++depth;
+    } else if (t == ">") {
+      --depth;
+      if (trackDepth >= 0 && depth == trackDepth) {
+        track = 0;
+        trackDepth = -1;
       }
     }
     pos = eol + 1;
   }
+  std::vector<int> out;
+  out.reserve(order.size());
+  for (const std::string& name : order) out.push_back(static_cast<int>(use[name].size()));
   return out;
 }
 
@@ -5742,9 +5791,12 @@ static void refreshSessionMeta(bool force) {
   for (const std::string& p : collectPlugins(text)) plugins.push_back(p);
   // `reaper` is this host's REAPER version: a joiner on a different one is
   // warned in the trust dialog (a newer host's project may not load faithfully).
+  // `plugin_tracks` runs alongside `plugins`: how many tracks use each one, so
+  // a joiner can tell a missing plugin on one track from one on most of them.
   const json meta = {{"v", 1},
                      {"tracks", CountTracks(nullptr)},
                      {"plugins", plugins},
+                     {"plugin_tracks", collectPluginTracks(text)},
                      {"reaper", g_reaperVersion},
                      {"project", g_hostProjectId}};
   reamesh_set_session_meta(g_handle, dumpJson(meta).c_str());
