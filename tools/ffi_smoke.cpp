@@ -7,6 +7,10 @@
 //     rust/target/release/libreamesh.a \
 //     -framework CoreFoundation -framework Security \
 //     -framework SystemConfiguration -lresolv -o /tmp/ffi_smoke && /tmp/ffi_smoke
+// Linux:
+//   g++ -std=c++20 -Iextension/include tools/ffi_smoke.cpp \
+//     rust/target/release/libreamesh.a -lpthread -ldl -lm \
+//     -o /tmp/ffi_smoke && /tmp/ffi_smoke
 
 #include "reamesh_ffi.h"
 

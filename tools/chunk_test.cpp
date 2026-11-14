@@ -9,6 +9,10 @@
 //     tools/chunk_test.cpp rust/target/release/libreamesh.a -framework CoreFoundation \
 //     -framework Security -framework SystemConfiguration -lresolv \
 //     -o /tmp/chunk_test && /tmp/chunk_test
+//   Linux:
+//   g++ -std=c++20 -Iextension/include -Iextension/sdk tools/chunk_test.cpp \
+//     rust/target/release/libreamesh.a -lpthread -ldl -lm \
+//     -o /tmp/chunk_test && /tmp/chunk_test
 //   (extension/build/generated/reamesh_gui_script.h is produced by the cmake step
 //   of ./build.sh)
 

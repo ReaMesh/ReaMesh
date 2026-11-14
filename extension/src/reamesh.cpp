@@ -191,6 +191,11 @@
 #define REAPERAPI_WANT_Undo_CanUndo2
 #define REAPERAPI_WANT_Undo_CanRedo2
 
+// SWELL and windows.h both define min/max as macros. libstdc++ does not guard
+// its headers against them, so they are switched off; nothing here uses them.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include "reaper_plugin.h"
 #include "reaper_plugin_functions.h"
 

@@ -1,6 +1,7 @@
 #!/bin/bash
 # ReaMesh build: Rust core -> FFI header -> REAPER extension -> ReaMesh app.
-# Runs on macOS and on Windows (from Git Bash / MSYS, which ships with Git).
+# Runs on macOS, on Linux and on Windows (from Git Bash / MSYS, which ships
+# with Git).
 #
 #   ./build.sh            everything
 #   ./build.sh --no-app   stop after the extension (CI signs it before the app build)
@@ -15,21 +16,22 @@ for arg in "$@"; do
   esac
 done
 
-export PATH="$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
 
 case "$(uname -s)" in
   Darwin)               PLATFORM=macos ;;
   MINGW*|MSYS*|CYGWIN*) PLATFORM=windows ;;
+  Linux)                PLATFORM=linux ;;
   *)                    PLATFORM=other ;;
 esac
 
 # cmake's Visual Studio generator is multi-config, so the DLL lands in a
 # Release/ subfolder; the single-config generator used on macOS does not.
-if [[ "$PLATFORM" == windows ]]; then
-  EXT_OUT="extension/build/Release/reaper_reamesh.dll"
-else
-  EXT_OUT="extension/build/reaper_reamesh.dylib"
-fi
+case "$PLATFORM" in
+  windows) EXT_OUT="extension/build/Release/reaper_reamesh.dll" ;;
+  macos)   EXT_OUT="extension/build/reaper_reamesh.dylib" ;;
+  *)       EXT_OUT="extension/build/reaper_reamesh.so" ;;
+esac
 
 # The ReaMesh app bundles the extension binary produced by step 3, so it has
 # to run after it. Platforms without an app target stop at step 3.
@@ -115,6 +117,10 @@ if [[ "$PLATFORM" == windows ]]; then
   (cd app && bun install && bun run tauri build)
   echo
   echo "Built: app/src-tauri/target/release/bundle/nsis/ (installer)"
+elif [[ "$PLATFORM" == linux ]]; then
+  (cd app && bun install && bun run tauri build)
+  echo
+  echo "Built: app/src-tauri/target/release/bundle/ (AppImage and .deb)"
 else
   (cd app && bun install && bun run tauri build --target universal-apple-darwin)
   echo

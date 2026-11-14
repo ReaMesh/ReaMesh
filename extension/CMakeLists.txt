@@ -79,4 +79,21 @@ elseif(WIN32)
     # time, so a system without it keeps the colour tint instead
     user32 comctl32 d3d11 d2d1 dwrite dxguid
   )
+else()
+  find_package(Threads REQUIRED)
+  target_link_libraries(reaper_reamesh PRIVATE Threads::Threads ${CMAKE_DL_LIBS} m)
+  target_link_options(reaper_reamesh PRIVATE
+    # REAPER needs ReaperPluginEntry and nothing else. Without the list the
+    # Rust staticlib's C ABI and libstdc++'s template instances would land in
+    # the dynamic symbol table, where another extension's copies could bind
+    # to them.
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports.map"
+    # A symbol nothing provides should fail the build, not the load in REAPER.
+    "LINKER:--no-undefined"
+    "LINKER:--gc-sections"
+    # The Rust archive carries its debug info, most of the file's size.
+    "LINKER:--strip-debug"
+  )
+  set_target_properties(reaper_reamesh PROPERTIES
+    LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
 endif()
