@@ -163,8 +163,9 @@ pub enum Channel {
 }
 
 /// On since 1.0.0, the first stable release. Off, the switch shows Stable
-/// greyed out and a stored "stable" reads as Beta.
-pub const STABLE_AVAILABLE: bool = true;
+/// greyed out and a stored "stable" reads as Beta. Linux builds are Beta only
+/// for now: stable.json carries no Linux entries (channel.yml strips them).
+pub const STABLE_AVAILABLE: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
 const CHANNEL_BASE: &str = "https://github.com/ReaMesh/ReaMesh/releases/download/updater/";
 
@@ -401,7 +402,10 @@ pub fn start(app: &AppHandle) {
 /// `update:restarting` first so it can remember its screen and fade out; the
 /// quit handler is bypassed because the session (if any) lives in REAPER and
 /// must survive this restart. Windows: `install` hands over to the installer,
-/// which quits this process and relaunches the app itself.
+/// which quits this process and relaunches the app itself. Linux: an AppImage
+/// is replaced in place; a .deb install runs `dpkg -i` through pkexec, which
+/// asks for the administrator password (the updater picks the artifact by the
+/// bundle type stamped into the binary, see release-manifest.ts).
 pub fn restart(app: &AppHandle) -> Result<(), String> {
     let (update, bytes) = {
         let inner = INNER.lock().unwrap();

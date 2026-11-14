@@ -100,3 +100,22 @@ if (process.platform === "darwin") {
     }
   }
 }
+
+// Linux: the dynamic loader refuses a library that needs a newer glibc than
+// the system has, and REAPER then just doesn't list the extension. Releases
+// are built on Ubuntu 22.04, so 2.35 is the floor they promise. A local build
+// on a newer distro naturally needs more; it only fails the check in CI.
+if (process.platform === "linux") {
+  const GLIBC_FLOOR = "2.35";
+  const key = (v: string) => v.split(".").map(Number).reduce((acc, n, i) => acc + n / 1000 ** i, 0);
+  const r = Bun.spawnSync(["objdump", "-T", binary]);
+  if (r.exitCode !== 0) fail("objdump could not read the REAPER extension binary (install binutils)");
+  const needed = [...r.stdout.toString().matchAll(/GLIBC_(\d+(?:\.\d+)+)/g)]
+    .map((m) => m[1])
+    .sort((a, b) => key(b) - key(a))[0];
+  if (needed && key(needed) > key(GLIBC_FLOOR)) {
+    const msg = `the REAPER extension binary needs glibc ${needed}, releases support ${GLIBC_FLOOR}`;
+    if (process.env.CI) fail(msg);
+    console.warn(`\n[check-extension] note: ${msg} (fine for this machine; CI builds the release)\n`);
+  }
+}

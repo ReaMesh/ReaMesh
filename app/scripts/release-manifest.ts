@@ -4,14 +4,14 @@
 //   bun scripts/release-manifest.ts <artifacts-dir> <version> <download-base-url>
 //
 // Looks for `*.app.tar.gz` (macOS, universal: Apple silicon and Intel get the
-// same entry) and `*-setup.exe` (Windows)
+// same entry), `*-setup.exe` (Windows) and `*.AppImage` / `*.deb` (Linux)
 // with their `.sig` files, as `tauri build --config src-tauri/tauri.release.conf.json`
 // leaves them. Next to Tauri's own fields it records the release's PROTO: the
 // app offers a restart in the middle of a session only when that matches the
 // running build (see src-tauri/src/updater.rs).
 //
 // It also writes `extension.json`, the same format for the extension binaries
-// (`reaper_reamesh.dylib` / `.dll` with their `.sig`): the app fetches it next
+// (`reaper_reamesh.dylib` / `.dll` / `.so` with their `.sig`): the app fetches it next
 // to the downloaded update to install the new extension before it restarts.
 //
 // The relay's builds (`reamesh-relay-linux-<arch>` with their `.sig`) go into
@@ -51,6 +51,13 @@ for (const mac of ["darwin-aarch64", "darwin-x86_64"]) {
 }
 entry("windows-x86_64", (f) => f.endsWith("-setup.exe"));
 entry("windows-x86_64", (f) => f === "reaper_reamesh.dll", extension);
+// Linux: the updater looks up `linux-x86_64-<bundle type>` first, so an
+// AppImage replaces itself and a .deb install updates through dpkg; a build
+// without a stamped bundle type falls back to the AppImage.
+entry("linux-x86_64-appimage", (f) => f.endsWith(".AppImage"));
+entry("linux-x86_64-deb", (f) => f.endsWith(".deb"));
+entry("linux-x86_64", (f) => f.endsWith(".AppImage"));
+entry("linux-x86_64", (f) => f === "reaper_reamesh.so", extension);
 for (const arch of ["x86_64", "aarch64"]) {
   entry(`linux-${arch}`, (f) => f === `reamesh-relay-linux-${arch}`, relay);
 }
