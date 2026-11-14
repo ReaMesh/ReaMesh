@@ -2,7 +2,7 @@
 
 <a href="https://github.com/ReaMesh/ReaMesh/releases/latest"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/release/ReaMesh/ReaMesh.svg?label=Release&amp;color=3f3f46&amp;logo=ri%3AGoTag&amp;variant=outline&amp;mode=dark&amp;valueColor=f0f6fc&amp;labelTextColor=f0f6fc&amp;logoColor=f0f6fc&amp;labelOpacity=1"><img alt="Latest release" src="https://shieldcn.dev/github/release/ReaMesh/ReaMesh.svg?label=Release&amp;color=d4d4d8&amp;logo=ri%3AGoTag&amp;variant=outline&amp;mode=light&amp;valueColor=1f2328&amp;labelTextColor=1f2328&amp;logoColor=1f2328&amp;labelOpacity=1"></picture></a>
 <a href="https://github.com/ReaMesh/ReaMesh/releases"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/dynamic/json.svg?url=https%3A%2F%2Fgithub.com%2FReaMesh%2FReaMesh%2Freleases%2Fdownload%2Fupdater%2Fdownloads.json&amp;query=%24.downloads&amp;variant=outline&amp;label=Downloads&amp;color=3f3f46&amp;logo=ri%3AGoDownload&amp;mode=dark&amp;valueColor=f0f6fc&amp;labelTextColor=f0f6fc&amp;logoColor=f0f6fc&amp;labelOpacity=1"><img alt="Downloads" src="https://shieldcn.dev/badge/dynamic/json.svg?url=https%3A%2F%2Fgithub.com%2FReaMesh%2FReaMesh%2Freleases%2Fdownload%2Fupdater%2Fdownloads.json&amp;query=%24.downloads&amp;variant=outline&amp;label=Downloads&amp;color=d4d4d8&amp;logo=ri%3AGoDownload&amp;mode=light&amp;valueColor=1f2328&amp;labelTextColor=1f2328&amp;logoColor=1f2328&amp;labelOpacity=1"></picture></a>
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/badges/platforms-dark.svg"><img alt="Platforms: Windows and macOS" src="docs/badges/platforms-light.svg"></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/badges/platforms-dark.svg"><img alt="Platforms: Windows, macOS and Linux" src="docs/badges/platforms-light.svg"></picture>
 <picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/REAPER-7.12%2B-3f3f46.svg?logo=ri%3ALuAudioWaveform&amp;variant=outline&amp;mode=dark&amp;valueColor=f0f6fc&amp;labelTextColor=f0f6fc&amp;logoColor=f0f6fc&amp;labelOpacity=1"><img alt="REAPER 7.12 or newer" src="https://shieldcn.dev/badge/REAPER-7.12%2B-d4d4d8.svg?logo=ri%3ALuAudioWaveform&amp;variant=outline&amp;mode=light&amp;valueColor=1f2328&amp;labelTextColor=1f2328&amp;logoColor=1f2328&amp;labelOpacity=1"></picture>
 <a href="LICENSE"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/License-GPL--3.0--only-3f3f46.svg?variant=outline&amp;logo=ri%3AGoLaw&amp;mode=dark&amp;valueColor=f0f6fc&amp;labelTextColor=f0f6fc&amp;logoColor=f0f6fc&amp;labelOpacity=1"><img alt="License: GPL-3.0-only" src="https://shieldcn.dev/badge/License-GPL--3.0--only-d4d4d8.svg?variant=outline&amp;logo=ri%3AGoLaw&amp;mode=light&amp;valueColor=1f2328&amp;labelTextColor=1f2328&amp;logoColor=1f2328&amp;labelOpacity=1"></picture></a>
 
@@ -23,7 +23,9 @@ handles sessions, invitations and setup alongside REAPER.
 
 You'll need REAPER 7.12 or newer and the ReaMesh app on each computer. See
 [Releases](https://github.com/ReaMesh/ReaMesh/releases) for packaged builds, or
-[build from source](#building-from-source).
+[build from source](#building-from-source). ReaMesh runs on macOS 11 or later,
+64-bit Windows and, as a beta, 64-bit Linux (glibc 2.35 or later, as an
+AppImage or a .deb). All three share sessions with each other.
 
 1. Open ReaMesh and follow the setup to install its bundled REAPER extension.
    If your REAPER resource folder isn't found, select it manually.
@@ -146,7 +148,10 @@ don't have this extra message encryption.
 Install Rust, Bun, CMake 3.20 or newer, and the
 [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) for your
 platform. On Windows, use the MSVC toolchain and run the script from Git Bash.
-On macOS, install the Xcode command-line tools.
+On macOS, install the Xcode command-line tools. On Linux (Debian/Ubuntu
+package names), also install `build-essential cmake file patchelf libssl-dev
+libxdo-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev libcairo2-dev
+libpango1.0-dev libx11-dev libxext-dev libxfixes-dev`.
 
 The macOS config includes the maintainer's signing identity. Before a local
 build, set `bundle.macOS.signingIdentity` in
@@ -166,8 +171,10 @@ optional; without it, the build uses the checked-in FFI header.
 | --- | --- |
 | Windows installer | `app/src-tauri/target/release/bundle/nsis/` |
 | macOS app | `app/src-tauri/target/release/bundle/macos/ReaMesh.app` |
+| Linux AppImage and .deb | `app/src-tauri/target/release/bundle/appimage/`, `.../bundle/deb/` |
 | Windows extension | `extension/build/Release/reaper_reamesh.dll` |
 | macOS extension | `extension/build/reaper_reamesh.dylib` |
+| Linux extension | `extension/build/reaper_reamesh.so` |
 
 After building the extension, run the app in development mode:
 
