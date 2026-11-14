@@ -4,10 +4,13 @@
 // is editing, are drawn as compositor layers on top of REAPER's track view,
 // inside REAPER's own process: Core Animation on macOS
 // (cursor_overlay_mac.mm), DirectComposition on Windows
-// (cursor_overlay_win.cpp). Where attach() fails (no track view, no
-// composition device), the extension keeps marking locked items with its
-// colour tint and cursors are neither drawn nor sent. The layer is
-// display-only and click-through; it never takes input.
+// (cursor_overlay_win.cpp), and on Linux a transparent X window of its own
+// laid over the track view and drawn with cairo (cursor_overlay_linux.cpp).
+// Where attach() fails (no track view, no composition device, no compositing
+// manager), the extension keeps marking locked items with its colour tint and
+// cursors are neither drawn nor sent (cursor_overlay_stub.cpp is that case for
+// a platform without a layer). The layer is display-only and click-through;
+// it never takes input.
 //
 // Positions travel semantically ({project seconds, track GUID, 0..1 within the
 // track}), so every peer sees a cursor at the same musical spot whatever their
@@ -119,12 +122,12 @@ struct Local {
 bool sampleLocal(Local* out);
 
 // The arrange's size in the units of Host::trackSpan (points on macOS,
-// pixels on Windows); false without a layer.
+// pixels on Windows, SWELL units on Linux); false without a layer.
 bool viewSize(double* w, double* h);
 
 // Arrange units per point: the factor that turns a distance meant in points
 // into arrange coordinates (1 on macOS, where they are points; the DPI scale
-// on Windows, where they are pixels).
+// on Windows, where they are pixels; REAPER's UI scale on Linux).
 double pixelScale();
 
 // Whether the left mouse button is held anywhere.

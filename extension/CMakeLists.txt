@@ -23,7 +23,7 @@ if(APPLE)
 elseif(WIN32)
   set(REAMESH_CURSOR_SRC src/cursor_overlay_win.cpp)
 else()
-  set(REAMESH_CURSOR_SRC src/cursor_overlay_stub.cpp)
+  set(REAMESH_CURSOR_SRC src/cursor_overlay_linux.cpp)
 endif()
 
 add_library(reaper_reamesh SHARED src/reamesh.cpp ${REAMESH_CURSOR_SRC})
@@ -82,8 +82,17 @@ elseif(WIN32)
 else()
   find_package(Threads REQUIRED)
   target_link_libraries(reaper_reamesh PRIVATE Threads::Threads ${CMAKE_DL_LIBS} m)
+  # Peer cursor layer (cursor_overlay_linux.cpp): compiled against the X11,
+  # Xfixes, Shape and cairo headers but not linked to them. It finds them at
+  # run time in REAPER's process (SWELL loads GDK), so a system without one
+  # keeps the colour tint instead of failing to load the extension.
+  # Debian/Ubuntu: apt install libx11-dev libxfixes-dev libxext-dev libcairo2-dev
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(REAMESH_CURSOR_HEADERS REQUIRED cairo x11 xfixes xext)
+  target_include_directories(reaper_reamesh PRIVATE ${REAMESH_CURSOR_HEADERS_INCLUDE_DIRS})
   target_link_options(reaper_reamesh PRIVATE
-    # REAPER needs ReaperPluginEntry and nothing else. Without the list the
+    # REAPER needs ReaperPluginEntry, SWELL its SWELL_dllMain (which hands
+    # the cursor layer SWELL's functions), nothing else. Without the list the
     # Rust staticlib's C ABI and libstdc++'s template instances would land in
     # the dynamic symbol table, where another extension's copies could bind
     # to them.

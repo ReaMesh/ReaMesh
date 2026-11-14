@@ -1,5 +1,6 @@
-// Peer cursor glyphs and the morph between them, shared by both platform
-// layers (cursor_overlay_mac.mm, cursor_overlay_win.cpp).
+// Peer cursor glyphs and the morph between them, shared by the platform
+// layers (cursor_overlay_mac.mm, cursor_overlay_win.cpp,
+// cursor_overlay_linux.cpp).
 //
 // Someone's cursor shows what REAPER shows them: the plain pointer, or a
 // glyph for trimming an item edge, dragging a fade, a razor edit and so on.
