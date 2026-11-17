@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { ArrowLeft } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
@@ -69,7 +70,33 @@ function CreditRow({ label, c }: { label: string; c?: Credit }) {
   );
 }
 
+/** Rows mounted with the screen: what fits on it, so its fade-in has frames to run on. */
+const FIRST_ROWS = 24;
+/** Rows added per frame once the screen is in. */
+const ROWS_PER_FRAME = 60;
+/** The screen's fade-in (SettingsWindow / App), plus a frame. */
+const ENTER_MS = 220;
+
+/** The full package list is long (two tooltips a row): mounting it with the
+ *  screen blocked the main thread past the fade-in, so the screen popped in
+ *  whole. Start with the first rows, add the rest a chunk per frame after. */
+function useGrowing(total: number): number {
+  const [count, setCount] = useState(Math.min(FIRST_ROWS, total));
+  useEffect(() => {
+    if (count >= total) return;
+    const grow = () => setCount((n) => Math.min(n + ROWS_PER_FRAME, total));
+    if (count === Math.min(FIRST_ROWS, total)) {
+      const id = window.setTimeout(grow, ENTER_MS);
+      return () => window.clearTimeout(id);
+    }
+    const id = requestAnimationFrame(grow);
+    return () => cancelAnimationFrame(id);
+  }, [count, total]);
+  return count;
+}
+
 export function Credits({ onBack }: { onBack: () => void }) {
+  const shown = useGrowing(ALL.length);
   return (
     <div className={cn("flex flex-1 flex-col overflow-y-auto", isWindows && "scroll-slim")}>
       <div className="w-full space-y-[18px] px-4 pt-1 pb-5">
@@ -103,7 +130,7 @@ export function Credits({ onBack }: { onBack: () => void }) {
         <section className="space-y-2">
           <SectionLabel aside={ALL.length}>{t("allPackages")}</SectionLabel>
           <Group>
-            {ALL.map((c, i) => (
+            {ALL.slice(0, shown).map((c, i) => (
               <div key={c.n} className="flex flex-col">
                 {i > 0 && <Divider inset={false} />}
                 <CreditRow label={c.n} c={c} />
