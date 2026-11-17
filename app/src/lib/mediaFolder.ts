@@ -11,12 +11,15 @@ export interface MediaFolder {
   /** reaper: the project's own media path in REAPER, else `DEFAULT_MEDIA_FOLDER`;
    *  beside: next to the project file; custom: `folder`, inside the project. */
   mode: MediaFolderMode;
-  /** For `custom`: a folder relative to the project. Empty or invalid falls
-   *  back to `DEFAULT_MEDIA_FOLDER`. */
+  /** For `custom`: a folder relative to the project, placeholders allowed.
+   *  Empty or invalid falls back to `DEFAULT_CUSTOM_FOLDER`. */
   folder: string;
 }
 
 export const DEFAULT_MEDIA_FOLDER = "Media";
+/** An own folder left empty: "Nightfall Media" next to Nightfall.rpp
+ *  (`kDefaultCustomFolder` in the extension). */
+export const DEFAULT_CUSTOM_FOLDER = "$project Media";
 
 const KEY = "reamesh.mediaFolder";
 const DEFAULTS: MediaFolder = { mode: "reaper", folder: "" };
@@ -90,4 +93,43 @@ export function cleanRelativeFolder(s: string): string {
     parts.push(part);
   }
   return parts.join("/");
+}
+
+/** The placeholders a custom folder may use, in the order the app offers them.
+ *  Filled in by the extension when hosting starts (`expandFolderTemplate` in
+ *  reamesh.cpp); the app only previews them. */
+export const FOLDER_VARS = ["project", "author", "date", "year", "month", "day", "time"] as const;
+export type FolderVar = (typeof FOLDER_VARS)[number];
+
+export interface FolderValues {
+  project: string;
+  author: string;
+  at: Date;
+}
+
+/** A placeholder's value as part of one folder name. */
+const namePart = (v: string) =>
+  // eslint-disable-next-line no-control-regex
+  v.replace(/[\u0000-\u001f/\\:*?"<>|]/g, "-");
+
+/** Mirrors `expandFolderTemplate` in the extension: placeholders filled in,
+ *  and names left empty or ending in a space or dot by them tidied up. */
+export function expandFolderTemplate(tpl: string, v: FolderValues): string {
+  const two = (n: number) => String(n).padStart(2, "0");
+  const d = v.at;
+  const values: Record<FolderVar, string> = {
+    project: namePart(v.project),
+    author: namePart(v.author),
+    date: `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}`,
+    year: String(d.getFullYear()),
+    month: two(d.getMonth() + 1),
+    day: two(d.getDate()),
+    time: `${two(d.getHours())}-${two(d.getMinutes())}`,
+  };
+  const out = tpl.replace(/\$(project|author|date|year|month|day|time)/g, (_, k: FolderVar) => values[k]);
+  return out
+    .split(/[/\\]/)
+    .map((part) => part.replace(/^ +/, "").replace(/[. ]+$/, ""))
+    .filter(Boolean)
+    .join("/");
 }

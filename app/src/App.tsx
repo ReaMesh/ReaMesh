@@ -27,6 +27,7 @@ import { t, useLang } from "@/lib/i18n";
 import { isWindows } from "@/lib/platform";
 import { localizeLogEntry } from "@/lib/log";
 import { getLastSession, lastSessionAfter, setLastSession } from "@/lib/lastSession";
+import { noteStarAskFrame } from "@/lib/starAsk";
 import { pluginStatus, useInstalledPlugins } from "@/lib/plugins";
 import { isInviteLink } from "@/lib/ticket";
 import { isRelayCode } from "@/lib/relay";
@@ -219,6 +220,7 @@ function useLastSessionFeed(state: ExtState | undefined, port: number | undefine
     const block = getLastSession(port);
     const next = lastSessionAfter(prev, state, block);
     if (next !== block) setLastSession(port, next);
+    noteStarAskFrame(state, port);
     if (state.error && next?.reason === state.error) shown.current = JSON.stringify(state.error);
     before.current = { port, state };
   }, [state, port]);

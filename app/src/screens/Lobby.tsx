@@ -7,12 +7,13 @@ import {
   LoaderCircle,
   LockKeyhole,
   Megaphone,
+  Star,
   Ticket,
   X,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -31,7 +32,7 @@ import { ProfileFields } from "@/components/ProfileEditor";
 import { FirewallBlocked } from "@/components/FirewallNotice";
 import { ListSlot } from "@/components/ListSlot";
 import { TrustDialog } from "@/components/TrustDialog";
-import { SwapText } from "@/components/Swap";
+import { DrawnCheck, SwapIcon, SwapText } from "@/components/Swap";
 import { Hint } from "@/components/Hint";
 import { RelayListingLine } from "@/components/RelayListing";
 import { FOUND_COLOR, inkFor } from "@/lib/colors";
@@ -57,6 +58,7 @@ import { noticeActive, noticeApplies, noticeWhen, type RelayAbout } from "@/lib/
 import { relayAbout, useRelays } from "@/lib/relays";
 import { localizeLogEntry, reconnectingText } from "@/lib/log";
 import { isCopyRefusal, setLastSession, useLastSession, type LastSession } from "@/lib/lastSession";
+import { REPO_URL, finishStarAsk, starAskDue, useStarAsk } from "@/lib/starAsk";
 import {
   copyDirName,
   copyPercent,
@@ -1589,6 +1591,105 @@ function RelaySessions({
   );
 }
 
+/** How long the star line says thank you before it folds away. */
+const THANKS_MS = 1600;
+
+/** The one-time "a star on GitHub helps" line over the host card. Decided when
+ *  the Lobby opens, so it never pops up while someone is looking, and only when
+ *  nothing else in the Lobby is asking for attention. Clicked or dismissed, it
+ *  is gone for good; Settings → Help keeps the link. */
+function StarAskLine({ quiet }: { quiet: boolean }) {
+  const rec = useStarAsk();
+  const [due] = useState(() => !quiet && starAskDue());
+  // A click says thank you for a moment before the line folds away. It is
+  // marked done at once, so a quit in between can't bring it back.
+  const [thanked, setThanked] = useState(false);
+  useEffect(() => {
+    if (!thanked) return;
+    const id = window.setTimeout(() => setThanked(false), THANKS_MS);
+    return () => window.clearTimeout(id);
+  }, [thanked]);
+  const [before, after] = t("starAsk").split("{link}");
+  return (
+    <AnimatePresence initial={false}>
+      {due && (!rec.done || thanked) && (
+        <motion.div
+          key="star"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1, transition: { duration: 0.4, delay: 0.6 } }}
+          exit={{ opacity: 0, height: 0, marginTop: -18 }}
+          transition={FOLD}
+          className="-my-1 flex shrink-0 items-center gap-1 overflow-hidden"
+        >
+          <button
+            type="button"
+            disabled={thanked}
+            onClick={() => {
+              finishStarAsk();
+              setThanked(true);
+              openUrl(REPO_URL);
+            }}
+            className={cn(
+              "group flex min-w-0 items-center gap-1.5 rounded px-1 py-0.5 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground disabled:hover:text-muted-foreground",
+              focusRing,
+            )}
+          >
+            <SwapIcon value={thanked ? "check" : "star"} from={thanked ? 0.85 : 0.25} className="size-3">
+              {thanked ? (
+                <DrawnCheck className="size-3 text-found" strokeWidth={2.5} />
+              ) : (
+                <Star className="size-3" aria-hidden="true" />
+              )}
+            </SwapIcon>
+            <span className="min-w-0 truncate">
+              <SwapText value={thanked ? "thanks" : "ask"}>
+                {thanked ? (
+                  <span className="text-foreground/80">{t("starAskThanks")}</span>
+                ) : (
+                  <>
+                    {before}
+                    <span className="text-foreground/80 transition-colors group-hover:text-foreground">
+                      {t("starAskLink")}
+                    </span>
+                    {after}
+                  </>
+                )}
+              </SwapText>
+            </span>
+            <span className="sr-only" aria-live="polite">
+              {thanked ? t("starAskThanks") : ""}
+            </span>
+          </button>
+          <AnimatePresence initial={false}>
+            {!thanked && (
+              <motion.span
+                key="dismiss"
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.15 }}
+                className="ml-auto shrink-0"
+              >
+                <Hint label={t("starAskDismiss")}>
+                  <button
+                    type="button"
+                    onClick={finishStarAsk}
+                    aria-label={t("starAskDismiss")}
+                    className={cn(
+                      "grid size-5 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground",
+                      focusRing,
+                    )}
+                  >
+                    <X className="size-3" aria-hidden="true" />
+                  </button>
+                </Hint>
+              </motion.span>
+            )}
+          </AnimatePresence>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
 export function Lobby({ state, port }: { state: ExtState; port: number | null }) {
   // Sessions discovered after this timestamp get a one-time highlight.
   const mountedAt = useRef(Date.now()).current;
@@ -1693,6 +1794,8 @@ export function Lobby({ state, port }: { state: ExtState; port: number | null })
           <InviteCard sessions={state.sessions} probe={state.probe} error={state.error} port={port} />
         </div>
       </div>
+
+      <StarAskLine quiet={!!last || !!state.reconnecting} />
 
       {/* Blocks outlive the session they were made in: keep them revocable. */}
       <BanList bans={state.bans ?? []} port={port} gap={18} />

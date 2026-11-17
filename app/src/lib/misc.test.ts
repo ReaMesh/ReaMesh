@@ -3,6 +3,7 @@ import { inkFor } from "./colors";
 import { formatBytes, reaperVersionKey } from "./format";
 import { hostSeenCount, recordHostJoin } from "./knownHosts";
 import { localizeLogEntry } from "./log";
+import { DEFAULT_CUSTOM_FOLDER, cleanRelativeFolder as cleanFolder, expandFolderTemplate } from "./mediaFolder";
 import { initials, normalizeState } from "./types";
 
 describe("initials", () => {
@@ -124,5 +125,28 @@ describe("localizeLogEntry", () => {
   it("falls back to the wire text for unknown codes", () => {
     expect(localizeLogEntry({ code: "brand_new_code", text: "raw english" })).toBe("raw english");
     expect(localizeLogEntry("plain string")).toBe("plain string");
+  });
+});
+
+
+describe("expandFolderTemplate", () => {
+  const at = new Date(2026, 2, 7, 9, 5);
+  const v = { project: "Night/fall: mix", author: "", at };
+  it("fills in the placeholders like the extension does", () => {
+    expect(expandFolderTemplate("Media/$project", v)).toBe("Media/Night-fall- mix");
+    expect(expandFolderTemplate("$date $time", v)).toBe("2026-03-07 09-05");
+    expect(expandFolderTemplate("$year/$month/$day", v)).toBe("2026/03/07");
+    expect(expandFolderTemplate("Media/$author", v)).toBe("Media");
+    expect(expandFolderTemplate("Take $author/x", v)).toBe("Take/x");
+    expect(expandFolderTemplate("$unknown", v)).toBe("$unknown");
+    expect(cleanFolder(expandFolderTemplate("Media/$project", v))).toBe("Media/Night-fall- mix");
+  });
+});
+
+describe("DEFAULT_CUSTOM_FOLDER", () => {
+  it("names the folder after the project, plain Media without one", () => {
+    const at = new Date(2026, 2, 7);
+    expect(expandFolderTemplate(DEFAULT_CUSTOM_FOLDER, { project: "Nightfall", author: "", at })).toBe("Nightfall Media");
+    expect(expandFolderTemplate(DEFAULT_CUSTOM_FOLDER, { project: "", author: "", at })).toBe("Media");
   });
 });

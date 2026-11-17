@@ -205,6 +205,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -3288,7 +3289,8 @@ static std::string diffSnapshots(const Snapshot& prev, const Snapshot& now,
 //   reaper  (default) the project's own "Path to save media files" when that
 //           is a folder inside the project, else kDefaultMediaFolder
 //   beside  next to the .rpp
-//   custom  a folder the user named, relative to the project
+//   custom  a folder the user named, relative to the project, by default
+//           kDefaultCustomFolder ("Nightfall Media" next to Nightfall.rpp)
 // Never outside the project folder: only files in it can be served, and an
 // absolute path never goes on the wire. A project saved straight onto the
 // desktop no longer spreads its media all over it.
@@ -3296,6 +3298,7 @@ enum class MediaFolderMode { Reaper, Beside, Custom };
 static MediaFolderMode g_mediaFolderMode = MediaFolderMode::Reaper;
 static std::string g_mediaFolderCustom;
 static const char* const kDefaultMediaFolder = "Media";
+static const char* const kDefaultCustomFolder = "$project Media";
 
 // A folder relative to the project, '/'-joined, or "" when `s` isn't one: no
 // root or drive, no empty, "." or ".." part, nothing Windows can't name.
@@ -3325,11 +3328,116 @@ static std::string cleanRelativeFolder(const std::string& s) {
   return out;
 }
 
+// Placeholders a custom folder may use, in the style of REAPER's render
+// wildcards: $project, $author, $date (YYYY-MM-DD), $year, $month, $day and
+// $time (HH-MM). Mirrored by expandFolderTemplate in the app's
+// lib/mediaFolder.ts, which only previews; this one decides.
+struct FolderVars {
+  std::string project, author;
+  int year = 0, month = 0, day = 0, hour = 0, minute = 0;
+};
+
+// What hosting started with: the folder must not move to a new date at
+// midnight, or follow a Save As, while the session runs. Unset outside hosting.
+static std::optional<FolderVars> g_hostFolderVars;
+
+// A placeholder's value as part of one folder name: separators and what
+// Windows can't name become '-'.
+static std::string folderNamePart(const std::string& v) {
+  std::string out;
+  for (unsigned char c : v) {
+    const bool bad = c < 0x20 || c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+                     c == '"' || c == '<' || c == '>' || c == '|';
+    out += bad ? '-' : (char)c;
+  }
+  return out;
+}
+
+static std::string expandFolderTemplate(const std::string& tpl, const FolderVars& v) {
+  auto two = [](int n) {
+    char buf[8];
+    std::snprintf(buf, sizeof buf, "%02d", n);
+    return std::string(buf);
+  };
+  const std::string date = std::to_string(v.year) + "-" + two(v.month) + "-" + two(v.day);
+  const std::pair<std::string_view, std::string> vars[] = {
+      {"$project", folderNamePart(v.project)},
+      {"$author", folderNamePart(v.author)},
+      {"$date", date},
+      {"$year", std::to_string(v.year)},
+      {"$month", two(v.month)},
+      {"$day", two(v.day)},
+      {"$time", two(v.hour) + "-" + two(v.minute)},
+  };
+  std::string out;
+  size_t i = 0;
+  while (i < tpl.size()) {
+    bool hit = false;
+    if (tpl[i] == '$') {
+      for (const auto& [key, value] : vars) {
+        if (tpl.compare(i, key.size(), key) == 0) {
+          out += value;
+          i += key.size();
+          hit = true;
+          break;
+        }
+      }
+    }
+    if (!hit) out += tpl[i++];
+  }
+  // An empty value ("$author" with no author set) must not leave a name
+  // ending in a space or dot, which cleanRelativeFolder would refuse whole.
+  std::string tidy, part;
+  auto flush = [&]() {
+    size_t a = part.find_first_not_of(' ');
+    size_t b = part.find_last_not_of(". ");
+    if (a != std::string::npos && b != std::string::npos && b >= a) {
+      if (!tidy.empty()) tidy += '/';
+      tidy += part.substr(a, b - a + 1);
+    }
+    part.clear();
+  };
+  for (char c : out) {
+    if (c == '/' || c == '\\') flush();
+    else part += c;
+  }
+  flush();
+  return tidy;
+}
+
+static std::tm localTime(std::time_t t) {
+  std::tm out{};
+#ifdef _WIN32
+  localtime_s(&out, &t);
+#else
+  localtime_r(&t, &out);
+#endif
+  return out;
+}
+
+static std::string currentProjectPath();
+static std::string fileStem(const std::string& path);
+
+static FolderVars folderVarsNow() {
+  const std::tm lt = localTime(std::time(nullptr));
+  FolderVars v;
+  v.project = fileStem(currentProjectPath());
+  v.author = captureProjectString("PROJECT_AUTHOR");
+  v.year = lt.tm_year + 1900;
+  v.month = lt.tm_mon + 1;
+  v.day = lt.tm_mday;
+  v.hour = lt.tm_hour;
+  v.minute = lt.tm_min;
+  return v;
+}
+
 // The folder copies go into, for the project in `projDir`.
 static fs::path mediaCopyDir(const fs::path& projDir) {
   if (g_mediaFolderMode == MediaFolderMode::Beside) return projDir;
   if (g_mediaFolderMode == MediaFolderMode::Custom) {
-    const std::string rel = cleanRelativeFolder(g_mediaFolderCustom);
+    const FolderVars vars = g_hostFolderVars ? *g_hostFolderVars : folderVarsNow();
+    std::string rel = cleanRelativeFolder(expandFolderTemplate(g_mediaFolderCustom, vars));
+    if (rel.empty()) rel = cleanRelativeFolder(expandFolderTemplate(kDefaultCustomFolder, vars));
     return projDir / fsPath(rel.empty() ? kDefaultMediaFolder : rel);
   }
   // RECORD_PATH may be blank, relative or absolute. Blank means "next to the
@@ -6059,6 +6167,7 @@ static void leaveSession(const char* code, json params, const std::string& text)
     g_handle = nullptr;
   }
   g_mode = Mode::Idle;
+  g_hostFolderVars.reset();
   g_sessionProjectPath.clear();
   g_snapshot = Snapshot{};
   g_deferredItems.clear();
@@ -6602,6 +6711,7 @@ static void onHost(const std::string& passphrase) {
     return;
   }
   g_mode = Mode::Hosting;
+  g_hostFolderVars = folderVarsNow();
   g_bootstrapSynced = true;  // The owner is already the source of truth.
   muteActivity(std::chrono::seconds(6));
   g_lastError = json();

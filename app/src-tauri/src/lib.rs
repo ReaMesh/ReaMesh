@@ -697,6 +697,30 @@ fn displace_loaded_plugin(_user_plugins: &Path, dest: &Path) -> Option<PathBuf> 
     None
 }
 
+/// REAPER's default "Path to save media files" for new projects, as saved
+/// with "Save as default project settings" (`projdefrecpath` in the [REAPER]
+/// section of reaper.ini); `None` when it isn't set or can't be read. Settings
+/// shows it under "As in REAPER", so no running REAPER is needed for it.
+#[tauri::command]
+fn reaper_media_default(app: AppHandle) -> Option<String> {
+    let dir = resource_dir(&load_custom_path(&app)).ok()?;
+    let bytes = fs::read(dir.join("reaper.ini")).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut in_reaper = false;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with('[') {
+            in_reaper = line.eq_ignore_ascii_case("[REAPER]");
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("projdefrecpath=").filter(|_| in_reaper) {
+            let v = v.trim();
+            return (!v.is_empty()).then(|| v.to_string());
+        }
+    }
+    None
+}
+
 #[tauri::command]
 fn reaper_status(app: AppHandle) -> Result<ReaperStatus, String> {
     compute_status(&app, &load_custom_path(&app))
@@ -1922,6 +1946,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_settings,
             reaper_status,
+            reaper_media_default,
             install_extension,
             extension_stale,
             remove_extension,

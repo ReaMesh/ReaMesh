@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowLeft, ChevronRight, Copy, ExternalLink, Plus } from "lucide-react";
+import { ArrowLeft, ChevronRight, Copy, ExternalLink, Plus, Star } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -22,7 +22,7 @@ import { ProfileEditor } from "@/components/ProfileEditor";
 import { DrawnCheck, SwapIcon } from "@/components/Swap";
 import { Hint } from "@/components/Hint";
 import { buildDiagnostics } from "@/lib/diagnostics";
-import { LANGUAGES, getLangPref, resolveLang, setLangPref, t, useLang, type LangPref } from "@/lib/i18n";
+import { LANGUAGES, getLangPref, resolveLang, setLangPref, t, useLang, type LangPref, type MsgKey } from "@/lib/i18n";
 import {
   getReaperPath,
   installExtension,
@@ -55,11 +55,16 @@ import { listJoinedProjects } from "@/screens/JoinedProjects";
 import { PROTO } from "@/lib/version";
 import { nearbyBlocked, setNearby, useNearby } from "@/lib/nearby";
 import { cn, focusRing } from "@/lib/utils";
+import { REPO_URL, finishStarAsk } from "@/lib/starAsk";
 import {
+  DEFAULT_CUSTOM_FOLDER,
   DEFAULT_MEDIA_FOLDER,
+  FOLDER_VARS,
   cleanRelativeFolder,
+  expandFolderTemplate,
   setMediaFolder,
   useMediaFolder,
+  type FolderVar,
   type MediaFolderMode,
 } from "@/lib/mediaFolder";
 import { send } from "@/lib/connection";
@@ -69,7 +74,7 @@ import { noticeApplies, noticeLine, relayNotes, relayVersionLine } from "@/lib/r
 import { relayKeepsList, relayName, useRelayWatch } from "@/lib/relayLists";
 import type { Instance, RelayList, RelayTest } from "@/lib/types";
 
-const SOURCE_URL = "https://github.com/ReaMesh/ReaMesh";
+const SOURCE_URL = REPO_URL;
 
 // The chosen option's surface slides across, on the same spring as the join
 // mode picker in the trust dialog.
@@ -112,27 +117,124 @@ function Row({
   );
 }
 
+/** Animates its own height when what is inside changes size, on the pill's
+ *  spring, so a longer or shorter line under a control grows into place. */
+function AutoHeight({ children }: { children: React.ReactNode }) {
+  const inner = useRef<HTMLDivElement>(null);
+  const [height, setHeight] = useState<number | "auto">("auto");
+  useLayoutEffect(() => {
+    const el = inner.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setHeight(el.offsetHeight));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return (
+    // The clip reaches a few pixels past the text on every side, so a blur
+    // crossfade inside isn't cut off at the edges; the negative margins keep
+    // the layout where it was.
+    <motion.div
+      initial={false}
+      animate={{ height }}
+      transition={PILL}
+      className="-mx-1 -mb-1 overflow-hidden"
+    >
+      <div ref={inner} className="relative px-1 pb-1">
+        {children}
+      </div>
+    </motion.div>
+  );
+}
+
+/** Placeholder chips under the custom folder field: the label for each `$name`. */
+const FOLDER_VAR_LABEL: Record<FolderVar, MsgKey> = {
+  project: "mediaVarProject",
+  author: "mediaVarAuthor",
+  date: "mediaVarDate",
+  year: "mediaVarYear",
+  month: "mediaVarMonth",
+  day: "mediaVarDay",
+  time: "mediaVarTime",
+};
+
+/** REAPER's default media folder for new projects (Project Settings →
+ *  Media, saved as default), read from reaper.ini by the backend; null when
+ *  none is set. Read again when the REAPER folder changes. */
+function useReaperMediaDefault(): string | null {
+  const resource = useReaperStatus()?.resourcePath;
+  const [folder, setFolder] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    invoke<string | null>("reaper_media_default").then(
+      (v) => live && setFolder(v ?? null),
+      () => live && setFolder(null),
+    );
+    return () => {
+      live = false;
+    };
+  }, [resource]);
+  return folder;
+}
+
+/** The line under "As in REAPER": REAPER's default for new projects when it
+ *  names a folder inside the project, else what the choice means in general. */
+function reaperLine(fallback: string | null): { key: string; node: React.ReactNode } {
+  const folder = fallback ? cleanRelativeFolder(fallback) : "";
+  return folder
+    ? { key: "reaper-default", node: t("mediaFolderReaperDefault", { folder }) }
+    : { key: "reaper", node: t("mediaFolderReaperSub", { folder: DEFAULT_MEDIA_FOLDER }) };
+}
+
 /** Where hosting puts media it copies into the project: REAPER's own media
  *  folder for the project (the default), next to the project file, or a
- *  folder of the user's naming inside the project. */
+ *  folder of the user's naming inside the project, which may use
+ *  placeholders the extension fills in when hosting starts. */
 function MediaFolderSection() {
   const media = useMediaFolder();
+  const project = useActiveInstance()?.state?.project;
+  const reaperDefault = useReaperMediaDefault();
+  const input = useRef<HTMLInputElement>(null);
   const modes: { value: MediaFolderMode; label: string }[] = [
     { value: "reaper", label: t("mediaFolderReaper") },
     { value: "beside", label: t("mediaFolderBeside") },
     { value: "custom", label: t("mediaFolderCustom") },
   ];
-  const invalid = media.folder.trim() !== "" && cleanRelativeFolder(media.folder.trim()) === "";
-  const explain =
-    media.mode === "reaper"
-      ? t("mediaFolderReaperSub", { folder: DEFAULT_MEDIA_FOLDER })
-      : media.mode === "beside"
-        ? t("mediaFolderBesideSub")
-        : t("mediaFolderCustomSub");
+  const custom = media.mode === "custom";
+  const folder = media.folder.trim();
+  const values = { project: project || t("mediaVarProject"), author: t("mediaVarAuthor"), at: new Date() };
+  const typed = cleanRelativeFolder(expandFolderTemplate(folder, values));
+  const fallback = cleanRelativeFolder(expandFolderTemplate(DEFAULT_CUSTOM_FOLDER, values));
+  const invalid = custom && folder !== "" && typed === "";
+  // Keyed by what the line says, not its text: the preview follows typing in
+  // place instead of crossfading on every key.
+  const line: { key: string; node: React.ReactNode } = invalid
+    ? {
+        key: "invalid",
+        node: <span className="text-amber-500">{t("mediaFolderInvalid", { folder: fallback })}</span>,
+      }
+    : custom
+      ? { key: "preview", node: t("mediaFolderPreview", { folder: typed || fallback }) }
+      : media.mode === "reaper"
+        ? reaperLine(reaperDefault)
+        : { key: "beside", node: t("mediaFolderBesideSub") };
+
+  const insert = (v: FolderVar) => {
+    const el = input.current;
+    const cur = media.folder;
+    const from = el?.selectionStart ?? cur.length;
+    const to = el?.selectionEnd ?? cur.length;
+    const token = `$${v}`;
+    setMediaFolder({ folder: cur.slice(0, from) + token + cur.slice(to) });
+    requestAnimationFrame(() => {
+      el?.focus();
+      el?.setSelectionRange(from + token.length, from + token.length);
+    });
+  };
+
   return (
-    <section className="space-y-2">
+    <section className="flex flex-col">
       <SectionLabel>{t("mediaFolderTitle")}</SectionLabel>
-      <div role="radiogroup" aria-label={t("mediaFolderTitle")} className="flex gap-1 rounded-xl bg-card p-1">
+      <div role="radiogroup" aria-label={t("mediaFolderTitle")} className="mt-2 flex gap-1 rounded-xl bg-card p-1">
         {modes.map((o) => (
           <button
             key={o.value}
@@ -141,7 +243,7 @@ function MediaFolderSection() {
             aria-checked={media.mode === o.value}
             onClick={() => setMediaFolder({ mode: o.value })}
             className={cn(
-              "relative h-7 min-w-0 flex-1 truncate rounded-lg px-1.5 text-[12px] font-medium transition-colors",
+              "relative h-7 min-w-0 flex-1 rounded-lg px-1.5 text-[12px] font-medium transition-colors",
               media.mode === o.value ? "text-foreground" : "text-muted-foreground hover:text-foreground",
               focusRing,
             )}
@@ -153,29 +255,69 @@ function MediaFolderSection() {
                 transition={PILL}
               />
             )}
-            <span className="relative">{o.label}</span>
+            {/* Truncate the label, not the button: a clipping button cut the
+                pill off as it slid over from its neighbour. */}
+            <span className="relative block truncate">{o.label}</span>
           </button>
         ))}
       </div>
-      {media.mode === "custom" && (
-        <Input
-          value={media.folder}
-          aria-label={t("mediaFolderCustom")}
-          placeholder={DEFAULT_MEDIA_FOLDER}
-          spellCheck={false}
-          autoCorrect="off"
-          autoCapitalize="off"
-          className={cn("h-8 border-0 bg-card text-[13px]", invalid && "ring-1 ring-red-500/70")}
-          onChange={(e) => setMediaFolder({ folder: e.target.value })}
-        />
-      )}
-      <p className="px-1 text-pretty text-[12px] leading-snug text-muted-foreground">
-        {invalid ? (
-          <span className="text-amber-500">{t("mediaFolderInvalid", { folder: DEFAULT_MEDIA_FOLDER })}</span>
-        ) : (
-          explain
+      <AnimatePresence initial={false}>
+        {custom && (
+          <motion.div
+            key="custom"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={PILL}
+            // A pixel of room keeps the field's ring unclipped while it folds.
+            className="-mx-px overflow-hidden px-px"
+          >
+            <div className="flex flex-col gap-1.5 pt-2 pb-px">
+              <Input
+                ref={input}
+                value={media.folder}
+                aria-label={t("mediaFolderCustom")}
+                placeholder={DEFAULT_CUSTOM_FOLDER}
+                spellCheck={false}
+                autoCorrect="off"
+                autoCapitalize="off"
+                className={cn("h-8 border-0 bg-card text-[13px]", invalid && "ring-1 ring-red-500/70")}
+                onChange={(e) => setMediaFolder({ folder: e.target.value })}
+              />
+              <div className="flex flex-wrap gap-1">
+                {FOLDER_VARS.map((v) => (
+                  <Hint key={v} label={`$${v}`}>
+                    <button
+                      type="button"
+                      onClick={() => insert(v)}
+                      className={cn(
+                        "h-6 rounded-md bg-card px-2 text-[11.5px] font-medium text-muted-foreground transition-colors hover:text-foreground",
+                        focusRing,
+                      )}
+                    >
+                      {t(FOLDER_VAR_LABEL[v])}
+                    </button>
+                  </Hint>
+                ))}
+              </div>
+            </div>
+          </motion.div>
         )}
-      </p>
+      </AnimatePresence>
+      <AutoHeight>
+        <AnimatePresence mode="popLayout" initial={false}>
+          <motion.p
+            key={line.key}
+            initial={{ opacity: 0, filter: "blur(2px)" }}
+            animate={{ opacity: 1, filter: "blur(0px)" }}
+            exit={{ opacity: 0, filter: "blur(2px)" }}
+            transition={{ duration: 0.18, ease: "easeOut" }}
+            className="px-1 pt-2 text-pretty text-[12px] leading-snug text-muted-foreground"
+          >
+            {line.node}
+          </motion.p>
+        </AnimatePresence>
+      </AutoHeight>
     </section>
   );
 }
@@ -1018,6 +1160,19 @@ export function Settings({
                 <span className="sr-only" aria-live="polite">
                   {copied ? t("diagnosticsCopied") : ""}
                 </span>
+              </Row>
+            </button>
+            <Divider inset={false} />
+            <button
+              type="button"
+              onClick={() => {
+                finishStarAsk();
+                openUrl(REPO_URL);
+              }}
+              className={cn("text-left transition-colors hover:bg-white/[0.03]", focusRing)}
+            >
+              <Row label={t("starOnGitHub")}>
+                <Star className="size-3.5 text-muted-foreground" aria-hidden="true" />
               </Row>
             </button>
             <Divider inset={false} />

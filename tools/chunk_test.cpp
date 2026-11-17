@@ -235,6 +235,29 @@ int main() {
   assert(cleanRelativeFolder("Media.").empty());
   assert(cleanRelativeFolder("Me|dia").empty());
 
+  // expandFolderTemplate: placeholders in a custom media folder.
+  {
+    FolderVars v;
+    v.project = "Night/fall: mix";
+    v.year = 2026;
+    v.month = 3;
+    v.day = 7;
+    v.hour = 9;
+    v.minute = 5;
+    assert(expandFolderTemplate("Media/$project", v) == "Media/Night-fall- mix");
+    assert(expandFolderTemplate("$date $time", v) == "2026-03-07 09-05");
+    assert(expandFolderTemplate("$year/$month/$day", v) == "2026/03/07");
+    // No author: the empty name drops out instead of spoiling the folder.
+    assert(expandFolderTemplate("Media/$author", v) == "Media");
+    assert(expandFolderTemplate("Take $author/x", v) == "Take/x");
+    assert(expandFolderTemplate("$unknown", v) == "$unknown");
+    assert(cleanRelativeFolder(expandFolderTemplate("Media/$project", v)) == "Media/Night-fall- mix");
+    // The custom default; an unsaved project (no name) leaves plain "Media".
+    assert(expandFolderTemplate(kDefaultCustomFolder, v) == "Night-fall- mix Media");
+    v.project = "";
+    assert(expandFolderTemplate(kDefaultCustomFolder, v) == "Media");
+  }
+
   // normalizeChunk drops volatile UI/selection lines (now incl. envelope
   // ARM/VIS: per-user automation workflow state), keeps the rest.
   std::string norm = normalizeChunk(kTrackChunk);
