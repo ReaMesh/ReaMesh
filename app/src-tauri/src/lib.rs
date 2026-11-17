@@ -767,6 +767,11 @@ fn process_started(pid: u32) -> Option<SystemTime> {
     let ok = unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) };
     let _ = unsafe { CloseHandle(handle) };
     ok.ok()?;
+    // A process that has exited can still be opened while someone holds a
+    // handle to it; its exit time is set then. It no longer runs.
+    if exited.dwHighDateTime != 0 || exited.dwLowDateTime != 0 {
+        return None;
+    }
     // 100ns ticks since 1601-01-01.
     let ticks = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
     let unix = ticks.checked_sub(116_444_736_000_000_000)?;

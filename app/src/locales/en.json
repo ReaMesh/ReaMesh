@@ -124,6 +124,8 @@
   "installed": "Installed",
   "updateAvailable": "Update available",
   "extInstalledToast": "Extension installed. Restart REAPER to load it.",
+  "extInstalledIdleToast": "Extension installed.",
+  "extRemovedIdleToast": "Extension removed.",
   "extUpdatedRestart": "Extension updated. Restart REAPER to load it.",
   "extUpdatedRestartSession": "ReaMesh was updated. Restart REAPER after this session.",
   "extRemovedToast": "Extension removed. Restart REAPER to unload it.",

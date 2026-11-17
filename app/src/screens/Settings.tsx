@@ -661,7 +661,7 @@ export function Settings({
     try {
       await installExtension();
       await refreshStatus(); // installExtension no longer publishes; refresh the badge
-      toast.success(t("extInstalledToast"));
+      toast.success(t(instance ? "extInstalledToast" : "extInstalledIdleToast"));
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -674,7 +674,7 @@ export function Settings({
     try {
       await removeExtension();
       await refreshStatus();
-      toast.success(t("extRemovedToast"));
+      toast.success(t(instance ? "extRemovedToast" : "extRemovedIdleToast"));
     } catch (e) {
       toast.error(String(e));
     } finally {

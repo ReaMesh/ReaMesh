@@ -103,6 +103,8 @@ export function useReaperStatus(): ReaperStatus | null | undefined {
  *  REAPER loads plugins only at startup). A REAPER started after an install
  *  already runs the new copy, so it is never asked to restart. Rechecked
  *  whenever the app installs. `undefined` until the backend has answered. */
+const STALE_RECHECK_MS = 1500;
+
 export function useExtensionStale(pid: number | undefined): boolean | undefined {
   const [stale, setStale] = useState<boolean | undefined>(undefined);
   const [installs, setInstalls] = useState(0);
@@ -119,11 +121,23 @@ export function useExtensionStale(pid: number | undefined): boolean | undefined 
     }
     setStale(undefined);
     let live = true;
-    invoke<boolean>("extension_stale", { pid })
-      .then((v) => live && setStale(v))
-      .catch(() => live && setStale(false));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Asked again while the answer is yes: once that REAPER has quit (or was
+    // killed) the backend finds no such process and says no, so the restart
+    // hint goes away even before the control socket notices it closed.
+    const check = () => {
+      invoke<boolean>("extension_stale", { pid })
+        .then((v) => {
+          if (!live) return;
+          setStale(v);
+          if (v) timer = setTimeout(check, STALE_RECHECK_MS);
+        })
+        .catch(() => live && setStale(false));
+    };
+    check();
     return () => {
       live = false;
+      clearTimeout(timer);
     };
   }, [pid, installs]);
   return stale;
