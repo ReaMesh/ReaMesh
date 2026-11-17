@@ -154,18 +154,18 @@ describe("mergeTicket", () => {
 describe("the host card's line", () => {
   it("names where the session shows, in German and English", () => {
     setLangPref("de");
-    expect(hostVisibleText([band], [])).toBe("Sichtbar in Bandrelay");
-    expect(hostVisibleText([band, studio], [])).toBe("Sichtbar in Bandrelay und Studio");
-    expect(hostVisibleText([band, studio], ["band"])).toBe("Sichtbar in Studio");
-    expect(hostVisibleText([band, studio], ["band", "studio"])).toBe("Nur im lokalen Netzwerk sichtbar");
+    expect(hostVisibleText([band], [])).toBe("Lokales Netzwerk und Bandrelay");
+    expect(hostVisibleText([band, studio], [])).toBe("Lokales Netzwerk und 2 Relays");
+    expect(hostVisibleText([band, studio], ["band"])).toBe("Lokales Netzwerk und Studio");
+    expect(hostVisibleText([band, studio], ["band", "studio"])).toBe("Nur lokales Netzwerk");
     expect(hostVisibleText([band, studio, relay("x", "Proberaum")], [])).toBe(
-      "Sichtbar in Bandrelay, Studio und Proberaum",
+      "Lokales Netzwerk und 3 Relays",
     );
     expect(viaNames(["Bandrelay", "Studio"])).toBe("Bandrelay und Studio");
     setLangPref("en");
-    expect(hostVisibleText([band], [])).toBe("Visible on Bandrelay");
-    expect(hostVisibleText([band, studio], [])).toBe("Visible on Bandrelay and Studio");
-    expect(hostVisibleText([band, studio], ["band", "studio"])).toBe("Only visible on your local network");
+    expect(hostVisibleText([band], [])).toBe("Local network and Bandrelay");
+    expect(hostVisibleText([band, studio], [])).toBe("Local network and 2 relays");
+    expect(hostVisibleText([band, studio], ["band", "studio"])).toBe("Local network only");
     expect(viaNames(["Bandrelay", "Studio"])).toBe("Bandrelay and Studio");
   });
 

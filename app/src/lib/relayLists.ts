@@ -212,13 +212,14 @@ export function listRelays(relays: RelayCode[], lists: Record<string, RelayList>
   return relays.filter((r) => relayKeepsList(r.peer, lists[r.peer]));
 }
 
-/** "Visible on Band relay and Studio": the line under the project name. */
+/** "Local network and Band relay": the line under the project name.
+ *  The LAN lobby always sees a hosted session; two or more relays are counted,
+ *  their names are in the popup. */
 export function hostVisibleText(relays: RelayCode[], hiddenPeers: string[]): string {
   const names = relays.filter((r) => !hiddenPeers.includes(r.peer)).map(relayName);
   if (names.length === 0) return t("hostVisibleNone");
   if (names.length === 1) return t("hostVisibleOne", { name: names[0] });
-  if (names.length === 2) return t("hostVisibleTwo", { a: names[0], b: names[1] });
-  return t("hostVisibleMany", { list: names.slice(0, -1).join(", "), last: names[names.length - 1] });
+  return t("hostVisibleMany", { count: names.length });
 }
 
 /** What that line means, for its tooltip. */
