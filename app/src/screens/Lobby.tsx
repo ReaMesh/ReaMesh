@@ -1119,7 +1119,17 @@ function HostCard({
     if (!project) invoke("focus_reaper", { pid: instance?.pid ?? 0 }).catch(() => {});
   };
   const dismissWarning = () => send({ cmd: "host_dismiss" }, port ?? undefined);
+  // The project shares its folder with everything else: REAPER's Save As, so
+  // it can go into a folder of its own, then the same checks again.
+  const relocate = () => {
+    if (port === null) return;
+    setPending(true);
+    stageHostPass(port, pass);
+    send({ cmd: "host_relocate", passphrase: pass }, port);
+    invoke("focus_reaper", { pid: instance?.pid ?? 0 }).catch(() => {});
+  };
   const w = warning ?? null;
+  const loose = w?.loose ? looseText(w.loose) : "";
   return (
     <div className="flex shrink-0 flex-col gap-2.5 rounded-xl bg-card p-3">
       <div className="flex min-h-7 items-center gap-3">
@@ -1169,7 +1179,9 @@ function HostCard({
           </DialogHeader>
           {w && w.files > 0 && (
             <DialogFacts>
-              <DialogFact label={t("hostCopyLabel")}>
+              <DialogFact
+                label={w.folder ? t("hostCopyIntoLabel", { folder: w.folder }) : t("hostCopyLabel")}
+              >
                 <span className="tabular-nums">{formatBytes(w.bytes)}</span>
               </DialogFact>
               {w.free_known && (
@@ -1186,6 +1198,24 @@ function HostCard({
           {w?.cloud && (
             <p className="text-[12px] leading-normal text-amber-500">{t("hostCloudWarning")}</p>
           )}
+          {loose && (
+            <div className="space-y-2">
+              <p className="text-[12px] leading-normal text-amber-500">
+                {loose} {t("hostLooseExplain")}
+              </p>
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-7 w-full text-[12px]"
+                onClick={() => {
+                  dismissWarning();
+                  relocate();
+                }}
+              >
+                {t("hostRelocate")}
+              </Button>
+            </div>
+          )}
           <DialogFooter>
             <Button variant="secondary" onClick={dismissWarning}>
               {t("cancel")}
@@ -1198,7 +1228,7 @@ function HostCard({
             >
               {/* Copying media is just what hosting this project takes; only a
                   real problem (no room, a syncing cloud folder) gets "anyway". */}
-              {w && (w.cloud || (w.files > 0 && w.free_known && !w.enough))
+              {w && (w.cloud || !!w.loose || (w.files > 0 && w.free_known && !w.enough))
                 ? t("hostAnyway")
                 : t("hostCopyAndHost")}
             </Button>
@@ -1207,6 +1237,22 @@ function HostCard({
       </Dialog>
     </div>
   );
+}
+
+/** The pre-host check's reason the project has no folder of its own. */
+function looseText(loose: string): string {
+  switch (loose) {
+    case "desktop":
+      return t(isWindows ? "hostLooseDesktopWin" : "hostLooseDesktop");
+    case "downloads":
+      return t("hostLooseDownloads");
+    case "documents":
+      return t("hostLooseDocuments");
+    case "home":
+      return t("hostLooseHome");
+    default:
+      return t("hostLooseCrowded");
+  }
 }
 
 /** A VPN can hide the sessions on this network (LAN discovery doesn't cross

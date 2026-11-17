@@ -55,6 +55,13 @@ import { listJoinedProjects } from "@/screens/JoinedProjects";
 import { PROTO } from "@/lib/version";
 import { nearbyBlocked, setNearby, useNearby } from "@/lib/nearby";
 import { cn, focusRing } from "@/lib/utils";
+import {
+  DEFAULT_MEDIA_FOLDER,
+  cleanRelativeFolder,
+  setMediaFolder,
+  useMediaFolder,
+  type MediaFolderMode,
+} from "@/lib/mediaFolder";
 import { send } from "@/lib/connection";
 import { MAX_RELAYS, parseRelayCode, relayHost, type RelayCode } from "@/lib/relay";
 import { addRelay, relayAbout, removeRelay, useRelays } from "@/lib/relays";
@@ -102,6 +109,74 @@ function Row({
       </div>
       {children}
     </div>
+  );
+}
+
+/** Where hosting puts media it copies into the project: REAPER's own media
+ *  folder for the project (the default), next to the project file, or a
+ *  folder of the user's naming inside the project. */
+function MediaFolderSection() {
+  const media = useMediaFolder();
+  const modes: { value: MediaFolderMode; label: string }[] = [
+    { value: "reaper", label: t("mediaFolderReaper") },
+    { value: "beside", label: t("mediaFolderBeside") },
+    { value: "custom", label: t("mediaFolderCustom") },
+  ];
+  const invalid = media.folder.trim() !== "" && cleanRelativeFolder(media.folder.trim()) === "";
+  const explain =
+    media.mode === "reaper"
+      ? t("mediaFolderReaperSub", { folder: DEFAULT_MEDIA_FOLDER })
+      : media.mode === "beside"
+        ? t("mediaFolderBesideSub")
+        : t("mediaFolderCustomSub");
+  return (
+    <section className="space-y-2">
+      <SectionLabel>{t("mediaFolderTitle")}</SectionLabel>
+      <div role="radiogroup" aria-label={t("mediaFolderTitle")} className="flex gap-1 rounded-xl bg-card p-1">
+        {modes.map((o) => (
+          <button
+            key={o.value}
+            type="button"
+            role="radio"
+            aria-checked={media.mode === o.value}
+            onClick={() => setMediaFolder({ mode: o.value })}
+            className={cn(
+              "relative h-7 min-w-0 flex-1 truncate rounded-lg px-1.5 text-[12px] font-medium transition-colors",
+              media.mode === o.value ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+              focusRing,
+            )}
+          >
+            {media.mode === o.value && (
+              <motion.span
+                layoutId="media-folder-pill"
+                className="absolute inset-0 rounded-lg bg-foreground/[0.14]"
+                transition={PILL}
+              />
+            )}
+            <span className="relative">{o.label}</span>
+          </button>
+        ))}
+      </div>
+      {media.mode === "custom" && (
+        <Input
+          value={media.folder}
+          aria-label={t("mediaFolderCustom")}
+          placeholder={DEFAULT_MEDIA_FOLDER}
+          spellCheck={false}
+          autoCorrect="off"
+          autoCapitalize="off"
+          className={cn("h-8 border-0 bg-card text-[13px]", invalid && "ring-1 ring-red-500/70")}
+          onChange={(e) => setMediaFolder({ folder: e.target.value })}
+        />
+      )}
+      <p className="px-1 text-pretty text-[12px] leading-snug text-muted-foreground">
+        {invalid ? (
+          <span className="text-amber-500">{t("mediaFolderInvalid", { folder: DEFAULT_MEDIA_FOLDER })}</span>
+        ) : (
+          explain
+        )}
+      </p>
+    </section>
   );
 }
 
@@ -818,6 +893,8 @@ export function Settings({
             </button>
           </Group>
         </section>
+
+        <MediaFolderSection />
 
         <section className="space-y-2">
           <SectionLabel>{t("overlaySettingsTitle")}</SectionLabel>

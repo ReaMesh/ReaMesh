@@ -13,6 +13,7 @@ import { getOverlaySettings, subscribeOverlaySettings } from "./overlaySettings"
 import { openCtlSocket } from "./ctlSocket";
 import { getRelays, noteRelayInfo, subscribeRelays } from "./relays";
 import { getHiddenRelays, noteRelayLists, subscribeHiddenRelays } from "./relayLists";
+import { getMediaFolder, subscribeMediaFolder } from "./mediaFolder";
 import { PROTO } from "./version";
 
 const ALL_PORTS = [47415, 47416, 47417, 47418];
@@ -94,6 +95,7 @@ function attach(port: number, ws: WebSocket) {
     sendCursors(port);
     sendRelays(port);
     sendRelayListing(port);
+    sendMediaFolder(port);
     emit();
   };
   ws.onmessage = (ev) => {
@@ -197,6 +199,16 @@ subscribeHiddenRelays(() => {
  *  heard this, it lists nothing. */
 export function sendRelayListing(port: number) {
   send({ cmd: "relay_listing", hidden: getHiddenRelays() }, port);
+}
+
+// Where hosting puts copied media: every extension follows the choice at once.
+subscribeMediaFolder(() => {
+  for (const p of sockets.keys()) sendMediaFolder(p);
+});
+
+export function sendMediaFolder(port: number) {
+  const { mode, folder } = getMediaFolder();
+  send({ cmd: "set_media_folder", mode, folder: folder.trim() }, port);
 }
 
 let lastTintSent: boolean | null = null;

@@ -222,6 +222,19 @@ static void reset() {
 }  // namespace fake
 
 int main() {
+  // cleanRelativeFolder: where copied media may go, always inside the project.
+  assert(cleanRelativeFolder("Media") == "Media");
+  assert(cleanRelativeFolder("Audio\\Takes/") == "Audio/Takes");
+  assert(cleanRelativeFolder("a//b") == "a/b");
+  assert(cleanRelativeFolder("").empty());
+  assert(cleanRelativeFolder("/Users/x/Media").empty());
+  assert(cleanRelativeFolder("\\\\server\\share").empty());
+  assert(cleanRelativeFolder("C:\\Media").empty());
+  assert(cleanRelativeFolder("../Media").empty());
+  assert(cleanRelativeFolder("Media/..").empty());
+  assert(cleanRelativeFolder("Media.").empty());
+  assert(cleanRelativeFolder("Me|dia").empty());
+
   // normalizeChunk drops volatile UI/selection lines (now incl. envelope
   // ARM/VIS: per-user automation workflow state), keeps the rest.
   std::string norm = normalizeChunk(kTrackChunk);

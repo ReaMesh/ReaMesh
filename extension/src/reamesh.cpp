@@ -3281,11 +3281,93 @@ static std::string diffSnapshots(const Snapshot& prev, const Snapshot& now,
 // on the next capture, on the main thread. While a source is still copying,
 // its items are pinned out of the capture diff (see captureLocalChanges), so
 // an absolute external path never reaches the wire.
+// ---------- where copied-in media goes ----------
+
+// Hosting copies media from outside the project folder into it (see
+// internalizeExternalMedia). Where inside it is the user's choice in the app:
+//   reaper  (default) the project's own "Path to save media files" when that
+//           is a folder inside the project, else kDefaultMediaFolder
+//   beside  next to the .rpp
+//   custom  a folder the user named, relative to the project
+// Never outside the project folder: only files in it can be served, and an
+// absolute path never goes on the wire. A project saved straight onto the
+// desktop no longer spreads its media all over it.
+enum class MediaFolderMode { Reaper, Beside, Custom };
+static MediaFolderMode g_mediaFolderMode = MediaFolderMode::Reaper;
+static std::string g_mediaFolderCustom;
+static const char* const kDefaultMediaFolder = "Media";
+
+// A folder relative to the project, '/'-joined, or "" when `s` isn't one: no
+// root or drive, no empty, "." or ".." part, nothing Windows can't name.
+// Accepts '/' and '\' alike, so a RECORD_PATH written on either platform reads.
+static std::string cleanRelativeFolder(const std::string& s) {
+  if (s.empty() || s.size() > 240 || s[0] == '/' || s[0] == '\\') return "";
+  std::string out, part;
+  auto flush = [&]() -> bool {
+    if (part.empty()) return true;  // "a//b" and a trailing slash are harmless
+    if (part == "." || part == ".." || part.back() == '.' || part.back() == ' ') return false;
+    if (!out.empty()) out += '/';
+    out += part;
+    part.clear();
+    return true;
+  };
+  for (unsigned char c : s) {
+    if (c == '/' || c == '\\') {
+      if (!flush()) return "";
+      continue;
+    }
+    if (c < 0x20 || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' ||
+        c == '|')
+      return "";
+    part += (char)c;
+  }
+  if (!flush()) return "";
+  return out;
+}
+
+// The folder copies go into, for the project in `projDir`.
+static fs::path mediaCopyDir(const fs::path& projDir) {
+  if (g_mediaFolderMode == MediaFolderMode::Beside) return projDir;
+  if (g_mediaFolderMode == MediaFolderMode::Custom) {
+    const std::string rel = cleanRelativeFolder(g_mediaFolderCustom);
+    return projDir / fsPath(rel.empty() ? kDefaultMediaFolder : rel);
+  }
+  // RECORD_PATH may be blank, relative or absolute. Blank means "next to the
+  // project file" to REAPER, which is exactly what this setting avoids.
+  char buf[4096] = "";
+  GetSetProjectInfo_String(nullptr, "RECORD_PATH", buf, false);
+  std::string rec = buf;
+  if (!rec.empty()) {
+    const fs::path p = fsPath(rec);
+    if (p.is_absolute()) {
+      std::error_code ec;
+      const fs::path rel = fs::relative(p, projDir, ec);
+      if (!ec && !rel.empty() && *rel.begin() != fs::path("..")) rec = fsUtf8(rel);
+      else rec.clear();
+    }
+    const std::string rel = cleanRelativeFolder(rec);
+    if (!rel.empty()) return projDir / fsPath(rel);
+  }
+  return projDir / fsPath(kDefaultMediaFolder);
+}
+
+// The copy folder as the app shows it: project-relative, "" = next to the .rpp.
+static std::string mediaCopyFolderLabel(const fs::path& projDir) {
+  std::error_code ec;
+  const fs::path rel = fs::relative(mediaCopyDir(projDir), projDir, ec);
+  if (ec || rel.empty() || rel == fs::path(".")) return "";
+  return cleanRelativeFolder(fsUtf8(rel));
+}
+
 struct CopyResult {
   std::string src, dest, err;
-  bool ok;
+  bool ok = false;
+  bool reused = false;  // an identical file was already there: nothing copied
 };
 static std::mutex g_copyMx;
+// Destinations a running copy has claimed (guarded by g_copyMx), so two
+// sources with the same file name never pick the same target.
+static std::set<std::string> g_copyReserved;
 static std::vector<CopyResult> g_copyDone;      // filled by worker threads
 static std::set<std::string> g_copyInFlight;    // source paths, main thread only
 static std::set<std::string> g_copyFailed;      // gave up (logged once)
@@ -3349,6 +3431,80 @@ static void noteAllSourcesForeign() {
     if (MediaItem* item = GetMediaItem(nullptr, i)) noteForeignSources(item);
 }
 
+// Byte for byte. Runs on a copy worker, never on the main thread.
+static bool sameFileContent(const fs::path& a, const fs::path& b) {
+  std::error_code ea, eb;
+  const auto sa = fs::file_size(a, ea);
+  const auto sb = fs::file_size(b, eb);
+  if (ea || eb || sa != sb) return false;
+  std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
+  if (!fa || !fb) return false;
+  std::vector<char> ba(1 << 20), bb(1 << 20);
+  for (;;) {
+    fa.read(ba.data(), (std::streamsize)ba.size());
+    fb.read(bb.data(), (std::streamsize)bb.size());
+    const auto na = fa.gcount(), nb = fb.gcount();
+    if (na != nb || std::memcmp(ba.data(), bb.data(), (size_t)na) != 0) return false;
+    if (na == 0 || !fa || !fb) return na == nb && fa.eof() == fb.eof();
+  }
+}
+
+// Copy `srcPath` into `dirPath` (created if needed) on a worker thread. A file
+// of that name already there is reused only when its content is the same (a
+// previous run copied it); anything else gets the next free "name (2).ext".
+static CopyResult copyIntoProject(const std::string& srcPath, const std::string& dirPath) {
+  CopyResult r;
+  r.src = srcPath;
+  std::error_code ec;
+  const fs::path source = fsPath(srcPath), dir = fsPath(dirPath);
+  fs::create_directories(dir, ec);
+  if (ec) {
+    r.err = ec.message();
+    return r;
+  }
+  const std::string stem = fsUtf8(source.stem()), ext = fsUtf8(source.extension());
+  fs::path dest;
+  for (int k = 1; k < 1000 && dest.empty(); ++k) {
+    const fs::path cand =
+        k == 1 ? dir / source.filename()
+               : dir / fsPath(stem + " (" + std::to_string(k) + ")" + ext);
+    const std::string key = fsUtf8(cand);
+    {
+      std::lock_guard<std::mutex> lk(g_copyMx);
+      if (g_copyReserved.count(key)) continue;
+      std::error_code xec;
+      if (!fs::exists(cand, xec)) {
+        g_copyReserved.insert(key);
+        dest = cand;
+        break;
+      }
+    }
+    if (sameFileContent(source, cand)) {
+      r.dest = key;
+      r.ok = r.reused = true;
+      return r;
+    }
+  }
+  if (dest.empty()) {
+    r.err = "no free file name";
+    return r;
+  }
+  const fs::path tmp = dir / fsPath(".reamesh-copy-" + fsUtf8(dest.filename()));
+  fs::copy_file(source, tmp, fs::copy_options::overwrite_existing, ec);
+  if (!ec) fs::rename(tmp, dest, ec);
+  if (ec) {
+    r.err = ec.message();
+    std::error_code rec;
+    fs::remove(tmp, rec);
+  } else {
+    r.ok = true;
+    r.dest = fsUtf8(dest);
+  }
+  std::lock_guard<std::mutex> lk(g_copyMx);
+  g_copyReserved.erase(fsUtf8(dest));
+  return r;
+}
+
 static void internalizeExternalMedia() {
   const fs::path projDir = projectDir();
   if (projDir.empty()) return;
@@ -3371,8 +3527,9 @@ static void internalizeExternalMedia() {
       continue;
     }
     repointed |= repointTakes(r.src, r.dest);
-    logEvent("media_copied", {{"file", name}},
-             "copied " + name + " into the project folder so peers get it");
+    if (!r.reused)
+      logEvent("media_copied", {{"file", name}},
+               "copied " + name + " into the project folder so peers get it");
   }
 
   // Scan for external sources and kick off copies for new ones. Track by
@@ -3387,6 +3544,7 @@ static void internalizeExternalMedia() {
     insideProject.clear();
   }
   g_itemsAwaitingCopy.clear();
+  fs::path destDir;  // looked up once, and only when something needs copying
   std::vector<MediaItem*> allItems;
   allItems.reserve(static_cast<size_t>(CountMediaItems(nullptr)));
   for (int t = 0, nt = CountTracks(nullptr); t < nt; ++t) {
@@ -3425,37 +3583,15 @@ static void internalizeExternalMedia() {
       continue;
     }
 
-    fs::path dest = projDir / source.filename();
-    for (int k = 2; fs::exists(dest, ec) && fs::file_size(dest, ec) != fs::file_size(source, ec);
-         ++k)
-      dest = projDir / fsPath(fsUtf8(source.stem()) + " (" + std::to_string(k) + ")" +
-                              fsUtf8(source.extension()));
-    if (fs::exists(dest, ec)) {
-      // Identical-size copy already in the project (a prior run): repoint now.
-      repointed |= repointTakes(fn, fsUtf8(dest));
-      continue;
-    }
-
+    if (destDir.empty()) destDir = mediaCopyDir(projDir);
     g_copyInFlight.insert(fn);
     g_itemsAwaitingCopy[itemGuid(item)] = fn;
-    // srcPath/destPath stay UTF-8: they are compared against REAPER's own take
-    // filenames and reported back to the app. Only the fs calls get converted.
-    std::thread([srcPath = fsUtf8(source), destPath = fsUtf8(dest)] {
-      std::error_code tec;
-      const fs::path destination = fsPath(destPath);
-      fs::path tmp = destination.parent_path() /
-                     fsPath(".reamesh-copy-" + fsUtf8(destination.filename()));
-      fs::copy_file(fsPath(srcPath), tmp, fs::copy_options::overwrite_existing, tec);
-      bool ok = !tec;
-      std::string err = tec ? tec.message() : "";
-      if (ok) {
-        fs::rename(tmp, destination, tec);
-        ok = !tec;
-        if (!ok) err = tec.message();
-      }
-      if (!ok) fs::remove(tmp, tec);
+    // Paths stay UTF-8: they are compared against REAPER's own take filenames
+    // and reported back to the app. Only the fs calls get converted.
+    std::thread([srcPath = fsUtf8(source), dirPath = fsUtf8(destDir)] {
+      CopyResult r = copyIntoProject(srcPath, dirPath);
       std::lock_guard<std::mutex> lk(g_copyMx);
-      g_copyDone.push_back({srcPath, destPath, err, ok});
+      g_copyDone.push_back(std::move(r));
     }).detach();
   }
 
@@ -6303,13 +6439,50 @@ static void reconnectTick() {
   }
 }
 
+// Why `projDir` is a poor folder to host from, or "" when it is fine. Hosting
+// walks the project folder with every subfolder to find the files the project
+// uses, and REAPER records next to a project without a media path, so a
+// project that shares its folder with everything else (saved straight onto
+// the desktop, into Downloads, Documents or the home folder) makes hosting
+// slow and that folder untidy. Judged by name, which is the same on disk on
+// every language of macOS and Windows (only the displayed name is localized).
+static std::string looseProjectFolder(const fs::path& projDir) {
+  std::error_code ec;
+  // A home folder: it holds a Desktop and a Documents folder.
+  if (fs::is_directory(projDir / "Desktop", ec) && fs::is_directory(projDir / "Documents", ec))
+    return "home";
+  std::string name = fsUtf8(projDir.filename());
+  std::transform(name.begin(), name.end(), name.begin(),
+                 [](unsigned char c) { return (char)tolower(c); });
+  if (name == "desktop") return "desktop";
+  if (name == "downloads") return "downloads";
+  if (name == "documents") return "documents";
+  // Any other folder crowded with files (a project of its own rarely holds
+  // more than a few thousand, peaks and backups not counted). The walk stops
+  // at the limit, so a huge folder costs no more than a full one.
+  constexpr int kCrowded = 4000;
+  int files = 0;
+  fs::recursive_directory_iterator it(projDir, fs::directory_options::skip_permission_denied, ec),
+      end;
+  for (; !ec && it != end && files <= kCrowded; it.increment(ec)) {
+    const std::string fname = fsUtf8(it->path().filename());
+    if (!fname.empty() && fname[0] == '.') {
+      if (it->is_directory(ec)) it.disable_recursion_pending();
+      continue;
+    }
+    if (it->is_regular_file(ec)) ++files;
+  }
+  return files > kCrowded ? "crowded" : "";
+}
+
 // What hosting would silently do to this machine, computed BEFORE the host
 // starts: internalizeExternalMedia will copy every out-of-project source into
 // the project folder (potentially tens of GB, with no free-space check), and a
 // project inside a cloud-synced folder means the sync client will fight the
 // session over the very files peers are transferring. Null = nothing to warn
-// about; otherwise {files,bytes,free,free_known,cloud,enough} for the app's
-// confirm dialog.
+// about; otherwise {files,bytes,free,free_known,cloud,enough,loose,folder} for
+// the app's confirm dialog (`loose`: looseProjectFolder; `folder`: where the
+// copies go, project-relative, "" = next to the project file).
 static json hostPrecheck() {
   const std::string path = currentProjectPath();
   if (path.empty()) return json();  // nothing saved, so no folder to look at
@@ -6351,15 +6524,22 @@ static json hostPrecheck() {
                      lower.find("com~apple~clouddocs") != std::string::npos ||
                      lower.find("mobile documents") != std::string::npos ||
                      lower.find("icloud") != std::string::npos;
-  if (count == 0 && !cloud) return json();
+  const std::string loose = looseProjectFolder(projDir);
+  if (count == 0 && !cloud && loose.empty()) return json();
 
   std::error_code ec;
   const fs::space_info sp = fs::space(projDir, ec);
   const uint64_t freeB = ec ? 0 : (uint64_t)sp.available;
   // Reserve 256 MiB of free space beyond the media copy size.
   const bool enough = ec ? true : bytes + (256ull << 20) <= freeB;
-  return json{{"files", count},   {"bytes", bytes},   {"free", freeB},
-              {"free_known", !ec}, {"cloud", cloud},   {"enough", enough}};
+  return json{{"files", count},
+              {"bytes", bytes},
+              {"free", freeB},
+              {"free_known", !ec},
+              {"cloud", cloud},
+              {"enough", enough},
+              {"loose", loose},
+              {"folder", count > 0 ? mediaCopyFolderLabel(projDir) : std::string()}};
 }
 
 // Hosting shares the project file, so an untitled project has to get one first:
@@ -6597,11 +6777,20 @@ static void ctlDispatch(const json& cmd) {
   if (c == "host" || c == "join" || c == "leave") g_reconnect.reset();
   if (c == "browse") {
     startBrowse();
-  } else if (c == "host") {
+  } else if (c == "host" || c == "host_relocate") {
     g_hostWarning = json();
     // First: the pre-check below has no folder to look at before the save.
     if (!ensureProjectSaved()) return;
-    if (!cmdBool("confirm")) {
+    if (c == "host_relocate") {
+      // The warning said the project shares its folder with everything else:
+      // REAPER's Save As, where "Create subdirectory for project" moves it into
+      // a folder of its own. Then the same checks as any first host, so a
+      // cancelled dialog brings the warning straight back.
+      g_applyingRemote = true;
+      Main_SaveProject(nullptr, true);
+      g_applyingRemote = false;
+    }
+    if (c == "host_relocate" || !cmdBool("confirm")) {
       // First pass: if hosting would copy external media in (or the project
       // lives in a cloud-synced folder), surface the numbers and wait for the
       // app's confirm instead of silently filling the disk.
@@ -6710,6 +6899,14 @@ static void ctlDispatch(const json& cmd) {
     g_cursorsShown = jsonBool(cmd, "show", true);
     g_cursorShared = jsonBool(cmd, "share", true);
     cursor_overlay::setShowCursors(g_cursorsShown);
+  } else if (c == "set_media_folder") {
+    // App setting: where media copied into the project goes (mediaCopyDir).
+    // Applies to the next copy; what was copied before stays where it is.
+    const std::string mode = jsonStr(cmd, "mode");
+    g_mediaFolderMode = mode == "beside"   ? MediaFolderMode::Beside
+                        : mode == "custom" ? MediaFolderMode::Custom
+                                           : MediaFolderMode::Reaper;
+    g_mediaFolderCustom = jsonStr(cmd, "folder");
   } else if (c == "set_tint") {
     // App overlay setting: whether to mark items someone else is editing (an
     // outline in the arrange layer, or the dark-grey tint where it can't draw).

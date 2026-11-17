@@ -183,6 +183,12 @@ export interface ExtState {
     free_known: boolean;
     cloud: boolean;
     enough: boolean;
+    /** The project shares its folder with everything else: "desktop",
+     *  "downloads", "documents", "home", "crowded" (thousands of other files),
+     *  "" or missing when it has a folder of its own. */
+    loose?: string;
+    /** Where the copies go, relative to the project; "" = next to the file. */
+    folder?: string;
   } | null;
   /** How many hosts ended at a cancelled Save As (an untitled project gets one
    *  first). Goes up instead of an error: the user answered the dialog. */
