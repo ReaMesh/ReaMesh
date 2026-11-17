@@ -3,6 +3,63 @@
 Downloads and install notes are on the
 [Releases](https://github.com/ReaMesh/ReaMesh/releases) page.
 
+## 1.3.0
+
+<sub>November 17, 2026</sub>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="proprietary/changelog/1.3.0-banner-dark.png">
+  <img alt="ReaMesh 1.3: a REAPER project next to the ReaMesh window asking whether to join Nightfall, with three missing plugins listed first, how many tracks use each and where to get them" src="proprietary/changelog/1.3.0-banner-light.png">
+</picture>
+
+ReaMesh 1.3 works with 1.2. Sessions can mix both versions, so there is no need for
+everyone to update at the same time.
+
+### See what's missing before you join
+
+The join dialog now lists the plugins you don't have first, with how many tracks
+use each one and a link to where you can get it. If you have a plugin, but in
+another format than the project uses, the dialog says which format is needed and
+which one you have. The plugins you already have are folded into one line.
+
+The choice in the dialog is now called "With plugins" and "Without plugins". The
+people list shows who joined without plugins, so the others know that person
+only watches.
+
+### Copied media gets its own folder
+
+When you host, files the project uses from outside its folder are copied into
+the project. They used to land next to the project file, so a project saved onto
+the desktop filled the desktop. They now go into the media folder set in
+REAPER's project settings, or into "Media" if none is set.
+
+Settings → Copied media lets you choose a folder next to the project instead, or
+name your own. Your own folder name can contain the project name, the author and
+the date, for example "Nightfall Media" next to Nightfall.rpp. A file of the same
+name that is already there is reused only when it is the same file.
+
+Before you host a project saved straight onto the desktop, into Downloads,
+Documents or your home folder, or into a folder with thousands of other files,
+ReaMesh says so and offers to save it into a folder of its own first.
+
+### Other changes
+
+- Notices from a relay show as cards at the top of the Lobby. Each one can be
+  closed, and a notice turns amber once its time window has begun.
+- The line under the project you host says where others can see it: "Local
+  network only", or the local network and the relays that list it.
+- Settings → Help links to ReaMesh on GitHub. After a few sessions with others,
+  the Lobby asks once for a star, and never again after a click either way.
+- After an update on macOS, the app opens again in its place in the Dock instead
+  of as a second icon.
+- Acknowledgements fade in instead of appearing all at once after a pause.
+
+### Fixes
+
+- Hosting no longer fails when the project folder contains a subfolder that
+  can't be read.
+- Dependencies were updated past known security advisories.
+
 ## 1.2.0
 
 <sub>November 5, 2026</sub>
