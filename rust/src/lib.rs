@@ -3475,18 +3475,29 @@ fn skip_in_manifest(name: &str) -> bool {
 }
 
 /// All shareable files under `dir`, as project-relative '/'-separated paths.
+///
+/// Only the project folder itself has to be readable. A subfolder or entry
+/// that can't be read is left out instead of failing the walk: a project
+/// saved into a busy folder (the desktop, the home folder) shares it with
+/// folders the user may not even be allowed to open, and none of those hold
+/// anything the project uses that the project could still load.
 fn build_manifest(dir: &Path) -> anyhow::Result<Vec<FileMeta>> {
     let mut out = Vec::new();
     let mut stack = vec![PathBuf::new()];
     while let Some(rel) = stack.pop() {
-        for entry in fs::read_dir(dir.join(&rel))? {
-            let entry = entry?;
+        let entries = match fs::read_dir(dir.join(&rel)) {
+            Ok(rd) => rd,
+            Err(e) if rel.as_os_str().is_empty() => return Err(e.into()),
+            Err(_) => continue,
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
             let name = entry.file_name().to_string_lossy().into_owned();
             if skip_in_manifest(&name) {
                 continue;
             }
             let rel_child = rel.join(&name);
-            let meta = entry.metadata()?;
+            let Ok(meta) = entry.metadata() else { continue };
             if meta.is_dir() {
                 stack.push(rel_child);
             } else if meta.is_file() {
@@ -8356,6 +8367,27 @@ mod transfer_safety_tests {
         for hidden in [".reamesh-backup/170/Audio/old.wav", "Audio/.x/old.wav", ".reamesh-link.json"] {
             assert!(hidden.split('/').any(skip_in_manifest), "{hidden}");
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A folder the user can't open (on a desktop the project shares with
+    /// everything else) is left out instead of failing the whole manifest.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_subfolder_does_not_fail_the_manifest() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("reamesh-unreadable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Locked")).unwrap();
+        fs::create_dir_all(root.join("Media")).unwrap();
+        fs::write(root.join("Locked/secret.wav"), b"x").unwrap();
+        fs::write(root.join("Media/take.wav"), b"y").unwrap();
+        fs::write(root.join("Song.rpp"), b"<REAPER_PROJECT\n>").unwrap();
+        fs::set_permissions(root.join("Locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let listed: Vec<String> = build_manifest(&root).map(|v| v.into_iter().map(|f| f.path).collect()).unwrap();
+        fs::set_permissions(root.join("Locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(listed.contains(&"Media/take.wav".to_string()));
+        assert!(listed.contains(&"Song.rpp".to_string()));
         let _ = fs::remove_dir_all(&root);
     }
 
