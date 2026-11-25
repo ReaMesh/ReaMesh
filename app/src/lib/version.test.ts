@@ -30,6 +30,7 @@ describe("version", () => {
     expect(cargoVersion("app/src-tauri/Cargo.toml")).toBe(v);
     expect(cargoVersion("rust/Cargo.toml")).toBe(v);
     expect(cargoVersion("relay/Cargo.toml")).toBe(v);
+    expect(cargoVersion("setup/Cargo.toml")).toBe(v);
     expect(/name = "reamesh-relay"\nversion = "([^"]+)"/.exec(read("relay/Cargo.lock"))?.[1]).toBe(v);
   });
 });

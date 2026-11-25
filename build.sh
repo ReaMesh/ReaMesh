@@ -112,9 +112,9 @@ fi
 echo
 echo "==> [4/$STEPS] Building the ReaMesh app"
 if [[ "$PLATFORM" == windows ]]; then
-  (cd app && bun install && bun run tauri build)
+  (cd app && bun install && bun run tauri build && bun run setup)
   echo
-  echo "Built: app/src-tauri/target/release/bundle/nsis/ (installer)"
+  echo "Built: app/src-tauri/target/release/bundle/setup/ (installer)"
 else
   (cd app && bun install && bun run tauri build --target universal-apple-darwin)
   echo

@@ -146,32 +146,39 @@ export function RMarkFill({
   height = 40,
   delay = 0.15,
   duration = 2,
+  progress,
   className,
 }: {
   height?: number;
   delay?: number;
   duration?: number;
+  /** Drives the fill (0 empty, 1 full) instead of playing it once. */
+  progress?: MotionValue<number>;
   className?: string;
 }) {
   const reduce = useReducedMotion();
   const { left, right } = getProfiles();
   const total = left.total + right.total;
   // One ink value for the whole mark; each stroke reads its own share.
-  const ink = useMotionValue(reduce ? total : 0);
+  const own = useMotionValue(reduce || progress ? total : 0);
+  const ink = useTransform(() =>
+    progress ? Math.min(1, Math.max(0, progress.get())) * total : own.get(),
+  );
   const leftInk = useTransform(ink, (v) => Math.min(v, left.total));
   const rightInk = useTransform(ink, (v) => Math.max(0, v - left.total));
   const id = `rmark-fill-${useId().replace(/[^a-zA-Z0-9]/g, "")}`;
 
   useEffect(() => {
+    if (progress) return;
     if (reduce) {
-      ink.set(total);
+      own.set(total);
       return;
     }
     // Soft at both ends, close to linear in the middle: the handoff between
     // the strokes sits mid-way and must not be the fastest moment.
-    const controls = animate(ink, total, { duration, delay, ease: [0.25, 0.1, 0.75, 0.9] });
+    const controls = animate(own, total, { duration, delay, ease: [0.25, 0.1, 0.75, 0.9] });
     return () => controls.stop();
-  }, [reduce, delay, duration, ink, total]);
+  }, [reduce, delay, duration, own, total, progress]);
 
   return (
     <svg

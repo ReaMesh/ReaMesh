@@ -13,6 +13,7 @@
     "build:universal": "tauri build --target universal-apple-darwin",
     "dev:b": "tauri dev --config src-tauri/tauri.dev-b.conf.json",
     "dev:ab": "bun scripts/dev-ab.ts",
+    "setup": "bun scripts/build-setup.ts",
     "dmg": "bash scripts/make-dmg.sh",
     "dmg:full": "bash scripts/build-dmg.sh",
     "dmg:sign": "bash scripts/sign-dmg.sh",

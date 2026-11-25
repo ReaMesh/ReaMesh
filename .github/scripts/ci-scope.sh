@@ -12,15 +12,17 @@
 set -uo pipefail
 
 print() {
-  local any_core=$1 any_app=$2 any_relay=$3
+  local any_core=$1 any_app=$2 any_relay=$3 any_setup=$4
   echo "core=$any_core"
   echo "relay=$any_relay"
+  # The Windows installer's own crate: its tests, and the Windows job.
+  echo "setup=$any_setup"
   [[ $any_core == true || $any_app == true ]] && echo "build=true" || echo "build=false"
   [[ $any_core == true || $any_relay == true ]] && echo "tests=true" || echo "tests=false"
 }
 
 classify() {
-  local core=false app=false relay=false f
+  local core=false app=false relay=false setup=false f
   while IFS= read -r f; do
     case "$f" in
       # What the workflow's paths-ignore lists: nothing builds these.
@@ -32,14 +34,15 @@ classify() {
       # The Intel check reads the minimum macOS from here.
       app/src-tauri/tauri.conf.json) core=true app=true ;;
       app/* | proprietary/*) app=true ;;
+      setup/*) setup=true ;;
       rust/* | extension/* | tools/* | build.sh) core=true ;;
       # The core depends on the contract; its list tests run the real relay.
       relay-proto/*) core=true relay=true ;;
       relay/*) relay=true ;;
-      *) core=true app=true relay=true ;;
+      *) core=true app=true relay=true setup=true ;;
     esac
   done
-  print "$core" "$app" "$relay"
+  print "$core" "$app" "$relay" "$setup"
 }
 
 if [[ ${1:-} == --classify ]]; then
@@ -49,7 +52,7 @@ fi
 
 everything() {
   echo "Running everything: $1"
-  print true true true >> "$GITHUB_OUTPUT"
+  print true true true true >> "$GITHUB_OUTPUT"
   exit 0
 }
 

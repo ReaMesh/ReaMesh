@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The Setup window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:deny-internal-toggle-maximize",
+    "core:window:allow-minimize",
+    "dialog:allow-open"
+  ]
+}

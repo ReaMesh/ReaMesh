@@ -164,7 +164,7 @@ optional; without it, the build uses the checked-in FFI header.
 
 | Output | Location |
 | --- | --- |
-| Windows installer | `app/src-tauri/target/release/bundle/nsis/` |
+| Windows installer | `app/src-tauri/target/release/bundle/setup/` |
 | macOS app | `app/src-tauri/target/release/bundle/macos/ReaMesh.app` |
 | Windows extension | `extension/build/Release/reaper_reamesh.dll` |
 | macOS extension | `extension/build/reaper_reamesh.dylib` |

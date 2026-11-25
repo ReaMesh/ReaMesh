@@ -1,4 +1,5 @@
-// Sets the one version app, extension, core and relay share, in every manifest:
+// Sets the one version app, extension, core, relay and the Windows Setup share,
+// in every manifest:
 //
 //   bun scripts/set-version.ts 0.2.0
 //
@@ -33,6 +34,7 @@ edit("app/src-tauri/tauri.conf.json", json);
 edit("app/src-tauri/Cargo.toml", cargo);
 edit("rust/Cargo.toml", cargo);
 edit("relay/Cargo.toml", cargo);
+edit("setup/Cargo.toml", cargo);
 // The relay builds with --locked, so its lockfile can't wait for the next build.
 edit("relay/Cargo.lock", (s) =>
   s.replace(/(name = "reamesh-relay"\nversion = )"[^"]+"/, `$1"${v}"`),

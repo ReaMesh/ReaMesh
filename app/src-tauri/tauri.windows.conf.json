@@ -19,16 +19,9 @@
     ]
   },
   "bundle": {
-    "targets": [
-      "nsis"
-    ],
+    "active": false,
     "resources": {
       "../../extension/build/Release/reaper_reamesh.dll": "reaper_reamesh.dll"
-    },
-    "windows": {
-      "nsis": {
-        "installMode": "currentUser"
-      }
     }
   }
 }

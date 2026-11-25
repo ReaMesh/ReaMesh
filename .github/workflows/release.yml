@@ -89,7 +89,7 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: cargo-registry-${{ github.job }}-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'app/src-tauri/Cargo.lock') }}
+          key: cargo-registry-${{ github.job }}-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock', 'app/src-tauri/Cargo.lock', 'setup/Cargo.lock') }}
           restore-keys: cargo-registry-${{ github.job }}-${{ runner.os }}-
       - name: Build Rust staticlib
         run: cargo build --release
@@ -110,32 +110,37 @@ jobs:
       - name: Build the app
         run: bun run tauri build --no-bundle --config src-tauri/tauri.release.conf.json
         working-directory: app
-      - name: Bundle the installer + signed updater artifacts
-        run: bun run tauri bundle --config src-tauri/tauri.release.conf.json
+      # ReaMesh Setup (setup/), carrying the app and the DLL. It is both the
+      # download and the update: the updater runs it with /S /UPDATE /R.
+      - name: Setup tests
+        run: cargo test --release --locked --features custom-protocol
+        working-directory: setup
+      - name: Build the installer
+        run: bun run setup
         working-directory: app
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      # The same DLL the installer carries, byte for byte, so the app's install
-      # check sees no difference once the update itself is installed.
-      - name: Sign the extension for pre-install
+      # The installer for the updater, and the same DLL the installer carries,
+      # byte for byte, so the app's install check sees no difference once the
+      # update itself is installed. Only this step sees the key.
+      - name: Sign the installer and the extension
         shell: bash
         working-directory: app
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          cp ../extension/build/Release/reaper_reamesh.dll src-tauri/target/release/bundle/nsis/
-          bun run tauri signer sign --app-version "$(bun -p 'require("./package.json").version')" \
-            src-tauri/target/release/bundle/nsis/reaper_reamesh.dll
+          B=src-tauri/target/release/bundle/setup
+          V="$(bun -p 'require("./package.json").version')"
+          cp ../extension/build/Release/reaper_reamesh.dll "$B/"
+          bun run tauri signer sign --app-version "$V" "$B/ReaMesh_${V}_x64-setup.exe"
+          bun run tauri signer sign --app-version "$V" "$B/reaper_reamesh.dll"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows
           path: |
-            app/src-tauri/target/release/bundle/nsis/*-setup.exe
-            app/src-tauri/target/release/bundle/nsis/*-setup.exe.sig
-            app/src-tauri/target/release/bundle/nsis/reaper_reamesh.dll
-            app/src-tauri/target/release/bundle/nsis/reaper_reamesh.dll.sig
+            app/src-tauri/target/release/bundle/setup/*-setup.exe
+            app/src-tauri/target/release/bundle/setup/*-setup.exe.sig
+            app/src-tauri/target/release/bundle/setup/reaper_reamesh.dll
+            app/src-tauri/target/release/bundle/setup/reaper_reamesh.dll.sig
 
   macos:
     runs-on: macos-latest

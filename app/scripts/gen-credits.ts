@@ -1,6 +1,7 @@
 // Writes src/assets/credits.json: every third-party package that ships in
-// ReaMesh (the core + extension, the app backend and the app's runtime npm
-// packages, plus the vendored C++ code), for the Acknowledgements screen.
+// ReaMesh (the core + extension, the app backend, the Windows Setup, the app's
+// runtime npm packages, plus the vendored C++ code), for the Acknowledgements
+// screen.
 //
 //   bun scripts/gen-credits.ts          regenerate
 //   bun scripts/gen-credits.ts --check  fail when the committed file is stale
@@ -151,7 +152,7 @@ const VENDORED: Credit[] = [
 // ---------- write ----------
 
 const ok =
-  rust(join(repo, "rust")) && rust(join(app, "src-tauri")) && npm();
+  rust(join(repo, "rust")) && rust(join(app, "src-tauri")) && rust(join(repo, "setup")) && npm();
 if (!ok) {
   if (check) {
     console.error("gen-credits: cargo or node_modules unavailable, can't check");
