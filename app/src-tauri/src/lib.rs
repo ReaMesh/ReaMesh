@@ -906,6 +906,60 @@ fn focus_reaper(pid: u32) -> bool {
     }
 }
 
+/// Windows: the window's system menu at the pointer, for a right-click on our
+/// own title bar (the window is undecorated, so Windows doesn't offer it
+/// there). Only what the window can actually do is enabled: minimize and
+/// close. The menu is modal, so it runs on the UI thread that owns the window.
+#[tauri::command]
+fn show_system_menu(window: tauri::WebviewWindow) {
+    #[cfg(target_os = "windows")]
+    {
+        let Ok(hwnd) = window.hwnd() else { return };
+        let hwnd = hwnd.0 as isize;
+        let _ = window.run_on_main_thread(move || system_menu_win(hwnd));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn system_menu_win(hwnd: isize) {
+    use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnableMenuItem, GetCursorPos, GetSystemMenu, PostMessageW, SetMenuDefaultItem,
+        TrackPopupMenu, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
+        SC_MOVE, SC_RESTORE, SC_SIZE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_SYSCOMMAND,
+    };
+    let hwnd = HWND(hwnd as *mut _);
+    unsafe {
+        let menu = GetSystemMenu(hwnd, false);
+        if menu.is_invalid() {
+            return;
+        }
+        for (cmd, on) in [
+            (SC_RESTORE, false),
+            (SC_MOVE, false),
+            (SC_SIZE, false),
+            (SC_MAXIMIZE, false),
+            (SC_MINIMIZE, true),
+            (SC_CLOSE, true),
+        ] {
+            let _ = EnableMenuItem(menu, cmd, MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED });
+        }
+        let _ = SetMenuDefaultItem(menu, SC_CLOSE, 0);
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_err() {
+            return;
+        }
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, None, hwnd, None);
+        if cmd.0 != 0 {
+            let _ = PostMessageW(Some(hwnd), WM_SYSCOMMAND, WPARAM(cmd.0 as usize), LPARAM(0));
+        }
+    }
+}
+
 // ---------- installed-plugin scan ----------
 //
 // The trust dialog marks each plugin a session would load as installed /
@@ -1958,6 +2012,7 @@ pub fn run() {
             launch_reaper,
             reaper_running,
             focus_reaper,
+            show_system_menu,
             open_overlay,
             close_overlay,
             get_reaper_path,

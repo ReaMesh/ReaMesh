@@ -1,4 +1,5 @@
 import { Minus, Settings, X } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Lockup } from "@/components/RMark";
 import { UpdateIndicator } from "@/components/UpdateIndicator";
@@ -59,6 +60,13 @@ export function TitleBar({ onOpenSettings }: { onOpenSettings: () => void }) {
     return (
       <header
         data-tauri-drag-region
+        onContextMenu={(e) => {
+          // Right-clicking the bar itself opens the window's system menu, as on
+          // a native title bar; its buttons keep no menu.
+          e.preventDefault();
+          if (e.target instanceof Element && e.target.closest("button")) return;
+          invoke("show_system_menu").catch(() => {});
+        }}
         className="relative flex h-11 shrink-0 select-none items-center bg-background/80 pl-3"
       >
         <Wordmark />
