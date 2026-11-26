@@ -112,12 +112,14 @@ jobs:
         working-directory: app
       # ReaMesh Setup (setup/), carrying the app and the DLL. It is both the
       # download and the update: the updater runs it with /S /UPDATE /R.
-      - name: Setup tests
-        run: cargo test --release --locked --features custom-protocol
-        working-directory: setup
       - name: Build the installer
         run: bun run setup
         working-directory: app
+      # After the installer build: the Setup crate embeds app/dist-setup at
+      # compile time, and that build is what creates it.
+      - name: Setup tests
+        run: cargo test --release --locked --features custom-protocol
+        working-directory: setup
       # The installer for the updater, and the same DLL the installer carries,
       # byte for byte, so the app's install check sees no difference once the
       # update itself is installed. Only this step sees the key.
